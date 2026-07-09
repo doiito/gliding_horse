@@ -15,6 +15,7 @@ use crate::tools::builtin::knowledge;
 #[cfg(feature = "ontology")]
 use crate::tools::builtin::ontology_tools;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::tools::tool_groups::ToolGroupManager;
 use crate::tools::workspace_monitor::{WorkspaceMonitor, FileState};
 
@@ -106,6 +107,7 @@ pub struct ToolExecutor {
     hook_runner: Option<HookRunner>,
     tool_group_manager: Option<ToolGroupManager>,
     workspace_monitor: Arc<parking_lot::RwLock<Option<Arc<WorkspaceMonitor>>>>,
+    shared_skill_graph: Arc<parking_lot::RwLock<Option<Arc<SkillGraphStore>>>>,
 }
 
 // Max micro-tool descriptions cap — removes oldest entries when exceeded.
@@ -144,6 +146,7 @@ impl ToolExecutor {
             hook_runner: None,
             tool_group_manager: None,
             workspace_monitor: Arc::new(parking_lot::RwLock::new(None)),
+            shared_skill_graph: Arc::new(parking_lot::RwLock::new(None)),
         };
         exe.register_builtins();
         exe
@@ -188,6 +191,12 @@ impl ToolExecutor {
     /// (e.g. by FusedRootCauseEngine for SPARQL semantic neighbor traversal).
     pub fn knowledge_graph_store(&self) -> Arc<std::sync::RwLock<KnowledgeGraphStore>> {
         self.kg_store.clone()
+    }
+
+    /// Inject the shared SkillGraphStore so that create_skill/convert_skill tools
+    /// write into the live graph instead of an isolated temporary store.
+    pub fn set_shared_skill_graph(&self, store: Arc<SkillGraphStore>) {
+        *self.shared_skill_graph.write() = Some(store);
     }
 
     /// Notify workspace_monitor that a file was read externally (e.g., via read_full_result).
@@ -547,7 +556,8 @@ impl ToolExecutor {
             "required": ["iri"]
         }), Arc::new(|input: Value| Box::pin(async move { knowledge::execute_knowledge_update(input).await })), all);
 
-        // ========== Skill Creation Tools ==========
+        // ========== Skill Creation Tools (with shared SkillGraphStore) ==========
+        let sg_for_create = self.shared_skill_graph.clone();
         self.register("create_skill", "Create a new Skill definition from natural language description using LLM. The skill will be auto-registered and available for use.", json!({
             "properties": {
                 "description": {"type":"string","description":"Natural language description of the skill to create"},
@@ -556,15 +566,22 @@ impl ToolExecutor {
                 "security_level_override": {"type":"string","description":"Security level override (optional): low|normal|high|critical"}
             },
             "required": ["description"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_create_skill(input).await })), &["DA"]);
+        }), Arc::new(move |input: Value| {
+            let sg = sg_for_create.read().clone();
+            Box::pin(async move { builtins::execute_create_skill(input, sg).await })
+        }), &["DA"]);
 
+        let sg_for_convert = self.shared_skill_graph.clone();
         self.register("convert_skill", "Convert a Markdown-formatted skill description into a JSON-LD Skill definition. Parses the markdown structure and generates proper skill schema.", json!({
             "properties": {
                 "markdown_content": {"type":"string","description":"Markdown content describing the skill"},
                 "source_path": {"type":"string","description":"Source file path (optional)"}
             },
             "required": ["markdown_content"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_convert_skill(input).await })), &["DA","CA"]);
+        }), Arc::new(move |input: Value| {
+            let sg = sg_for_convert.read().clone();
+            Box::pin(async move { builtins::execute_convert_skill(input, sg).await })
+        }), &["DA","CA"]);
 
         // ========== Knowledge Graph Tools ==========
         let kg_store_for_extract = self.kg_store.clone();

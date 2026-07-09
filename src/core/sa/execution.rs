@@ -130,11 +130,11 @@ impl SupervisorAgent {
         match result.status.as_str() {
             "success" => {
                 let task_result = serde_json::json!({"status": "success", "summary": &result.summary});
-                self.perception.on_task_end(&task_result, &result.task_iri);
+                self.perception.on_task_end(&task_result, &result.task_iri).await;
             }
             "failed" => {
                 let task_result = serde_json::json!({"status": "failed", "summary": &result.summary});
-                self.perception.on_task_end(&task_result, &result.task_iri);
+                self.perception.on_task_end(&task_result, &result.task_iri).await;
             }
             _ => {}
         }
@@ -775,7 +775,7 @@ impl SupervisorAgent {
     #[allow(clippy::too_many_arguments)]
     async fn handle_step_result(
         &self,
-        result: TaskResult,
+        mut result: TaskResult,
         step: PlanStep,
         _node_idx: NodeIndex,
         i: usize,
@@ -879,14 +879,46 @@ impl SupervisorAgent {
             }
         }
 
-        // CA perception
-        if step.role == AgentRole::Check && result.status == "success" {
+        // CA perception + dimension audit
+        if step.role == AgentRole::Check {
             let check_data = serde_json::json!({
                 "summary": &result.summary,
                 "objective": &step.objective,
             });
             if let Some(advisory) = self.perception.on_check_completed(&check_data, task_iri) {
                 info!(advisory = ?advisory, "CA perception advisories generated");
+            }
+
+            // Run dimension-level audit against the 5W2H specification
+            let audit_results = crate::core::five_w2h::audit_dimensions(
+                five_w2h,
+                &result,
+                task_iri,
+                self.runner.causal_engine.as_ref().map(|ce| ce.as_ref()),
+            );
+            let failures: Vec<&crate::core::five_w2h::DimensionAuditResult> = audit_results.iter()
+                .filter(|r| matches!(r.status, crate::core::five_w2h::AuditStatus::Fail(_)))
+                .collect();
+            if !failures.is_empty() {
+                let fail_summary: Vec<String> = failures.iter()
+                    .map(|r| format!("[{}] {}: {}", r.dimension, match &r.status {
+                        crate::core::five_w2h::AuditStatus::Fail(msg) => msg.as_str(),
+                        _ => "failed",
+                    }, r.evidence))
+                    .collect();
+                warn!(
+                    task_iri = %task_iri,
+                    dimensions = ?failures.iter().map(|r| &r.dimension).collect::<Vec<_>>(),
+                    "Dimension audit: {} dimension(s) failed — causal observations recorded",
+                    failures.len()
+                );
+                // Append dimension audit findings to the CA agent's result summary
+                if result.summary.len() < 4000 {
+                    let audit_note = format!("\n\n--- Dimension Audit ---\n{}", fail_summary.join("\n"));
+                    if !result.summary.contains("Dimension Audit") {
+                        result.summary.push_str(&audit_note);
+                    }
+                }
             }
         }
 

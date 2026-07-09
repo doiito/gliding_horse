@@ -5,6 +5,8 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{debug, info, instrument};
 
+use crate::causal::engine::CausalEngine;
+use crate::causal::types::CausalObservation;
 use crate::core::event_bus::{EventBus, EventType};
 use crate::core::perception_store::{PerceptionEntry, PerceptionSource, PerceptionStore};
 use crate::memory::l2_blackboard::Blackboard;
@@ -89,6 +91,7 @@ pub struct WorkspaceMonitor {
     watch_engine: Option<WatchEngine>,
     event_bus: Option<Arc<EventBus>>,
     perception_store: RwLock<Option<Arc<PerceptionStore>>>,
+    causal_engine: RwLock<Option<Arc<CausalEngine>>>,
 }
 
 impl WorkspaceMonitor {
@@ -177,16 +180,12 @@ impl WorkspaceMonitor {
             watch_engine,
             event_bus: event_bus_for_struct,
             perception_store: RwLock::new(None),
+            causal_engine: RwLock::new(None),
         };
 
-        // Async consumer needs tokio runtime; skip if no runtime is available
-        // (glidingcode scenario: deferred to start_async_components in async context)
-        if tokio::runtime::Handle::try_current().is_ok() {
-            ws.register_event_consumers();
-        } else {
-            tracing::info!("No tokio runtime in init context, event consumers deferred");
-        }
-
+        // Event consumers are deferred to start_async_components() which is called
+        // from within an async context (process_task) after finalize_setup() has
+        // wired the perception_store. This avoids spawning consumers with None.
         // Perform initial scan
         {
             let inv = ws.inventory.read();
@@ -257,43 +256,70 @@ impl WorkspaceMonitor {
 
         let inventory = self.inventory.clone();
         let perception = self.perception_store.read().clone();
-        // Subscribe before spawning to ensure no events are missed between
-        // spawn and subscribe.
+        let causal = self.causal_engine.read().clone();
         let mut receiver = event_bus.subscribe();
         tokio::spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
-                        match EventType::from_str(&event.event_type) {
+                        let path = event.payload.clone();
+                        let event_type_name = event.event_type.clone();
+                        match EventType::from_str(&event_type_name) {
                             EventType::WorkspaceFileCreated => {
-                                inventory.read().add_or_update(&event.payload);
-                                // Notify perception region
+                                inventory.read().add_or_update(&path);
+                                if let Some(ref ce) = causal {
+                                    ce.record_observation(CausalObservation::new(
+                                        &format!("ws_create_{}", uuid::Uuid::new_v4()),
+                                        "iri://workspace_monitor",
+                                        "WorkspaceFileChange",
+                                        &format!("file_created:{}", path),
+                                    ));
+                                }
                                 if let Some(ref p) = perception {
                                     let entry = PerceptionEntry::new(
                                         PerceptionSource::WorkspaceMonitor,
-                                        format!("New file created: {}", event.payload),
+                                        format!("New file created: {}", path),
                                     ).with_priority(6);
                                     p.store_global(entry);
                                 }
                             }
                             EventType::WorkspaceFileModified => {
-                                inventory.read().mark_stale(&event.payload);
-                                // Notify perception region
+                                let inv = inventory.read();
+                                if inv.get_entry(&path).is_none() && std::path::Path::new(&path).exists() {
+                                    drop(inv);
+                                    inventory.read().add_or_update(&path);
+                                }
+                                inventory.read().mark_stale(&path);
+                                if let Some(ref ce) = causal {
+                                    ce.record_observation(CausalObservation::new(
+                                        &format!("ws_modify_{}", uuid::Uuid::new_v4()),
+                                        "iri://workspace_monitor",
+                                        "WorkspaceFileChange",
+                                        &format!("file_modified:{}", path),
+                                    ));
+                                }
                                 if let Some(ref p) = perception {
                                     let entry = PerceptionEntry::new(
                                         PerceptionSource::WorkspaceMonitor,
-                                        format!("File externally modified: {}", event.payload),
+                                        format!("File externally modified: {}", path),
                                     ).with_priority(6);
                                     p.store_global(entry);
                                 }
                             }
                             EventType::WorkspaceFileRemoved => {
-                                inventory.read().remove(&event.payload);
-                                // Notify perception region
+                                inventory.read().remove(&path);
+                                if let Some(ref ce) = causal {
+                                    ce.record_observation(CausalObservation::new(
+                                        &format!("ws_remove_{}", uuid::Uuid::new_v4()),
+                                        "iri://workspace_monitor",
+                                        "WorkspaceFileChange",
+                                        &format!("file_removed:{}", path),
+                                    ));
+                                }
                                 if let Some(ref p) = perception {
                                     let entry = PerceptionEntry::new(
                                         PerceptionSource::WorkspaceMonitor,
-                                        format!("File deleted: {}", event.payload),
+                                        format!("File deleted: {}", path),
                                     ).with_priority(5);
                                     p.store_global(entry);
                                 }
@@ -454,6 +480,11 @@ impl WorkspaceMonitor {
         *self.perception_store.write() = Some(store);
     }
 
+    /// Attach a CausalEngine to record file-change observations for causal analysis.
+    pub fn set_causal_engine(&self, engine: Arc<CausalEngine>) {
+        *self.causal_engine.write() = Some(engine);
+    }
+
     /// Generate workspace file status summary text for injection into perception region
     /// Reset the file inventory, clearing all tracked files.
     /// Called on topic shift to prevent files from previous tasks leaking into new task perception.
@@ -465,7 +496,7 @@ impl WorkspaceMonitor {
         }
     }
 
-    pub fn generate_perception_text(&self) -> Option<String> {
+    pub fn generate_perception_text(&self, task_context: Option<&str>) -> Option<String> {
         let inv = self.inventory.read();
         let all = inv.list_all();
         if all.is_empty() {
@@ -473,9 +504,30 @@ impl WorkspaceMonitor {
         }
 
         let total = all.len();
-        let stale: Vec<_> = all.iter().filter(|e| e.state == crate::tools::workspace_monitor::FileState::ReadStale).collect();
-        let written_unread: Vec<_> = all.iter().filter(|e| e.state == crate::tools::workspace_monitor::FileState::WrittenUnread).collect();
-        let discovered: Vec<_> = all.iter().filter(|e| e.state == crate::tools::workspace_monitor::FileState::Discovered).collect();
+
+        // Build keyword set from task context for relevance scoring
+        let keywords: Vec<String> = task_context
+            .map(|ctx| {
+                ctx.split(|c: char| !c.is_alphanumeric() && c != '.')
+                    .filter(|w| w.len() > 2)
+                    .map(|w| w.to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let score_relevance = |path: &str| -> usize {
+            if keywords.is_empty() { return 0; }
+            let path_lower = path.to_lowercase();
+            keywords.iter().filter(|k| path_lower.contains(k.as_str())).count()
+        };
+
+        let mut stale: Vec<_> = all.iter().filter(|e| e.state == FileState::ReadStale).collect();
+        let mut written_unread: Vec<_> = all.iter().filter(|e| e.state == FileState::WrittenUnread).collect();
+        let discovered: Vec<_> = all.iter().filter(|e| e.state == FileState::Discovered).collect();
+
+        // Sort by task relevance (highest first)
+        stale.sort_by(|a, b| score_relevance(&b.path).cmp(&score_relevance(&a.path)));
+        written_unread.sort_by(|a, b| score_relevance(&b.path).cmp(&score_relevance(&a.path)));
 
         let mut parts = Vec::new();
         parts.push(format!("{} files total", total));
@@ -561,11 +613,12 @@ impl WorkspaceMonitor {
         Some(summary)
     }
 
-    /// Write current file status perception summary to PerceptionStore
-    pub fn inject_file_perception(&self) {
+    /// Write current file status perception summary to PerceptionStore.
+    /// `task_context` optionally describes the current task for relevance sorting.
+    pub fn inject_file_perception(&self, task_context: Option<&str>) {
         let ps = self.perception_store.read();
         if let Some(ref store) = *ps {
-            if let Some(text) = self.generate_perception_text() {
+            if let Some(text) = self.generate_perception_text(task_context) {
                 let entry = PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, text);
                 store.store_global(entry);
             }
@@ -1065,7 +1118,7 @@ mod tests {
             inv.mark_stale(&file2.to_string_lossy());
         }
 
-        ws.inject_file_perception();
+        ws.inject_file_perception(None);
 
         let text = ps.take_perception_text("iri://task/t");
         assert!(!text.is_empty(), "Should have perception text after inject");
@@ -1075,7 +1128,7 @@ mod tests {
     #[test]
     fn test_generate_perception_text_empty_inventory() {
         let (ws, _dir) = temp_ws_monitor();
-        let text = ws.generate_perception_text();
+        let text = ws.generate_perception_text(None);
         // Fresh inventory with initial scan may have files
         // If empty, it returns None; otherwise it should have text
         let inv = ws.inventory.read();
@@ -1104,7 +1157,7 @@ mod tests {
             inv.mark_stale(&f2.to_string_lossy());
         }
 
-        let text = ws.generate_perception_text();
+        let text = ws.generate_perception_text(None);
         assert!(text.is_some(), "Should generate perception text");
         let t = text.unwrap();
         assert!(t.contains("files total"), "Should mention total file count: {}", t);
@@ -1114,7 +1167,7 @@ mod tests {
     fn test_inject_file_perception_no_perception_store_noop() {
         let (ws, _dir) = temp_ws_monitor();
         // Should not panic when perception_store is None
-        ws.inject_file_perception();
+        ws.inject_file_perception(None);
     }
 
     #[test]
@@ -1132,9 +1185,9 @@ mod tests {
             .with_perception_store(ps.clone());
 
         // Verify it's configured
-        ws.inject_file_perception();
+        ws.inject_file_perception(None);
         // Should not panic, meaning perception_store is Some
-        let _ = ws.generate_perception_text();
+        let _ = ws.generate_perception_text(None);
     }
 
     /// Full integration: event consumer → perception store → take → verify

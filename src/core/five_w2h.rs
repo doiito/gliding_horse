@@ -3,6 +3,244 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+// ── Dimension Audit types ──────────────────────────────────────────────
+
+/// Per-dimension audit status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AuditStatus {
+    Pass,
+    Warning(String),
+    Fail(String),
+}
+
+/// Result of auditing a single 5W2H dimension
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimensionAuditResult {
+    pub dimension: String,
+    pub status: AuditStatus,
+    pub evidence: String,
+    pub details: Vec<String>,
+}
+
+/// Run a dimension-level audit of task results against the 5W2H specification.
+///
+/// Evaluates each of the 7 dimensions (what, why, who, when, where, how, how_much)
+/// against the task result. Failed dimensions are recorded as `CausalObservation`s
+/// on the optional `causal_engine` for automated root-cause analysis.
+///
+/// Returns a `Vec<DimensionAuditResult>` — one entry per dimension, each with
+/// pass/fail/warning status and supporting evidence.
+pub fn audit_dimensions(
+    five_w2h: &Task5W2H,
+    result: &crate::core::agent_runner::TaskResult,
+    task_iri: &str,
+    causal_engine: Option<&crate::causal::CausalEngine>,
+) -> Vec<DimensionAuditResult> {
+    use crate::causal::CausalObservation;
+    let now = Utc::now();
+
+    let mut results: Vec<DimensionAuditResult> = Vec::new();
+
+    // ── What dimension: was the objective achieved? ──
+    {
+        let finished = result.status == "success" || result.status == "partial_success";
+        let has_content = result.output.is_some() || !result.summary.is_empty();
+        let detail = if finished && has_content {
+            AuditStatus::Pass
+        } else if result.status == "partial_success" {
+            AuditStatus::Warning("Objective partially achieved".to_string())
+        } else {
+            if let Some(ce) = causal_engine {
+                ce.record_observation(CausalObservation::new(
+                    &format!("obs-{}-{}-what", task_iri, now.timestamp_millis()),
+                    "iri://system/5w2h/what",
+                    "TaskNotCompleted",
+                    result.status.as_str(),
+                ));
+            }
+            AuditStatus::Fail("Task was not completed successfully".to_string())
+        };
+        results.push(DimensionAuditResult {
+            dimension: "what".to_string(),
+            status: detail,
+            evidence: format!("status={}, has_output={}, summary_len={}", result.status, has_content, result.summary.len()),
+            details: vec![format!("Task status: {}", result.status)],
+        });
+    }
+
+    // ── Why dimension: did we meet the success criteria? ──
+    {
+        let criteria = &five_w2h.why.success_criteria;
+        if criteria.is_empty() {
+            results.push(DimensionAuditResult {
+                dimension: "why".to_string(),
+                status: AuditStatus::Warning("No explicit success criteria".to_string()),
+                evidence: "success_criteria is empty".to_string(),
+                details: vec![],
+            });
+        } else {
+            let matched: Vec<&String> = criteria.iter().filter(|c| result.summary.contains(c.as_str())).collect();
+            let ratio = matched.len() as f64 / criteria.len().max(1) as f64;
+            let detail = if ratio >= 0.8 {
+                AuditStatus::Pass
+            } else if ratio >= 0.5 {
+                AuditStatus::Warning(format!("{:.0}% of success criteria met", ratio * 100.0))
+            } else {
+                if let Some(ce) = causal_engine {
+                    for c in criteria.iter().filter(|c| !matched.contains(c)) {
+                        let obs_id = format!("obs-{}-{}-why-{}", task_iri, now.timestamp_millis(), c.chars().take(16).collect::<String>());
+                        ce.record_observation(CausalObservation::new(
+                            &obs_id,
+                            "iri://system/5w2h/why",
+                            "SuccessCriteriaNotMet",
+                            c,
+                        ));
+                    }
+                }
+                AuditStatus::Fail(format!("Only {:.0}% of success criteria met", ratio * 100.0))
+            };
+            results.push(DimensionAuditResult {
+                dimension: "why".to_string(),
+                status: detail,
+                evidence: format!("{}/{} criteria matched", matched.len(), criteria.len()),
+                details: criteria.iter().map(|c| format!("Criterion: {}", c)).collect(),
+            });
+        }
+    }
+
+    // ── Who dimension: was the execution role appropriate? ──
+    {
+        let detail = if let Some(ref who) = five_w2h.who {
+            if let Some(ref required_role) = who.required_role {
+                if result.status == "success" || result.status == "partial_success" {
+                    AuditStatus::Pass
+                } else {
+                    AuditStatus::Warning(format!("Required role '{}' but execution had issues", required_role))
+                }
+            } else {
+                AuditStatus::Pass
+            }
+        } else {
+            AuditStatus::Pass
+        };
+        results.push(DimensionAuditResult {
+            dimension: "who".to_string(),
+            status: detail,
+            evidence: format!("required_role={:?}", five_w2h.who.as_ref().and_then(|w| w.required_role.as_ref())),
+            details: vec![],
+        });
+    }
+
+    // ── When dimension: was the task completed on time? ──
+    {
+        let detail = if let Some(ref when) = five_w2h.when {
+            if let Some(ref deadline) = when.deadline {
+                if now > *deadline {
+                    AuditStatus::Warning(format!("Deadline exceeded: deadline={}, now={}", deadline, now))
+                } else {
+                    AuditStatus::Pass
+                }
+            } else {
+                AuditStatus::Pass
+            }
+        } else {
+            AuditStatus::Pass
+        };
+        results.push(DimensionAuditResult {
+            dimension: "when".to_string(),
+            status: detail,
+            evidence: format!("deadline={:?}", five_w2h.when.as_ref().and_then(|w| w.deadline)),
+            details: vec![],
+        });
+    }
+
+    // ── Where dimension: was the execution environment correct? ──
+    {
+        let detail = if let Some(ref where_detail) = five_w2h.where_ {
+            if let Some(ref env) = where_detail.execution_environment {
+                if let Ok(cwd) = std::env::current_dir() {
+                    let cwd_str = cwd.to_string_lossy().to_string();
+                    if !cwd_str.contains(env.trim_end_matches('/')) {
+                        AuditStatus::Warning(format!("Execution environment mismatch: expected={}, actual={}", env, cwd_str))
+                    } else {
+                        AuditStatus::Pass
+                    }
+                } else {
+                    AuditStatus::Pass
+                }
+            } else {
+                AuditStatus::Pass
+            }
+        } else {
+            AuditStatus::Pass
+        };
+        results.push(DimensionAuditResult {
+            dimension: "where".to_string(),
+            status: detail,
+            evidence: format!("execution_environment={:?}", five_w2h.where_.as_ref().and_then(|w| w.execution_environment.as_ref())),
+            details: vec![],
+        });
+    }
+
+    // ── How dimension: was the approach quality acceptable? ──
+    {
+        let detail = match result.status.as_str() {
+            "success" => AuditStatus::Pass,
+            "partial_success" => AuditStatus::Warning("Task partially succeeded — approach had gaps".to_string()),
+            s => {
+                if let Some(ce) = causal_engine {
+                    ce.record_observation(CausalObservation::new(
+                        &format!("obs-{}-{}-how", task_iri, now.timestamp_millis()),
+                        "iri://system/5w2h/how",
+                        "ExecutionFailed",
+                        s,
+                    ));
+                }
+                AuditStatus::Fail(format!("Execution failed with status: {}", s))
+            }
+        };
+        results.push(DimensionAuditResult {
+            dimension: "how".to_string(),
+            status: detail,
+            evidence: format!("status={}, errors={}", result.status, result.errors.len()),
+            details: result.errors.clone(),
+        });
+    }
+
+    // ── HowMuch dimension: was the task within budget? ──
+    {
+        let detail = if let Some(ref hm) = five_w2h.how_much {
+            let mut warnings = Vec::new();
+            if let Some(ref budget) = hm.token_budget {
+                let usage = result.tool_call_count as u64 * 1000; // rough estimate
+                if usage > *budget {
+                    warnings.push(format!("Token budget exceeded: budget={}, estimated={}", budget, usage));
+                }
+            }
+            if let Some(ref max_cycles) = hm.max_pdca_cycles {
+                if result.turn_count > *max_cycles {
+                    warnings.push(format!("Turn count exceeded: max={}, actual={}", max_cycles, result.turn_count));
+                }
+            }
+            if warnings.is_empty() {
+                AuditStatus::Pass
+            } else {
+                AuditStatus::Warning(warnings.join("; "))
+            }
+        } else {
+            AuditStatus::Pass
+        };
+        results.push(DimensionAuditResult {
+            dimension: "how_much".to_string(),
+            status: detail,
+            evidence: format!("turns={}, tool_calls={}, errors={}", result.turn_count, result.tool_call_count, result.errors.len()),
+            details: vec![],
+        });
+    }
+
+    results
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Priority {
     High,

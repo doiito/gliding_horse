@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 use crate::core::agent_runner::AgentRunner;
 use crate::core::event_bus::{Event, EventBus};
+use crate::core::perception_store::PerceptionStore;
 use crate::core::relevance_tracker::RelevanceTracker;
 use crate::core::supplementary_store::SupplementaryInputStore;
 use crate::jsonld::type_router::TypeRouter;
@@ -14,6 +15,7 @@ use crate::memory::scheduler::MemoryScheduler;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::EmbeddingService;
 use crate::perception::proactive_engine::ProactiveEngine;
+use crate::skill_graph::discovery::SkillDiscoveryEngine;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::sharing::SharingProtocol;
 use crate::tools::skill_registry::SkillRegistry;
@@ -49,6 +51,8 @@ pub struct SupervisorAgent {
     pub(super) relevance_tracker: RelevanceTracker,
     /// Timeout for intervention/LLM execution (seconds)
     pub(super) execution_timeout_secs: u64,
+    /// Skill discovery engine for semantic skill search during planning
+    pub(super) discovery_engine: Option<Arc<SkillDiscoveryEngine>>,
 }
 
 impl SupervisorAgent {
@@ -103,6 +107,7 @@ impl SupervisorAgent {
             embedder: None,
             relevance_tracker: RelevanceTracker::new(0.6),
             execution_timeout_secs: 30,
+            discovery_engine: None,
         }
     }
 
@@ -137,6 +142,20 @@ impl SupervisorAgent {
     /// Attach HyperspaceStore to the perception engine for semantic experience retrieval.
     pub fn with_perception_hyperspace(mut self, store: Arc<HyperspaceStore>) -> Self {
         self.perception.hyperspace = Some(store);
+        self
+    }
+
+    /// Attach a PerceptionStore so the proactive engine can inject conflict alerts
+    /// and anomaly perception data visible to the agent during execution.
+    pub fn with_perception_store(mut self, store: Arc<PerceptionStore>) -> Self {
+        self.perception.perception_store = Some(store);
+        self
+    }
+
+    /// Attach SkillDiscoveryEngine for semantic skill search during task planning.
+    /// When set, the SA will enrich the agent's context with relevant skill suggestions.
+    pub fn with_discovery_engine(mut self, engine: Arc<SkillDiscoveryEngine>) -> Self {
+        self.discovery_engine = Some(engine);
         self
     }
 

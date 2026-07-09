@@ -604,12 +604,11 @@ Output the summary report directly, not in JSON format."#,
             },
         ];
 
-        // Inject workspace file inventory into perception store so the agent
-        // knows what files exist before it starts.
         {
             let executor = self.tool_executor.read();
             if let Some(wm) = executor.get_workspace_monitor() {
-                wm.inject_file_perception();
+                wm.snapshots().create_snapshot("pre_task", Some(&ctx.task_iri));
+                wm.inject_file_perception(Some(&ctx.objective));
             }
         }
 
@@ -623,12 +622,32 @@ Output the summary report directly, not in JSON format."#,
             );
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: format!("# 📡 Agent Perception\n\n{}", perception_text),
+                content: format!("# Agent Perception\n\n{}", perception_text),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
             });
+        }
+
+        // Proactive KG context injection: query the knowledge graph for entities relevant to the task
+        // and inject them as environment context before the agent begins reasoning.
+        if let Some(ref kg_store) = self.unified_graph_store {
+            let kg_context = Self::build_kg_context(kg_store, &ctx.objective);
+            if !kg_context.is_empty() {
+                info!(
+                    "[kg_context] injecting {} bytes of knowledge graph context",
+                    kg_context.len()
+                );
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: format!("# Knowledge Graph Context\n\n{}", kg_context),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
         }
 
         // Resume mode: restore history messages from checkpoint, placed after system and before new user message
@@ -1952,5 +1971,55 @@ Output the summary report directly, not in JSON format."#,
             tracked_actions: Vec::new(),
             archive_iri: unfinished_archive,
         })
+    }
+
+    /// Build knowledge graph context string from the unified Oxigraph store.
+    /// Queries for entities (subjects with rdf:type) that have labels or names,
+    /// returning them as a structured context block the LLM can use to ground its reasoning.
+    fn build_kg_context(store: &oxigraph::store::Store, objective: &str) -> String {
+        let sparql = "\
+            SELECT DISTINCT ?s ?label ?type WHERE {\
+                ?s a ?type .\
+                OPTIONAL { ?s rdfs:label ?label }\
+                OPTIONAL { ?s <http://schema.org/name> ?label }\
+            } ORDER BY DESC(?label) LIMIT 30\
+        ";
+
+        use oxigraph::sparql::QueryResults as Qr;
+        use oxigraph::sparql::QuerySolution;
+        let solutions: Vec<QuerySolution> = match store.query(sparql) {
+            Ok(Qr::Solutions(it)) => it.filter_map(Result::ok).collect(),
+            _ => return String::new(),
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        for solution in &solutions {
+            let s = solution.get("s").map(|v| format!("{}", v)).unwrap_or_default();
+            let label = solution.get("label").map(|v| format!("{}", v)).unwrap_or_default();
+            let type_ = solution.get("type").map(|v| format!("{}", v)).unwrap_or_default();
+            if s.is_empty() {
+                continue;
+            }
+            let name = if !label.is_empty() { label } else { s.clone() };
+            let entity = if !type_.is_empty() {
+                format!("- **{}** ({})", name, type_)
+            } else {
+                format!("- **{}**", name)
+            };
+            if !lines.contains(&entity) {
+                lines.push(entity);
+            }
+        }
+
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let mut result = format!(
+            "The following entities are available in the knowledge graph (task context: {}):\n\n",
+            objective.chars().take(80).collect::<String>()
+        );
+        result.push_str(&lines.join("\n"));
+        result
     }
 }

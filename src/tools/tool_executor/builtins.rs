@@ -13,6 +13,7 @@ use crate::knowledge_graph::extractor::KnowledgeExtractor;
 use crate::knowledge_graph::ontology::OntologyManager;
 use crate::knowledge_graph::rdf_mapper::RdfMapper;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::knowledge_graph::types::{BridgeRelationType, NodeDef, EdgeDef, RdfQuad, RdfValue};
 use crate::utils::text::safe_truncate;
 
@@ -1154,7 +1155,7 @@ pub(crate) fn init_skill_creator_gateway(gateway: std::sync::Arc<crate::gateway:
     let _ = SKILL_CREATOR_GATEWAY.set(gateway);
 }
 
-pub(super) async fn execute_create_skill(input: Value) -> Result<Value, String> {
+pub(super) async fn execute_create_skill(input: Value, shared_graph: Option<Arc<SkillGraphStore>>) -> Result<Value, String> {
     let description = input["description"].as_str().unwrap_or("").to_string();
     if description.is_empty() {
         return Err("description is required".to_string());
@@ -1165,7 +1166,7 @@ pub(super) async fn execute_create_skill(input: Value) -> Result<Value, String> 
     let security_level_override = input["security_level_override"].as_str().map(String::from);
 
     if let Some(gateway) = SKILL_CREATOR_GATEWAY.get() {
-        let graph_store = std::sync::Arc::new(crate::skill_graph::SkillGraphStore::new());
+        let graph_store = shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
         let registry = std::sync::Arc::new(crate::tools::SkillRegistry::new());
         let config = crate::skill_graph::SkillCreatorConfig::default();
         let creator = crate::skill_graph::SkillCreator::new(
@@ -1205,7 +1206,7 @@ pub(super) async fn execute_create_skill(input: Value) -> Result<Value, String> 
     }
 }
 
-pub(super) async fn execute_convert_skill(input: Value) -> Result<Value, String> {
+pub(super) async fn execute_convert_skill(input: Value, shared_graph: Option<Arc<SkillGraphStore>>) -> Result<Value, String> {
     let markdown_content = input["markdown_content"].as_str().unwrap_or("").to_string();
     if markdown_content.is_empty() {
         return Err("markdown_content is required".to_string());
@@ -1213,7 +1214,7 @@ pub(super) async fn execute_convert_skill(input: Value) -> Result<Value, String>
     let source_path = input["source_path"].as_str().map(String::from);
 
     if let Some(gateway) = SKILL_CREATOR_GATEWAY.get() {
-        let graph_store = std::sync::Arc::new(crate::skill_graph::SkillGraphStore::new());
+        let graph_store = shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
         let registry = std::sync::Arc::new(crate::tools::SkillRegistry::new());
         let config = crate::skill_graph::SkillCreatorConfig::default();
         let creator = crate::skill_graph::SkillCreator::new(

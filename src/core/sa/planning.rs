@@ -18,7 +18,7 @@ impl SupervisorAgent {
     ) -> Result<String, CoreError> {
         let cycle_id = format!("cycle_{}", uuid::Uuid::new_v4().hyphenated());
 
-        let perception_result = self.perception.on_task_start(user_input, task_iri)?;
+        let perception_result = self.perception.on_task_start(user_input, task_iri).await?;
         info!(
             cycle_id = %cycle_id,
             task_iri = %task_iri,

@@ -73,9 +73,42 @@ impl SupervisorAgent {
             tracing::info!(task_iri = %task_iri, what = %five_w2h.what, "5W2H initialization complete");
         }
 
-        let perception_hints = self.perception.on_task_start(user_input, task_iri)
+        let perception_hints = self.perception.on_task_start(user_input, task_iri).await
             .map(|a| a.relevant_experience_hints)
             .unwrap_or_default();
+
+        // Enrich with skill discovery results if a discovery engine is available
+        let mut all_hints: Vec<String> = perception_hints;
+        if let Some(ref de) = self.discovery_engine {
+            let disc_task = crate::skill_graph::discovery::Task5W2H {
+                what: five_w2h.what.clone(),
+                why: five_w2h.why.description.clone(),
+                who: five_w2h.who.as_ref().and_then(|w| w.required_role.clone()),
+                when_phase: five_w2h.when.as_ref().map(|w| format!("{:?}", w)),
+                where_context: five_w2h.where_.as_ref().map(|w| format!("{:?}", w)),
+                how_approach: five_w2h.how.as_ref().and_then(|h| h.required_steps.clone()),
+                constraints: five_w2h.why.success_criteria.clone(),
+            };
+            let matches = de.discover_for_task(&disc_task);
+            let skill_hints: Vec<String> = matches.iter()
+                .filter_map(|m| {
+                    let name = if !m.skill.name.is_empty() {
+                        m.skill.name.clone()
+                    } else {
+                        m.skill.skill_iri.rsplit('/').next()?.to_string()
+                    };
+                    Some(name)
+                })
+                .take(5)
+                .collect();
+            if !skill_hints.is_empty() {
+                all_hints.extend(skill_hints);
+                tracing::info!(
+                    task_iri = %task_iri,
+                    "Skill discovery enriched planning with relevant skills"
+                );
+            }
+        }
 
         // Unified execution path: build ExecutionPlan from JSON-LD workflow or LLM
         let mut plan = if let Some(ref wf_jsonld) = ctx.workflow_jsonld {
@@ -90,7 +123,7 @@ impl SupervisorAgent {
         } else if ctx.resumed_messages.is_some() {
             self.build_resume_plan()
         } else {
-            self.analyze_task_with_llm(user_input, &five_w2h, &perception_hints).await
+            self.analyze_task_with_llm(user_input, &five_w2h, &all_hints).await
         };
 
         // ── Verify-first optimization ──

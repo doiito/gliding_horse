@@ -131,7 +131,7 @@ impl CodeCliEngine {
         let proj = Arc::new(ProjectionEngine::with_vector_store(
             l2.clone(),
             agent_settings.max_projection_size,
-            Some(vector_store),
+            Some(vector_store.clone()),
         ));
         let core_config = CoreConfig {
             max_node_size: settings.memory.l2.max_node_size,
@@ -224,7 +224,8 @@ impl CodeCliEngine {
 
         // ── Skill Discovery Engine (semantic skill search via Hyperspace) ──
         let discovery_engine = Arc::new(
-            SkillDiscoveryEngine::new(skill_graph.clone()),
+            SkillDiscoveryEngine::new(skill_graph.clone())
+                .with_vector_store(vector_store.clone()),
         );
 
         // ── FeatureExtractor (GNN topological features for causal analysis) ──
@@ -255,6 +256,11 @@ impl CodeCliEngine {
 
         // 初始化 WorkspaceMonitor — 从 settings.workspace 读取配置
         let workspace_monitor: Option<Arc<WorkspaceMonitor>> = {
+            let ws_db_path = {
+                let mut p = workspace_root.clone();
+                p.push(".gliding_horse/ws_monitor");
+                p
+            };
             let ws_config = WorkspaceMonitorConfig {
                 workspace_root,
                 content_store_max_bytes: settings.workspace.content_store_max_bytes,
@@ -264,6 +270,7 @@ impl CodeCliEngine {
                 debounce_ms: settings.workspace.debounce_ms,
                 max_debounce_wait_ms: settings.workspace.max_debounce_wait_ms,
                 exclude_patterns: settings.workspace.exclude_patterns.clone(),
+                db_path: Some(ws_db_path),
                 ..Default::default()
             };
             match WorkspaceMonitor::initialize(ws_config, None, Some(event_bus.clone())) {
@@ -279,15 +286,28 @@ impl CodeCliEngine {
             }
         };
 
-        // 注入 WorkspaceMonitor 到 ToolExecutor
         if let Some(ref wm) = workspace_monitor {
             let mut executor = runner.tool_executor.write();
             executor.set_workspace_monitor(wm.clone());
+            wm.set_causal_engine(causal_engine.clone());
         }
+
+        // 注入共享 SkillGraphStore 到 ToolExecutor（create_skill 工具使用）
+        {
+            let executor = runner.tool_executor.write();
+            executor.set_shared_skill_graph(skill_graph.clone());
+        }
+
+        // 注入 CausalEngine + SkillGraphStore 到 AgentRunner
+        runner = runner
+            .with_causal_engine(causal_engine.clone())
+            .with_skill_graph_store(skill_graph.clone());
 
         // 完成 AgentRunner 初始化接线：perception_store → WorkspaceMonitor
         runner.finalize_setup();
 
+        // 保存 runner 的 perception_store 引用，传递给 SA 的 ProactiveEngine
+        let runner_perception = runner.perception_store.clone();
         let runner = Arc::new(runner);
         let l2_bb = l2.clone();
         let sa = SupervisorAgent::with_pdca_cycles(
@@ -299,7 +319,10 @@ impl CodeCliEngine {
             config.max_pdca_cycles,
         )
         .with_memory(Some(l2), None, None)
-        .with_execution_timeout(agent_settings.sa_execution_timeout_secs);
+        .with_execution_timeout(agent_settings.sa_execution_timeout_secs)
+        .with_perception_hyperspace(vector_store.clone())
+        .with_perception_store(Arc::new(runner_perception))
+        .with_discovery_engine(discovery_engine.clone());
 
         let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) = sa.token_usage_arcs();
 

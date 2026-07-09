@@ -214,41 +214,36 @@ impl ProactiveEngine {
         }
     }
 
-    fn query_relevant_experiences(&self, query: &str) -> Vec<serde_json::Value> {
+    async fn query_relevant_experiences(&self, query: &str) -> Vec<serde_json::Value> {
         // When HyperspaceStore is available, use semantic search with time decay
         if let Some(ref hs) = self.hyperspace {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let result = handle.block_on(async {
-                    // Wrap query to give the embedding model more context
-                    let augmented_query = format!("agent experience: {}", query);
-                    // Use time-decay search: λ=0.5 means experiences are halved in score every ~1.4h
-                    // Filter to only "experience" tagged entries with "experience" JSON-LD type
-                    let filter = crate::memory::hyperspace_store::HybridSearchFilter::new()
-                        .with_must_tags(vec!["experience".to_string()])
-                        .with_jsonld_types(vec!["Experience".to_string()])
-                        .with_min_importance(0.05);
-                    hs.search_with_time_decay(&augmented_query, &filter, 0.5, 5).await
-                });
-                match result {
-                    Ok(entries) => {
-                        return entries.iter()
-                            .filter_map(|entry| {
-                                // ScoredEntry has iri, text, score, tags, importance, jsonld_types, stored_at
-                                // The full experience JSON was stored in L0, indexed by IRI
-                                if !entry.iri.is_empty() {
-                                    if let Ok(Some(l0_entry)) = self.l0.retrieve(&entry.iri) {
-                                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&l0_entry.content) {
-                                            return Some(val);
-                                        }
+            // Wrap query to give the embedding model more context
+            let augmented_query = format!("agent experience: {}", query);
+            // Use time-decay search: λ=0.5 means experiences are halved in score every ~1.4h
+            // Filter to only "experience" tagged entries with "experience" JSON-LD type
+            let filter = crate::memory::hyperspace_store::HybridSearchFilter::new()
+                .with_must_tags(vec!["experience".to_string()])
+                .with_jsonld_types(vec!["Experience".to_string()])
+                .with_min_importance(0.05);
+            match hs.search_with_time_decay(&augmented_query, &filter, 0.5, 5).await {
+                Ok(entries) => {
+                    return entries.iter()
+                        .filter_map(|entry| {
+                            // ScoredEntry has iri, text, score, tags, importance, jsonld_types, stored_at
+                            // The full experience JSON was stored in L0, indexed by IRI
+                            if !entry.iri.is_empty() {
+                                if let Ok(Some(l0_entry)) = self.l0.retrieve(&entry.iri) {
+                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&l0_entry.content) {
+                                        return Some(val);
                                     }
                                 }
-                                None
-                            })
-                            .take(5)
-                            .collect();
-                    }
-                    Err(_) => {} // Fall through to L0 fallback
+                            }
+                            None
+                        })
+                        .take(5)
+                        .collect();
                 }
+                Err(_) => {} // Fall through to L0 fallback
             }
         }
 
@@ -311,7 +306,7 @@ impl ProactiveEngine {
         }
     }
 
-    pub fn on_task_start(&mut self, user_input: &str, task_iri: &str) -> Result<TaskAnalysis, CoreError> {
+    pub async fn on_task_start(&mut self, user_input: &str, task_iri: &str) -> Result<TaskAnalysis, CoreError> {
         let key = Self::cache_key("task_start", task_iri);
         if self.is_cached(&key) {
             return Ok(serde_json::from_value(self.cache[&key].1.clone())
@@ -320,7 +315,19 @@ impl ProactiveEngine {
 
         let mut analysis = self.analyze_task(user_input);
 
-        let experiences = self.query_relevant_experiences(user_input);
+        // Query workspace perception data: check if files have changed externally
+        if let Some(ref ps) = self.perception_store {
+            let ws_events = ps.peek_unconsumed_for_source(PerceptionSource::WorkspaceMonitor);
+            if !ws_events.is_empty() {
+                // Merge workspace file events into the analysis as relevant context
+                for event_text in &ws_events {
+                    analysis.relevant_experience_hints.push(event_text.clone());
+                }
+                analysis.risks.push(format!("External file changes detected ({} event(s))", ws_events.len()));
+            }
+        }
+
+        let experiences = self.query_relevant_experiences(user_input).await;
         analysis.relevant_experience_hints = experiences.iter()
             .filter_map(|e| e.get("scenario").and_then(|s| s.as_str()).map(|s| s.to_string()))
             .take(5)
@@ -395,7 +402,7 @@ impl ProactiveEngine {
         None
     }
 
-    pub fn on_task_end(&self, task_result: &Value, task_iri: &str) -> Option<Experience> {
+    pub async fn on_task_end(&self, task_result: &Value, task_iri: &str) -> Option<Experience> {
         let status = task_result.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
         if status == "success" || status == "failed" {
             debug!(task = %task_iri, status = %status, "Extracting experience");
@@ -460,19 +467,15 @@ impl ProactiveEngine {
 
                 // Also store to HyperspaceStore for semantic retrieval when available
                 if let Some(ref hs) = self.hyperspace {
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        let hs_tags = experience.tags.clone();
-                        let _ = handle.block_on(async {
-                            hs.upsert_with_metadata(
-                                &iri,
-                                &hs_content,
-                                &hs_tags,
-                                Some(experience.success_rating as f32),
-                                Some(&["Experience".to_string()]),
-                                None,
-                            ).await
-                        });
-                    }
+                    let hs_tags = experience.tags.clone();
+                    let _ = hs.upsert_with_metadata(
+                        &iri,
+                        &hs_content,
+                        &hs_tags,
+                        Some(experience.success_rating as f32),
+                        Some(&["Experience".to_string()]),
+                        None,
+                    ).await;
                 }
             }
 
@@ -720,14 +723,14 @@ mod tests {
         Arc::new(EventBus::new(100))
     }
 
-    #[test]
-    fn test_task_start_analysis() {
-        with_l0(|l0| {
-            let mut engine = ProactiveEngine::new(l0, test_event_bus());
-            let analysis = engine.on_task_start("Write a hello world program", "iri://task/1").unwrap();
-            assert_eq!(analysis.complexity, "simple");
-            assert_eq!(analysis.estimated_steps, 1);
-        });
+    #[tokio::test]
+    async fn test_task_start_analysis() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut engine = ProactiveEngine::new(l0, test_event_bus());
+        let analysis = engine.on_task_start("Write a hello world program", "iri://task/1").await.unwrap();
+        assert_eq!(analysis.complexity, "simple");
+        assert_eq!(analysis.estimated_steps, 1);
     }
 
     #[test]
@@ -749,34 +752,34 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_custom_config() {
-        with_l0(|l0| {
-            let config = PerceptionConfig {
-                simple_input_threshold: 100,
-                medium_input_threshold: 500,
-                ..Default::default()
-            };
-            let mut engine = ProactiveEngine::with_config(config, l0, test_event_bus());
-            let analysis = engine.on_task_start("A medium length task description", "iri://task/1").unwrap();
-            assert_eq!(analysis.complexity, "simple");
-        });
+    #[tokio::test]
+    async fn test_custom_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let config = PerceptionConfig {
+            simple_input_threshold: 100,
+            medium_input_threshold: 500,
+            ..Default::default()
+        };
+        let mut engine = ProactiveEngine::with_config(config, l0, test_event_bus());
+        let analysis = engine.on_task_start("A medium length task description", "iri://task/1").await.unwrap();
+        assert_eq!(analysis.complexity, "simple");
     }
 
-    #[test]
-    fn test_cache_eviction() {
-        with_l0(|l0| {
-            let config = PerceptionConfig {
-                cache_max_entries: 2,
-                cache_ttl_seconds: 300,
-                ..Default::default()
-            };
-            let mut engine = ProactiveEngine::with_config(config, l0, test_event_bus());
-            engine.on_task_start("task1", "iri://task/1").unwrap();
-            engine.on_task_start("task2", "iri://task/2").unwrap();
-            engine.on_task_start("task3", "iri://task/3").unwrap();
-            assert!(engine.cache.len() <= 3);
-        });
+    #[tokio::test]
+    async fn test_cache_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let config = PerceptionConfig {
+            cache_max_entries: 2,
+            cache_ttl_seconds: 300,
+            ..Default::default()
+        };
+        let mut engine = ProactiveEngine::with_config(config, l0, test_event_bus());
+        engine.on_task_start("task1", "iri://task/1").await.unwrap();
+        engine.on_task_start("task2", "iri://task/2").await.unwrap();
+        engine.on_task_start("task3", "iri://task/3").await.unwrap();
+        assert!(engine.cache.len() <= 3);
     }
 
     #[test]
@@ -848,45 +851,45 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_on_task_end_success_creates_experience() {
-        with_l0(|l0| {
-            let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
-            let task_result = serde_json::json!({
-                "status": "success",
-                "summary": "Completed fibonacci function"
-            });
-            let experience = engine.on_task_end(&task_result, "iri://task/1");
-            assert!(experience.is_some());
-            let exp = experience.unwrap();
-            assert_eq!(exp.success_rating, 0.9);
-            assert!(exp.scenario.contains("fibonacci"));
-            let retrieved = l0.search_by_tags(&["experience".to_string()]).ok();
-            assert!(retrieved.is_some_and(|r| !r.is_empty()));
+    #[tokio::test]
+    async fn test_on_task_end_success_creates_experience() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
+        let task_result = serde_json::json!({
+            "status": "success",
+            "summary": "Completed fibonacci function"
         });
+        let experience = engine.on_task_end(&task_result, "iri://task/1").await;
+        assert!(experience.is_some());
+        let exp = experience.unwrap();
+        assert_eq!(exp.success_rating, 0.9);
+        assert!(exp.scenario.contains("fibonacci"));
+        let retrieved = l0.search_by_tags(&["experience".to_string()]).ok();
+        assert!(retrieved.is_some_and(|r| !r.is_empty()));
     }
 
-    #[test]
-    fn test_on_task_end_failed_creates_experience() {
-        with_l0(|l0| {
-            let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
-            let task_result = serde_json::json!({
-                "status": "failed",
-                "summary": "Faulty implementation"
-            });
-            let experience = engine.on_task_end(&task_result, "iri://task/2");
-            assert!(experience.is_some());
-            assert_eq!(experience.unwrap().success_rating, 0.1);
+    #[tokio::test]
+    async fn test_on_task_end_failed_creates_experience() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
+        let task_result = serde_json::json!({
+            "status": "failed",
+            "summary": "Faulty implementation"
         });
+        let experience = engine.on_task_end(&task_result, "iri://task/2").await;
+        assert!(experience.is_some());
+        assert_eq!(experience.unwrap().success_rating, 0.1);
     }
 
-    #[test]
-    fn test_on_task_end_unknown_status_no_experience() {
-        with_l0(|l0| {
-            let engine = ProactiveEngine::new(l0, test_event_bus());
-            let task_result = serde_json::json!({"status": "running"});
-            assert!(engine.on_task_end(&task_result, "iri://task/3").is_none());
-        });
+    #[tokio::test]
+    async fn test_on_task_end_unknown_status_no_experience() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let engine = ProactiveEngine::new(l0, test_event_bus());
+        let task_result = serde_json::json!({"status": "running"});
+        assert!(engine.on_task_end(&task_result, "iri://task/3").await.is_none());
     }
 
     #[test]
@@ -925,19 +928,19 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_evict_cache_on_insert() {
-        with_l0(|l0| {
-            let mut engine = ProactiveEngine::with_config(
-                PerceptionConfig { cache_ttl_seconds: 300, cache_max_entries: 2, ..Default::default() },
-                l0, test_event_bus(),
-            );
-            let _ = engine.on_task_start("task1", "iri://task/1");
-            let _ = engine.on_task_start("task2", "iri://task/2");
-            let _ = engine.on_task_start("task3", "iri://task/3");
-            let _ = engine.on_task_start("task4", "iri://task/4");
-            assert!(engine.cache.len() <= 2, "cache should evict to max_entries=2 got {}", engine.cache.len());
-        });
+    #[tokio::test]
+    async fn test_evict_cache_on_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut engine = ProactiveEngine::with_config(
+            PerceptionConfig { cache_ttl_seconds: 300, cache_max_entries: 2, ..Default::default() },
+            l0, test_event_bus(),
+        );
+        let _ = engine.on_task_start("task1", "iri://task/1").await;
+        let _ = engine.on_task_start("task2", "iri://task/2").await;
+        let _ = engine.on_task_start("task3", "iri://task/3").await;
+        let _ = engine.on_task_start("task4", "iri://task/4").await;
+        assert!(engine.cache.len() <= 2, "cache should evict to max_entries=2 got {}", engine.cache.len());
     }
 }
 

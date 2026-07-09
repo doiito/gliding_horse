@@ -195,7 +195,6 @@ impl WatchEngine {
         let mut debouncer = new_debouncer(
             debounce,
             move |result: DebounceEventResult| {
-                // update inventory directly from the watcher thread (no tokio::spawn needed)
                 if let Some(ref inv) = inventory {
                     if let Ok(events) = &result {
                         for event in events {
@@ -259,24 +258,17 @@ impl WatchEngine {
                         continue;
                     }
                     let (event_type_str, path_str) = Self::map_event(&event);
-                    if let Some(path) = path_str {
-                        let payload = serde_json::json!({
-                            "path": path,
-                            "kind": event_type_str,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-                        let _ = event_bus.emit(
-                            "iri://workspace",
-                            &event_type_str,
-                            "iri://workspace_monitor",
-                            &payload.to_string(),
-                        );
-                        debug!(
-                            event_type = %event_type_str,
-                            path = %path,
-                            "WatchEngine: event emitted"
-                        );
-                    }
+                    let _ = event_bus.emit(
+                        "iri://workspace",
+                        &event_type_str,
+                        "iri://workspace_monitor",
+                        &path_str,
+                    );
+                    debug!(
+                        event_type = %event_type_str,
+                        path = %path_str,
+                        "WatchEngine: event emitted"
+                    );
                 }
             }
             Err(e) => {
@@ -286,16 +278,14 @@ impl WatchEngine {
         Ok(())
     }
 
-    fn map_event(event: &notify_debouncer_mini::DebouncedEvent) -> (String, Option<String>) {
-        let kind = match event.kind {
-            notify_debouncer_mini::DebouncedEventKind::Any => "WORKSPACE_FILE_MODIFIED",
-            notify_debouncer_mini::DebouncedEventKind::AnyContinuous => "WORKSPACE_FILE_MODIFIED",
-            _ => "WORKSPACE_FILE_MODIFIED",
+    fn map_event(event: &notify_debouncer_mini::DebouncedEvent) -> (String, String) {
+        let event_type = if !event.path.exists() {
+            "WORKSPACE_FILE_REMOVED"
+        } else {
+            "WORKSPACE_FILE_MODIFIED"
         };
-
-        let path = event.path.to_str().map(|s| s.to_string());
-
-        (kind.to_string(), path)
+        let path = event.path.to_str().unwrap_or("").to_string();
+        (event_type.to_string(), path)
     }
 
     // ── Polling fallback ──
@@ -337,16 +327,11 @@ impl WatchEngine {
                 }
 
                 for path in changed {
-                    let payload = serde_json::json!({
-                        "path": path,
-                        "kind": "WORKSPACE_FILE_MODIFIED",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    });
                     let _ = event_bus.emit(
                         "iri://workspace",
                         "WORKSPACE_FILE_MODIFIED",
                         "iri://workspace_monitor",
-                        &payload.to_string(),
+                        &path,
                     );
                 }
             }

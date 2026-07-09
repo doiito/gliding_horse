@@ -23,7 +23,7 @@ use crate::core::EventBus;
 use super::task_queue::{WorkerQueue, AgentOsTask, AgentOsResult, QueueError};
 
 /// Agent OS Worker Configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     /// Queue base path
     pub queue_base_path: String,
@@ -39,6 +39,26 @@ pub struct WorkerConfig {
     pub workspace_root: Option<String>,
     /// Event bus capacity
     pub event_bus_capacity: usize,
+    /// Causal engine for root-cause analysis (optional — when set, enables dimension audit observations)
+    pub causal_engine: Option<std::sync::Arc<crate::causal::CausalEngine>>,
+    /// Skill graph store — the cognitive network (optional — when set, wired into tools and runner)
+    pub skill_graph_store: Option<std::sync::Arc<crate::skill_graph::graph_store::SkillGraphStore>>,
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("queue_base_path", &self.queue_base_path)
+            .field("l0_path", &self.l0_path)
+            .field("concurrency", &self.concurrency)
+            .field("gateway", &self.gateway)
+            .field("approval_config", &self.approval_config)
+            .field("workspace_root", &self.workspace_root)
+            .field("event_bus_capacity", &self.event_bus_capacity)
+            .field("causal_engine", &self.causal_engine.as_ref().map(|_| "Some(...)"))
+            .field("skill_graph_store", &self.skill_graph_store.as_ref().map(|_| "Some(...)"))
+            .finish()
+    }
 }
 
 impl Default for WorkerConfig {
@@ -51,6 +71,8 @@ impl Default for WorkerConfig {
             approval_config: None,
             workspace_root: None,
             event_bus_capacity: 100,
+            causal_engine: None,
+            skill_graph_store: None,
         }
     }
 }
@@ -108,6 +130,8 @@ impl WorkerConfig {
             gateway,
             approval_config,
             event_bus_capacity: 100,
+            causal_engine: None,
+            skill_graph_store: None,
         }
     }
 }
@@ -118,6 +142,8 @@ pub struct AgentOsWorker {
     queue: WorkerQueue,
     sa: SupervisorAgent,
     approval_notifier: Option<Arc<ChannelApprovalNotifier>>,
+    /// Event bus for cross-component communication
+    pub event_bus: Arc<EventBus>,
 }
 
 impl AgentOsWorker {
@@ -225,7 +251,19 @@ impl AgentOsWorker {
         if let Some(ref ws_root) = workspace_root_path {
             runner_builder = runner_builder.with_workspace_root(ws_root.clone());
         }
+        // Wire optional advanced subsystems BEFORE wrapping in Arc
+        if let Some(ref ce) = config.causal_engine {
+            runner_builder = runner_builder.with_causal_engine(ce.clone());
+        }
+        if let Some(ref sg) = config.skill_graph_store {
+            runner_builder = runner_builder.with_skill_graph_store(sg.clone());
+        }
         let runner = Arc::new(runner_builder);
+        
+        // Wire shared SkillGraphStore into ToolExecutor (via Arc interior lock)
+        if let Some(ref sg) = config.skill_graph_store {
+            runner.tool_executor.write().set_shared_skill_graph(sg.clone());
+        }
         
         // Set workspace_monitor on ToolExecutor
         if let Some(ref wm) = workspace_monitor_opt {
@@ -234,16 +272,23 @@ impl AgentOsWorker {
         
         // Finalize AgentRunner initialization wiring: perception_store → WorkspaceMonitor
         runner.finalize_setup();
-        
+
+        // Capture the runner's perception store so it can be shared with the SA
+        let runner_perception = runner.perception_store.clone();
+
+        let event_bus = Arc::new(EventBus::new(config.event_bus_capacity));
         let sa = SupervisorAgent::new(
             runner,
             templates_engine,
             skills,
-            Arc::new(EventBus::new(config.event_bus_capacity)),
+            event_bus.clone(),
             20,
-        ).with_memory(Some(blackboard), Some(prefetch), Some(scheduler));
-        
-        Ok(Self { config, queue, sa, approval_notifier })
+        )
+        .with_memory(Some(blackboard), Some(prefetch), Some(scheduler))
+        .with_perception_store(Arc::new(runner_perception))
+        .with_execution_timeout(600);
+
+        Ok(Self { config, queue, sa, approval_notifier, event_bus })
     }
     
     /// Get the approval notifier (for external approval submission)

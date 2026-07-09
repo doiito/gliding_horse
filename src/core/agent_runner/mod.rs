@@ -281,6 +281,10 @@ pub struct AgentRunner {
     pub relevance_tracker: Option<Arc<std::sync::Mutex<RelevanceTracker>>>,
     /// Workspace root directory path (all Agent file operations are restricted to this scope)
     pub workspace_root: Option<PathBuf>,
+    /// Causal engine for root-cause analysis of task failures and dimension audit observations
+    pub causal_engine: Option<Arc<crate::causal::CausalEngine>>,
+    /// Skill graph store — the cognitive network of registered skills
+    pub skill_graph_store: Option<Arc<crate::skill_graph::graph_store::SkillGraphStore>>,
 }
 
 impl AgentRunner {
@@ -354,6 +358,8 @@ impl AgentRunner {
             embedder: None,
             relevance_tracker: None,
             workspace_root: None,
+            causal_engine: None,
+            skill_graph_store: None,
         };
         runner.init_context_compressors();
         runner
@@ -489,6 +495,18 @@ impl AgentRunner {
         let engine = Arc::new(engine);
         engine.register_hooks(&self.hook_manager, "agent");
         self.root_cause_engine = Some(engine);
+        self
+    }
+
+    /// Attach a CausalEngine for root-cause analysis of task failures and dimension audit observations.
+    pub fn with_causal_engine(mut self, engine: Arc<crate::causal::CausalEngine>) -> Self {
+        self.causal_engine = Some(engine);
+        self
+    }
+
+    /// Attach a SkillGraphStore — the cognitive network — for skill-related operations.
+    pub fn with_skill_graph_store(mut self, store: Arc<crate::skill_graph::graph_store::SkillGraphStore>) -> Self {
+        self.skill_graph_store = Some(store);
         self
     }
 

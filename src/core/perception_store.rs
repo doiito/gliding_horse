@@ -197,6 +197,17 @@ impl PerceptionStore {
         lines.join("\n")
     }
 
+    /// Peek at global unconsumed entries for a specific source (non-consuming read).
+    /// Used by ProactiveEngine to check for workspace file events during task analysis
+    /// without consuming the entries (they remain available for agent context injection).
+    pub fn peek_unconsumed_for_source(&self, source: PerceptionSource) -> Vec<String> {
+        let global = self.global.lock().expect("PerceptionStore global lock poisoned");
+        global.iter()
+            .filter(|e| e.source == source && !e.consumed)
+            .map(|e| e.render())
+            .collect()
+    }
+
     /// Check whether a given task has unconsumed perception entries
     pub fn has_new(&self, task_iri: &str) -> bool {
         // Check global

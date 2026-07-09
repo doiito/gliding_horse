@@ -13,8 +13,11 @@ data/
 # logs
 logs/
 
-# test data
+# trae data
 .trae*/
+
+# omo data
+.omo*/
 
 # Rust backup files
 **/*.rs.bk

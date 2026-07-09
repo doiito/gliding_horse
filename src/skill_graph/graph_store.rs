@@ -13,6 +13,7 @@ use crate::skill_graph::discovery::SkillDiscoveryEngine;
 use crate::skill_graph::embedding::SkillGraphEmbedder;
 use crate::skill_graph::index::PreAggregatedIndex;
 use crate::skill_graph::types::*;
+use crate::snapshots::{GraphMutation, TimelineStore};
 use crate::CoreError;
 
 const SKILL_GRAPH_NAMED_GRAPH: &str = "system:skill_graph";
@@ -27,6 +28,10 @@ pub struct SkillGraphStore {
     blackboard: Option<Arc<Blackboard>>,
     l0_store: Option<Arc<L0Store>>,
     oxi_store: Option<Arc<Store>>,
+    /// Optional TimelineStore for recording graph mutations.
+    /// When set, every structural change to the skill graph is recorded so that
+    /// `TimelineStore::pending_mutations()` reflects real activity.
+    timeline: Option<Arc<TimelineStore>>,
 }
 
 impl SkillGraphStore {
@@ -41,6 +46,25 @@ impl SkillGraphStore {
             blackboard: None,
             l0_store: None,
             oxi_store: None,
+            timeline: None,
+        }
+    }
+
+    /// Attach a TimelineStore that receives a `GraphMutation` for every
+    /// structural change applied to this skill graph. This is what makes
+    /// `TimelineStore::pending_mutations()` / `snapshot_count()` reflect real
+    /// graph activity instead of staying permanently at 0.
+    pub fn with_timeline(mut self, timeline: Arc<TimelineStore>) -> Self {
+        self.timeline = Some(timeline);
+        self
+    }
+
+    /// Record a structural mutation against the attached TimelineStore (if any).
+    /// No SnapshotBackend is supplied, so this only appends to the incremental
+    /// mutation log — the engine still takes explicit full snapshots per task.
+    fn emit_mutation(&self, mutation: GraphMutation) {
+        if let Some(ref tl) = self.timeline {
+            tl.record_mutation(mutation, None);
         }
     }
 
@@ -100,7 +124,7 @@ impl SkillGraphStore {
         }
 
         self.index.index_skill(&skill);
-        self.skills.write().insert(iri.clone(), skill);
+        self.skills.write().insert(iri.clone(), skill.clone());
 
         // P0-1: sync to Oxigraph
         if let Some(skill) = self.skills.read().get(&iri) {
@@ -130,6 +154,8 @@ impl SkillGraphStore {
             debug!("Skill written to L0 store: {}", iri);
         }
 
+        self.emit_mutation(GraphMutation::SkillRegistered(skill));
+
         Ok(())
     }
 
@@ -139,12 +165,13 @@ impl SkillGraphStore {
 
     pub fn update_skill(&self, skill: SkillGraphNode) -> Result<(), CoreError> {
         let iri = skill.skill_iri.clone();
-        if self.skills.read().contains_key(&iri) {
+        if let Some(old) = self.skills.read().get(&iri).cloned() {
             self.index.update_skill(&skill);
             // P0-1: sync update to Oxigraph (delete old + insert new)
             self.sync_skill_delete(&iri);
             self.sync_skill_insert(&skill);
-            self.skills.write().insert(iri, skill);
+            self.skills.write().insert(iri, skill.clone());
+            self.emit_mutation(GraphMutation::SkillUpdated { old, new: skill });
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -154,11 +181,12 @@ impl SkillGraphStore {
     }
 
     pub fn remove_skill(&self, skill_iri: &str) -> Result<(), CoreError> {
-        if self.skills.write().remove(skill_iri).is_some() {
+        if let Some(removed) = self.skills.write().remove(skill_iri) {
             self.index.remove_skill(skill_iri);
             // P0-1: sync delete from Oxigraph
             self.sync_skill_delete(skill_iri);
             info!("Skill removed from graph: {}", skill_iri);
+            self.emit_mutation(GraphMutation::SkillRemoved(removed));
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -193,6 +221,11 @@ impl SkillGraphStore {
                 // P0-1: sync link triple to Oxigraph
                 self.sync_skill_insert(&skill);
             }
+            self.emit_mutation(GraphMutation::LinkAdded {
+                source: source_iri.to_string(),
+                target: target_iri.to_string(),
+                link_type,
+            });
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -364,7 +397,8 @@ impl SkillGraphStore {
     pub fn register_moc(&self, moc: MOCNode) -> Result<(), CoreError> {
         let moc_iri = moc.moc_iri.clone();
         info!("Registering MOC node: {} ({})", moc.name, moc_iri);
-        self.mocs.write().insert(moc_iri, moc);
+        self.mocs.write().insert(moc_iri, moc.clone());
+        self.emit_mutation(GraphMutation::MOCAdded(moc));
         Ok(())
     }
 
@@ -657,7 +691,8 @@ impl SkillGraphStore {
     pub fn register_hyperedge(&self, hyperedge: Hyperedge) -> Result<(), CoreError> {
         let id = hyperedge.hyperedge_id.clone();
         info!("Registering hyperedge: {} ({})", hyperedge.name, id);
-        self.hyperedges.write().insert(id, hyperedge);
+        self.hyperedges.write().insert(id, hyperedge.clone());
+        self.emit_mutation(GraphMutation::HyperedgeAdded(hyperedge));
         Ok(())
     }
 
@@ -672,6 +707,7 @@ impl SkillGraphStore {
     pub fn remove_hyperedge(&self, hyperedge_id: &str) -> Result<(), CoreError> {
         if self.hyperedges.write().remove(hyperedge_id).is_some() {
             info!("Hyperedge removed: {}", hyperedge_id);
+            self.emit_mutation(GraphMutation::HyperedgeRemoved(hyperedge_id.to_string()));
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -1003,16 +1039,23 @@ impl SkillGraphStore {
     /// Mark a skill as deprecated. It stays in the store for reference but is
     /// removed from the search index.
     pub fn deprecate_skill(&self, skill_iri: &str) -> Result<(), CoreError> {
-        let mut skills = self.skills.write();
-        if let Some(skill) = skills.get_mut(skill_iri) {
-            skill.maturity = "deprecated".to_string();
-            let updated = skills.get(skill_iri).cloned();
-            drop(skills);
-            if let Some(skill) = updated {
-                self.index.remove_skill(skill_iri);
-                self.skills.write().insert(skill_iri.to_string(), skill);
+        let (old, new) = {
+            let mut skills = self.skills.write();
+            match skills.get_mut(skill_iri) {
+                Some(skill) => {
+                    let old = skill.clone();
+                    skill.maturity = "deprecated".to_string();
+                    let new = skill.clone();
+                    (Some(old), Some(new))
+                }
+                None => (None, None),
             }
+        };
+        if let (Some(old), Some(new)) = (old, new) {
+            self.index.remove_skill(skill_iri);
+            self.skills.write().insert(skill_iri.to_string(), new.clone());
             info!("Skill marked as deprecated: {}", skill_iri);
+            self.emit_mutation(GraphMutation::SkillUpdated { old, new });
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -1058,6 +1101,26 @@ impl Default for SkillGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_register_skill_records_timeline_mutation() {
+        let timeline = Arc::new(TimelineStore::new(100, 10));
+        let store = SkillGraphStore::new().with_timeline(timeline.clone());
+
+        assert_eq!(timeline.pending_mutations(), 0);
+
+        let skill = SkillGraphNode::new("iri://skills/tl-test", "TL Test", "verifies mutation log");
+        store.register_skill(skill).unwrap();
+
+        // The structural mutation must now be reflected in the timeline.
+        assert_eq!(timeline.pending_mutations(), 1);
+
+        // Without an attached timeline, no mutation is recorded.
+        let store2 = SkillGraphStore::new();
+        let skill2 = SkillGraphNode::new("iri://skills/tl-test2", "TL Test 2", "no timeline");
+        store2.register_skill(skill2).unwrap();
+        assert_eq!(timeline.pending_mutations(), 1);
+    }
 
     #[test]
     fn test_register_and_get_skill() {

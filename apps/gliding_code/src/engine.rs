@@ -178,11 +178,20 @@ impl CodeCliEngine {
 
         let workspace_root = std::path::PathBuf::from(&config.workspace);
 
+        // ── TimelineStore (temporal event recording for graph mutations) ──
+        // Created before SkillGraphStore so the store can attach it and record
+        // every structural mutation (otherwise TL: pending stays at 0).
+        let timeline = Arc::new(TimelineStore::new(
+            agent_settings.snapshot_frequency,
+            agent_settings.max_full_snapshots,
+        ));
+
         // ── Skill Graph Store — cognitive network ──
         let skill_graph = Arc::new(
             SkillGraphStore::new()
                 .with_blackboard(l2.clone())
-                .with_l0_store(l0.clone()),
+                .with_l0_store(l0.clone())
+                .with_timeline(timeline.clone()),
         );
 
         // Bootstrap the SkillGraphStore with default skills from SkillRegistry
@@ -251,12 +260,6 @@ impl CodeCliEngine {
         let causal_engine = Arc::new(CausalEngine::new(
             causal_model_store,
             graph_backend.clone(),
-        ));
-
-        // ── TimelineStore (temporal event recording for graph mutations) ──
-        let timeline = Arc::new(TimelineStore::new(
-            agent_settings.snapshot_frequency,
-            agent_settings.max_full_snapshots,
         ));
 
         let event_bus = Arc::new(EventBus::new(100));

@@ -1512,9 +1512,14 @@ Output the summary report directly, not in JSON format."#,
                         } else {
                             None
                         };
+                        let force_status = if soft_limit_force_finish && errs.iter().any(|e| e.contains("max turns") || e.contains("force-finish")) {
+                            "partial_success"
+                        } else {
+                            "success"
+                        };
                         return Ok(TaskResult {
                             task_iri: ctx.task_iri,
-                            status: "success".to_string(),
+                            status: force_status.to_string(),
                             summary: final_summary,
                             output: Some(output_value),
                             jsonld_output,

@@ -323,10 +323,35 @@ impl SupervisorAgent {
                 break;
             }
 
-            cycle_feedback = Some(format!(
-                "PDCA Cycle #{} result:\nStatus: {}\n\nAA Evaluation:\n{}\n\n---\nPlease analyze the issues above and create an improved approach.",
-                cycle_num + 1, result.status, result.summary
-            ));
+            // Build targeted feedback — when AA identifies execution gaps, tell PA
+            // to preserve the plan structure and focus on specific DA improvements.
+            // The CA→DA correction loop (in execute_plan) already handles in-cycle fixes;
+            // this SA-level feedback addresses persistent failures requiring plan adjustment.
+            let da_fixes = result.summary.contains("Dimension Audit") ||
+                result.summary.contains("execution failed") ||
+                result.summary.contains("not completed");
+
+            cycle_feedback = Some(if da_fixes {
+                format!(
+                    "PDCA Cycle #{}: AA identified execution-level issues.\n\
+                     Status: {}\n\n\
+                     AA Evaluation:\n{}\n\n\
+                     ---\n\
+                     PRESERVE your previous plan structure. Focus ONLY on:\n\
+                     1. Which specific execution steps failed or were incomplete\n\
+                     2. What DA needs to do differently (more detail, different approach)\n\
+                     3. Do NOT create a brand new plan — refine the existing one",
+                    cycle_num + 1, result.status, result.summary
+                )
+            } else {
+                format!(
+                    "PDCA Cycle #{} result:\nStatus: {}\n\n\
+                     AA Evaluation:\n{}\n\n\
+                     ---\n\
+                     Please analyze the issues above and create an improved approach.",
+                    cycle_num + 1, result.status, result.summary
+                )
+            });
             final_result = Some(result);
         }
 

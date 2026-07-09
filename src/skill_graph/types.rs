@@ -570,6 +570,50 @@ impl SkillGraphNode {
         self
     }
 
+    /// Convert a `SkillMeta` (from SkillRegistry) into a `SkillGraphNode`.
+    /// Tags are populated from `category` and `skill_types`; security info
+    /// maps the security_level string to a `TrustLevel`.
+    pub fn from_skill_meta(meta: &crate::tools::skill_registry::SkillMeta) -> Self {
+        let mut tags: Vec<String> = meta.skill_types.clone();
+        if !tags.contains(&meta.category) {
+            tags.push(meta.category.clone());
+        }
+
+        let trust = match meta.security_level.as_str() {
+            "critical" => TrustLevel::System,
+            "high" => TrustLevel::High,
+            "normal" => TrustLevel::Medium,
+            "low" => TrustLevel::Low,
+            _ => TrustLevel::Medium,
+        };
+        let security = SkillSecurityInfo::new(SkillSource::SystemBuiltin)
+            .with_trust_level(trust);
+
+        let w2h = Skill5W2H::new(&meta.name, &meta.description)
+            .with_agent_role("DA");
+
+        Self {
+            skill_iri: meta.skill_iri.clone(),
+            name: meta.name.clone(),
+            description: meta.description.clone(),
+            version: meta.version.clone(),
+            node_type: SkillNodeType::Atomic,
+            maturity: "stable".to_string(),
+            tags,
+            w2h,
+            links: Vec::new(),
+            graph_meta: SkillGraphMeta::new(),
+            content: None,
+            attached_to: None,
+            security_info: Some(security),
+            mcp_server_id: None,
+            storage_tier: StorageTier::L0Permanent,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_used_at: None,
+        }
+    }
+
     pub fn is_mcp_tool(&self) -> bool {
         self.node_type == SkillNodeType::MCPTool || self.mcp_server_id.is_some()
     }
@@ -1679,5 +1723,67 @@ mod tests {
         let text = skill.to_structural_embedding_text();
         assert!(text.contains("Test"));
         assert!(text.contains("rust-basics"));
+    }
+
+    #[test]
+    fn test_from_skill_meta_converts_fields() {
+        let meta = crate::tools::skill_registry::SkillMeta {
+            skill_iri: "iri://skills/test_read".to_string(),
+            name: "test_read".to_string(),
+            description: "Test read operation".to_string(),
+            version: "1.0.0".to_string(),
+            category: "file".to_string(),
+            security_level: "normal".to_string(),
+            allowed_roles: vec!["PA".to_string(), "DA".to_string()],
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+            compiled_template: String::new(),
+            signature: None,
+            signature_algorithm: None,
+            input_mapping: std::collections::HashMap::new(),
+            output_mapping: std::collections::HashMap::new(),
+            skill_types: vec!["iri://skill-types/FileOperation".to_string()],
+        };
+        let node = SkillGraphNode::from_skill_meta(&meta);
+        assert_eq!(node.skill_iri, "iri://skills/test_read");
+        assert_eq!(node.name, "test_read");
+        assert_eq!(node.description, "Test read operation");
+        assert_eq!(node.version, "1.0.0");
+        assert_eq!(node.node_type, SkillNodeType::Atomic);
+        assert!(node.tags.contains(&"file".to_string()));
+        assert!(node.tags.contains(&"iri://skill-types/FileOperation".to_string()));
+        let sec = node.security_info.expect("security_info should be set");
+        assert_eq!(sec.source, SkillSource::SystemBuiltin);
+        assert_eq!(sec.trust_level, TrustLevel::Medium);
+    }
+
+    #[test]
+    fn test_from_skill_meta_security_level_mapping() {
+        let check = |level: &str, expected: TrustLevel| {
+            let meta = crate::tools::skill_registry::SkillMeta {
+                skill_iri: format!("iri://skills/{}", level),
+                name: level.to_string(),
+                description: String::new(),
+                version: "1.0.0".to_string(),
+                category: String::new(),
+                security_level: level.to_string(),
+                allowed_roles: vec![],
+                input_schema: serde_json::json!({}),
+                output_schema: serde_json::json!({}),
+                compiled_template: String::new(),
+                signature: None,
+                signature_algorithm: None,
+                input_mapping: std::collections::HashMap::new(),
+                output_mapping: std::collections::HashMap::new(),
+                skill_types: vec![],
+            };
+            let node = SkillGraphNode::from_skill_meta(&meta);
+            assert_eq!(node.security_info.unwrap().trust_level, expected);
+        };
+        check("critical", TrustLevel::System);
+        check("high", TrustLevel::High);
+        check("normal", TrustLevel::Medium);
+        check("low", TrustLevel::Low);
+        check("unknown", TrustLevel::Medium);
     }
 }

@@ -741,6 +741,86 @@ impl SupervisorAgent {
 
         }
 
+        // ── CA→DA correction loop ──
+        // When CA's dimension audit detects failures in DA's work, re-dispatch DA
+        // with corrective feedback instead of immediately proceeding to AA.
+        const MAX_CA_DA_CORRECTIONS: usize = 3;
+        let mut correction_count = 0;
+        loop {
+            let ca_summary = prev_summary.clone();
+            let has_ca_failures = ca_summary.as_ref().map_or(false, |ps| {
+                ps.contains("Dimension Audit")
+                    && (ps.contains("[what]") || ps.contains("[why]")
+                        || ps.contains("[how]") || ps.contains("[how_much]"))
+                    && ps.len() > 50
+            });
+
+            if !has_ca_failures || correction_count >= MAX_CA_DA_CORRECTIONS {
+                break;
+            }
+
+            correction_count += 1;
+            let ca_text = ca_summary.unwrap_or_default();
+
+            info!(
+                task_iri = %task_iri,
+                correction = correction_count,
+                "CA dimension audit found failures — re-dispatching DA with corrective context"
+            );
+
+            let da_corrective_objective = format!(
+                "## Corrective Re-Execution (iteration {})\n\n\
+                 Previous audit found gaps:\n\n{}\n\n\
+                 Fix ALL identified issues. Output what was fixed.",
+                correction_count,
+                &ca_text[..ca_text.len().min(4000)]
+            );
+
+            let da_ctx = TaskContext::new(task_iri, &da_corrective_objective, self.max_iterations)
+                .with_original_task(user_input)
+                .with_cycle_id(&cycle_id);
+
+            match self.dispatch_agent(AgentRole::Do, da_ctx, &cycle_id, None, 0).await {
+                Ok(da_result) => {
+                    let ca_objective = format!(
+                        "Re-evaluate corrected execution:\n\n\
+                         Corrected Output (iteration {}):\n{}\n\n\
+                         Verify ALL previous audit issues are resolved.",
+                        correction_count, da_result.summary
+                    );
+
+                    let ca_ctx = TaskContext::new(task_iri, &ca_objective, self.max_iterations)
+                        .with_original_task(user_input)
+                        .with_cycle_id(&cycle_id);
+
+                    match self.dispatch_agent(AgentRole::Check, ca_ctx, &cycle_id, None, 0).await {
+                        Ok(ca_result) => {
+                            let archive_ref = ca_result.archive_iri.as_ref()
+                                .map(|iri| format!("\n\nFor detailed report, use read_agent_output: {}", iri))
+                                .unwrap_or_default();
+                            prev_summary = Some(format!(
+                                "## Corrected Execution (iter {})\n{}\n\n## CA Re-Evaluation\n{}{}",
+                                correction_count, da_result.summary, ca_result.summary, archive_ref
+                            ));
+                            last_result = Some(ca_result);
+
+                            self.emit_sa_thought(task_iri,
+                                &format!("CA→DA correction #{} completed", correction_count),
+                                "ca_da_correction").await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "CA re-dispatch after DA correction failed");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "DA corrective re-dispatch failed");
+                    break;
+                }
+            }
+        }
+
         if let Some(cycle) = self.active_cycles.get_mut(&cycle_id) {
             cycle.phase = CyclePhase::Completed;
             cycle.task_completed = true;

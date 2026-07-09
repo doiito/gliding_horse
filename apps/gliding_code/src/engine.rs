@@ -184,6 +184,16 @@ impl CodeCliEngine {
                 .with_blackboard(l2.clone())
                 .with_l0_store(l0.clone()),
         );
+
+        // Bootstrap the SkillGraphStore with default skills from SkillRegistry
+        // so that SG: N E (node/edge) metrics are non-zero from startup.
+        for meta in skills.list_all_skills() {
+            if let Err(e) = skill_graph.register_skill(
+                glidinghorse::skill_graph::types::SkillGraphNode::from_skill_meta(&meta),
+            ) {
+                tracing::warn!("Failed to register bootstrap skill {}: {}", meta.name, e);
+            }
+        }
         let skill_graph_algorithms = Arc::new(SkillGraphAlgorithms::from_store(&skill_graph));
 
         // ── PetgraphBackend (structural dimension for FusedRootCauseEngine) ──

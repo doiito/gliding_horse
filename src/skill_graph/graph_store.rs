@@ -125,6 +125,7 @@ impl SkillGraphStore {
 
         self.index.index_skill(&skill);
         self.skills.write().insert(iri.clone(), skill.clone());
+        self.emit_mutation(GraphMutation::SkillRegistered(skill));
 
         // P0-1: sync to Oxigraph
         if let Some(skill) = self.skills.read().get(&iri) {
@@ -153,8 +154,6 @@ impl SkillGraphStore {
             l0_store.store(&iri, &serde_json::to_string(&entry).unwrap_or_default())?;
             debug!("Skill written to L0 store: {}", iri);
         }
-
-        self.emit_mutation(GraphMutation::SkillRegistered(skill));
 
         Ok(())
     }

@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.3-blue)](https://github.com/doiito/gliding_horse/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.4-blue)](https://github.com/doiito/gliding_horse/releases)
 
 ---
 
@@ -23,6 +23,21 @@
 [**B站播客**](https://space.bilibili.com/1547455799/lists)
 
 </div>
+
+---
+
+## 🎉 v0.1.4 正式发布
+
+我们自豪地宣布 **流马智能体操作系统 v0.1.4 正式发布** — 本次发布聚焦于核心 PDCA 执行引擎的稳定性加固。
+
+**v0.1.4 修复内容：**
+
+| 修复 | 说明 |
+|------|------|
+| **PDCA P0: 预检运行时错误** | 修复 TL（任务领导者）无法匹配技能时的崩溃问题（`Error("expect L0-3")`）。预检阶段现在优雅降级至 L0 执行，而非中止整个工作流。 |
+| **PDCA P1: PA 无法创建** | 修复 DA/TL 设置 `PauseOnError` 时 PA（规划智能体）创建失败的问题。智能体模板中缺少 `execute` 字段 — 现在 PA 创建上下文中已正确填充。 |
+| **PDCA P2: L0 降级无输出** | 修复 L0 降级执行时指标不可用导致的静默输出丢失问题。现提供默认指标，确保用户始终能收到响应。 |
+| **TL: pend 始终为 0** | 修复 TL 聚合中 `pend_sum` 的计算错误 — 错误地使用了 `sum` 而非子任务的实际 pend 值，导致 TL 在子任务仍在运行时报告无待办工作。 |
 
 ---
 

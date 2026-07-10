@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.3-blue)](https://github.com/doiito/gliding_horse/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.4-blue)](https://github.com/doiito/gliding_horse/releases)
 
 ---
 
@@ -23,6 +23,21 @@
 [**B站播客**](https://space.bilibili.com/1547455799/lists)
 
 </div>
+
+---
+
+## 🎉 v0.1.4 Release
+
+We are proud to announce the **v0.1.4 release** of Gliding Horse Agent OS — a stability-focused release hardening the core PDCA execution engine.
+
+**What's new in v0.1.4:**
+
+| Fix | Description |
+|-----|-------------|
+| **PDCA P0: Pre-check Runtime Error** | Fixed crash (`Error("expect L0-3")`) when TL (Task Leader) fails to match a skill. Pre-check now gracefully falls back to L0 execution instead of aborting the entire workflow. |
+| **PDCA P1: PA Uncreatable** | Fixed PA (Plan Agent) creation failure when DA/TL sets `PauseOnError`. The `execute` field was missing from the agent template — now properly populated in PA creation context. |
+| **PDCA P2: No Output on L0 Fallback** | Fixed silent output loss when metrics are unavailable during L0 fallback execution. Default metrics are now provided, ensuring the user always receives a response. |
+| **TL: pend always 0** | Fixed `pend_sum` calculation in TL aggregation — was incorrectly using `sum` instead of actual pend values from sub-tasks, causing TL to report no pending work despite running sub-tasks. |
 
 ---
 

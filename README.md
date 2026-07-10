@@ -26,9 +26,9 @@
 
 ---
 
-## 🎉 v0.1.4 Release
+## 🎉 v0.1.4.preview Release
 
-We are proud to announce the **v0.1.4 release** of Gliding Horse Agent OS — a stability-focused release hardening the core PDCA execution engine.
+We are proud to announce the **v0.1.4.preview release** of Gliding Horse Agent OS — a stability-focused release hardening the core PDCA execution engine.
 
 **What's new in v0.1.4:**
 

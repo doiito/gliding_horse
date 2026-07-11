@@ -28,16 +28,29 @@
 
 ## 🎉 v0.1.4.preview Release
 
-We are proud to announce the **v0.1.4.preview release** of Gliding Horse Agent OS — a stability-focused release hardening the core PDCA execution engine.
+We are proud to announce the **v0.1.4.preview release** of Gliding Horse Agent OS — a major stability and intelligence release with significant architectural refactoring and 85 file changes (+6134 / −4127 lines).
 
-**What's new in v0.1.4:**
+**Highlights:**
 
-| Fix | Description |
-|-----|-------------|
-| **PDCA P0: Pre-check Runtime Error** | Fixed crash (`Error("expect L0-3")`) when TL (Task Leader) fails to match a skill. Pre-check now gracefully falls back to L0 execution instead of aborting the entire workflow. |
-| **PDCA P1: PA Uncreatable** | Fixed PA (Plan Agent) creation failure when DA/TL sets `PauseOnError`. The `execute` field was missing from the agent template — now properly populated in PA creation context. |
-| **PDCA P2: No Output on L0 Fallback** | Fixed silent output loss when metrics are unavailable during L0 fallback execution. Default metrics are now provided, ensuring the user always receives a response. |
-| **TL: pend always 0** | Fixed `pend_sum` calculation in TL aggregation — was incorrectly using `sum` instead of actual pend values from sub-tasks, causing TL to report no pending work despite running sub-tasks. |
+| Area | Description |
+|------|-------------|
+| **SA Module Monolith Decomposition** | Split the 3408-line `sa/mod.rs` into 8 focused modules (`types`, `planning`, `execution`, `intervention`, `agent`, `process`, `stats`, `actions`) — each with a single responsibility. The largest structural refactor in the codebase. |
+| **Unified Timeline System** | New `TimeRange` + `TimelineEntry` framework for cross-subsystem temporal queries. Includes exponential time-decay reranking (`apply_time_decay()`) for memory recall — older entries gracefully decay in relevance. |
+| **5W2H Dimension Audit** | Formalized dimension-level audit with `AuditStatus` (Pass/Warning/Fail) and automatic causal chain linkage. Failed dimensions now feed into `CausalEngine` for root-cause analysis — no more black-box PASS/FAIL. |
+| **Knowledge Graph Context Injection** | Agent system prompts now auto-inject relevant KG entities before each execution turn, ensuring SA interventions and new knowledge are immediately visible to all agents. |
+| **Time-Aware System Prompt** | Agents now receive current time and session context via `SystemPromptRegion::TimeAwareness`, enabling time-sensitive reasoning and checkpoint-consistent recovery. |
+| **Hyperspace-Integrated Proactive Perception** | `ProactiveEngine` now uses HyperspaceStore semantic search (with time decay λ=0.5) for experience retrieval — replacing L0 tag-substring matching. Graceful fallback to legacy path. |
+| **Causal-Integrated Workspace Monitor** | File events (create/modify/delete) now record `CausalObservation` for root-cause traceability. Pre-task snapshots + objective-aware file inventory injection. |
+| **LLRU Cold Archive (Skill Graph)** | `SkillGraphStore` auto-archives cold skills (`last_used_at < cutoff`) to L0 with `storage_tier = L0Permanent`. `find_stale_skills()` triggers re-indexing of outdated entries. |
+| **TimelineStore Mutation Tracking** | Every `SkillGraphStore` structural change (register/update/remove/link/MOC) now records a `GraphMutation` — making `pending_mutations()` and `snapshot_count()` accurately reflect real graph activity. |
+| **Old DAG Workflow Engine Removed** | Removed the 211-line petgraph-based `DagEngine` — PDCA's 7-level adaptive execution now fully replaces the legacy DAG orchestration. |
+| **HNSW Lock-Free Safety** | `visited_gen` changed from `Vec<usize>` to `Vec<AtomicUsize>` in `IncrementalHNSW`, eliminating concurrent search data races while preserving lock-free throughput. |
+| **PDCA P0: Pre-check Runtime Error** | Fixed crash (`Error("expect L0-3")`) when TL fails to match a skill — gracefully falls back to L0 execution instead of aborting the workflow. |
+| **PDCA P1: PA Uncreatable** | Fixed PA creation failure when DA/TL sets `PauseOnError` — missing `execute` field now properly populated. |
+| **PDCA P2: No Output on L0 Fallback** | Fixed silent output loss when metrics unavailable — default metrics ensure user always receives a response. |
+| **TL: pend always 0** | Fixed `pend_sum` calculation in TL aggregation — was incorrectly using `sum` instead of actual pend values from sub-tasks. |
+| **Error Handling Cleanup** | Removed two `.expect("RwLock poisoned")` calls in `execution.rs` — graceful degradation over panic. |
+| **Skill Graph Security Enhancements** | New access-control checkpoints in skill registration and query paths, plus MCP tool call security filtering. |
 
 ---
 

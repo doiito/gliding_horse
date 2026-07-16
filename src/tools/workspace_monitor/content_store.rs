@@ -88,7 +88,15 @@ impl ContentStore {
     /// Returns a `ReadResult` with content, version info, and optional diff.
     pub fn read_file(&self, path: &str, mode: ReadMode) -> std::io::Result<ReadResult> {
         let disk_content = std::fs::read_to_string(path)?;
-        let disk_lines: Vec<String> = disk_content.lines().map(|l| l.to_string()).collect();
+        Ok(self.process_content(path, &disk_content, mode))
+    }
+
+    /// Process already-read content through the caching and diff pipeline.
+    ///
+    /// Same logic as `read_file()` but accepts pre-read content to avoid redundant disk I/O.
+    /// Callers (tool executor) can read disk once and pass the content here for caching + diff.
+    pub fn process_content(&self, path: &str, content: &str, mode: ReadMode) -> ReadResult {
+        let disk_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
         let total_lines = disk_lines.len();
         let disk_mtime = std::fs::metadata(path)
             .ok()
@@ -96,20 +104,19 @@ impl ContentStore {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let disk_hash = hash_content(&disk_content);
+        let disk_hash = hash_content(content);
 
         let mut version_index = self.version_index.write();
         let current_version = version_index.get(path).copied().unwrap_or(0);
 
-        // Force refresh mode: always read fresh
         if mode == ReadMode::ForceRefresh {
             let new_version = current_version + 1;
             version_index.insert(path.to_string(), new_version);
-            self.store_version(path, &disk_content, new_version);
+            self.store_version(path, content, new_version);
             drop(version_index);
             self.invalidate_cache(path);
 
-            return Ok(ReadResult {
+            return ReadResult {
                 path: path.to_string(),
                 lines: disk_lines,
                 total_lines,
@@ -119,7 +126,7 @@ impl ContentStore {
                 changed_lines: None,
                 from_cache: false,
                 version: new_version,
-            });
+            };
         }
 
         let cached = {
@@ -129,7 +136,7 @@ impl ContentStore {
 
         if let Some(cached) = cached {
             if disk_mtime == cached.mtime && !mode.is_diff() {
-                return Ok(ReadResult {
+                return ReadResult {
                     path: path.to_string(),
                     lines: cached.lines,
                     total_lines,
@@ -139,7 +146,7 @@ impl ContentStore {
                     changed_lines: None,
                     from_cache: true,
                     version: cached.version,
-                });
+                };
             }
 
             if disk_hash == cached.hash {
@@ -150,7 +157,7 @@ impl ContentStore {
                     mtime: disk_mtime,
                     version: cached.version,
                 });
-                return Ok(ReadResult {
+                return ReadResult {
                     path: path.to_string(),
                     lines: cached.lines,
                     total_lines,
@@ -160,12 +167,12 @@ impl ContentStore {
                     changed_lines: None,
                     from_cache: true,
                     version: cached.version,
-                });
+                };
             }
 
             let new_version = current_version + 1;
             version_index.insert(path.to_string(), new_version);
-            self.store_version(path, &disk_content, new_version);
+            self.store_version(path, content, new_version);
             drop(version_index);
 
             let is_diff_or_changed = mode == ReadMode::Diff || mode == ReadMode::ChangedOnly;
@@ -196,7 +203,7 @@ impl ContentStore {
                 version: new_version,
             });
 
-            return Ok(ReadResult {
+            return ReadResult {
                 path: path.to_string(),
                 lines: disk_lines,
                 total_lines,
@@ -206,12 +213,12 @@ impl ContentStore {
                 changed_lines,
                 from_cache: false,
                 version: new_version,
-            });
+            };
         }
 
         let new_version = current_version + 1;
         version_index.insert(path.to_string(), new_version);
-        self.store_version(path, &disk_content, new_version);
+        self.store_version(path, content, new_version);
         drop(version_index);
 
         let mut cache = self.lines_cache.lock();
@@ -222,7 +229,7 @@ impl ContentStore {
             version: new_version,
         });
 
-        Ok(ReadResult {
+        ReadResult {
             path: path.to_string(),
             lines: disk_lines,
             total_lines,
@@ -232,7 +239,7 @@ impl ContentStore {
             changed_lines: None,
             from_cache: false,
             version: new_version,
-        })
+        }
     }
 
     /// Extract only the changed/inserted lines (with 3 lines of context)

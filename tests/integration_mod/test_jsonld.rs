@@ -118,7 +118,10 @@ fn test_entity_alignment_and_graph_merge() {
     
     blackboard.write_node(shared_id, &node1, &config).unwrap();
     blackboard.write_node(shared_id, &node2, &config).unwrap();
-    
+
+    // Wait for background Oxigraph sync before SPARQL querying
+    blackboard.flush_oxigraph();
+
     let nodes = blackboard.query_nodes(shared_id).unwrap();
     assert!(!nodes.is_empty(), "应该能查询到写入的节点");
     
@@ -156,7 +159,9 @@ fn test_multi_type_query() {
     blackboard.write_node("iri://test/plan", &plan_node, &config).unwrap();
     blackboard.write_node("iri://test/exec", &exec_node, &config).unwrap();
     blackboard.write_node("iri://test/multi", &multi_node, &config).unwrap();
-    
+
+    blackboard.flush_oxigraph();
+
     let plan_nodes = blackboard.query_by_types(&["PlanNode".to_string()]).unwrap();
     assert_eq!(plan_nodes.len(), 2, "应该找到2个PlanNode类型的节点");
     
@@ -186,7 +191,9 @@ fn test_named_graph_isolation() {
     
     blackboard.write_node_to_graph("iri://test/plan", &plan_node, "system:plan", &config).unwrap();
     blackboard.write_node_to_graph("iri://test/exec", &exec_node, "system:execution", &config).unwrap();
-    
+
+    blackboard.flush_oxigraph();
+
     let plan_results = blackboard.query_graph("system:plan", "?s ?p ?o").unwrap();
     assert!(!plan_results.is_empty(), "plan图应该有节点");
     
@@ -377,7 +384,9 @@ fn test_sparql_query_on_jsonld_nodes() {
     
     blackboard.write_node("iri://task/1", &node1, &config).unwrap();
     blackboard.write_node("iri://task/2", &node2, &config).unwrap();
-    
+
+    blackboard.flush_oxigraph();
+
     let sparql = r#"
         SELECT ?s ?status WHERE {
             ?s a <http://agent-os.org/type/Task> .

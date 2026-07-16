@@ -79,11 +79,13 @@ impl SkillDiscoveryEngine {
         self
     }
 
-    pub fn discover_for_task(&self, task: &Task5W2H) -> Vec<SkillMatch> {
+    pub async fn discover_for_task(&self, task: &Task5W2H) -> Vec<SkillMatch> {
         info!("Discovering skills for task: what={}", task.what);
         
+        let mut seen_iris = HashSet::new();
         let mut matches: Vec<SkillMatch> = Vec::new();
         
+        // Phase 1: keyword-based 5W2H matching
         let keyword_matches = self.graph_store.find_skills_by_5w2h(
             Some(&task.what),
             Some(&task.why),
@@ -131,6 +133,7 @@ impl SkillDiscoveryEngine {
                 .cloned()
                 .collect();
 
+            seen_iris.insert(skill.skill_iri.clone());
             matches.push(SkillMatch {
                 skill,
                 relevance_score: score,
@@ -139,9 +142,28 @@ impl SkillDiscoveryEngine {
             });
         }
 
+        // Phase 2: semantic vector search for complementary results
+        if self.vector_store.is_some() {
+            let query = [
+                task.what.as_str(),
+                task.why.as_str(),
+                task.how_approach.as_deref().unwrap_or(""),
+            ].join(" ");
+            if let Ok(semantic_matches) = self.semantic_search(&query, 5).await {
+                for sm in semantic_matches {
+                    if seen_iris.insert(sm.skill.skill_iri.clone()) {
+                        matches.push(sm);
+                    }
+                }
+            }
+        }
+
         matches.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
         
-        debug!("Found {} matching skills", matches.len());
+        debug!("Found {} matching skills ({} keyword, {} semantic)",
+            matches.len(),
+            matches.iter().filter(|m| m.match_reasons.iter().any(|r| r != "semantic match")).count(),
+            matches.iter().filter(|m| m.match_reasons.contains(&"semantic match".to_string())).count());
         matches
     }
 
@@ -392,8 +414,8 @@ mod tests {
         store
     }
 
-    #[test]
-    fn test_discover_for_task() {
+    #[tokio::test]
+    async fn test_discover_for_task() {
         let store = setup_test_store();
         let engine = SkillDiscoveryEngine::new(store);
         
@@ -401,7 +423,7 @@ mod tests {
             .with_phase("Do")
             .with_agent_role("DA");
         
-        let matches = engine.discover_for_task(&task);
+        let matches = engine.discover_for_task(&task).await;
         
         assert!(!matches.is_empty());
         assert!(matches.iter().any(|m| m.skill.skill_iri == "iri://skills/jwt-auth"));

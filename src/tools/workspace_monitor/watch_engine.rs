@@ -48,17 +48,7 @@ impl WatchConfig {
         let normalized = path.replace('\\', "/");
         for pattern in &self.exclude_patterns {
             let pat = pattern.replace('\\', "/");
-            let pat_dir = if pat.ends_with('/') {
-                pat.clone()
-            } else {
-                format!("{}/", pat)
-            };
-            // Match as full path, directory prefix, path component, or parent dir:
-            if normalized == pat
-                || normalized.starts_with(&pat_dir)
-                || normalized.contains(&format!("/{}", pat_dir))
-                || normalized.ends_with(&format!("/{}", pat))
-            {
+            if crate::tools::workspace_monitor::inventory::match_glob_pattern(&normalized, &pat) {
                 return true;
             }
         }
@@ -225,16 +215,7 @@ impl WatchEngine {
         let normalized = path.replace('\\', "/");
         for pattern in exclude_patterns {
             let pat = pattern.replace('\\', "/");
-            let pat_dir = if pat.ends_with('/') {
-                pat.clone()
-            } else {
-                format!("{}/", pat)
-            };
-            if normalized == pat
-                || normalized.starts_with(&pat_dir)
-                || normalized.contains(&format!("/{}", pat_dir))
-                || normalized.ends_with(&format!("/{}", pat))
-            {
+            if crate::tools::workspace_monitor::inventory::match_glob_pattern(&normalized, &pat) {
                 return true;
             }
         }

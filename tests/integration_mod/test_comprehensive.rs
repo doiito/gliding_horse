@@ -138,6 +138,7 @@ fn test_memory_full_pipeline() {
     let node = infra.l2.read_node("iri://task/test_mem/node_1").unwrap().unwrap();
     assert_eq!(node.node_type.as_ref().unwrap(), "TestNode");
 
+    infra.l2.flush_oxigraph();
     let sparql_results = infra.l2.query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 5").unwrap();
     assert!(!sparql_results.is_empty(), "SPARQL should return results after write_node");
 

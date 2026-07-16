@@ -164,7 +164,8 @@ impl SkillGraphStore {
 
     pub fn update_skill(&self, skill: SkillGraphNode) -> Result<(), CoreError> {
         let iri = skill.skill_iri.clone();
-        if let Some(old) = self.skills.read().get(&iri).cloned() {
+        let old = self.skills.read().get(&iri).cloned();
+        if let Some(old) = old {
             self.index.update_skill(&skill);
             // P0-1: sync update to Oxigraph (delete old + insert new)
             self.sync_skill_delete(&iri);

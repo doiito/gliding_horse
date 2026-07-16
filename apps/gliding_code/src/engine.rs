@@ -20,6 +20,7 @@ use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::skill_graph::discovery::SkillDiscoveryEngine;
+use glidinghorse::skill_graph::evolution::SkillEvolutionEngine;
 use glidinghorse::skill_graph::graph_algorithms::SkillGraphAlgorithms;
 use glidinghorse::skill_graph::graph_store::SkillGraphStore;
 use glidinghorse::snapshots::timeline::TimelineStore;
@@ -66,8 +67,12 @@ pub struct CodeCliEngine {
     feature_extractor: Arc<FeatureExtractor>,
     /// Causal engine (Bayesian inference on skill graph)
     causal_engine: Arc<CausalEngine>,
+    /// Skill evolution engine (usage tracking & self-improvement)
+    evolution_engine: Arc<tokio::sync::Mutex<SkillEvolutionEngine>>,
     /// Timeline store (temporal event recording)
     timeline: Arc<TimelineStore>,
+    /// Core config for L2 blackboard writes etc.
+    core_config: CoreConfig,
 }
 
 impl CodeCliEngine {
@@ -162,7 +167,7 @@ impl CodeCliEngine {
             l0.clone(),
             l2.clone(),
             proj.clone(),
-            core_config,
+            core_config.clone(),
         )));
         let mm_for_runner = mm.clone();
 
@@ -229,6 +234,7 @@ impl CodeCliEngine {
                 .read().expect("kg_store RwLock poisoned")
                 .store_arc().clone()
         };
+        let unified_kg_store = inner_store.clone();
         {
             let fused_kg = Arc::new(
                 KnowledgeGraphStore::with_shared_store(inner_store)
@@ -260,6 +266,13 @@ impl CodeCliEngine {
         let causal_engine = Arc::new(CausalEngine::new(
             causal_model_store,
             graph_backend.clone(),
+        ));
+
+        // ── SkillEvolutionEngine (usage tracking & self-improvement) ──
+        let evolution_engine = Arc::new(tokio::sync::Mutex::new(
+            SkillEvolutionEngine::new(skill_graph.clone())
+                .with_causal_analysis(5000)
+                .with_causal_engine(causal_engine.clone()),
         ));
 
         let event_bus = Arc::new(EventBus::new(100));
@@ -314,7 +327,8 @@ impl CodeCliEngine {
         // 注入 CausalEngine + SkillGraphStore 到 AgentRunner
         runner = runner
             .with_causal_engine(causal_engine.clone())
-            .with_skill_graph_store(skill_graph.clone());
+            .with_skill_graph_store(skill_graph.clone())
+            .with_unified_graph_store(unified_kg_store);
 
         // 完成 AgentRunner 初始化接线：perception_store → WorkspaceMonitor
         runner.finalize_setup();
@@ -394,7 +408,9 @@ impl CodeCliEngine {
             discovery_engine,
             feature_extractor,
             causal_engine,
+            evolution_engine,
             timeline,
+            core_config,
         })
     }
 
@@ -461,6 +477,9 @@ impl CodeCliEngine {
         // 首次进入 async 上下文时完成 WorkspaceMonitor 的异步初始化
         if let Some(ref wm) = self.workspace_monitor {
             wm.start_async_components();
+            // Trigger rescan when WatchEngine is not active to catch files
+            // created between tasks (e.g. by git clones, dependency installs).
+            wm.rescan();
         }
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -500,6 +519,166 @@ impl CodeCliEngine {
             tool_call_count = result.tool_call_count,
             "任务处理完成"
         );
+
+        // Record post-task metrics for skill evolution + causal analysis
+        if let Ok(mut ee) = self.evolution_engine.try_lock() {
+            let success = result.status == "completed" || result.status == "success";
+            let tool_names: Vec<String> = result.tracked_actions.iter()
+                .map(|a| a.tool_name.clone())
+                .collect();
+
+            // Track each distinct tool as a skill usage event
+            for tool_name in &tool_names {
+                let tool_iri = format!("iri://skill/tool/{}", tool_name);
+                let _ = ee.record_usage(
+                    glidinghorse::skill_graph::evolution::UsageRecord::new(
+                        &tool_iri,
+                        &task_iri,
+                        "system:sa",
+                        success,
+                    )
+                    .with_context_tag(&result.status)
+                    .with_tokens(result.turn_count * 100),
+                );
+            }
+
+            // When task fails, record a failure event that triggers infer_root_cause
+            if !success {
+                let error_msg = if !result.errors.is_empty() {
+                    result.errors.join("; ")
+                } else {
+                    format!("Task status: {}", result.status)
+                };
+                let _ = ee.record_usage(
+                    glidinghorse::skill_graph::evolution::UsageRecord::new(
+                        "iri://skill/task-completion",
+                        &task_iri,
+                        "system:sa",
+                        false,
+                    )
+                    .with_error(&error_msg)
+                    .with_context_tag(&result.status)
+                    .with_context_tag(&tool_names.join(",")),
+                );
+
+                // Phase 2: Extract causal root cause from evolution engine and
+                // publish suggestions to the event bus for observability / downstream use.
+                {
+                    let suggestions = ee.get_pending_suggestions().to_vec();
+                    if !suggestions.is_empty() {
+                        let causal_summary = suggestions.iter()
+                            .map(|s| format!("{} (conf={:.2}): {}", s.skill_iri, s.confidence, s.description))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        info!(
+                            task_iri = %task_iri,
+                            suggestion_count = suggestions.len(),
+                            causal_summary = %causal_summary,
+                            "故障因果分析完成，生成了演化建议"
+                        );
+
+                        // Publish causal analysis result to event bus
+                        let serialized_suggestions: Vec<serde_json::Value> = suggestions.iter()
+                            .map(|s| serde_json::json!({
+                                "type": format!("{:?}", s.suggestion_type),
+                                "skill_iri": s.skill_iri,
+                                "description": s.description,
+                                "confidence": s.confidence,
+                            }))
+                            .collect();
+                        let _ = self.event_bus.emit(
+                            &task_iri,
+                            "causal_analysis",
+                            "system:evolution_engine",
+                            &serde_json::json!({
+                                "task_iri": task_iri,
+                                "status": result.status,
+                                "errors": result.errors,
+                                "suggestions": serialized_suggestions,
+                            }).to_string(),
+                        ).await;
+                    }
+                }
+
+                // Also collect preventive actions for each affected tool
+                for tool_name in &tool_names {
+                    let tool_iri = format!("iri://skill/tool/{}", tool_name);
+                    let actions = ee.suggest_preventive_action(&tool_iri);
+                    for action in &actions {
+                        let _ = ee.suggest_link(
+                            &tool_iri,
+                            "iri://knowledge/causal-analysis",
+                            glidinghorse::skill_graph::SkillLinkType::Related,
+                            action,
+                        );
+                    }
+                }
+
+                // Persist causal analysis to L2 blackboard for cross-task awareness
+                {
+                    let suggestions = ee.get_pending_suggestions().to_vec();
+                    if !suggestions.is_empty() {
+                        let causal_node_iri = format!("{}#causal", task_iri);
+                        let all_suggestions: Vec<serde_json::Value> = suggestions.iter()
+                            .map(|s| serde_json::json!({
+                                "type": format!("{:?}", s.suggestion_type),
+                                "skill_iri": s.skill_iri,
+                                "description": s.description,
+                                "confidence": s.confidence,
+                            }))
+                            .collect();
+                        let causal_json = serde_json::json!({
+                            "@id": causal_node_iri,
+                            "@type": "CausalAnalysis",
+                            "task_iri": task_iri,
+                            "status": result.status,
+                            "errors": result.errors,
+                            "error_message": error_msg,
+                            "suggestions": all_suggestions,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        let _ = self.l2_bb.write_node(
+                            &causal_node_iri,
+                            &causal_json.to_string(),
+                            &self.core_config,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Periodic suggest_improvements & health snapshot after each task
+        // (runs unlocked so async calls are safe)
+        {
+            if let Ok(mut ee) = self.evolution_engine.try_lock() {
+                let improvements = ee.suggest_improvements().await;
+                if !improvements.is_empty() {
+                    let snapshot_json = serde_json::json!({
+                        "@id": format!("{}#health-snapshot", task_iri),
+                        "@type": "SkillHealthSnapshot",
+                        "task_iri": task_iri,
+                        "improvements": improvements.iter().map(|s| serde_json::json!({
+                            "type": format!("{:?}", s.suggestion_type),
+                            "skill_iri": s.skill_iri,
+                            "description": s.description,
+                            "confidence": s.confidence,
+                        })).collect::<Vec<_>>(),
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+                    let snapshot_iri = format!("{}#health-snapshot", task_iri);
+                    let _ = self.l2_bb.write_node(
+                        &snapshot_iri,
+                        &snapshot_json.to_string(),
+                        &self.core_config,
+                    );
+                    info!(
+                        task_iri = %task_iri,
+                        improvement_count = improvements.len(),
+                        "技能图健康快照已保存"
+                    );
+                }
+            }
+        }
 
         Ok((task_iri, result))
     }
@@ -552,6 +731,11 @@ impl CodeCliEngine {
     /// CausalEngine — Bayesian causal inference on the skill graph.
     pub fn causal_engine(&self) -> Arc<CausalEngine> {
         self.causal_engine.clone()
+    }
+
+    /// SkillEvolutionEngine — usage tracking and self-improvement.
+    pub fn evolution_engine(&self) -> Arc<tokio::sync::Mutex<SkillEvolutionEngine>> {
+        self.evolution_engine.clone()
     }
 
     /// TimelineStore — versioned snapshots of skill graph mutations.

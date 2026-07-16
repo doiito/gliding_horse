@@ -112,6 +112,14 @@ pub const WORKSPACE_GRAPH: &str = "iri://workspace";
 /// Inventory cache table: key = file path (str), value = serialized FileEntry.
 const INVENTORY_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("inventory_cache");
 
+/// Maximum number of entries in the in-memory inventory.
+/// Prevents unbounded memory growth in large workspaces.
+/// In tests, uses a small value so limit enforcement is testable without 50k files.
+#[cfg(not(test))]
+pub(crate) const MAX_INVENTORY_ENTRIES: usize = 50_000;
+#[cfg(test)]
+pub(crate) const MAX_INVENTORY_ENTRIES: usize = 10;
+
 /// FileInventory — thin facade over L2 Blackboard (RDF) with redb hot cache.
 ///
 /// The authority data source is L2 (Oxigraph RDF named graph `iri://workspace`).
@@ -123,8 +131,8 @@ pub struct FileInventory {
     cache: Option<Database>,
     /// In-memory cache for fastest access (no redb deserialization).
     mem_cache: RwLock<HashMap<String, FileEntry>>,
-    /// Exclude patterns for scanning.
-    exclude_patterns: Vec<String>,
+    /// Exclude patterns for scanning. Uses RwLock for post-construction updates (gitignore sync).
+    exclude_patterns: RwLock<Vec<String>>,
 }
 
 impl FileInventory {
@@ -162,7 +170,7 @@ impl FileInventory {
             blackboard,
             cache: db,
             mem_cache: RwLock::new(mem_cache),
-            exclude_patterns,
+            exclude_patterns: RwLock::new(exclude_patterns),
         }
     }
 
@@ -172,6 +180,15 @@ impl FileInventory {
     #[instrument(skip(self))]
     pub fn full_scan(&self, root: &str) -> usize {
         let mut count = 0;
+
+        // Check if inventory is already full before scanning
+        {
+            let mem = self.mem_cache.read();
+            if mem.len() >= MAX_INVENTORY_ENTRIES {
+                enforce_max_entries(mem.len());
+                return 0;
+            }
+        }
 
         for entry in WalkDir::new(root)
             .into_iter()
@@ -205,6 +222,15 @@ impl FileInventory {
             // File doesn't exist — treat as removal
             self.remove_internal(path);
             return None;
+        }
+
+        // Enforce maximum entries limit — only reject genuinely NEW entries
+        if self.get_entry(path).is_none() {
+            let mem = self.mem_cache.read();
+            if mem.len() >= MAX_INVENTORY_ENTRIES {
+                enforce_max_entries(mem.len());
+                return None;
+            }
         }
 
         let metadata = match std::fs::metadata(path) {
@@ -385,6 +411,16 @@ impl FileInventory {
         mem.get(path).cloned()
     }
 
+    /// Update exclude patterns after construction (e.g., after WatchEngine loads .gitignore).
+    pub fn set_exclude_patterns(&self, patterns: Vec<String>) {
+        let mut ep = self.exclude_patterns.write();
+        for p in patterns {
+            if !ep.contains(&p) {
+                ep.push(p);
+            }
+        }
+    }
+
     /// List all files matching a state filter.
     pub fn list_by_state(&self, state: FileState) -> Vec<FileEntry> {
         let mem = self.mem_cache.read();
@@ -443,13 +479,16 @@ impl FileInventory {
 
     // ── Private helpers ──
 
-    fn is_excluded(&self, path: &std::path::Path) -> bool {
+    pub(crate) fn is_excluded(&self, path: &std::path::Path) -> bool {
+        let ep = self.exclude_patterns.read();
+        if ep.is_empty() {
+            return false;
+        }
         let path_str = path.to_string_lossy();
-        // Normalize path separators
         let normalized = path_str.replace('\\', "/");
-        for pattern in &self.exclude_patterns {
+        for pattern in ep.iter() {
             let pat = pattern.replace('\\', "/");
-            if normalized.contains(&pat) || normalized.ends_with(&pat) {
+            if match_glob_pattern(&normalized, &pat) {
                 return true;
             }
         }
@@ -457,6 +496,15 @@ impl FileInventory {
     }
 
     fn add_entry(&self, path: &str) -> Option<FileEntry> {
+        // Enforce maximum entries limit
+        {
+            let mem = self.mem_cache.read();
+            if mem.len() >= MAX_INVENTORY_ENTRIES {
+                enforce_max_entries(mem.len());
+                return None;
+            }
+        }
+
         let path_obj = Path::new(path);
         let content = std::fs::read_to_string(path).unwrap_or_default();
         let content_hash = hash_content(&content);
@@ -603,6 +651,54 @@ fn hash_content(content: &str) -> String {
     format!("sha256:{}", hex::encode(result))
 }
 
+/// Match a path against a gitignore-style glob pattern.
+///
+/// Supports:
+/// - `*.ext` (extension glob)
+/// - `name/` (directory prefix)
+/// - `path/name` (exact path segment)
+/// - Substring match as fallback (backward compatibility)
+pub fn match_glob_pattern(path: &str, pattern: &str) -> bool {
+    // Exact match
+    if path == pattern {
+        return true;
+    }
+
+    // Directory prefix: pattern like "node_modules/" or "target/"
+    let pat_dir = if pattern.ends_with('/') {
+        pattern.to_string()
+    } else if !pattern.contains('.') {
+        format!("{}/", pattern)
+    } else {
+        // Check if it's a glob extension pattern like *.log
+        if let Some(ext) = pattern.strip_prefix("*.") {
+            if ext.contains('*') || ext.contains('/') {
+                // Complex pattern — fall back to substring match
+                return path.contains(pattern) || path.ends_with(pattern);
+            }
+            // Match file extension
+            let ext_dot = format!(".{}", ext);
+            return path.ends_with(&ext_dot)
+                || path.contains(&format!("/{}", ext_dot));
+        }
+        return path.contains(pattern) || path.ends_with(pattern);
+    };
+
+    // Directory match: the path starts with the dir or contains /<dir> or ends with /<dir>
+    path.starts_with(&pat_dir)
+        || path.contains(&format!("/{}", pat_dir))
+        || path.ends_with(&format!("/{}", pat_dir.trim_end_matches('/')))
+}
+
+fn enforce_max_entries(count: usize) {
+    if count >= MAX_INVENTORY_ENTRIES {
+        warn!(
+            "FileInventory has reached {} entries (max {}). Further files will not be tracked.",
+            count, MAX_INVENTORY_ENTRIES
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +807,154 @@ mod tests {
 
         let counts = inventory.state_counts();
         assert_eq!(*counts.get("read_fresh").unwrap_or(&0), 1);
+    }
+
+    // ── match_glob_pattern tests ──
+
+    #[test]
+    fn test_glob_exact_match() {
+        assert!(match_glob_pattern("node_modules/pkg/index.js", "node_modules/"));
+        assert!(match_glob_pattern("target/debug/app", "target/"));
+        assert!(match_glob_pattern("src/main.rs", "src/main.rs"));
+    }
+
+    #[test]
+    fn test_glob_extension_wildcard() {
+        // *.log should match .log files
+        assert!(match_glob_pattern("server.log", "*.log"));
+        assert!(match_glob_pattern("logs/app.log", "*.log"));
+        assert!(match_glob_pattern("src/error.log", "*.log"));
+        // Should NOT match files without .log ending
+        assert!(!match_glob_pattern("server.logger", "*.log"));
+        assert!(!match_glob_pattern("log.txt", "*.log"));
+        assert!(!match_glob_pattern("logs", "*.log"));
+    }
+
+    #[test]
+    fn test_glob_extension_wildcard_other() {
+        // *.rs should match .rs files
+        assert!(match_glob_pattern("src/main.rs", "*.rs"));
+        assert!(match_glob_pattern("lib.rs", "*.rs"));
+        assert!(!match_glob_pattern("main.rs.bak", "*.rs"));
+    }
+
+    #[test]
+    fn test_glob_directory_prefix() {
+        // Directory patterns - with trailing slash
+        assert!(match_glob_pattern("node_modules/pkg/index.js", "node_modules/"));
+        assert!(match_glob_pattern("project/node_modules/pkg.js", "node_modules/"));
+
+        // Without trailing slash, no dot → treated as directory
+        assert!(match_glob_pattern("node_modules/pkg/index.js", "node_modules"));
+        assert!(match_glob_pattern("build/output.o", "build"));
+
+        // Should NOT match partial directory names
+        assert!(!match_glob_pattern("src/node_modules_test/helper.js", "node_modules/"));
+    }
+
+    #[test]
+    fn test_glob_path_specific() {
+        // Exact path segments in the middle
+        assert!(match_glob_pattern("/home/user/project/data/rag/doc.json", "data/"));
+        assert!(!match_glob_pattern("/home/user/project/database/schema.sql", "data/"));
+    }
+
+    #[test]
+    fn test_glob_gitignore_patterns() {
+        // Common .gitignore patterns
+        let patterns = vec![
+            ".env",           // dotfile
+            "*.pyc",          // compiled python
+            "__pycache__/",   // cache dir
+            ".next/",         // build dir
+            "dist/",          // output dir
+            ".gliding_horse/", // app data
+        ];
+
+        for pat in &patterns {
+            assert!(
+                match_glob_pattern(&format!("/workspace/{}", pat.trim_end_matches('/')), pat),
+                "Pattern '{}' should match itself", pat
+            );
+        }
+    }
+
+    #[test]
+    fn test_glob_exclude_all_variants() {
+        let inventory = FileInventory::new(
+            None, None,
+            vec!["node_modules/".into(), "*.pyc".into(), "build/".into()],
+        );
+
+        // Must exclude
+        assert!(inventory.is_excluded(Path::new("/project/node_modules/pkg/index.js")));
+        assert!(inventory.is_excluded(Path::new("/project/src/__pycache__/cache.pyc")));
+        assert!(inventory.is_excluded(Path::new("/project/build/o.app")));
+
+        // Must NOT exclude
+        assert!(!inventory.is_excluded(Path::new("/project/src/main.rs")));
+        assert!(!inventory.is_excluded(Path::new("/project/Cargo.toml")));
+        assert!(!inventory.is_excluded(Path::new("/project/src/pycache/api.py")));
+    }
+
+    #[test]
+    fn test_glob_no_false_positive_substring() {
+        // Ensure "target" doesn't match "targeting.rs"
+        let inventory = FileInventory::new(None, None, vec!["target/".into()]);
+        assert!(!inventory.is_excluded(Path::new("/project/src/targeting.rs")));
+        assert!(inventory.is_excluded(Path::new("/project/target/debug/app")));
+    }
+
+    #[test]
+    fn test_set_exclude_patterns() {
+        let inventory = FileInventory::new(None, None, vec!["node_modules/".into()]);
+        assert!(inventory.is_excluded(Path::new("node_modules/pkg/index.js")));
+        assert!(!inventory.is_excluded(Path::new("build/output.o")));
+
+        // Add patterns after construction (simulates gitignore sync)
+        inventory.set_exclude_patterns(vec!["build/".into(), "*.o".into()]);
+        assert!(inventory.is_excluded(Path::new("build/output.o")));
+        // Original patterns preserved
+        assert!(inventory.is_excluded(Path::new("node_modules/pkg/index.js")));
+    }
+
+    #[test]
+    fn test_max_entries_limit() {
+        let dir = TempDir::new().unwrap();
+        // Create files that would exceed limit
+        // We use a fresh inventory and lower the effective limit by
+        // directly testing add_entry behavior
+        let inventory = FileInventory::new(None, None, vec![]);
+
+        // Fill up to MAX_INVENTORY_ENTRIES
+        for i in 0..super::MAX_INVENTORY_ENTRIES {
+            let path = dir.path().join(format!("file_{}.rs", i));
+            std::fs::write(&path, "fn f() {}").unwrap();
+            let result = inventory.add_or_update(&path.to_string_lossy());
+            assert!(result.is_some(), "Entry {} should be added", i);
+        }
+
+        // Next entry should be rejected
+        let overflow = dir.path().join("overflow.rs");
+        std::fs::write(&overflow, "fn overflow() {}").unwrap();
+        let result = inventory.add_or_update(&overflow.to_string_lossy());
+        assert!(result.is_none(), "Entry beyond MAX_INVENTORY_ENTRIES should be rejected");
+
+        assert_eq!(inventory.total_count(), super::MAX_INVENTORY_ENTRIES);
+    }
+
+    #[test]
+    fn test_full_scan_honors_exclude_patterns() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("vendor/lib.rs"), "pub fn lib() {}").unwrap();
+
+        let inventory = FileInventory::new(None, None, vec!["vendor/".into()]);
+        let count = inventory.full_scan(&dir.path().to_string_lossy());
+        assert_eq!(count, 1, "full_scan should exclude vendor/");
+        assert!(inventory.get_entry(&dir.path().join("src/main.rs").to_string_lossy()).is_some());
+        assert!(inventory.get_entry(&dir.path().join("vendor/lib.rs").to_string_lossy()).is_none());
     }
 }

@@ -277,9 +277,42 @@ impl ToolExecutor {
                     .and_then(|v| v.as_str())
                     .unwrap_or("auto")
                     .to_string();
+                let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 // Extract offset/limit before input is moved into execute_file_read
                 let has_offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
                 let has_limit = input.get("limit").is_some();
+
+                // Fast path: check ContentStore + FileInventory cache to skip disk read
+                if !path.is_empty() && mode != "force_refresh" {
+                    let guard = ws.read();
+                    if let Some(ref wm) = *guard {
+                        let entry = wm.inventory.read().get_entry(&path);
+                        let should_cache = match entry {
+                            Some(ref e) => e.state == crate::tools::workspace_monitor::FileState::ReadFresh
+                                && e.current_version == e.last_read_version
+                                && wm.content().try_get_cached(&path).is_some(),
+                            None => false,
+                        };
+                        if should_cache {
+                            if !has_offset && !has_limit {
+                                return Ok(json!({
+                                    "path": path,
+                                    "from_cache": true,
+                                    "message": "Cache hit: file unchanged since last read. Content already in your context — skip re-reading and proceed with what you have."
+                                }));
+                            } else {
+                                return Ok(json!({
+                                    "path": path,
+                                    "from_cache": true,
+                                    "message": "Cache hit: file unchanged since last read. Content already in your context — skip re-reading."
+                                }));
+                            }
+                        }
+                    }
+                    drop(guard);
+                }
+
+                // Slow path: read from disk once
                 let result = builtins::execute_file_read(input).await?;
                 let guard = ws.read();
                 if let Some(ref wm) = *guard {

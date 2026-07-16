@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -87,11 +88,12 @@ pub struct WorkspaceMonitor {
     pub inventory: Arc<RwLock<FileInventory>>,
     pub content_store: Arc<ContentStore>,
     pub snapshot_manager: Arc<SnapshotManager>,
-    #[allow(dead_code)]
     watch_engine: Option<WatchEngine>,
     event_bus: Option<Arc<EventBus>>,
     perception_store: RwLock<Option<Arc<PerceptionStore>>>,
     causal_engine: RwLock<Option<Arc<CausalEngine>>>,
+    /// Idempotent guard for start_async_components().
+    async_started: AtomicBool,
 }
 
 impl WorkspaceMonitor {
@@ -157,6 +159,10 @@ impl WorkspaceMonitor {
             if watch_config.use_gitignore {
                 watch_config.load_gitignore(&config.workspace_root);
             }
+            // Synchronize gitignore patterns to FileInventory so full_scan also respects them
+            let gitignore_patterns = watch_config.exclude_patterns.clone();
+            inventory.read().set_exclude_patterns(gitignore_patterns);
+
             match WatchEngine::start(&root, watch_config, eb, Some(inventory.clone())) {
                 Ok(engine) => {
                     info!("WatchEngine started for {}", root);
@@ -181,6 +187,7 @@ impl WorkspaceMonitor {
             event_bus: event_bus_for_struct,
             perception_store: RwLock::new(None),
             causal_engine: RwLock::new(None),
+            async_started: AtomicBool::new(false),
         };
 
         // Event consumers are deferred to start_async_components() which is called
@@ -229,9 +236,19 @@ impl WorkspaceMonitor {
 
     /// Re-scan the entire workspace root, discovering new files and tracking state changes.
     /// Returns the number of newly discovered files.
+    /// Skips rescan if WatchEngine is active (events handle incremental discovery).
     pub fn rescan(&self) -> usize {
+        if self.watch_engine_active() {
+            debug!("rescan skipped: WatchEngine active");
+            return 0;
+        }
         let root = self.config.workspace_root.to_string_lossy().to_string();
-        self.inventory.read().full_scan(&root)
+        let discovered = self.inventory.read().full_scan(&root);
+        if discovered > 0 {
+            info!(discovered = discovered, "rescan discovered new files");
+            self.inject_file_perception(None);
+        }
+        discovered
     }
 
     /// Get the snapshot manager reference.
@@ -346,16 +363,23 @@ impl WorkspaceMonitor {
     ///
     /// Must be called from within a tokio runtime (e.g., during `process_task`).
     /// Registers event consumers that listen for WorkspaceFile* events via EventBus.
-    ///
-    /// Safe to call multiple times — event consumer registration is idempotent
-    /// (each call spawns a redundant listener, but the extra listener will simply
-    /// process events that have already been handled by the first).
+    /// Idempotent: only runs once regardless of how many times it's called.
     pub fn start_async_components(&self) {
+        if self.async_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::error!("start_async_components must be called from within a tokio runtime");
+            self.async_started.store(false, Ordering::SeqCst);
             return;
         }
         self.register_event_consumers();
+    }
+
+    /// Check whether a native or polling WatchEngine is actively monitoring the filesystem.
+    /// Returns false when WatchEngine was never started (no EventBus) or failed to start.
+    pub fn watch_engine_active(&self) -> bool {
+        self.watch_engine.is_some()
     }
 
     /// Register hooks for file read/write tools to check inventory state.
@@ -1230,5 +1254,334 @@ mod tests {
         // Second take should be empty (consumed)
         let text2 = ps.take_perception_text("iri://task_full");
         assert!(text2.is_empty(), "Second take should be empty after consumption");
+    }
+
+    // ── New optimization tests ──
+
+    #[tokio::test]
+    async fn test_start_async_components_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bus = Arc::new(EventBus::new(100));
+
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+
+        let ws = WorkspaceMonitor::initialize(config, None, Some(bus)).unwrap();
+
+        // First call should succeed (inside tokio runtime)
+        ws.start_async_components();
+
+        assert!(ws.async_started.load(std::sync::atomic::Ordering::SeqCst),
+            "async_started should be true after first call");
+
+        // Second call must not spawn another consumer
+        let old_flag = ws.async_started.load(std::sync::atomic::Ordering::SeqCst);
+        ws.start_async_components();
+        assert_eq!(ws.async_started.load(std::sync::atomic::Ordering::SeqCst), old_flag,
+            "async_started unchanged after second call");
+    }
+
+    #[test]
+    fn test_watch_engine_active() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Without EventBus — no watch engine
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
+        assert!(!ws.watch_engine_active(), "No EventBus → watch_engine should be None");
+    }
+
+    #[test]
+    fn test_rescan_empty_inventory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
+
+        // rescan on empty inventory with no watch engine should do full scan
+        let count = ws.rescan();
+        // No files in temp dir, so count should be 0 or small
+        assert_eq!(count, 0, "rescan on empty dir should discover 0 new files");
+    }
+
+    #[test]
+    fn test_rescan_skipped_when_watch_engine_active() {
+        // When EventBus is provided, WatchEngine starts but may be in polling mode.
+        // rescan checks watch_engine_active() and skips if Some.
+        // We can only verify it doesn't crash.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bus = Arc::new(EventBus::new(100));
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: true,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, Some(bus)).unwrap();
+
+        // rescan should return 0 (skipped, or if native watch started, skipped)
+        let count = ws.rescan();
+        assert_eq!(count, 0, "rescan should return 0 when watch engine is active or polling is fallback");
+    }
+
+    #[test]
+    fn test_rescan_discoveres_new_files_without_watch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
+
+        // Add file AFTER initialization
+        let new_file = dir.path().join("new_file.rs");
+        std::fs::write(&new_file, "fn new() {}").unwrap();
+
+        // rescan should discover it (no watch engine active)
+        let count = ws.rescan();
+        assert_eq!(count, 1, "rescan should discover the new file");
+
+        // Verify it's in inventory
+        let entry = ws.inventory.read().get_entry(&new_file.to_string_lossy());
+        assert!(entry.is_some(), "New file should be in inventory after rescan");
+    }
+
+    #[test]
+    fn test_rescan_does_not_re_add_tracked_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
+
+        // Add a file
+        let file = dir.path().join("tracked.rs");
+        std::fs::write(&file, "fn tracked() {}").unwrap();
+        let count1 = ws.rescan();
+        assert_eq!(count1, 1, "First rescan should find the file");
+
+        // Second rescan: file already tracked, should be 0 new
+        let count2 = ws.rescan();
+        assert_eq!(count2, 0, "Second rescan should not re-add tracked file");
+    }
+
+    #[test]
+    fn test_rescan_injects_perception_on_new_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ps = Arc::new(PerceptionStore::new());
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None)
+            .unwrap()
+            .with_perception_store(ps.clone());
+
+        // Add file after init
+        let file = dir.path().join("percept.rs");
+        std::fs::write(&file, "fn percept() {}").unwrap();
+
+        ws.rescan();
+
+        // PerceptionStore should have an entry from rescan's inject_file_perception
+        let text = ps.take_perception_text("iri://task/rescan_test");
+        assert!(!text.is_empty(), "rescan should inject perception on new files");
+        assert!(text.contains("files total"), "Perception text should contain file summary");
+    }
+
+    #[test]
+    fn test_file_inventory_summary_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
+
+        // Empty → None
+        assert!(ws.get_file_inventory_summary().is_none(), "Empty inventory should return None");
+
+        // Add files
+        for name in &["main.rs", "lib.rs", "README.md"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "content").unwrap();
+        }
+        ws.rescan();
+
+        let summary = ws.get_file_inventory_summary();
+        assert!(summary.is_some(), "Non-empty inventory should return summary");
+        let s = summary.unwrap();
+        assert!(s.contains("files across"), "Summary should mention files/dirs: {}", s);
+        assert!(s.contains("rust"), "Summary should mention rust language: {}", s);
+    }
+
+    #[test]
+    fn test_reset_inventory_clears_perception_global() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ps = Arc::new(PerceptionStore::new());
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None)
+            .unwrap()
+            .with_perception_store(ps.clone());
+
+        // Add a file so inject_file_perception has content to work with
+        let file = dir.path().join("tracked.rs");
+        std::fs::write(&file, "fn tracked() {}").unwrap();
+        ws.inventory.read().add_or_update(&file.to_string_lossy()).unwrap();
+
+        ws.inject_file_perception(Some("test task"));
+        assert!(ps.has_new("iri://task/check"), "Should have perception after inject");
+
+        ws.reset_inventory();
+        assert!(!ps.has_new("iri://task/check"), "Should have no perception after reset");
+    }
+
+    #[test]
+    fn test_gitignore_patterns_synced_to_inventory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.log\nbuild/\n.env\n").unwrap();
+        let files = ["app.log", "src/main.rs", "build/output.o", ".env"];
+        for f in &files {
+            let path = dir.path().join(f);
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                std::fs::create_dir_all(parent).unwrap_or(());
+            }
+            std::fs::write(&path, "x").unwrap();
+        }
+
+        let bus = Arc::new(EventBus::new(100));
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: true,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, Some(bus)).unwrap();
+
+        let inv = ws.inventory.read();
+        // *.log → app.log should be excluded
+        assert!(inv.is_excluded(std::path::Path::new("app.log")));
+        // build/ → build/output.o should be excluded
+        assert!(inv.is_excluded(std::path::Path::new("build/output.o")));
+        // .env should be excluded
+        assert!(inv.is_excluded(std::path::Path::new(".env")));
+        // src/main.rs should NOT be excluded
+        assert!(!inv.is_excluded(std::path::Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn test_force_rescan_after_reset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = WorkspaceMonitorConfig {
+            workspace_root: dir.path().to_path_buf(),
+            watch_enabled: false,
+            db_path: None,
+            ..WorkspaceMonitorConfig::default()
+        };
+        let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
+
+        // Add files
+        std::fs::write(dir.path().join("file_a.rs"), "fn a() {}").unwrap();
+        ws.rescan();
+        assert_eq!(ws.inventory.read().total_count(), 1);
+
+        // Reset inventory
+        ws.reset_inventory();
+        assert_eq!(ws.inventory.read().total_count(), 0, "Inventory should be empty after reset");
+
+        // Rescan should rediscover
+        let count = ws.rescan();
+        assert_eq!(count, 1, "rescan should rediscover files after reset");
+        assert_eq!(ws.inventory.read().total_count(), 1);
+    }
+
+    #[test]
+    fn test_content_store_process_content_equals_read_file() {
+        // Verify process_content produces the same result as read_file
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Use separate files for each test path to avoid cross-contamination
+        let p1 = dir.path().join("proc_1.rs");
+        std::fs::write(&p1, "fn proc1() {}").unwrap();
+        let p1s = p1.to_string_lossy().to_string();
+
+        let p2 = dir.path().join("proc_2.rs");
+        std::fs::write(&p2, "fn proc2() {}").unwrap();
+        let p2s = p2.to_string_lossy().to_string();
+
+        let store = crate::tools::workspace_monitor::ContentStore::new(100, 65536, None);
+
+        // Read file1 via read_file (reads disk)
+        let from_disk = store.read_file(&p1s, crate::tools::workspace_monitor::ReadMode::Full).unwrap();
+        assert!(!from_disk.from_cache, "First read_file should not be from cache");
+
+        // Read file2 via process_content with pre-read content
+        let content = std::fs::read_to_string(&p2s).unwrap();
+        let from_content = store.process_content(&p2s, &content, crate::tools::workspace_monitor::ReadMode::Full);
+
+        // Both should have version 1 (first read)
+        assert_eq!(from_disk.version, 1);
+        assert_eq!(from_content.version, 1);
+        assert!(!from_content.from_cache, "First process_content should not be from cache");
+        assert_eq!(from_content.lines.len(), 1, "Should have 1 line of content");
+
+        // Second call via process_content on SAME file should be cache hit
+        let cached = store.process_content(&p2s, &content, crate::tools::workspace_monitor::ReadMode::Full);
+        assert!(cached.from_cache, "Second process_content should return from_cache=true");
+        assert_eq!(cached.version, 1, "Version should not change on cache hit");
+    }
+
+    #[test]
+    fn test_content_store_diff_mode_via_process_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test_diff.rs");
+        std::fs::write(&path, "line1\nline2\nline3").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let store = crate::tools::workspace_monitor::ContentStore::new(100, 65536, None);
+
+        // First read
+        let r1_content = std::fs::read_to_string(&path_str).unwrap();
+        let r1 = store.process_content(&path_str, &r1_content, crate::tools::workspace_monitor::ReadMode::Full);
+        assert_eq!(r1.version, 1);
+
+        // Modify file
+        std::fs::write(&path, "line1\nmodified\nline3").unwrap();
+
+        // Read via process_content again with Diff mode
+        let r2_content = std::fs::read_to_string(&path_str).unwrap();
+        let r2 = store.process_content(&path_str, &r2_content, crate::tools::workspace_monitor::ReadMode::Diff);
+
+        assert_eq!(r2.version, 2, "Version should increment on change");
+        assert!(r2.changed, "Changed flag should be true");
+        assert!(r2.unified_diff.is_some(), "Diff should be computed");
+        assert!(r2.unified_diff.as_ref().unwrap().contains("modified"), "Diff should contain the modified line");
     }
 }

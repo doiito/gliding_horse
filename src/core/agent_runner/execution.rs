@@ -1982,13 +1982,47 @@ Output the summary report directly, not in JSON format."#,
     /// Queries for entities (subjects with rdf:type) that have labels or names,
     /// returning them as a structured context block the LLM can use to ground its reasoning.
     fn build_kg_context(store: &oxigraph::store::Store, objective: &str) -> String {
-        let sparql = "\
-            SELECT DISTINCT ?s ?label ?type WHERE {\
-                ?s a ?type .\
-                OPTIONAL { ?s rdfs:label ?label }\
-                OPTIONAL { ?s <http://schema.org/name> ?label }\
-            } ORDER BY DESC(?label) LIMIT 30\
-        ";
+        // Extract meaningful keywords from the task objective (words >= 3 chars, no punctuation)
+        let keywords: Vec<&str> = objective
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3)
+            .collect();
+
+        let dynamic_query;
+        let sparql: &str = if keywords.is_empty() {
+            "\
+                SELECT DISTINCT ?s ?label ?type WHERE {\
+                    ?s a ?type .\
+                    OPTIONAL { ?s rdfs:label ?label }\
+                    OPTIONAL { ?s <http://schema.org/name> ?label }\
+                } ORDER BY DESC(?label) LIMIT 10\
+            "
+        } else {
+            let keyword_filters: String = keywords
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{{ ?s <http://schema.org/name> ?name . FILTER(CONTAINS(LCASE(STR(?name)), LCASE(\"{}\"))) }} \
+                         UNION {{ ?s rdfs:label ?label . FILTER(CONTAINS(LCASE(STR(?label)), LCASE(\"{}\"))) }} \
+                         UNION {{ FILTER(CONTAINS(LCASE(STR(?s)), LCASE(\"{}\"))) }}",
+                        k, k, k
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" UNION ");
+
+            dynamic_query = format!(
+                "\
+                    SELECT DISTINCT ?s ?label ?type WHERE {{\
+                        {{ {} }} \
+                        OPTIONAL {{ ?s rdfs:label ?label }} \
+                        OPTIONAL {{ ?s a ?type }} \
+                    }} LIMIT 10\
+                ",
+                keyword_filters
+            );
+            dynamic_query.as_str()
+        };
 
         use oxigraph::sparql::QueryResults as Qr;
         use oxigraph::sparql::QuerySolution;

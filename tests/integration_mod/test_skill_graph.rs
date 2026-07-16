@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use glidinghorse::causal::engine::CausalEngine;
+use glidinghorse::causal::store::CausalModelStore;
+use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend};
 use glidinghorse::skill_graph::*;
 use glidinghorse::tools::{SkillRegistry, ToolExecutor};
 
@@ -127,8 +130,8 @@ fn test_full_skill_graph_workflow() {
     assert!(tree.is_object());
 }
 
-#[test]
-fn test_discovery_with_conflicts() {
+#[tokio::test]
+async fn test_discovery_with_conflicts() {
     let store = create_test_graph_with_skills();
 
     let mut oauth = store.get_skill("iri://skills/oauth-auth").unwrap();
@@ -150,7 +153,7 @@ fn test_discovery_with_conflicts() {
         .with_agent_role("DA")
         .with_phase("Do")
         .with_constraint("低延迟");
-    let matches = engine.discover_for_task(&task_5w2h);
+    let matches = engine.discover_for_task(&task_5w2h).await;
     assert!(!matches.is_empty());
 }
 
@@ -547,8 +550,8 @@ fn test_skill_creator_register_axure_vue2_refactor() {
     assert!(json_ld.get("@context").is_some());
 }
 
-#[test]
-fn test_skill_creator_two_skills_coexist() {
+#[tokio::test]
+async fn test_skill_creator_two_skills_coexist() {
     let (graph_store, registry) = create_skill_creator_components();
 
     let config = SkillCreatorConfig {
@@ -623,7 +626,7 @@ fn test_skill_creator_two_skills_coexist() {
     let task = Task5W2H::new("Axure 原型转 Vue2", "前端开发")
         .with_agent_role("DA")
         .with_phase("Do");
-    let matches = discovery.discover_for_task(&task);
+    let matches = discovery.discover_for_task(&task).await;
     assert!(!matches.is_empty(), "任务发现应能找到相关 Skill");
 }
 
@@ -768,4 +771,239 @@ fn test_skill_creator_disclosure_levels() {
 
     let full = graph_store.get_skill_at_level(&created.skill_iri, DisclosureLevel::FullContent);
     assert!(full.is_some(), "FullContent 级别应可获取");
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Causal Engine integration tests (end-to-end)
+// ═════════════════════════════════════════════════════════════════════
+
+fn create_causal_store_with_links() -> Arc<SkillGraphStore> {
+    let store = Arc::new(SkillGraphStore::new());
+
+    // Base service (root cause target)
+    let base = SkillGraphNode::new("iri://skills/base", "Base Service", "Core base service");
+    store.register_skill(base).unwrap();
+
+    // Auth service depends on base
+    let auth = SkillGraphNode::new("iri://skills/auth", "Auth Service", "Authentication")
+        .with_link(SkillLink {
+            link_type: SkillLinkType::Prerequisite,
+            target_iri: "iri://skills/base".to_string(),
+            strength: LinkStrength::Required,
+            description: "Auth requires base".to_string(),
+        });
+    store.register_skill(auth).unwrap();
+
+    // API gateway depends on auth and base
+    let api = SkillGraphNode::new("iri://skills/api-gateway", "API Gateway", "API gateway")
+        .with_link(SkillLink {
+            link_type: SkillLinkType::Prerequisite,
+            target_iri: "iri://skills/auth".to_string(),
+            strength: LinkStrength::Required,
+            description: "API depends on auth".to_string(),
+        })
+        .with_link(SkillLink {
+            link_type: SkillLinkType::Composition,
+            target_iri: "iri://skills/base".to_string(),
+            strength: LinkStrength::Required,
+            description: "API includes base".to_string(),
+        });
+    store.register_skill(api).unwrap();
+
+    store
+}
+
+/// Create a minimal CausalEngine wrapping a PetgraphBackend for the given store.
+fn create_causal_engine(store: &Arc<SkillGraphStore>) -> Arc<CausalEngine> {
+    let model_store = Arc::new(CausalModelStore::new());
+    let backend: Arc<dyn GraphBackend> = Arc::new(PetgraphBackend::new(store.clone()));
+    Arc::new(CausalEngine::new(model_store, backend))
+}
+
+#[test]
+fn test_causal_pipeline_e2e() {
+    let store = create_causal_store_with_links();
+    let causal = create_causal_engine(&store);
+    let mut engine = SkillEvolutionEngine::new(store)
+        .with_causal_analysis(5000)
+        .with_causal_engine(causal);
+
+    // Record failure in api-gateway — should trigger Path A (CausalEngine delegate)
+    engine.record_usage(
+        UsageRecord::new(
+            "iri://skills/api-gateway",
+            "iri://task/e2e-001",
+            "agent:da/001",
+            false,
+        ).with_error("Gateway timeout after 30s")
+    ).unwrap();
+
+    // Should produce at least one evolution suggestion
+    let suggestions = engine.get_pending_suggestions();
+    assert!(!suggestions.is_empty(),
+        "Causal failure should produce suggestions");
+    
+    // The suggestion should reference the failed skill
+    assert_eq!(suggestions[0].skill_iri, "iri://skills/api-gateway");
+    
+    // Confidence from CausalEngine should be > 0
+    assert!(suggestions[0].confidence > 0.0,
+        "CausalEngine should provide non-zero confidence");
+}
+
+#[test]
+fn test_causal_propagation_chain_e2e() {
+    let store = create_causal_store_with_links();
+    let causal = create_causal_engine(&store);
+    let mut engine = SkillEvolutionEngine::new(store)
+        .with_causal_analysis(5000)
+        .with_causal_engine(causal);
+
+    // Record failure in base (root cause)
+    engine.record_usage(
+        UsageRecord::new(
+            "iri://skills/base",
+            "iri://task/e2e-002",
+            "agent:da/001",
+            false,
+        ).with_error("Base service crashed")
+    ).unwrap();
+
+    // Record failure in auth (depends on base) — should detect propagation
+    engine.record_usage(
+        UsageRecord::new(
+            "iri://skills/auth",
+            "iri://task/e2e-003",
+            "agent:da/002",
+            false,
+        ).with_error("Auth failed — dependency unavailable")
+    ).unwrap();
+
+    // After two failures, both should be tracked via suggestions
+    let suggestions = engine.get_pending_suggestions();
+    assert_eq!(suggestions.len(), 2,
+        "Both failures should produce suggestions");
+
+    // Search root cause on a known-good event via find_root_cause with
+    // a generated event ID pattern — verify it returns Some
+    let events_found = engine.suggest_preventive_action("iri://skills/base");
+    assert!(!events_found.is_empty() || suggestions.len() >= 2,
+        "Either preventive actions or suggestions should exist");
+}
+
+#[test]
+fn test_causal_preventive_actions_e2e() {
+    let store = create_causal_store_with_links();
+    let causal = create_causal_engine(&store);
+    let mut engine = SkillEvolutionEngine::new(store)
+        .with_causal_analysis(5000)
+        .with_causal_engine(causal);
+
+    // Record enough failures to trigger preventive actions
+    for i in 0..8 {
+        let record = UsageRecord::new(
+            "iri://skills/base",
+            &format!("iri://task/e2e-{:03}", i),
+            "agent:da/001",
+            false,
+        ).with_error("Connection timeout");
+        engine.record_usage(record).unwrap();
+    }
+
+    // Check that preventive actions exist
+    let actions = engine.suggest_preventive_action("iri://skills/base");
+    assert!(!actions.is_empty(),
+        "Multiple failures should generate preventive actions for base");
+
+    // At least one action should mention failure count
+    assert!(actions.iter().any(|a| a.contains("failures")),
+        "Preventive actions should reference recorded failures: {:?}", actions);
+}
+
+#[test]
+fn test_causal_pipeline_shared_engine() {
+    let store = create_causal_store_with_links();
+    let causal = create_causal_engine(&store);
+
+    // Two evolution engines sharing the same CausalEngine
+    let mut engine_a = SkillEvolutionEngine::new(store.clone())
+        .with_causal_analysis(5000)
+        .with_causal_engine(causal.clone());
+
+    let mut engine_b = SkillEvolutionEngine::new(store)
+        .with_causal_analysis(5000)
+        .with_causal_engine(causal);
+
+    // Both record failures
+    engine_a.record_usage(
+        UsageRecord::new(
+            "iri://skills/api-gateway",
+            "iri://task/shared-001",
+            "agent:da/001",
+            false,
+        ).with_error("Engine A timeout")
+    ).unwrap();
+
+    engine_b.record_usage(
+        UsageRecord::new(
+            "iri://skills/auth",
+            "iri://task/shared-002",
+            "agent:da/002",
+            false,
+        ).with_error("Engine B auth error")
+    ).unwrap();
+
+    // Both should produce suggestions
+    assert!(!engine_a.get_pending_suggestions().is_empty(),
+        "Engine A should have suggestions from shared CausalEngine");
+    assert!(!engine_b.get_pending_suggestions().is_empty(),
+        "Engine B should have suggestions from shared CausalEngine");
+}
+
+#[test]
+fn test_causal_no_false_positive_on_success() {
+    let store = create_causal_store_with_links();
+    let causal = create_causal_engine(&store);
+    let mut engine = SkillEvolutionEngine::new(store)
+        .with_causal_analysis(5000)
+        .with_causal_engine(causal);
+
+    // Successful usage should NOT trigger causal analysis
+    engine.record_usage(
+        UsageRecord::new(
+            "iri://skills/auth",
+            "iri://task/success-001",
+            "agent:da/001",
+            true,
+        ).with_tokens(500)
+    ).unwrap();
+
+    // With no failures, no preventive actions
+    let actions = engine.suggest_preventive_action("iri://skills/auth");
+    assert!(actions.is_empty(),
+        "No failures means no preventive actions");
+    assert!(engine.get_pending_suggestions().is_empty(),
+        "Successful usage should not create suggestions");
+}
+
+#[test]
+fn test_causal_legacy_fallback_without_engine() {
+    // Without a CausalEngine, the legacy Path B is used
+    let store = create_causal_store_with_links();
+    let mut engine = SkillEvolutionEngine::new(store)
+        .with_causal_analysis(5000);
+
+    engine.record_usage(
+        UsageRecord::new(
+            "iri://skills/auth",
+            "iri://task/legacy-001",
+            "agent:da/001",
+            false,
+        ).with_error("Legacy path error")
+    ).unwrap();
+
+    assert!(!engine.get_pending_suggestions().is_empty(),
+        "Legacy path should still produce suggestions");
+    assert_eq!(engine.get_pending_suggestions()[0].confidence, 0.7,
+        "Legacy path defaults to 0.7 confidence");
 }

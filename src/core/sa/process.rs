@@ -89,7 +89,7 @@ impl SupervisorAgent {
                 how_approach: five_w2h.how.as_ref().and_then(|h| h.required_steps.clone()),
                 constraints: five_w2h.why.success_criteria.clone(),
             };
-            let matches = de.discover_for_task(&disc_task);
+            let matches = de.discover_for_task(&disc_task).await;
             let skill_hints: Vec<String> = matches.iter()
                 .filter_map(|m| {
                     let name = if !m.skill.name.is_empty() {

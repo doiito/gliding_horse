@@ -128,7 +128,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(prompt) = cli.prompt {
-        run_single(config, &prompt)?;
+        if cli.debug {
+            run_single_with_logs(config, &prompt, log_buffer)?;
+        } else {
+            run_single(config, &prompt)?;
+        }
     } else {
         code_cli::tui::App::new(config, log_buffer, None)?.run()?;
     }
@@ -158,6 +162,49 @@ fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Resu
     println!();
 
     let result = rt.block_on(engine.process_task(prompt));
+
+    match result {
+        Ok((_, tr)) => {
+            let icon = match tr.status.as_str() { "success" => "✅", _ => "❌" };
+            println!("{} {} | Turns: {} | Tools: {}", icon, tr.status.to_uppercase(), tr.turn_count, tr.tool_call_count);
+            println!("📁 Output: {}", engine.workspace());
+            println!();
+            println!("{}", tr.summary);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Run a single task and dump all captured logs before exiting.
+/// Used for testing/verification when --debug is passed.
+#[allow(dead_code)]
+fn run_single_with_logs(
+    config: code_cli::config::CliConfig,
+    prompt: &str,
+    log_buffer: std::sync::Arc<code_cli::log_buffer::LogBuffer>,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    
+    let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
+    println!("Code CLI - Agent OS");
+    println!("Model: {} | Workspace: {}", engine.model(), engine.workspace());
+    println!();
+
+    let result = rt.block_on(engine.process_task(prompt));
+
+    // Dump logs before result so they appear in chronological order
+    let logs = log_buffer.drain();
+    if !logs.is_empty() {
+        eprintln!("--- LOG DUMP ({} lines) ---", logs.len());
+        for line in logs {
+            eprintln!("{}", line);
+        }
+        eprintln!("--- END LOG DUMP ---");
+    }
 
     match result {
         Ok((_, tr)) => {

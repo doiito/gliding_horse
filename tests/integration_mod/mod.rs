@@ -11,3 +11,4 @@ mod test_skill_graph;
 mod test_e2e_research;
 mod test_result_router;
 mod test_e2e_autonomous;
+mod test_causal_comprehensive;

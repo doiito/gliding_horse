@@ -5,9 +5,9 @@ use super::types::{BridgeRelationType, RdfQuad, RdfValue};
 
 /// Entity-to-skill relation bridge backed by Oxigraph.
 ///
-/// **Note**: This struct is only instantiated in unit tests. Production code
-/// uses `UnifiedGraphStore::with_shared_store()` + `SkillGraphStore::with_oxi_store()`
-/// for cross-subsystem Oxigraph sharing. See `src/memory/unified_graph.rs`.
+/// Creates bidirectional links between knowledge graph entities and skills
+/// in a dedicated `graph:bridge` named graph. The underlying Oxigraph store
+/// is shared with the rest of the system via [`from_kg_store`].
 pub struct KnowledgeBridge {
     store: KnowledgeGraphStore,
     bridge_graph: String,
@@ -38,6 +38,12 @@ impl KnowledgeBridge {
             store,
             bridge_graph: "graph:bridge".to_string(),
         })
+    }
+
+    /// Share the underlying Oxigraph store from an existing `KnowledgeGraphStore`.
+    /// Both instances operate on the same triples via the same `Arc<Store>`.
+    pub fn from_kg_store(kg: &KnowledgeGraphStore) -> Result<Self, String> {
+        Self::with_shared_store(kg.store_arc().clone())
     }
 
     fn relation_to_iri(relation: &BridgeRelationType) -> &'static str {
@@ -195,5 +201,27 @@ mod tests {
 
         let empty = bridge.query_bridged_entities("iri://skill/nonexistent").unwrap();
         assert!(empty.is_empty(), "nonexistent skill should return empty list");
+    }
+
+    #[test]
+    fn test_from_kg_store_shares_oxigraph_store() {
+        // Given: a shared KnowledgeGraphStore + a bridge created via from_kg_store
+        let kg_store = KnowledgeGraphStore::new().unwrap();
+        let bridge = KnowledgeBridge::from_kg_store(&kg_store).unwrap();
+
+        // When: creating a bridge link through the bridge
+        bridge
+            .create_bridge("entity_shared", "iri://skill/shared-test", BridgeRelationType::HasSkill)
+            .unwrap();
+
+        // Then: the data must be visible through the original kg_store
+        let sparql = "SELECT ?skill WHERE { <iri://entity/entity_shared> <https://agentos.ontology/bridge/hasSkill> ?skill }";
+        let results = kg_store.query_sparql(sparql, Some("graph:bridge")).unwrap();
+        let skills: Vec<&str> = results
+            .iter()
+            .filter_map(|row| row.get("?skill").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(skills.len(), 1, "Should see 1 bridged skill via original kg_store");
+        assert!(skills.contains(&"iri://skill/shared-test"), "Should contain the correct skill IRI");
     }
 }

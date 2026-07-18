@@ -219,7 +219,8 @@ impl AgentOSService {
         let skill_graph = Arc::new(
             SkillGraphStore::new()
                 .with_blackboard(blackboard.clone())
-                .with_l0_store(l0.clone()),
+                .with_l0_store(l0.clone())
+                .with_oxi_store(unified_graph.store()),
         );
         let batch_mgr = {
             let mut mgr = BatchAgentManager::new()
@@ -365,6 +366,9 @@ impl AgentOSService {
         .with_scheduler(self.scheduler.clone())
         .with_prefetch_engine(self.prefetch.clone())
         .with_unified_graph_store(self.unified_graph.store());
+        if let Some(ref sg) = self.skill_graph {
+            runner_builder = runner_builder.with_skill_graph_store(sg.clone());
+        }
         if let Some(ref ws_root) = workspace_root_path {
             runner_builder = runner_builder.with_workspace_root(ws_root.clone());
         }
@@ -375,7 +379,9 @@ impl AgentOSService {
             let ug_store = self.unified_graph.store();
             let mut executor = runner.tool_executor.write();
             executor.set_unified_kg_store(ug_store);
-            // set workspace_monitor on ToolExecutor
+            if let Some(ref sg) = self.skill_graph {
+                executor.set_shared_skill_graph(sg.clone());
+            }
             if let Some(ref wm) = workspace_monitor_opt {
                 executor.set_workspace_monitor(wm.clone());
             }

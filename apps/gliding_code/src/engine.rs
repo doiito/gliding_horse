@@ -19,6 +19,7 @@ use glidinghorse::memory::l0_store::L0Store;
 use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
+use glidinghorse::memory::unified_graph::UnifiedGraphStore;
 use glidinghorse::skill_graph::discovery::SkillDiscoveryEngine;
 use glidinghorse::skill_graph::evolution::SkillEvolutionEngine;
 use glidinghorse::skill_graph::graph_algorithms::SkillGraphAlgorithms;
@@ -103,8 +104,17 @@ impl CodeCliEngine {
             L0Store::new(&l0_path)
                 .map_err(|e| anyhow::anyhow!("L0Store 创建失败: {}", e))?,
         );
+
+        // ── Unified Oxigraph Store — shared across Blackboard, SkillGraphStore,
+        //    ToolExecutor (KnowledgeGraphStore), and KnowledgeBridge so that all
+        //    subsystems operate on the same RDF store via named-graph isolation.
+        let unified = Arc::new(
+            UnifiedGraphStore::new()
+                .map_err(|e| anyhow::anyhow!("UnifiedGraphStore 创建失败: {}", e))?,
+        );
+
         let l2 = Arc::new(
-            Blackboard::new()
+            Blackboard::with_store(unified.store())
                 .map_err(|e| anyhow::anyhow!("Blackboard 创建失败: {}", e))?,
         );
 
@@ -196,6 +206,7 @@ impl CodeCliEngine {
             SkillGraphStore::new()
                 .with_blackboard(l2.clone())
                 .with_l0_store(l0.clone())
+                .with_oxi_store(unified.store())
                 .with_timeline(timeline.clone()),
         );
 
@@ -227,17 +238,11 @@ impl CodeCliEngine {
             tmpl.clone(),
         )).with_workspace_root(workspace_root.clone());
 
-        // Extract the ToolExecutor's KGS, create FusedRootCauseEngine, and upgrade the runner
-        let inner_store = {
-            let executor = runner.tool_executor.read();
-            executor.knowledge_graph_store()
-                .read().expect("kg_store RwLock poisoned")
-                .store_arc().clone()
-        };
-        let unified_kg_store = inner_store.clone();
+        // Create FusedRootCauseEngine backed by the shared unified Oxigraph store
+        let unified_kg_store = unified.store();
         {
             let fused_kg = Arc::new(
-                KnowledgeGraphStore::with_shared_store(inner_store)
+                KnowledgeGraphStore::with_shared_store(unified_kg_store.clone())
                     .expect("Failed to create shared KG Store for FusedRootCauseEngine"),
             );
             let fused_rce = FusedRootCauseEngine::new(
@@ -311,6 +316,12 @@ impl CodeCliEngine {
                 }
             }
         };
+
+        // 注入共享 Oxigraph Store 到 ToolExecutor（替换内部隔离的 KnowledgeGraphStore）
+        {
+            let mut executor = runner.tool_executor.write();
+            executor.set_unified_kg_store(unified.store());
+        }
 
         if let Some(ref wm) = workspace_monitor {
             let mut executor = runner.tool_executor.write();

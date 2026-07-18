@@ -1471,4 +1471,69 @@ mod tests {
             .await;
         assert!(results.is_empty(), "Empty store should return no results");
     }
+
+    #[allow(deprecated)]
+    fn count_triples(store: &oxigraph::store::Store, sparql: &str) -> usize {
+        match store.query(sparql).unwrap() {
+            oxigraph::sparql::QueryResults::Solutions(solutions) => {
+                solutions.filter_map(|r| r.ok()).count()
+            }
+            oxigraph::sparql::QueryResults::Boolean(b) => {
+                if b { 1 } else { 0 }
+            }
+            oxigraph::sparql::QueryResults::Graph(_) => 0,
+        }
+    }
+
+    #[test]
+    fn test_oxigraph_sync_with_oxi_store() {
+        // Given: a SkillGraphStore with a shared Oxigraph store
+        let oxi = Arc::new(oxigraph::store::Store::new().unwrap());
+        let store = SkillGraphStore::new().with_oxi_store(oxi.clone());
+
+        // When: registering a skill
+        let skill = SkillGraphNode::new(
+            "iri://skills/oxi-sync-test",
+            "OxiSyncTest",
+            "Verifies Oxigraph sync wiring",
+        );
+        store.register_skill(skill).unwrap();
+
+        // Then: the skill's triples must exist in the shared Oxigraph store's named graph
+        let count = count_triples(
+            &oxi,
+            "SELECT ?p ?o WHERE { GRAPH <system:skill_graph> { <iri://skills/oxi-sync-test> ?p ?o } }",
+        );
+        assert!(
+            count > 0,
+            "Skill triples must be synced to Oxigraph named graph 'system:skill_graph' (got {} triples)",
+            count,
+        );
+    }
+
+    #[test]
+    fn test_oxigraph_sync_delete_with_oxi_store() {
+        // Given: a SkillGraphStore with a shared Oxigraph store and a registered skill
+        let oxi = Arc::new(oxigraph::store::Store::new().unwrap());
+        let store = SkillGraphStore::new().with_oxi_store(oxi.clone());
+
+        let skill = SkillGraphNode::new(
+            "iri://skills/oxi-delete-test",
+            "OxiDeleteTest",
+            "Verifies delete sync",
+        );
+        store.register_skill(skill).unwrap();
+
+        // Verify the skill exists in Oxigraph before deletion
+        let query = "SELECT ?p ?o WHERE { GRAPH <system:skill_graph> { <iri://skills/oxi-delete-test> ?p ?o } }";
+        let before_count = count_triples(&oxi, query);
+        assert!(before_count > 0, "Skill should exist before deletion");
+
+        // When: removing the skill
+        store.remove_skill("iri://skills/oxi-delete-test").unwrap();
+
+        // Then: the skill's triples must be deleted from Oxigraph
+        let after_count = count_triples(&oxi, query);
+        assert_eq!(after_count, 0, "Skill triples must be deleted from Oxigraph");
+    }
 }

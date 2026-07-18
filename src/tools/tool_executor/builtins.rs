@@ -12,6 +12,7 @@ use crate::knowledge_graph::code_ast::CodeAstExtractor;
 use crate::knowledge_graph::extractor::KnowledgeExtractor;
 use crate::knowledge_graph::ontology::OntologyManager;
 use crate::knowledge_graph::rdf_mapper::RdfMapper;
+use crate::knowledge_graph::bridge::KnowledgeBridge;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::knowledge_graph::types::{BridgeRelationType, NodeDef, EdgeDef, RdfQuad, RdfValue};
@@ -1546,23 +1547,14 @@ pub(super) async fn execute_knowledge_bridge_with_store(input: Value, kg_store: 
         _ => return Err(format!("Unsupported relation type: {}, options: HasSkill, ApplicableIn, RelatedTo", relation_type_str)),
     };
 
-    let entity_iri = format!("iri://entity/{}", entity_id);
-    let predicate = match relation {
-        BridgeRelationType::HasSkill => "https://agentos.ontology/bridge/hasSkill",
-        BridgeRelationType::ApplicableIn => "https://agentos.ontology/bridge/applicableIn",
-        BridgeRelationType::RelatedTo => "https://agentos.ontology/bridge/relatedTo",
-    };
+    // Create a bridge that shares the same underlying Oxigraph store.
+    // Both `kg_store` and the bridge operate on the same triples.
+    let guard = kg_store.read().map_err(|e| format!("Failed to acquire kg_store lock: {}", e))?;
+    let bridge = KnowledgeBridge::from_kg_store(&guard)
+        .map_err(|e| format!("Failed to create KnowledgeBridge: {}", e))?;
+    drop(guard); // release the read lock before write operations
 
-    let bridge_graph = "graph:bridge";
-    let quad = RdfQuad {
-        subject: entity_iri,
-        predicate: predicate.to_string(),
-        object: RdfValue::Iri(skill_iri.to_string()),
-        graph: Some(bridge_graph.to_string()),
-    };
-
-    let store = kg_store.write().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    store.write_quads(&[quad], bridge_graph)?;
+    bridge.create_bridge(&entity_id, &skill_iri, relation)?;
 
     Ok(json!({
         "success": true,

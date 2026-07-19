@@ -16,6 +16,9 @@ logs/
 # trae data
 .trae*/
 
+# project data
+.gliding_*/
+
 # omo data
 .omo*/
 

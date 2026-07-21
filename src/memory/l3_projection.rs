@@ -137,8 +137,8 @@ impl ProjectionEngine {
                 }
                 WHERE {
                     ?node a ?type .
-                    ?node ex:summary ?summary .
-                    ?node ex:status ?status .
+                    OPTIONAL { ?node ex:summary ?summary }
+                    OPTIONAL { ?node ex:status ?status }
                     OPTIONAL { ?node ex:confidence ?conf }
                 }
             "#.to_string()),
@@ -535,6 +535,9 @@ impl ProjectionEngine {
         projection.insert("frame".to_string(), serde_json::Value::String(frame_name.to_string()));
 
         let artifacts = if let Some(sparql_template) = &frame.sparql_template {
+            // Flush pending Oxigraph syncs before SPARQL query to avoid write-lock contention
+            // and ensure all recently written nodes are queryable.
+            self.blackboard.flush_oxigraph();
             self.execute_sparql_construct(sparql_template, &frame.include_properties, frame.max_nodes)?
         } else {
             self.project_from_cache(task_iri, &frame.include_properties, frame.max_nodes)?

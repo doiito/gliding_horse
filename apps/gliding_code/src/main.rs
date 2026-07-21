@@ -60,6 +60,19 @@ fn main() -> anyhow::Result<()> {
         "warn"
     };
 
+    // ── Terminal crash recovery ──
+    // If the previous glidingcode instance was killed by SIGKILL (OOM killer),
+    // the terminal may still be in raw mode + alternate screen.
+    // Clean up here BEFORE any mode-specific code runs, so --help, one-shot,
+    // and interactive mode all recover from a prior crash.
+    let _ = crossterm::terminal::disable_raw_mode();
+    let mut crash_recovery_stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        crash_recovery_stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+    );
+
     // Capture all tracing output into a shared buffer so the TUI can display it
     // in the log panel instead of sending it to stderr where it corrupts the display.
     let log_buffer = std::sync::Arc::new(code_cli::log_buffer::LogBuffer::new());

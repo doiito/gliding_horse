@@ -638,6 +638,7 @@ dependencies = [
  "glidinghorse",
  "glob",
  "mermaid-rs-renderer",
+ "oxigraph",
  "ratatui",
  "rustyline",
  "serde",

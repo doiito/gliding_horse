@@ -258,11 +258,11 @@ impl Blackboard {
                 if key.starts_with('@') {
                     if key == "@type" {
                         if let Some(t) = value.as_str() {
-                            let type_uri = if t.contains("://") { format!("<{}>", t) } else { format!("<http://agent-os.org/type/{}>", t) };
+                            let type_uri = if t.contains("://") { format!("<{}>", t) } else { format!("<http://agent-os.org/ontology/{}>", t) };
                             triples.push(format!("{} a {} .", subject, type_uri));
                         } else if let Some(arr) = value.as_array() {
                             for t in arr.iter().filter_map(|v| v.as_str()) {
-                                let type_uri = if t.contains("://") { format!("<{}>", t) } else { format!("<http://agent-os.org/type/{}>", t) };
+                                let type_uri = if t.contains("://") { format!("<{}>", t) } else { format!("<http://agent-os.org/ontology/{}>", t) };
                                 triples.push(format!("{} a {} .", subject, type_uri));
                             }
                         }
@@ -271,7 +271,7 @@ impl Blackboard {
                 }
 
                 let escaped_key = key.replace(' ', "_");
-                let predicate = format!("<http://agent-os.org/prop/{}>", escaped_key);
+                let predicate = format!("<http://agent-os.org/ontology/{}>", escaped_key);
 
                 match value {
                     serde_json::Value::String(s) => {
@@ -1111,7 +1111,7 @@ impl Blackboard {
                 if t.contains("://") {
                     format!("<{}>", t)
                 } else {
-                    format!("<http://agent-os.org/type/{}>", t)
+                    format!("<http://agent-os.org/ontology/{}>", t)
                 }
             })
             .collect();

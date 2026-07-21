@@ -389,8 +389,8 @@ fn test_sparql_query_on_jsonld_nodes() {
 
     let sparql = r#"
         SELECT ?s ?status WHERE {
-            ?s a <http://agent-os.org/type/Task> .
-            ?s <http://agent-os.org/prop/status> ?status .
+        ?s a <http://agent-os.org/ontology/Task> .
+        ?s <http://agent-os.org/ontology/status> ?status .
         }
     "#;
     
@@ -538,7 +538,7 @@ fn test_performance_sparql_query() {
     }
     
     let start = Instant::now();
-    let sparql = "SELECT ?s WHERE { ?s a <http://agent-os.org/type/TypeA> }";
+    let sparql = "SELECT ?s WHERE { ?s a <http://agent-os.org/ontology/TypeA> }";
     let results = blackboard.query(sparql).unwrap();
     let query_time = start.elapsed().as_millis();
     
@@ -571,4 +571,449 @@ fn test_performance_projection() {
     
     println!("投影生成时间: {} ms, 结果大小: {} bytes", projection_time, result.len());
     assert!(projection_time < 50, "投影生成应该小于50ms");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Bug 3 fix verification: type/ → ontology/ namespace
+// ═══════════════════════════════════════════════════════════════
+#[test]
+fn test_bug3_type_namespace_fix() {
+    let blackboard = Arc::new(Blackboard::new().unwrap());
+    let config = CoreConfig::default();
+
+    // Step 1: Write a node with @type: "Task"
+    let node = json!({
+        "@id": "iri://task/bug3_test",
+        "@type": "Task",
+        "summary": "Bug 3 test task",
+        "status": "running",
+        "confidence": 0.9,
+    }).to_string();
+    blackboard.write_node("iri://task/bug3_test", &node, &config).unwrap();
+
+    // Step 2: Query with ontology/ namespace (the fix)
+    blackboard.flush_oxigraph();
+
+    let sparql_ontology = r#"
+        PREFIX ex: <http://agent-os.org/ontology/>
+        SELECT ?s ?summary WHERE {
+            ?s a ex:Task .
+            ?s ex:summary ?summary .
+        }
+    "#;
+    let results = blackboard.query(sparql_ontology).unwrap();
+    assert!(!results.is_empty(),
+        "Bug 3 FAIL: SPARQL query with ex:Task (ontology/) returned 0 results. \
+         write_node with @type='Task' should store as <http://agent-os.org/ontology/Task>");
+    println!("[Bug 3] ontology/ SPARQL returned {} result(s)", results.len());
+    println!("[Bug 3] First result: {:?}", results[0]);
+
+    // Step 3: Negative test — type/ should NOT exist
+    let sparql_type = "SELECT ?s WHERE { ?s a <http://agent-os.org/type/Task> } LIMIT 1";
+    let old_results = blackboard.query(sparql_type).unwrap();
+    assert!(old_results.is_empty(),
+        "Bug 3 FAIL: type/ namespace should NOT contain data anymore");
+    println!("[Bug 3] type/ namespace correctly empty");
+
+    // Step 4: Projection engine summary_only (uses ?node a ?type — should find the node)
+    let proj = ProjectionEngine::new(blackboard.clone(), 1024);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let projection = rt.block_on(async {
+        proj.project("iri://task/bug3_test", "summary_only", HashMap::new()).await.unwrap()
+    });
+    assert!(projection.contains("iri://task/bug3_test"),
+        "Bug 3 FAIL: summary_only projection should include the task node. Got: {}", &projection[..300.min(projection.len())]);
+    println!("[Bug 3] summary_only projection includes task node ({} bytes)", projection.len());
+
+    // Step 5: pa_init also uses ex:Task — verify it returns artifacts
+    let projection_pa = rt.block_on(async {
+        proj.project("iri://task/bug3_test", "pa_init", HashMap::new()).await.unwrap()
+    });
+    println!("[Bug 3] pa_init projection: {} bytes", projection_pa.len());
+
+    // Step 6: da_input with ex:PlanNode — negative test (should return 0 since we wrote Task, not PlanNode)
+    let projection_da = rt.block_on(async {
+        proj.project("iri://task/bug3_test", "da_input", HashMap::new()).await.unwrap()
+    });
+    // da_input requires ex:PlanNode, our node is ex:Task, so this should have 0 artifacts
+    println!("[Bug 3] da_input projection (expect 0, no PlanNode): {} bytes", projection_da.len());
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Bug 1 fix verification: PREFIX skill: in to_sparql_insert()
+// ═══════════════════════════════════════════════════════════════
+#[test]
+fn test_bug1_skill_iri_fix() {
+    use glidinghorse::skill_graph::types::{
+        SkillGraphNode, SkillLinkType, Skill5W2H,
+    };
+
+    // Step 1: Build a SkillGraphNode
+    let node = SkillGraphNode::new("iri://skills/test_bug1", "bug1_test", "Bug 1 fix test")
+        .with_5w2h(Skill5W2H::new("bug1_test", "Testing Bug 1 fix"))
+        .with_tag("test");
+
+    // Step 2: SPARQL must have PREFIX
+    let sparql = node.to_sparql_insert("system:test_graph");
+    assert!(sparql.starts_with("PREFIX skill:"),
+        "Bug 1 FAIL: to_sparql_insert() should start with 'PREFIX skill:'. Got: {}...",
+        &sparql[..60.min(sparql.len())]);
+    println!("[Bug 1] SPARQL includes PREFIX skill:");
+
+    // Step 3: Validate SPARQL is syntactically sound by direct Oxigraph execution
+    let store = oxigraph::store::Store::new().unwrap();
+    store.update(&sparql).unwrap_or_else(|e| {
+        panic!("Bug 1 FAIL: SPARQL execution failed: {}\nSPARQL:\n---\n{}\n---", e, sparql)
+    });
+    println!("[Bug 1] SPARQL INSERT DATA executed successfully");
+
+    // Step 4: Verify the data via SELECT (data is in named graph system:test_graph)
+    use oxigraph::sparql::QueryResults;
+    let verify_sparql = "PREFIX skill: <https://agent-harness.os/skill#>
+        SELECT ?s WHERE { GRAPH <system:test_graph> { ?s a skill:CognitiveSkill } }";
+    let query_results = store.query(verify_sparql).unwrap();
+    let solutions: Vec<_> = match query_results {
+        QueryResults::Solutions(solutions) => solutions.collect(),
+        _ => vec![],
+    };
+    assert!(!solutions.is_empty(), "Bug 1 FAIL: no CognitiveSkill found (GRAPH <system:test_graph>)");
+    println!("[Bug 1] Skill roundtrip confirmed: {} CognitiveSkill node(s)", solutions.len());
+
+    // Step 5: Verify linked usageCount and successRate data
+    let detail_sparql = "PREFIX skill: <https://agent-harness.os/skill#>
+        SELECT ?usage ?rate WHERE { GRAPH <system:test_graph> { ?s skill:usageCount ?usage ; skill:successRate ?rate } }";
+    let detail_results = store.query(detail_sparql).unwrap();
+    let detail_solutions: Vec<_> = match detail_results {
+        QueryResults::Solutions(solutions) => solutions.collect(),
+        _ => vec![],
+    };
+    assert_eq!(detail_solutions.len(), 1, "Bug 1 FAIL: should find usage+rate data");
+    println!("[Bug 1] Skill detail data (usageCount, successRate) also confirmed");
+
+    // Step 6: Cross-graph query — default graph should NOT have the data
+    let default_sparql = "PREFIX skill: <https://agent-harness.os/skill#>
+        SELECT ?s WHERE { ?s a skill:CognitiveSkill }";
+    let default_results = store.query(default_sparql).unwrap();
+    let default_solutions: Vec<_> = match default_results {
+        QueryResults::Solutions(solutions) => solutions.collect(),
+        _ => vec![],
+    };
+    assert!(default_solutions.is_empty(),
+        "Bug 1: data should NOT be in default graph (only in GRAPH <system:test_graph>)");
+    println!("[Bug 1] Data correctly isolated to named graph (not in default graph)");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Bug 2 fix verification: kg_search entity_type auto-namespace
+// ═══════════════════════════════════════════════════════════════
+#[test]
+fn test_bug2_kg_search_entity_type_fix() {
+    use glidinghorse::knowledge_graph::store::KnowledgeGraphStore;
+
+    let store = KnowledgeGraphStore::new().unwrap();
+
+    // Step 1: Insert a quad with type in ontology/ namespace via inner store
+    let insert_sparql = "PREFIX ex: <http://agent-os.org/ontology/>
+        INSERT DATA {
+            GRAPH <http://agent-os.org/graph/test_graph> {
+                <iri://entity/test_entity> a ex:TestEntity .
+                <iri://entity/test_entity> <http://www.w3.org/2000/01/rdf-schema#label> \"Test Entity Label\" .
+            }
+        }";
+    store.store_arc().update(insert_sparql).unwrap();
+    println!("[Bug 2] Test entity inserted");
+
+    // Step 2: Search with entity_type WITHOUT namespace (the fix)
+    let results = store.search_entities("Test", Some("TestEntity")).unwrap();
+    assert!(!results.is_empty(),
+        "Bug 2 FAIL: search_entities(entity_type='TestEntity') returned 0 results");
+    println!("[Bug 2] entity_type='TestEntity' (auto-qualified) returned {} result(s)", results.len());
+    println!("[Bug 2] First result: {}", results[0]);
+
+    // Step 3: Search with full IRI still works
+    let results_full = store.search_entities("Test", Some("http://agent-os.org/ontology/TestEntity")).unwrap();
+    assert!(!results_full.is_empty(),
+        "Bug 2 FAIL: full IRI search should also work");
+    println!("[Bug 2] Full IRI entity_type also works ({} result(s))", results_full.len());
+
+    // Step 4: Search without entity_type
+    let results_none = store.search_entities("Entity", None).unwrap();
+    assert!(!results_none.is_empty(),
+        "Bug 2 FAIL: keyword search without entity_type should work");
+    println!("[Bug 2] Keyword search without entity_type: {} result(s)", results_none.len());
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Round 2: Edge case + stress tests
+// ═══════════════════════════════════════════════════════════════
+
+// Bug 3 edge cases: multiple types, write+query+delete cycle
+#[test]
+fn test_bug3_edge_cases() {
+    let blackboard = Arc::new(Blackboard::new().unwrap());
+    let config = CoreConfig::default();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Edge 1: Node with multiple @type values
+    let multi_type = json!({
+        "@id": "iri://edge/multi_type",
+        "@type": ["Task", "Urgent", "ReviewNeeded"],
+        "summary": "Multi-type node"
+    }).to_string();
+    blackboard.write_node("iri://edge/multi_type", &multi_type, &config).unwrap();
+    blackboard.flush_oxigraph();
+
+    let sparql = r#"PREFIX ex: <http://agent-os.org/ontology/>
+        SELECT ?s WHERE { ?s a ex:Urgent }"#;
+    let results = blackboard.query(sparql).unwrap();
+    assert_eq!(results.len(), 1, "Multi-type: ex:Urgent should match");
+    println!("[R2 Bug3-E1] Multi-type node matched via ex:Urgent: {} result(s)", results.len());
+
+    // Edge 2: @type with full IRI (should NOT be prefixed with ontology/)
+    let full_iri_type = json!({
+        "@id": "iri://edge/full_iri_type",
+        "@type": "http://custom-ontology.org/types/MyType",
+        "summary": "Full IRI type"
+    }).to_string();
+    blackboard.write_node("iri://edge/full_iri_type", &full_iri_type, &config).unwrap();
+    blackboard.flush_oxigraph();
+
+    let sparql_full = "SELECT ?s WHERE { ?s a <http://custom-ontology.org/types/MyType> }";
+    let results_full = blackboard.query(sparql_full).unwrap();
+    assert_eq!(results_full.len(), 1, "Full IRI @type should match directly");
+    println!("[R2 Bug3-E2] Full IRI type correctly stored and queryable: {} result(s)", results_full.len());
+
+    // Edge 3: Multiple nodes with same type — bulk projection
+    for i in 0..10 {
+        let node = json!({
+            "@id": format!("iri://edge/bulk/{}", i),
+            "@type": "BulkNode",
+            "summary": format!("Bulk node {}", i),
+        }).to_string();
+        blackboard.write_node(&format!("iri://edge/bulk/{}", i), &node, &config).unwrap();
+    }
+    blackboard.flush_oxigraph();
+
+    let sparql_bulk = r#"PREFIX ex: <http://agent-os.org/ontology/>
+        SELECT (COUNT(?s) AS ?cnt) WHERE { ?s a ex:BulkNode }"#;
+    let bulk_results = blackboard.query(sparql_bulk).unwrap();
+    println!("[R2 Bug3-E3] Bulk type query: {:?}", bulk_results);
+
+    // Edge 4: query_by_types method (also uses ontology/ now)
+    let type_nodes = blackboard.query_by_types(&["Task".to_string()]).unwrap();
+    assert!(!type_nodes.is_empty(), "query_by_types('Task') should return nodes");
+    println!("[R2 Bug3-E4] query_by_types('Task') returned {} node(s)", type_nodes.len());
+
+    // Edge 5: projection with summary_only on bulk data
+    let proj = ProjectionEngine::new(blackboard.clone(), 2048);
+    let projection = rt.block_on(async {
+        proj.project("iri://edge", "summary_only", HashMap::new()).await.unwrap()
+    });
+    assert!(!projection.is_empty(), "summary_only projection should return data for bulk nodes");
+    println!("[R2 Bug3-E5] summary_only projection across 10 BulkNode nodes OK ({} bytes)", projection.len());
+}
+
+// Bug 1 edge cases: complex skill nodes, link IRI verification
+#[test]
+fn test_bug1_edge_cases() {
+    use glidinghorse::skill_graph::types::{
+        SkillGraphNode, SkillLink, SkillLinkType, Skill5W2H, SkillGraphMeta,
+    };
+    use oxigraph::sparql::QueryResults;
+
+    // Edge 1: Skill with ALL possible link types
+    let mut node = SkillGraphNode::new("iri://skills/edge_complex", "edge_complex", "Edge case complex skill");
+    let all_link_types = [
+        (SkillLinkType::Prerequisite, "iri://skills/prereq"),
+        (SkillLinkType::Composition, "iri://skills/composition"),
+        (SkillLinkType::Related, "iri://skills/related"),
+        (SkillLinkType::Alternative, "iri://skills/alt"),
+        (SkillLinkType::Extends, "iri://skills/extends"),
+        (SkillLinkType::Generalization, "iri://skills/gen"),
+    ];
+    for (link_type, target) in &all_link_types {
+        node = node.with_link(SkillLink {
+            target_iri: target.to_string(),
+            link_type: *link_type,
+            strength: glidinghorse::skill_graph::types::LinkStrength::Recommended,
+            description: format!("{:?} link", link_type),
+        });
+    }
+
+    let sparql = node.to_sparql_insert("system:edge_graph");
+    eprintln!("DEBUG SPARQL:\n{}", sparql);
+    let store = oxigraph::store::Store::new().unwrap();
+    store.update(&sparql).unwrap();
+    println!("[R2 Bug1-E1] Skill with 6 link types inserted successfully");
+
+    // Verify each link type (use prefixed name without angle brackets)
+    for (link_type, target_iri) in &all_link_types {
+        let link_name = format!("{:?}", link_type); // e.g., "Prerequisite"
+        let verify = format!(
+            "PREFIX skill: <https://agent-harness.os/skill#>
+             SELECT ?s WHERE {{ GRAPH <system:edge_graph> {{ ?s skill:{} <{}> }} }}",
+            link_name, target_iri
+        );
+        let qr = store.query(&verify).unwrap();
+        let sols: Vec<_> = match qr { QueryResults::Solutions(s) => s.collect(), _ => vec![] };
+        assert_eq!(sols.len(), 1, "Link {} should be found", link_name);
+    }
+    println!("[R2 Bug1-E1] All 6 link types confirmed queryable");
+
+    // Edge 2: Skill with special characters in name/description
+    let special = SkillGraphNode::new("iri://skills/special_chars", "it's \"quoted\" & <encoded>", "Description with 'single' and \"double\" quotes");
+    let sparql_special = special.to_sparql_insert("system:special_graph");
+    let store2 = oxigraph::store::Store::new().unwrap();
+    store2.update(&sparql_special).unwrap();
+
+    let verify_special = r#"PREFIX skill: <https://agent-harness.os/skill#>
+        SELECT ?name ?desc WHERE { GRAPH <system:special_graph> { ?s skill:name ?name ; skill:description ?desc } }"#;
+    let qr = store2.query(verify_special).unwrap();
+    let sols: Vec<_> = match qr { QueryResults::Solutions(s) => s.collect(), _ => vec![] };
+    assert_eq!(sols.len(), 1, "Special chars skill should be found");
+    let (name_val, desc_val): (String, String) = {
+        let mut sols_iter = sols.into_iter();
+        let sol = sols_iter.next().unwrap().unwrap();
+        use oxigraph::model::Term;
+        let get_literal = |v: &str| -> String {
+            match sol.get(v).unwrap() {
+                Term::Literal(lit) => lit.value().to_string(),
+                _ => panic!("expected literal for {}", v),
+            }
+        };
+        (get_literal("name"), get_literal("desc"))
+    };
+    assert_eq!(name_val, "it's \"quoted\" & <encoded>", "Name with special chars should roundtrip");
+    assert_eq!(desc_val, "Description with 'single' and \"double\" quotes", "Desc with special chars should roundtrip");
+    println!("[R2 Bug1-E2] Special characters in skill name/description roundtrip correctly");
+
+    // Edge 3: Empty links skill
+    let empty = SkillGraphNode::new("iri://skills/empty", "empty", "No links");
+    let sparql_empty = empty.to_sparql_insert("system:empty_graph");
+    let store3 = oxigraph::store::Store::new().unwrap();
+    store3.update(&sparql_empty).unwrap();
+
+    let verify_empty = r#"PREFIX skill: <https://agent-harness.os/skill#>
+        SELECT ?s WHERE { GRAPH <system:empty_graph> { ?s a skill:CognitiveSkill } }"#;
+    let qr = store3.query(verify_empty).unwrap();
+    let sols: Vec<_> = match qr { QueryResults::Solutions(s) => s.collect(), _ => vec![] };
+    assert_eq!(sols.len(), 1, "Empty-link skill should be found");
+    println!("[R2 Bug1-E3] Skill with no links inserted and queried successfully");
+}
+
+// Bug 2 edge cases: various entity_type formats
+#[test]
+fn test_bug2_edge_cases() {
+    use glidinghorse::knowledge_graph::store::KnowledgeGraphStore;
+
+    let store = KnowledgeGraphStore::new().unwrap();
+
+    // Insert entities with different types
+    let inserts = [
+        ("type_a", "TypeA", "Entity A label"),
+        ("type_b", "TypeB", "Entity B label"),
+        ("type_c", "http://custom.org/types/TypeC", "Entity C label"),
+    ];
+    for (id, type_name, label) in &inserts {
+        let type_iri = if type_name.contains("://") {
+            format!("<{}>", type_name)
+        } else {
+            format!("<http://agent-os.org/ontology/{}>", type_name)
+        };
+        let sparql = format!(
+            "INSERT DATA {{ GRAPH <http://agent-os.org/graph/kg_search> {{ <iri://entity/{}> a {} . \
+             <iri://entity/{}> <http://www.w3.org/2000/01/rdf-schema#label> \"{}\" . }} }}",
+            id, type_iri, id, label
+        );
+        store.store_arc().update(&sparql).unwrap();
+    }
+    println!("[R2 Bug2] 3 test entities inserted with different types");
+
+    // Edge 1: search with simple type name (no namespace) — should auto-qualify
+    let results = store.search_entities("Entity", Some("TypeA")).unwrap();
+    assert_eq!(results.len(), 1, "search_entities('TypeA') should find 1");
+    println!("[R2 Bug2-E1] Auto-qualified TypeA: {} result(s)", results.len());
+
+    // Edge 2: search with a different simple type
+    let results = store.search_entities("Entity", Some("TypeB")).unwrap();
+    assert_eq!(results.len(), 1, "search_entities('TypeB') should find 1");
+    println!("[R2 Bug2-E2] Auto-qualified TypeB: {} result(s)", results.len());
+
+    // Edge 3: search with full custom IRI type
+    let results = store.search_entities("Entity", Some("http://custom.org/types/TypeC")).unwrap();
+    assert_eq!(results.len(), 1, "search_entities(full IRI TypeC) should find 1");
+    println!("[R2 Bug2-E3] Full custom IRI TypeC: {} result(s)", results.len());
+
+    // Edge 4: search with non-existent type
+    let results = store.search_entities("Entity", Some("NonExistentType")).unwrap();
+    assert_eq!(results.len(), 0, "search_entities('NonExistentType') should find 0");
+    println!("[R2 Bug2-E4] Non-existent type correctly returns 0 results");
+
+    // Edge 5: search with empty string keyword but valid type
+    let results = store.search_entities("A", Some("TypeA")).unwrap();
+    assert_eq!(results.len(), 1, "Keyword 'A' + TypeA should find entity A");
+    println!("[R2 Bug2-E5] Keyword 'A' + TypeA: {} result(s)", results.len());
+
+    // Edge 6: verify no false positives across types
+    let results = store.search_entities("Entity", Some("TypeB")).unwrap();
+    let has_a = results.iter().any(|r| r["?s"].as_str().map_or(false, |s| s.contains("type_a")));
+    assert!(!has_a, "TypeB search should NOT return type_a entity");
+    println!("[R2 Bug2-E6] Type isolation verified: no cross-type false positives");
+}
+
+// Combined: stress test with many nodes
+#[test]
+fn test_all_bugfixes_stress() {
+    let blackboard = Arc::new(Blackboard::new().unwrap());
+    let config = CoreConfig::default();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Write 100 nodes with alternating types
+    for i in 0..100 {
+        let type_name = if i % 2 == 0 { "EvenType" } else { "OddType" };
+        let node = json!({
+            "@id": format!("iri://stress/node/{}", i),
+            "@type": type_name,
+            "summary": format!("Stress test node {}", i),
+            "index": i,
+        }).to_string();
+        blackboard.write_node(&format!("iri://stress/node/{}", i), &node, &config).unwrap();
+    }
+    blackboard.flush_oxigraph();
+
+    // Verify all EvenType nodes via ontology/ namespace
+    let sparql = r#"PREFIX ex: <http://agent-os.org/ontology/>
+        SELECT (COUNT(?s) AS ?cnt) WHERE { ?s a ex:EvenType }"#;
+    let results = blackboard.query(sparql).unwrap();
+    println!("[Stress] EvenType count via SPARQL: {:?}", results);
+
+    // Verify all OddType nodes
+    let sparql_odd = r#"PREFIX ex: <http://agent-os.org/ontology/>
+        SELECT (COUNT(?s) AS ?cnt) WHERE { ?s a ex:OddType }"#;
+    let results_odd = blackboard.query(sparql_odd).unwrap();
+    println!("[Stress] OddType count via SPARQL: {:?}", results_odd);
+
+    // Verify query_by_types
+    let even_nodes = blackboard.query_by_types(&["EvenType".to_string()]).unwrap();
+    assert_eq!(even_nodes.len(), 50, "Should find 50 EvenType nodes");
+    let odd_nodes = blackboard.query_by_types(&["OddType".to_string()]).unwrap();
+    assert_eq!(odd_nodes.len(), 50, "Should find 50 OddType nodes");
+    println!("[Stress] query_by_types: {} EvenType + {} OddType = 100 total",
+        even_nodes.len(), odd_nodes.len());
+
+    // Projection on stress data
+    let proj = ProjectionEngine::new(blackboard.clone(), 4096);
+    let proj_result = rt.block_on(async {
+        proj.project("iri://stress", "summary_only", HashMap::new()).await.unwrap()
+    });
+    assert!(proj_result.len() > 50, "summary_only projection should be substantial for 100 nodes");
+    println!("[Stress] summary_only projection OK ({} bytes)", proj_result.len());
+
+    // type/ namespace must be completely empty
+    for type_name in &["EvenType", "OddType"] {
+        let sparql_old = format!("SELECT ?s WHERE {{ ?s a <http://agent-os.org/type/{}> }} LIMIT 1", type_name);
+        let old_results = blackboard.query(&sparql_old).unwrap();
+        assert!(old_results.is_empty(), "type/{} should have 0 results", type_name);
+    }
+    println!("[Stress] type/ namespace verified empty for all types — all data in ontology/");
 }

@@ -824,13 +824,9 @@ impl App {
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
-        // 清理前一次崩溃残留的终端状态（SIGKILL 导致 Drop/Panic Hook 未执行）
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture
-        );
+        // 注意: 前一次崩溃的终端状态清理已移到 main.rs 入口处，
+        // 这样 --help 和单命令模式也能恢复终端。
+        // 此处不再重复。
 
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();

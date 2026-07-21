@@ -194,7 +194,10 @@ impl KnowledgeGraphStore {
         let escaped = Self::escape_sparql_string(keyword);
 
         let type_filter = match entity_type {
-            Some(t) => format!("?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .", t),
+            Some(t) => {
+                let type_iri = if t.contains("://") { t.to_string() } else { format!("http://agent-os.org/ontology/{}", t) };
+                format!("?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .", type_iri)
+            },
             None => String::new(),
         };
 

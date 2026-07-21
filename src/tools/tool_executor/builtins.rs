@@ -1304,13 +1304,72 @@ pub(super) async fn execute_knowledge_query(input: Value, kg_store: Arc<RwLock<K
     let named_graph = input["named_graph"].as_str().map(String::from);
 
     let store = kg_store.read().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
-    let results = store.query_sparql(&sparql, named_graph.as_deref())?;
+    match store.query_sparql(&sparql, named_graph.as_deref()) {
+        Ok(results) => Ok(json!({
+            "success": true,
+            "results": results,
+            "count": results.len(),
+        })),
+        Err(e) => Err(diagnose_sparql_error(&sparql, &e)),
+    }
+}
 
-    Ok(json!({
-        "success": true,
-        "results": results,
-        "count": results.len(),
-    }))
+/// Parse a SPARQL error and return a clean, actionable diagnostic for the LLM.
+/// The raw Oxigraph error is cryptic; this extracts position context and suggests fixes.
+fn diagnose_sparql_error(sparql: &str, raw_error: &str) -> String {
+    let mut msg = String::from("SPARQL query syntax error. Fix the query and retry.\n\n");
+
+    let error_body = raw_error.strip_prefix("SPARQL query failed: ").unwrap_or(raw_error);
+    let pos = parse_error_position(error_body);
+
+    if let Some((line, col)) = pos {
+        let lines: Vec<&str> = sparql.lines().collect();
+        if line > 0 && line <= lines.len() {
+            let problem_line = lines[line - 1];
+            msg.push_str(&format!("┌─ Position: line {line}, column {col}\n"));
+            msg.push_str("│\n");
+            msg.push_str(&format!("│   {problem_line}\n"));
+            let caret_pos = col.saturating_sub(1).min(problem_line.len());
+            msg.push_str(&format!("│   {:indent$}↑ here\n", "", indent = caret_pos));
+            msg.push_str("│\n");
+
+            if let Some(detail_start) = error_body.find(": ").and_then(|p| {
+                let rest = &error_body[p+2..];
+                rest.find(": ").map(|p2| &rest[p2+2..])
+            }) {
+                let detail = detail_start.trim();
+                if !detail.is_empty() && detail.len() < 200 {
+                    msg.push_str(&format!("└─ Parser: {detail}\n"));
+                }
+            }
+        }
+    } else {
+        let first_line = raw_error.lines().next().unwrap_or(raw_error);
+        msg.push_str(&format!("Error: {first_line}\n"));
+    }
+
+    msg.push_str("\nCommon fixes for LLM-generated SPARQL:\n");
+    msg.push_str("  • Close all parentheses: FILTER(REGEX(...)) not FILTER(REGEX(...\n");
+    msg.push_str("  • Add PREFIX declarations for every namespace used\n");
+    msg.push_str("  • Use ex: prefix for ontology types: ?s a ex:Task\n");
+    msg.push_str("  • Use single quotes for string literals: 'value' not \"value\"\n");
+    msg.push_str("  • Check all curly braces { } are properly matched\n");
+    msg.push_str("  • Try a simpler query without REGEX or nested FILTER\n");
+
+    msg
+}
+
+/// Extract (line, col) from an Oxigraph error like "error at 3:15: expected ..."
+fn parse_error_position(body: &str) -> Option<(usize, usize)> {
+    let prefix = "error at ";
+    let at_pos = body.find(prefix)?;
+    let rest = &body[at_pos + prefix.len()..];
+    let colon1 = rest.find(':')?;
+    let line = rest[..colon1].parse::<usize>().ok()?;
+    let rest2 = &rest[colon1 + 1..];
+    let colon2 = rest2.find(':')?;
+    let col = rest2[..colon2].parse::<usize>().ok()?;
+    Some((line, col))
 }
 
 pub(super) async fn execute_knowledge_search(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
@@ -1620,5 +1679,64 @@ pub(super) async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<R
                 "graph": graph,
             })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_error_position_standard() {
+        let err = "error at 1:123: expected one of Prefix not found";
+        assert_eq!(parse_error_position(err), Some((1, 123)));
+    }
+
+    #[test]
+    fn test_parse_error_position_multi_line() {
+        let err = "error at 3:15: expected '.', found 'x'";
+        assert_eq!(parse_error_position(err), Some((3, 15)));
+    }
+
+    #[test]
+    fn test_parse_error_position_no_match() {
+        assert_eq!(parse_error_position("unexpected end of input"), None);
+        assert_eq!(parse_error_position(""), None);
+    }
+
+    #[test]
+    fn test_diagnose_sparql_error_includes_position() {
+        let sparql = "SELECT ?s WHERE { ?s a ?type . FILTER(REGEX(?s, \"test\" )";
+        let raw = "SPARQL query failed: error at 1:53: expected '}'";
+        let msg = diagnose_sparql_error(sparql, raw);
+        assert!(msg.contains("line 1"), "should mention the line number");
+        assert!(msg.contains("column 53"), "should mention the column");
+        assert!(msg.contains("↑"), "should have a caret marker");
+        assert!(msg.contains("Common fixes"), "should include fix suggestions");
+        assert!(msg.contains("parentheses"), "should mention parentheses");
+    }
+
+    #[test]
+    fn test_diagnose_sparql_error_missing_prefix() {
+        let sparql = "SELECT ?x WHERE { ?x ex:name ?n }";
+        let raw = "error at 1:22: expected one of Prefix not found";
+        let msg = diagnose_sparql_error(sparql, raw);
+        assert!(msg.contains("PREFIX"), "should suggest adding PREFIX");
+        assert!(msg.contains("↑"), "should have caret");
+    }
+
+    #[test]
+    fn test_diagnose_sparql_error_unparseable_fallback() {
+        let sparql = "BAD SPARQL";
+        let raw = "unknown parser error: catastrophic failure";
+        let msg = diagnose_sparql_error(sparql, raw);
+        assert!(msg.contains("unknown"), "should include the raw error text");
+        assert!(msg.contains("Common fixes"), "should still suggest fixes");
+    }
+
+    #[test]
+    fn test_diagnose_sparql_error_handles_empty_sparql() {
+        let msg = diagnose_sparql_error("", "error at 1:1: unexpected end");
+        assert!(msg.contains("Common fixes"), "should handle gracefully");
     }
 }

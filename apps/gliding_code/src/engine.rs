@@ -12,6 +12,7 @@ use glidinghorse::memory::l1_session::EvictionConfig;
 use glidinghorse::gateway::UnifiedGateway;
 use glidinghorse::graph_features::features::FeatureExtractor;
 use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend, SkillGraphSnapshotBackend};
+use glidinghorse::knowledge_graph::code_ast::CodeAstExtractor;
 use glidinghorse::knowledge_graph::store::KnowledgeGraphStore;
 use glidinghorse::memory::embedding_service::{create_embedding_service_from_config, FallbackEmbeddingService};
 use glidinghorse::memory::hyperspace_store::HyperspaceStore;
@@ -24,6 +25,7 @@ use glidinghorse::skill_graph::discovery::SkillDiscoveryEngine;
 use glidinghorse::skill_graph::evolution::SkillEvolutionEngine;
 use glidinghorse::skill_graph::graph_algorithms::SkillGraphAlgorithms;
 use glidinghorse::skill_graph::graph_store::SkillGraphStore;
+use glidinghorse::skill_graph::{LinkStrength, SkillLinkType};
 use glidinghorse::snapshots::timeline::TimelineStore;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::mcp_client::McpClient;
@@ -74,6 +76,8 @@ pub struct CodeCliEngine {
     timeline: Arc<TimelineStore>,
     /// Core config for L2 blackboard writes etc.
     core_config: CoreConfig,
+    /// Unified Oxigraph store reference for auto-code-analysis et al.
+    oxi_store: Arc<oxigraph::store::Store>,
 }
 
 impl CodeCliEngine {
@@ -217,6 +221,36 @@ impl CodeCliEngine {
                 glidinghorse::skill_graph::types::SkillGraphNode::from_skill_meta(&meta),
             ) {
                 tracing::warn!("Failed to register bootstrap skill {}: {}", meta.name, e);
+            }
+        }
+
+        // ── Auto-create Related links between skills sharing skill_types ──
+        // This gives the skill graph non-zero edge count (SG: N E) from startup
+        // and makes the cognitive network navigable from the beginning.
+        {
+            let nodes = skill_graph.list_all_skills();
+            let mut link_count = 0usize;
+            for i in 0..nodes.len() {
+                for j in (i + 1)..nodes.len() {
+                    let a = &nodes[i];
+                    let b = &nodes[j];
+                    let shared: Vec<&str> = a.tags.iter().filter_map(|t| {
+                        if b.tags.contains(t) { Some(t.as_str()) } else { None }
+                    }).collect();
+                    if !shared.is_empty() {
+                        let strength = if shared.len() >= 2 {
+                            LinkStrength::Recommended
+                        } else {
+                            LinkStrength::Navigation
+                        };
+                        let desc = format!("Related via: {}", shared.join(", "));
+                        let _ = skill_graph.add_link(&a.skill_iri, &b.skill_iri, SkillLinkType::Related, strength, &desc);
+                        link_count += 1;
+                    }
+                }
+            }
+            if link_count > 0 {
+                info!(link_count = link_count, "Auto-created skill graph edges from shared types");
             }
         }
         let skill_graph_algorithms = Arc::new(SkillGraphAlgorithms::from_store(&skill_graph));
@@ -422,6 +456,7 @@ impl CodeCliEngine {
             evolution_engine,
             timeline,
             core_config,
+            oxi_store: unified.store(),
         })
     }
 
@@ -499,6 +534,51 @@ impl CodeCliEngine {
         // Collect workspace file summary once for both paths
         let ws_summary = self.workspace_monitor.as_ref()
             .and_then(|wm| wm.get_file_inventory_summary());
+
+        // ── Auto code analysis: incremental AST extraction on workspace source files ──
+        {
+            let ws_root = std::path::Path::new(&self.config.workspace);
+            if ws_root.is_dir() {
+                let kg_store = KnowledgeGraphStore::with_shared_store(self.oxi_store.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to create KG store for code analysis: {}", e))?;
+                let supported = |ext: &str| -> bool {
+                    matches!(ext, "rs" | "py" | "pyi" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "h" | "hpp")
+                };
+                let mut analyzed = 0u32;
+                let mut errors = 0u32;
+                let mut dir_entries: Vec<_> = match ws_root.read_dir() {
+                    Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+                    Err(_) => Vec::new(),
+                };
+                // Sort for deterministic order
+                dir_entries.sort_by_key(|e| e.file_name());
+                for entry in &dir_entries {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if !supported(ext) {
+                            continue;
+                        }
+                        match CodeAstExtractor::extract_incremental(
+                            &path.to_string_lossy(),
+                            "graph:code",
+                            &kg_store,
+                        ) {
+                            Ok(_) => analyzed += 1,
+                            Err(e) => {
+                                warn!("Code analysis failed for {}: {}", path.display(), e);
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+                if analyzed > 0 || errors > 0 {
+                    info!(analyzed, errors, "Auto code analysis complete on workspace files");
+                }
+            }
+        }
 
         let result = if let Some(ref wf_path) = self.config.workflow_path {
             let wf_jsonld = std::fs::read_to_string(wf_path)
@@ -688,6 +768,32 @@ impl CodeCliEngine {
                         "技能图健康快照已保存"
                     );
                 }
+            }
+        }
+
+        // ── Write task metadata to the unified KG store for knowledge evolution ──
+        // This gives the KG auto-growing task records queryable via SPARQL.
+        {
+            use std::fmt::Write as FmtWrite;
+            let mut sparql = String::from("PREFIX task: <https://agent-harness.os/task#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n");
+            let escape_sparql = |s: &str| -> String {
+                s.replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace('\n', " ")
+                    .replace('\r', " ")
+            };
+            let status_safe = escape_sparql(&result.status);
+            let input_safe: String = user_input.chars().take(200).collect();
+            let input_safe = escape_sparql(&input_safe);
+            let _ = write!(sparql, "INSERT DATA {{ GRAPH <graph:tasks> {{ <{iri}> a task:Task ; task:status '{status}' ; task:input '{input}' ; task:turnCount \"{turns}\"^^xsd:integer . }} }}\n",
+                iri = task_iri,
+                status = status_safe,
+                input = input_safe,
+                turns = result.turn_count,
+            );
+            match self.l2_bb.sparql_update(&sparql) {
+                Ok(_) => info!(task_iri = %task_iri, "Task metadata written to KG store"),
+                Err(e) => warn!(task_iri = %task_iri, error = %e, "Failed to write task metadata to KG"),
             }
         }
 

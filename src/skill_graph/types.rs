@@ -227,12 +227,12 @@ pub enum SkillLinkType {
 impl SkillLinkType {
     pub fn as_sparql_uri(&self) -> &'static str {
         match self {
-            Self::Prerequisite => "<skill:Prerequisite>",
-            Self::Composition => "<skill:Composition>",
-            Self::Related => "<skill:Related>",
-            Self::Alternative => "<skill:Alternative>",
-            Self::Extends => "<skill:Extends>",
-            Self::Generalization => "<skill:Generalization>",
+            Self::Prerequisite => "skill:Prerequisite",
+            Self::Composition => "skill:Composition",
+            Self::Related => "skill:Related",
+            Self::Alternative => "skill:Alternative",
+            Self::Extends => "skill:Extends",
+            Self::Generalization => "skill:Generalization",
         }
     }
 }
@@ -739,7 +739,7 @@ impl SkillGraphNode {
 
         let _ = write!(
             triples,
-            "<{}> a <skill:CognitiveSkill> ;\n  <skill:name> '{}' ;\n  <skill:description> '{}' .\n",
+            "<{}> a skill:CognitiveSkill ;\n  skill:name '{}' ;\n  skill:description '{}' .\n",
             self.skill_iri,
             self.name.replace('\'', "\\'"),
             self.description.replace('\'', "\\'"),
@@ -747,7 +747,7 @@ impl SkillGraphNode {
 
         let _ = write!(
             triples,
-            "<{}> <skill:what> '{}' ;\n  <skill:why> '{}' .\n",
+            "<{}> skill:what '{}' ;\n  skill:why '{}' .\n",
             self.skill_iri,
             self.w2h.what.replace('\'', "\\'"),
             self.w2h.why.replace('\'', "\\'"),
@@ -756,7 +756,7 @@ impl SkillGraphNode {
         for link in &self.links {
             let _ = writeln!(
                 triples,
-                "<{}> <{}> <{}> .",
+                "<{}> {} <{}> .",
                 self.skill_iri,
                 link.link_type.as_sparql_uri(),
                 link.target_iri
@@ -765,14 +765,14 @@ impl SkillGraphNode {
 
         let _ = write!(
             triples,
-            "<{}> <skill:usageCount> {} ;\n  <skill:successRate> \"{}\"^^<http://www.w3.org/2001/XMLSchema#float> ;\n  <skill:maturity> '{}' .\n",
+            "<{}> skill:usageCount {} ;\n  skill:successRate \"{}\"^^<http://www.w3.org/2001/XMLSchema#float> ;\n  skill:maturity '{}' .\n",
             self.skill_iri,
             self.graph_meta.usage_count,
             self.graph_meta.success_rate,
             self.maturity,
         );
 
-        format!("INSERT DATA {{ GRAPH <{}> {{ {} }} }}", graph, triples)
+        format!("PREFIX skill: <https://agent-harness.os/skill#>\nINSERT DATA {{ GRAPH <{}> {{ {} }} }}", graph, triples)
     }
 
     pub fn to_json_ld(&self) -> serde_json::Value {
@@ -1697,12 +1697,12 @@ mod tests {
 
     #[test]
     fn test_skill_link_type_sparql_uri() {
-        assert_eq!(SkillLinkType::Prerequisite.as_sparql_uri(), "<skill:Prerequisite>");
-        assert_eq!(SkillLinkType::Composition.as_sparql_uri(), "<skill:Composition>");
-        assert_eq!(SkillLinkType::Related.as_sparql_uri(), "<skill:Related>");
-        assert_eq!(SkillLinkType::Alternative.as_sparql_uri(), "<skill:Alternative>");
-        assert_eq!(SkillLinkType::Extends.as_sparql_uri(), "<skill:Extends>");
-        assert_eq!(SkillLinkType::Generalization.as_sparql_uri(), "<skill:Generalization>");
+        assert_eq!(SkillLinkType::Prerequisite.as_sparql_uri(), "skill:Prerequisite");
+        assert_eq!(SkillLinkType::Composition.as_sparql_uri(), "skill:Composition");
+        assert_eq!(SkillLinkType::Related.as_sparql_uri(), "skill:Related");
+        assert_eq!(SkillLinkType::Alternative.as_sparql_uri(), "skill:Alternative");
+        assert_eq!(SkillLinkType::Extends.as_sparql_uri(), "skill:Extends");
+        assert_eq!(SkillLinkType::Generalization.as_sparql_uri(), "skill:Generalization");
     }
 
     #[test]

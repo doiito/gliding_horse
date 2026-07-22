@@ -11,6 +11,8 @@ use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::scheduler::MemoryScheduler;
 use crate::core::tracked_action::TrackedAction;
+#[cfg(feature = "ontology")]
+use crate::ontology_bridge::OntologyBridgeManager;
 use crate::{CoreConfig, CoreError};
 
 /// Coordinates all four memory layers (L0/L1/L2/L3)
@@ -29,6 +31,9 @@ pub struct MemoryManager {
     /// HyperspaceEngine-backed vector store for semantic search.
     /// Available to all memory layers for embedding-based retrieval.
     vector_store: Option<Arc<HyperspaceStore>>,
+    /// OntologyBridge dual-space embedding store (text Cosine + struct Poincaré).
+    #[cfg(feature = "ontology")]
+    ontology_bridge: Option<Arc<OntologyBridgeManager>>,
 }
 
 impl MemoryManager {
@@ -59,6 +64,8 @@ impl MemoryManager {
             scheduler: None,
             l1_active_count: AtomicU64::new(0),
             vector_store,
+            #[cfg(feature = "ontology")]
+            ontology_bridge: None,
         }
     }
 
@@ -94,6 +101,8 @@ impl MemoryManager {
             scheduler: Some(scheduler),
             l1_active_count: AtomicU64::new(0),
             vector_store,
+            #[cfg(feature = "ontology")]
+            ontology_bridge: None,
         }
     }
 
@@ -115,6 +124,18 @@ impl MemoryManager {
     /// Get HyperspaceEngine vector store reference (if configured)
     pub fn vector_store(&self) -> Option<&Arc<HyperspaceStore>> {
         self.vector_store.as_ref()
+    }
+
+    /// Attach an OntologyBridgeManager at runtime.
+    #[cfg(feature = "ontology")]
+    pub fn set_ontology_bridge(&mut self, ob: Arc<OntologyBridgeManager>) {
+        self.ontology_bridge = Some(ob);
+    }
+
+    /// Get OntologyBridgeManager reference (if configured).
+    #[cfg(feature = "ontology")]
+    pub fn ontology_bridge(&self) -> Option<&Arc<OntologyBridgeManager>> {
+        self.ontology_bridge.as_ref()
     }
 
     // ========== L1 Session Management ==========

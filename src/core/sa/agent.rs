@@ -15,6 +15,8 @@ use crate::memory::scheduler::MemoryScheduler;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::EmbeddingService;
 use crate::perception::proactive_engine::ProactiveEngine;
+#[cfg(feature = "ontology")]
+use crate::ontology_bridge::OntologyBridgeManager;
 use crate::skill_graph::discovery::SkillDiscoveryEngine;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::sharing::SharingProtocol;
@@ -142,6 +144,13 @@ impl SupervisorAgent {
     /// Attach HyperspaceStore to the perception engine for semantic experience retrieval.
     pub fn with_perception_hyperspace(mut self, store: Arc<HyperspaceStore>) -> Self {
         self.perception.hyperspace = Some(store);
+        self
+    }
+
+    /// Attach OntologyBridge to the perception engine for dual-space embedding writes.
+    #[cfg(feature = "ontology")]
+    pub fn with_perception_ontology_bridge(mut self, ob: Arc<OntologyBridgeManager>) -> Self {
+        self.perception = self.perception.with_ontology_bridge(ob);
         self
     }
 

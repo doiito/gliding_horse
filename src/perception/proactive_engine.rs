@@ -10,6 +10,8 @@ use crate::core::event_bus::EventBus;
 use crate::core::perception_store::{PerceptionEntry, PerceptionSource, PerceptionStore};
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l0_store::{L0Entry, L0Store, MesiState};
+#[cfg(feature = "ontology")]
+use crate::ontology_bridge::OntologyBridgeManager;
 use crate::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +128,9 @@ pub struct ProactiveEngine {
     event_bus: Arc<EventBus>,
     pub(crate) perception_store: Option<Arc<PerceptionStore>>,
     pub(crate) hyperspace: Option<Arc<HyperspaceStore>>,
+    /// OntologyBridge dual-space embedding store for cross-domain structural search.
+    #[cfg(feature = "ontology")]
+    pub(crate) ontology_bridge: Option<Arc<OntologyBridgeManager>>,
 }
 
 impl ProactiveEngine {
@@ -138,6 +143,8 @@ impl ProactiveEngine {
             event_bus,
             perception_store: None,
             hyperspace: None,
+            #[cfg(feature = "ontology")]
+            ontology_bridge: None,
         }
     }
 
@@ -154,6 +161,8 @@ impl ProactiveEngine {
             event_bus,
             perception_store: None,
             hyperspace: None,
+            #[cfg(feature = "ontology")]
+            ontology_bridge: None,
         }
     }
 
@@ -168,6 +177,13 @@ impl ProactiveEngine {
     /// instead of L0 tag-based substring matching.
     pub fn with_hyperspace_store(mut self, store: Arc<HyperspaceStore>) -> Self {
         self.hyperspace = Some(store);
+        self
+    }
+
+    /// Attach OntologyBridge for dual-space (text + structural) embedding writes.
+    #[cfg(feature = "ontology")]
+    pub fn with_ontology_bridge(mut self, ob: Arc<OntologyBridgeManager>) -> Self {
+        self.ontology_bridge = Some(ob);
         self
     }
 
@@ -476,6 +492,24 @@ impl ProactiveEngine {
                         Some(&["Experience".to_string()]),
                         None,
                     ).await;
+                }
+
+                // Store dual-space embedding to OntologyBridge (text Cosine + struct Poincaré)
+                #[cfg(feature = "ontology")]
+                if let Some(ref ob) = self.ontology_bridge {
+                    let jsonld = serde_json::json!({
+                        "@id": iri,
+                        "@type": ["Experience"],
+                        "scenario": experience.scenario,
+                        "pattern": experience.pattern,
+                        "success_rating": experience.success_rating,
+                    });
+                    let features = crate::ontology_bridge::StructuralFeatures {
+                        tags: experience.tags.clone(),
+                        jsonld_types: vec!["Experience".to_string()],
+                        named_graph: None,
+                    };
+                    let _ = ob.store_dual_embedding(&iri, &hs_content, &features, &jsonld).await;
                 }
             }
 

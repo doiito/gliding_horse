@@ -35,10 +35,18 @@ pub mod graph_backend;
 pub mod ontology;
 
 /// Bridge types for ontology embedding storage (OntologyEmbedStore, HyperspaceEmbedStore,
-/// OntologySearchBridge).  This module was moved out of crates/hyperspace-engine/src/open_ontologies.rs
+/// OntologySearchBridge, OntologyBridgeManager, StructuralEmbeddingService).
+/// This module was moved out of crates/hyperspace-engine/src/open_ontologies.rs
 /// because it bridges two independent subsystems; it belongs at the application level.
 #[cfg(feature = "ontology")]
 pub mod ontology_bridge;
+
+#[cfg(feature = "ontology")]
+pub use ontology_bridge::{
+    FallbackStructuralEmbeddingService, HyperspaceEmbedStore, OntologyBridgeConfig,
+    OntologyBridgeManager, OntologyEmbedStore, OntologySearchBridge,
+    StructuralEmbeddingService, StructuralFeatures,
+};
 
 pub use core::{
     AgentRunner, AgentInstance, SupervisorAgent,

@@ -31,6 +31,9 @@ use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::mcp_client::McpClient;
 use glidinghorse::tools::skill_registry::SkillRegistry;
 use glidinghorse::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
+use glidinghorse::ontology_bridge::{
+    FallbackStructuralEmbeddingService, OntologyBridgeConfig, OntologyBridgeManager,
+};
 use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -145,6 +148,34 @@ impl CodeCliEngine {
             .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
         );
 
+        // ── OntologyBridge: dual-space embedding store (text Cosine + struct Poincaré) ──
+        // Uses separate data directories alongside the main HyperspaceStore.
+        let ontology_base = std::path::Path::new(&hyperspace_path).parent()
+            .map(|p| p.join("ontology"))
+            .unwrap_or_else(|| {
+                let mut p = std::path::PathBuf::from(&hyperspace_path);
+                p.pop();
+                p.join("ontology")
+            });
+        let _ = std::fs::create_dir_all(&ontology_base);
+        let text_dir = ontology_base.join("text");
+        let struct_dir = ontology_base.join("struct");
+        // Reuse the same text embedding service; structural uses its own.
+        let struct_embed_svc: Arc<dyn glidinghorse::ontology_bridge::StructuralEmbeddingService> =
+            Arc::new(FallbackStructuralEmbeddingService::new());
+        let ontology_bridge = OntologyBridgeManager::open(OntologyBridgeConfig {
+            text_dir,
+            struct_dir,
+            embed: match &loaded_settings {
+                Some(s) => create_embedding_service_from_config(&s.embedding, s.agents.embedding_timeout_secs),
+                None => Arc::new(FallbackEmbeddingService::new()),
+            },
+            struct_embed: struct_embed_svc,
+        })
+        .map_err(|e| anyhow::anyhow!("OntologyBridge 初始化失败: {}", e))?;
+        let ontology_bridge = Arc::new(ontology_bridge);
+        info!("OntologyBridge initialised (text + structural engines)");
+
         let agent_settings = settings.agents.clone();
 
         let proj = Arc::new(ProjectionEngine::with_vector_store(
@@ -183,6 +214,11 @@ impl CodeCliEngine {
             proj.clone(),
             core_config.clone(),
         )));
+        // Attach OntologyBridge to MemoryManager for dual-space embedding access.
+        {
+            let mut mm_lock = mm.blocking_lock();
+            mm_lock.set_ontology_bridge(ontology_bridge.clone());
+        }
         let mm_for_runner = mm.clone();
 
         let templates_dir = dir.path().join("templates");
@@ -394,7 +430,8 @@ impl CodeCliEngine {
         .with_execution_timeout(agent_settings.sa_execution_timeout_secs)
         .with_perception_hyperspace(vector_store.clone())
         .with_perception_store(Arc::new(runner_perception))
-        .with_discovery_engine(discovery_engine.clone());
+        .with_discovery_engine(discovery_engine.clone())
+        .with_perception_ontology_bridge(ontology_bridge.clone());
 
         let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) = sa.token_usage_arcs();
 

@@ -135,7 +135,12 @@ impl WatchEngine {
 
         // Attempt native watching — runs on its own thread (notify), no tokio needed.
         let inv_for_callback = inventory.clone();
-        let debouncer = match Self::try_start_native(root, &config, event_bus.clone(), inv_for_callback) {
+        let debouncer = match Self::try_start_native(
+            root,
+            &config,
+            event_bus.clone(),
+            inv_for_callback,
+        ) {
             Ok(d) => {
                 debug!(root = %root, "WatchEngine: native watching started");
                 Some(d)
@@ -182,25 +187,22 @@ impl WatchEngine {
         let root_owned = root.to_string();
         let exclude = config.exclude_patterns.clone();
 
-        let mut debouncer = new_debouncer(
-            debounce,
-            move |result: DebounceEventResult| {
-                if let Some(ref inv) = inventory {
-                    if let Ok(events) = &result {
-                        for event in events {
-                            if let Some(path) = event.path.to_str() {
-                                if !Self::is_path_excluded(path, &exclude) {
-                                    inv.read().mark_stale(path);
-                                }
+        let mut debouncer = new_debouncer(debounce, move |result: DebounceEventResult| {
+            if let Some(ref inv) = inventory {
+                if let Ok(events) = &result {
+                    for event in events {
+                        if let Some(path) = event.path.to_str() {
+                            if !Self::is_path_excluded(path, &exclude) {
+                                inv.read().mark_stale(path);
                             }
                         }
                     }
                 }
-                if let Err(e) = Self::handle_debounced_events(result, &eb, &exclude) {
-                    error!(error = %e, "WatchEngine: event handler error");
-                }
-            },
-        )
+            }
+            if let Err(e) = Self::handle_debounced_events(result, &eb, &exclude) {
+                error!(error = %e, "WatchEngine: event handler error");
+            }
+        })
         .map_err(|e| format!("Failed to create debouncer: {}", e))?;
 
         debouncer
@@ -271,13 +273,18 @@ impl WatchEngine {
 
     // ── Polling fallback ──
 
-    fn start_polling(root: &str, config: &WatchConfig, event_bus: Arc<EventBus>) -> tokio::task::AbortHandle {
+    fn start_polling(
+        root: &str,
+        config: &WatchConfig,
+        event_bus: Arc<EventBus>,
+    ) -> tokio::task::AbortHandle {
         let root = root.to_string();
         let interval = Duration::from_millis(config.poll_interval_ms);
         let exclude = config.exclude_patterns.clone();
 
         let handle = tokio::spawn(async move {
-            let mut last_mtimes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            let mut last_mtimes: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
             let mut interval_timer = tokio::time::interval(interval);
             interval_timer.tick().await;
 
@@ -285,7 +292,10 @@ impl WatchEngine {
                 interval_timer.tick().await;
 
                 let mut changed = Vec::new();
-                for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+                for entry in walkdir::WalkDir::new(&root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
                     if !entry.file_type().is_file() {
                         continue;
                     }
@@ -399,7 +409,9 @@ mod tests {
         let mut config = WatchConfig::default();
         config.load_gitignore(dir.path());
 
-        assert!(config.exclude_patterns.contains(&"node_modules/".to_string()));
+        assert!(config
+            .exclude_patterns
+            .contains(&"node_modules/".to_string()));
         assert!(config.exclude_patterns.contains(&".env".to_string()));
         assert!(config.exclude_patterns.contains(&"*.log".to_string()));
         assert!(config.exclude_patterns.contains(&"build/".to_string()));
@@ -414,7 +426,9 @@ mod tests {
         let mut config = WatchConfig::default();
         config.load_gitignore(dir.path());
 
-        assert!(config.exclude_patterns.contains(&"node_modules/".to_string()));
+        assert!(config
+            .exclude_patterns
+            .contains(&"node_modules/".to_string()));
         assert_eq!(config.exclude_patterns.len(), 1);
     }
 

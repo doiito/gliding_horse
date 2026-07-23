@@ -65,7 +65,9 @@ impl ResponseCache {
     pub fn get(&self, key: &str) -> Option<Value> {
         let mut entries = self.entries.write();
         if let Some(pos) = entries.iter().position(|e| e.key == key) {
-            let mut entry = entries.remove(pos).expect("pos confirmed by position() above");
+            let mut entry = entries
+                .remove(pos)
+                .expect("pos confirmed by position() above");
             // Check TTL
             if entry.created.elapsed() > self.ttl {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -117,7 +119,11 @@ impl ResponseCache {
         let hits = self.hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
     }
 
     /// Current size
@@ -165,9 +171,7 @@ mod tests {
 
     #[test]
     fn test_build_key() {
-        let msgs = vec![
-            json!({"role": "user", "content": "hello"}),
-        ];
+        let msgs = vec![json!({"role": "user", "content": "hello"})];
         let key = ResponseCache::build_key("deepseek-v4-pro", &msgs);
         assert!(key.starts_with("deepseek-v4-pro:"));
     }

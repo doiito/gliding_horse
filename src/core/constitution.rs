@@ -9,7 +9,6 @@
 ///
 /// Architecture Layer: L3 — Constitution (Always-On)
 /// See design: PR-res/superpowers-skills-full-integration-design.md §1
-
 use std::collections::HashMap;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -136,7 +135,14 @@ impl ConstitutionEntry {
         principle: &'static str,
         label: &'static str,
     ) -> Self {
-        Self { id, category, role, principle, label, bindings: Vec::new() }
+        Self {
+            id,
+            category,
+            role,
+            principle,
+            label,
+            bindings: Vec::new(),
+        }
     }
 }
 
@@ -150,307 +156,349 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
     let mut m = HashMap::new();
 
     // ── Universal: Perception ──
-    m.insert("uni-perception-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "uni-perception-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:using-superpowers",
             enforcement: "ToolGuard::PreInjection(file_read tools) — inject red-flag table",
             trigger: ActivationCondition::OnToolCategory(&["file_read", "file_search"]),
-        },
-    ]);
-    m.insert("uni-perception-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-perception-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:index-priority",
-            enforcement: "ToolGuard::PreInjection(search_before_traverse) — search first, then read",
+            enforcement:
+                "ToolGuard::PreInjection(search_before_traverse) — search first, then read",
             trigger: ActivationCondition::OnToolCategory(&["glob", "find", "search"]),
-        },
-    ]);
-    m.insert("uni-perception-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-perception-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:index-priority",
             enforcement: "SyscallGate::validate_source(time_sensitive → realtime tool)",
             trigger: ActivationCondition::OnHookPoint("PreToolCall"),
-        },
-    ]);
-    m.insert("uni-perception-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-perception-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:brainstorming",
             enforcement: "SA::clarify() → StageGate::Plan→Do pre-check",
             trigger: ActivationCondition::OnPhaseEnd("PLAN"),
-        },
-    ]);
+        }],
+    );
 
     // ── Universal: Verification ──
-    m.insert("uni-verification-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "uni-verification-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:verification-before-completion",
             enforcement: "StageGate::Act→Archive + ToolGuard::PostValidation",
             trigger: ActivationCondition::OnPhaseEnd("ACT"),
-        },
-    ]);
-    m.insert("uni-verification-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-verification-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:systematic-debugging",
             enforcement: "RootCauseEngine::trace() — 5-level backtracking + evidence chain",
             trigger: ActivationCondition::OnTaskError,
-        },
-    ]);
-    m.insert("uni-verification-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-verification-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:verification-before-completion",
             enforcement: "ToolGuard::PostValidation — re-run verification after fix",
             trigger: ActivationCondition::OnHookPoint("PostToolCall"),
-        },
-    ]);
+        }],
+    );
 
     // ── Universal: Boundary ──
-    m.insert("uni-boundary-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "uni-boundary-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:least-privilege",
             enforcement: "SyscallGate::WhitelistManager — tool whitelist restriction",
             trigger: ActivationCondition::OnToolCategory(&["shell", "network", "file_write"]),
-        },
-    ]);
-    m.insert("uni-boundary-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-boundary-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:boundary-enforcement",
             enforcement: "StageGate::HardBlock — risk assessment before side effects",
             trigger: ActivationCondition::OnHookPoint("PreDestructiveAction"),
-        },
-    ]);
-    m.insert("uni-boundary-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-boundary-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:boundary-enforcement",
             enforcement: "SyscallGate::Abort — reject illegal requests",
             trigger: ActivationCondition::Always,
-        },
-    ]);
-    m.insert("uni-boundary-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "uni-boundary-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:complexity-assessment",
             enforcement: "StageGate::ScopeCheck — task scope exceeded suggestion",
             trigger: ActivationCondition::OnPhaseEnd("PLAN"),
-        },
-    ]);
+        }],
+    );
 
     // ── PA ──
-    m.insert("pa-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "pa-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:writing-plans",
             enforcement: "PlanStep granularity — cite source per step",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Plan]),
-        },
-    ]);
-    m.insert("pa-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "pa-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:using-superpowers",
             enforcement: "SyscallGate::RulePriorityCheck",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Plan]),
-        },
-    ]);
-    m.insert("pa-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "pa-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:systematic-debugging",
             enforcement: "hypothesis declaration template injection",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Plan]),
-        },
-    ]);
-    m.insert("pa-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "pa-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:cost-awareness",
             enforcement: "TokenBudget + TimeEstimator",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Plan]),
-        },
-    ]);
-    m.insert("pa-5", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "pa-5",
+        vec![MethodologyBinding {
             methodology_id: "methodology:verification-before-completion",
             enforcement: "PA self-check checklist",
             trigger: ActivationCondition::OnPhaseEnd("PLAN"),
-        },
-    ]);
+        }],
+    );
 
     // ── DA ──
-    m.insert("da-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "da-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:test-driven-development",
             enforcement: "ToolGuard(force Read before Write)",
             trigger: ActivationCondition::OnToolCategory(&["file_write"]),
-        },
-    ]);
-    m.insert("da-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "da-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:executing-plans",
             enforcement: "SkillRegistry pre-search",
             trigger: ActivationCondition::OnToolCategory(&["file_create"]),
-        },
-    ]);
-    m.insert("da-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "da-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:dispatching-parallel-agents",
             enforcement: "ToolGuard atomicity check",
             trigger: ActivationCondition::Always,
-        },
-    ]);
-    m.insert("da-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "da-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:subagent-driven-development",
             enforcement: "output template + comment rules",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Do]),
-        },
-    ]);
-    m.insert("da-5", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "da-5",
+        vec![MethodologyBinding {
             methodology_id: "methodology:finishing-a-development-branch",
             enforcement: "HumanApprovalHook",
             trigger: ActivationCondition::OnHookPoint("PreDestructiveAction"),
-        },
-    ]);
-    m.insert("da-6", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "da-6",
+        vec![MethodologyBinding {
             methodology_id: "methodology:cost-awareness",
             enforcement: "OutputCompressor + grep rate limiting",
             trigger: ActivationCondition::OnToolCategory(&["bash", "file_read"]),
-        },
-    ]);
+        }],
+    );
 
     // ── CA ──
-    m.insert("ca-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "ca-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:requesting-code-review",
             enforcement: "CA two-phase review",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Check]),
-        },
-    ]);
-    m.insert("ca-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "ca-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:requesting-code-review",
             enforcement: "EvidenceChain reference validation",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Check]),
-        },
-    ]);
-    m.insert("ca-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "ca-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:receiving-code-review",
             enforcement: "RuleBasedReview standard loading",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Check]),
-        },
-    ]);
-    m.insert("ca-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "ca-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:subagent-driven-development",
             enforcement: "StageGate deviation → rollback path",
             trigger: ActivationCondition::OnPhaseEnd("CHECK"),
-        },
-    ]);
+        }],
+    );
 
     // ── AA ──
-    m.insert("aa-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "aa-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:receiving-code-review",
             enforcement: "CA→AA evidence transfer",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Act]),
-        },
-    ]);
-    m.insert("aa-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "aa-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:finishing-a-development-branch",
             enforcement: "decision tree conservative branch",
             trigger: ActivationCondition::OnHookPoint("PreDestructiveAction"),
-        },
-    ]);
-    m.insert("aa-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "aa-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:cost-awareness",
             enforcement: "sunk cost vs rollback cost comparison",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Act]),
-        },
-    ]);
-    m.insert("aa-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "aa-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:receiving-code-review",
             enforcement: "advice → execution separation template",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Act]),
-        },
-    ]);
+        }],
+    );
 
     // ── SA ──
-    m.insert("sa-perception-1", vec![
-        MethodologyBinding {
+    m.insert(
+        "sa-perception-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:brainstorming",
             enforcement: "L3 Projection — full task context loading",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
-        },
-    ]);
-    m.insert("sa-perception-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-perception-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:brainstorming",
             enforcement: "clarification template → SA→User follow-up",
             trigger: ActivationCondition::OnHookPoint("PrePlanCreation"),
-        },
-    ]);
-    m.insert("sa-perception-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-perception-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:complexity-assessment",
             enforcement: "TaskComplexity — 7-level complexity assessment matrix",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
-        },
-    ]);
-    m.insert("sa-decision-1", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-decision-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:systematic-debugging",
             enforcement: "RootCauseEngine — fact chain verification",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
-        },
-    ]);
-    m.insert("sa-decision-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-decision-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:using-superpowers",
             enforcement: "SyscallGate — rule priority arbitration",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
-        },
-    ]);
-    m.insert("sa-decision-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-decision-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:cost-awareness",
             enforcement: "AgentSequenceOptimizer — Token+cost assessment",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
-        },
-    ]);
-    m.insert("sa-decision-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-decision-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:writing-plans",
             enforcement: "source citation verification",
             trigger: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
-        },
-    ]);
-    m.insert("sa-safety-1", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-safety-1",
+        vec![MethodologyBinding {
             methodology_id: "methodology:executing-plans",
             enforcement: "StageGate — Plan→Do human confirmation",
             trigger: ActivationCondition::OnHookPoint("PrePlanExecution"),
-        },
-    ]);
-    m.insert("sa-safety-2", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-safety-2",
+        vec![MethodologyBinding {
             methodology_id: "methodology:dispatching-parallel-agents",
             enforcement: "EventBus progress broadcast",
             trigger: ActivationCondition::OnHookPoint("TaskProgress"),
-        },
-    ]);
-    m.insert("sa-safety-3", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-safety-3",
+        vec![MethodologyBinding {
             methodology_id: "methodology:complexity-assessment",
             enforcement: "ResourceMonitor — overload warning",
             trigger: ActivationCondition::OnHookPoint("PreTaskAssign"),
-        },
-    ]);
-    m.insert("sa-safety-4", vec![
-        MethodologyBinding {
+        }],
+    );
+    m.insert(
+        "sa-safety-4",
+        vec![MethodologyBinding {
             methodology_id: "methodology:boundary-enforcement",
             enforcement: "SyscallGate::Abort + rejection reason template",
             trigger: ActivationCondition::Always,
-        },
-    ]);
+        }],
+    );
 
     m
 }
@@ -476,20 +524,24 @@ impl ConstitutionRegistry {
     /// Create a new registry with all default entries and bindings
     pub fn new() -> Self {
         let entries = Self::all_entries();
-        let by_id = entries.iter().enumerate()
-            .map(|(i, e)| (e.id, i))
-            .collect();
+        let by_id = entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
         let bindings = default_bindings();
-        Self { entries, by_id, bindings }
+        Self {
+            entries,
+            by_id,
+            bindings,
+        }
     }
 
     /// Create with custom bindings (for testing or customization)
     pub fn with_bindings(bindings: HashMap<&'static str, Vec<MethodologyBinding>>) -> Self {
         let entries = Self::all_entries();
-        let by_id = entries.iter().enumerate()
-            .map(|(i, e)| (e.id, i))
-            .collect();
-        Self { entries, by_id, bindings }
+        let by_id = entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+        Self {
+            entries,
+            by_id,
+            bindings,
+        }
     }
 
     // ── Entry Definitions ──
@@ -682,14 +734,16 @@ impl ConstitutionRegistry {
 
     /// Get all entries for a given role (includes Universal rules + role-specific)
     pub fn for_role(&self, role: ConstitutionRole) -> Vec<&ConstitutionEntry> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| e.role == role || e.role == ConstitutionRole::Universal)
             .collect()
     }
 
     /// Get entries by category
     pub fn by_category(&self, category: ConstitutionCategory) -> Vec<&ConstitutionEntry> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| e.category == category)
             .collect()
     }
@@ -725,9 +779,8 @@ impl ConstitutionRegistry {
     /// Build prompt text for only the exact role's rules (no universal).
     /// Used by SA prompt which manages its own universal rules separately.
     pub fn build_prompt_for_role_exact(&self, role: ConstitutionRole) -> String {
-        let rules: Vec<&ConstitutionEntry> = self.entries.iter()
-            .filter(|e| e.role == role)
-            .collect();
+        let rules: Vec<&ConstitutionEntry> =
+            self.entries.iter().filter(|e| e.role == role).collect();
         self.build_prompt_for_entries(&rules)
     }
 
@@ -770,17 +823,27 @@ mod tests {
     #[test]
     fn test_all_entries_loaded() {
         let registry = ConstitutionRegistry::new();
-        assert!(registry.count() >= 40, "Expected 40+ entries, got {}", registry.count());
+        assert!(
+            registry.count() >= 40,
+            "Expected 40+ entries, got {}",
+            registry.count()
+        );
     }
 
     #[test]
     fn test_bindings_exist() {
         let registry = ConstitutionRegistry::new();
         let ids_with_bindings: Vec<_> = registry.bindings.keys().collect();
-        assert!(!ids_with_bindings.is_empty(), "Bindings should not be empty");
+        assert!(
+            !ids_with_bindings.is_empty(),
+            "Bindings should not be empty"
+        );
         for id in &ids_with_bindings {
-            assert!(registry.get(id).is_some(),
-                "Binding references non-existent entry: {}", id);
+            assert!(
+                registry.get(id).is_some(),
+                "Binding references non-existent entry: {}",
+                id
+            );
         }
     }
 
@@ -788,27 +851,46 @@ mod tests {
     fn test_for_role_includes_universal() {
         let registry = ConstitutionRegistry::new();
         let pa_rules = registry.for_role(ConstitutionRole::Plan);
-        let universal_count = pa_rules.iter()
+        let universal_count = pa_rules
+            .iter()
             .filter(|e| e.role == ConstitutionRole::Universal)
             .count();
-        assert!(universal_count >= 11, "Universal rules should appear for PA");
+        assert!(
+            universal_count >= 11,
+            "Universal rules should appear for PA"
+        );
     }
 
     #[test]
     fn test_build_prompt_universal() {
         let registry = ConstitutionRegistry::new();
         let prompt = registry.build_prompt_for_role(ConstitutionRole::Universal);
-        assert!(prompt.contains("Perception Principles"), "Should contain perception header");
-        assert!(prompt.contains("Verification Principles"), "Should contain verification header");
-        assert!(prompt.contains("Boundary Principles"), "Should contain boundary header");
-        assert!(prompt.contains("Full Read"), "Should contain first perception rule");
+        assert!(
+            prompt.contains("Perception Principles"),
+            "Should contain perception header"
+        );
+        assert!(
+            prompt.contains("Verification Principles"),
+            "Should contain verification header"
+        );
+        assert!(
+            prompt.contains("Boundary Principles"),
+            "Should contain boundary header"
+        );
+        assert!(
+            prompt.contains("Full Read"),
+            "Should contain first perception rule"
+        );
     }
 
     #[test]
     fn test_build_prompt_pa() {
         let registry = ConstitutionRegistry::new();
         let prompt = registry.build_prompt_for_role(ConstitutionRole::Plan);
-        assert!(prompt.contains("Plan Agent Addendum"), "Should contain PA addendum");
+        assert!(
+            prompt.contains("Plan Agent Addendum"),
+            "Should contain PA addendum"
+        );
     }
 
     #[test]
@@ -824,7 +906,9 @@ mod tests {
         let bindings = registry.get_bindings("uni-verification-2");
         assert!(bindings.is_some(), "Root cause rule should have bindings");
         if let Some(b) = bindings {
-            assert!(b.iter().any(|m| m.methodology_id == "methodology:systematic-debugging"));
+            assert!(b
+                .iter()
+                .any(|m| m.methodology_id == "methodology:systematic-debugging"));
         }
     }
 
@@ -832,7 +916,8 @@ mod tests {
     fn test_sa_rules() {
         let registry = ConstitutionRegistry::new();
         let sa_rules = registry.for_role(ConstitutionRole::Supervisor);
-        let decision_rules = sa_rules.iter()
+        let decision_rules = sa_rules
+            .iter()
             .filter(|e| e.category == ConstitutionCategory::Decision)
             .count();
         assert_eq!(decision_rules, 4, "SA should have 4 decision rules");
@@ -842,10 +927,12 @@ mod tests {
     fn test_all_bindings_valid() {
         let registry = ConstitutionRegistry::new();
         for (&id, bindings) in &registry.bindings {
-            assert!(registry.get(id).is_some(),
-                "Binding entry not found: {}", id);
-            assert!(!bindings.is_empty(),
-                "Empty bindings for: {}", id);
+            assert!(
+                registry.get(id).is_some(),
+                "Binding entry not found: {}",
+                id
+            );
+            assert!(!bindings.is_empty(), "Empty bindings for: {}", id);
         }
     }
 }

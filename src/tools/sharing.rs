@@ -43,11 +43,11 @@ impl Permission {
             Self::Admin => "admin",
         }
     }
-    
+
     pub fn allows_read(&self) -> bool {
         matches!(self, Self::Read | Self::Write | Self::Admin)
     }
-    
+
     pub fn allows_write(&self) -> bool {
         matches!(self, Self::Write | Self::Admin)
     }
@@ -234,7 +234,8 @@ impl ShareResponse {
     }
 
     pub fn with_projection(mut self, iri: &str, projection: &str) -> Self {
-        self.projections.insert(iri.to_string(), projection.to_string());
+        self.projections
+            .insert(iri.to_string(), projection.to_string());
         self
     }
 
@@ -305,7 +306,7 @@ impl SharingProtocol {
             }
 
             let share_id = ref_.share_id.clone();
-            
+
             index
                 .entry(target_agent_iri.to_string())
                 .or_default()
@@ -334,7 +335,7 @@ impl SharingProtocol {
 
     pub fn resolve_iri(&self, iri: &str, agent_iri: &str) -> Option<SharedReference> {
         let shares = self.active_shares.read();
-        
+
         for (share_id, ref_) in shares.iter() {
             if ref_.node_iri == iri && ref_.target_agent_iri == agent_iri {
                 if ref_.is_expired() {
@@ -343,7 +344,7 @@ impl SharingProtocol {
                     self.revoke_share(&share_id);
                     return None;
                 }
-                
+
                 if !ref_.permission.allows_read() {
                     return None;
                 }
@@ -351,20 +352,20 @@ impl SharingProtocol {
                 if let Some(ref audit) = self.audit_log {
                     audit.log_share_resolved(share_id, agent_iri);
                 }
-                
+
                 return Some(ref_.clone());
             }
         }
-        
+
         None
     }
 
     pub fn get_shares_for_agent(&self, agent_iri: &str) -> Vec<SharedReference> {
         self.cleanup_expired();
-        
+
         let index = self.share_index.read();
         let shares = self.active_shares.read();
-        
+
         if let Some(share_ids) = index.get(agent_iri) {
             share_ids
                 .iter()
@@ -377,7 +378,7 @@ impl SharingProtocol {
 
     pub fn revoke_share(&self, share_id: &str) -> bool {
         let mut shares = self.active_shares.write();
-        
+
         if let Some(ref_) = shares.remove(share_id) {
             let mut index = self.share_index.write();
             if let Some(share_ids) = index.get_mut(&ref_.target_agent_iri) {
@@ -529,7 +530,8 @@ mod tests {
             "iri://task/123/result",
             ShareType::Projection,
             Permission::Read,
-        ).with_ttl(3600);
+        )
+        .with_ttl(3600);
 
         assert!(ref_.permission.allows_read());
         assert!(!ref_.permission.allows_write());
@@ -539,7 +541,7 @@ mod tests {
     #[test]
     fn test_sharing_protocol() {
         let protocol = SharingProtocol::new();
-        
+
         let refs = protocol.create_share(
             "iri://agent/pa",
             "iri://agent/da",
@@ -549,13 +551,13 @@ mod tests {
             Some(3600),
             None,
         );
-        
+
         assert_eq!(refs.len(), 1);
         assert_eq!(protocol.active_share_count(), 1);
-        
+
         let resolved = protocol.resolve_iri("iri://task/123/plan", "iri://agent/da");
         assert!(resolved.is_some());
-        
+
         let not_authorized = protocol.resolve_iri("iri://task/123/plan", "iri://agent/ca");
         assert!(not_authorized.is_none());
     }
@@ -564,7 +566,7 @@ mod tests {
     fn test_context_injector() {
         let sharing = Arc::new(SharingProtocol::new());
         let injector = ContextInjector::new(sharing.clone());
-        
+
         sharing.create_share(
             "iri://agent/pa",
             "iri://agent/da",
@@ -574,20 +576,20 @@ mod tests {
             Some(3600),
             None,
         );
-        
+
         let context = injector.inject_context(
             "iri://agent/da",
             "iri://task/123",
             &["iri://task/123/plan".to_string()],
         );
-        
+
         assert!(context.get("context_nodes").is_some());
     }
 
     #[test]
     fn test_share_expiration() {
         let protocol = SharingProtocol::new();
-        
+
         let _refs = protocol.create_share(
             "iri://agent/pa",
             "iri://agent/da",
@@ -597,9 +599,9 @@ mod tests {
             Some(1),
             None,
         );
-        
+
         std::thread::sleep(std::time::Duration::from_secs(2));
-        
+
         let resolved = protocol.resolve_iri("iri://task/123/plan", "iri://agent/da");
         assert!(resolved.is_none());
         assert_eq!(protocol.active_share_count(), 0);

@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 
+use crate::core::tracked_action::TrackedAction;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l1_session::{L1Session, SessionSummary};
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::scheduler::MemoryScheduler;
-use crate::core::tracked_action::TrackedAction;
 #[cfg(feature = "ontology")]
 use crate::ontology_bridge::OntologyBridgeManager;
 use crate::{CoreConfig, CoreError};
@@ -141,7 +141,12 @@ impl MemoryManager {
     // ========== L1 Session Management ==========
 
     /// Create new L1 session
-    pub fn create_session(&mut self, agent_id: &str, agent_role: &str, task_iri: &str) -> L1Session {
+    pub fn create_session(
+        &mut self,
+        agent_id: &str,
+        agent_role: &str,
+        task_iri: &str,
+    ) -> L1Session {
         let session = match self.config.eviction_config {
             Some(cfg) => L1Session::with_config(agent_id, agent_role, task_iri, 2000, cfg),
             None => L1Session::new(agent_id, agent_role, task_iri),
@@ -182,9 +187,12 @@ impl MemoryManager {
     /// Compress and close session, returns session summary
     pub fn close_session(&mut self, session_id: &str) -> Result<SessionSummary, CoreError> {
         let result = if let Some(ref scheduler) = self.scheduler {
-            let session = scheduler.remove_session(session_id).ok_or_else(|| CoreError::Internal {
-                message: format!("Session not found: {}", session_id),
-            })?;
+            let session =
+                scheduler
+                    .remove_session(session_id)
+                    .ok_or_else(|| CoreError::Internal {
+                        message: format!("Session not found: {}", session_id),
+                    })?;
             let summary = session.summarize();
             info!(
                 session_id = %session_id,
@@ -193,9 +201,12 @@ impl MemoryManager {
             );
             Ok(summary)
         } else {
-            let session = self.sessions.remove(session_id).ok_or_else(|| CoreError::Internal {
-                message: format!("Session not found: {}", session_id),
-            })?;
+            let session = self
+                .sessions
+                .remove(session_id)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("Session not found: {}", session_id),
+                })?;
             let summary = session.summarize();
             info!(
                 session_id = %session_id,
@@ -246,8 +257,15 @@ impl MemoryManager {
         self.l2.write_node(&node_iri, &json_ld, &self.config)
     }
 
-    pub fn archive_session_actions(&self, task_iri: &str, actions: &[TrackedAction], summary: &str) -> Result<(), CoreError> {
-        if actions.is_empty() { return Ok(()); }
+    pub fn archive_session_actions(
+        &self,
+        task_iri: &str,
+        actions: &[TrackedAction],
+        summary: &str,
+    ) -> Result<(), CoreError> {
+        if actions.is_empty() {
+            return Ok(());
+        }
         let task_id = format!("iri://task/{}", task_iri);
         let mut produces = vec![];
         for a in actions {
@@ -267,11 +285,18 @@ impl MemoryManager {
             "aos:produces": produces,
             "aos:summary": summary,
             "aos:actionCount": actions.len(),
-        }).to_string();
+        })
+        .to_string();
         self.l2.write_node(&task_id, &json_ld, &self.config)
     }
 
-    pub fn archive_experience(&self, task_iri: &str, agent_role: &str, summary: &str, success_rate: f32) -> Result<(), CoreError> {
+    pub fn archive_experience(
+        &self,
+        task_iri: &str,
+        agent_role: &str,
+        summary: &str,
+        success_rate: f32,
+    ) -> Result<(), CoreError> {
         let exp = serde_json::json!({
             "experience_id": format!("exp_{}", uuid::Uuid::new_v4().hyphenated()),
             "scenario": summary,
@@ -280,7 +305,8 @@ impl MemoryManager {
             "tags": ["experience", agent_role],
             "task_iri": task_iri,
             "created_at": chrono::Utc::now().to_rfc3339(),
-        }).to_string();
+        })
+        .to_string();
         let iri = format!("iri://experience/{}", uuid::Uuid::new_v4().hyphenated());
         self.l0.store(&iri, &exp)
     }
@@ -315,25 +341,34 @@ impl MemoryManager {
         match handle {
             Ok(_h) => {
                 let frame = self.projection.get_frame(frame_name);
-                let actual_frame = if frame.is_some() { frame_name } else { "reference_only" };
+                let actual_frame = if frame.is_some() {
+                    frame_name
+                } else {
+                    "reference_only"
+                };
                 let proj = self.projection.clone();
                 let task_iri = task_iri.to_string();
                 let actual_frame = actual_frame.to_string();
-                
+
                 let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        proj.project(&task_iri, &actual_frame, params).await
-                    })
+                    tokio::runtime::Handle::current()
+                        .block_on(async { proj.project(&task_iri, &actual_frame, params).await })
                 })?;
                 Ok(Some(result))
             }
             Err(_) => {
-                let frames: Vec<String> = self.projection.list_frames().iter().map(|f| f.name.clone()).collect();
+                let frames: Vec<String> = self
+                    .projection
+                    .list_frames()
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect();
                 let result = serde_json::json!({
                     "@context": "https://pdca-agent.org/context/projection",
                     "note": "Async runtime not available, returning frame list",
                     "available_frames": frames,
-                }).to_string();
+                })
+                .to_string();
                 Ok(Some(result))
             }
         }
@@ -342,18 +377,24 @@ impl MemoryManager {
     // ========== Unified Storage Interface ==========
 
     /// Unified storage interface: store data by layer
-    pub fn store(&self, agent_id: &str, key: &str, value: &str, layer: &str) -> Result<String, CoreError> {
+    pub fn store(
+        &self,
+        agent_id: &str,
+        key: &str,
+        value: &str,
+        layer: &str,
+    ) -> Result<String, CoreError> {
         match layer {
             "L0" | "l0" => {
                 let iri = format!("iri://{}/{}", agent_id, key);
                 self.l0.store(&iri, value)?;
                 Ok(iri)
             }
-            "L1" | "l1" => {
-                Err(CoreError::Internal {
-                    message: "L1 layer does not support direct key-value storage; use session APIs instead".to_string(),
-                })
-            }
+            "L1" | "l1" => Err(CoreError::Internal {
+                message:
+                    "L1 layer does not support direct key-value storage; use session APIs instead"
+                        .to_string(),
+            }),
             "L2" | "l2" => {
                 let iri = format!("iri://{}/{}", agent_id, key);
                 self.l2.write_node(&iri, value, &self.config)?;
@@ -391,15 +432,20 @@ impl MemoryManager {
     /// ensuring consistency engine invalidation propagation and projection cache cleanup.
     pub fn archive_session(&self, session_id: &str) -> Result<(), CoreError> {
         if let Some(ref scheduler) = self.scheduler {
-            let session = scheduler.remove_session(session_id).ok_or_else(|| CoreError::Internal {
-                message: format!("Session not found: {}", session_id),
-            })?;
+            let session =
+                scheduler
+                    .remove_session(session_id)
+                    .ok_or_else(|| CoreError::Internal {
+                        message: format!("Session not found: {}", session_id),
+                    })?;
             let summary = session.summarize();
             self.archive_to_l0(&summary)?;
             self.archive_to_l2(&summary.task_iri, &summary)?;
             Ok(())
         } else {
-            let session = self.sessions.get(session_id)
+            let session = self
+                .sessions
+                .get(session_id)
                 .ok_or_else(|| CoreError::Internal {
                     message: format!("Session not found: {}", session_id),
                 })?;
@@ -414,7 +460,11 @@ impl MemoryManager {
     ///
     /// Suitable for callers like AgentRunner that directly own the session.
     /// Automates: track → close → archive_to_l2 → archive_to_l0
-    pub fn finalize_session(&mut self, session: L1Session, task_iri: &str) -> Result<(), CoreError> {
+    pub fn finalize_session(
+        &mut self,
+        session: L1Session,
+        task_iri: &str,
+    ) -> Result<(), CoreError> {
         let session_id = session.session_id().to_string();
         self.track_session(session);
         let summary = self.close_session(&session_id)?;
@@ -461,7 +511,12 @@ impl MemoryManager {
     }
 
     /// Update Agent status
-    pub fn update_agent_status(&self, agent_id: &str, status: crate::memory::AgentActivity, operation: Option<&str>) {
+    pub fn update_agent_status(
+        &self,
+        agent_id: &str,
+        status: crate::memory::AgentActivity,
+        operation: Option<&str>,
+    ) {
         self.l2.update_agent_status(agent_id, status, operation);
     }
 

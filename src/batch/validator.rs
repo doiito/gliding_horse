@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::batch::error::BatchError;
 use crate::batch::types::{
-    BatchAgentConfig, ExtractionResult, ExtractedDecision, ExtractedEntity, ExtractedRelation,
+    BatchAgentConfig, ExtractedDecision, ExtractedEntity, ExtractedRelation, ExtractionResult,
 };
 
 pub struct OutputValidator;
@@ -123,10 +123,7 @@ impl OutputValidator {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
-                            confidence: e
-                                .get("confidence")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.5),
+                            confidence: e.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5),
                             source_messages: vec![],
                         })
                     })
@@ -161,10 +158,7 @@ impl OutputValidator {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
-                            confidence: r
-                                .get("confidence")
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(0.5),
+                            confidence: r.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -188,9 +182,7 @@ impl OutputValidator {
                     .and_then(|v| v.as_object())
                     .map(|o| {
                         o.iter()
-                            .map(|(k, v)| {
-                                (k.clone(), v.as_str().unwrap_or("").to_string())
-                            })
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                             .collect()
                     })
                     .unwrap_or_default(),

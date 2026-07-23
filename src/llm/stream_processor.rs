@@ -7,8 +7,7 @@ use tracing::debug;
 use crate::llm::response_parser::ToolCall;
 use crate::llm::sse::{SseError, SseParser};
 use crate::llm::stream_types::{
-    ContentBlock, ContentBlockDelta,
-    StreamAccumulator, StreamEvent, StreamResponse, Usage,
+    ContentBlock, ContentBlockDelta, StreamAccumulator, StreamEvent, StreamResponse, Usage,
 };
 
 pub type StreamCallback = Box<dyn Fn(&StreamEvent) + Send + Sync>;
@@ -38,21 +37,21 @@ impl StreamingProcessor {
 
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamEvent>, SseError> {
         let events = self.parser.push(chunk)?;
-        
+
         for event in &events {
             self.process_event(event);
         }
-        
+
         Ok(events)
     }
 
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, SseError> {
         let events = self.parser.finish()?;
-        
+
         for event in &events {
             self.process_event(event);
         }
-        
+
         Ok(events)
     }
 
@@ -62,10 +61,7 @@ impl StreamingProcessor {
         match event {
             StreamEvent::MessageStart(e) => {
                 self.message_started = true;
-                debug!(
-                    "Stream message started: id={:?}, model={:?}",
-                    e.id, e.model
-                );
+                debug!("Stream message started: id={:?}, model={:?}", e.id, e.model);
             }
             StreamEvent::ContentBlockStart(e) => {
                 self.current_block_index = e.index;
@@ -78,7 +74,12 @@ impl StreamingProcessor {
                 }
             }
             StreamEvent::ContentBlockDelta(e) => {
-                if let ContentBlockDelta::ToolCallDelta { id, name, arguments } = &e.delta {
+                if let ContentBlockDelta::ToolCallDelta {
+                    id,
+                    name,
+                    arguments,
+                } = &e.delta
+                {
                     let idx = e.index as usize;
                     while self.tool_call_states.len() <= idx {
                         self.tool_call_states.push(ToolCallState::default());
@@ -122,8 +123,9 @@ impl StreamingProcessor {
         } else {
             Some(self.accumulator.thinking.clone())
         };
-        
-        let tool_calls: Vec<crate::llm::response_parser::ToolCall> = self.accumulator
+
+        let tool_calls: Vec<crate::llm::response_parser::ToolCall> = self
+            .accumulator
             .tool_calls
             .iter()
             .filter(|tc| !tc.name.is_empty())
@@ -134,7 +136,11 @@ impl StreamingProcessor {
             })
             .collect();
 
-        let finish_reason = self.accumulator.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+        let finish_reason = self
+            .accumulator
+            .finish_reason
+            .clone()
+            .unwrap_or_else(|| "stop".to_string());
 
         let mut response = StreamResponse {
             thought,
@@ -144,19 +150,23 @@ impl StreamingProcessor {
             finish_reason,
             usage: self.accumulator.usage.clone(),
         };
-        
+
         if response.thought.is_none() {
-            if let Some((thought, content, summary)) = Self::parse_structured_content_static(&response.content) {
+            if let Some((thought, content, summary)) =
+                Self::parse_structured_content_static(&response.content)
+            {
                 response.thought = thought;
                 response.content = content;
                 response.summary = summary;
             }
         }
-        
+
         response
     }
 
-    fn parse_structured_content_static(content: &str) -> Option<(Option<String>, String, Option<String>)> {
+    fn parse_structured_content_static(
+        content: &str,
+    ) -> Option<(Option<String>, String, Option<String>)> {
         let content = content.trim();
         if content.is_empty() {
             return None;
@@ -220,8 +230,12 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            let chunk = self.response.chunk().await.map_err(|e| SseError(e.to_string()))?;
-            
+            let chunk = self
+                .response
+                .chunk()
+                .await
+                .map_err(|e| SseError(e.to_string()))?;
+
             match chunk {
                 Some(bytes) => {
                     let events = self.processor.push_chunk(&bytes)?;
@@ -245,7 +259,10 @@ impl MessageStream {
         Ok(std::mem::take(&mut self.processor).into_response())
     }
 
-    pub async fn collect_with_callback<F>(&mut self, mut callback: F) -> Result<StreamResponse, SseError>
+    pub async fn collect_with_callback<F>(
+        &mut self,
+        mut callback: F,
+    ) -> Result<StreamResponse, SseError>
     where
         F: FnMut(&StreamEvent),
     {
@@ -309,9 +326,17 @@ impl StreamingResponseBuilder {
 
     pub fn build(self) -> StreamResponse {
         StreamResponse {
-            thought: if self.thought.is_empty() { None } else { Some(self.thought) },
+            thought: if self.thought.is_empty() {
+                None
+            } else {
+                Some(self.thought)
+            },
             content: self.content,
-            summary: if self.summary.is_empty() { None } else { Some(self.summary) },
+            summary: if self.summary.is_empty() {
+                None
+            } else {
+                Some(self.summary)
+            },
             tool_calls: self.tool_calls,
             finish_reason: self.finish_reason,
             usage: self.usage,
@@ -332,13 +357,13 @@ mod tests {
     #[test]
     fn test_streaming_processor_text() {
         let mut processor = StreamingProcessor::new();
-        
+
         let chunk1 = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n";
         let chunk2 = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" World\"}}]}\n\n";
-        
+
         processor.push_chunk(chunk1).unwrap();
         processor.push_chunk(chunk2).unwrap();
-        
+
         let acc = processor.get_accumulator();
         assert_eq!(acc.get_text(), "Hello World");
     }
@@ -346,11 +371,11 @@ mod tests {
     #[test]
     fn test_streaming_processor_thinking() {
         let mut processor = StreamingProcessor::new();
-        
+
         let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Thinking...\"}}]}\n\n";
-        
+
         processor.push_chunk(chunk).unwrap();
-        
+
         let acc = processor.get_accumulator();
         assert_eq!(acc.thinking, "Thinking...");
     }
@@ -363,7 +388,7 @@ mod tests {
             .with_summary("Calculated answer")
             .with_finish_reason("stop")
             .build();
-        
+
         assert_eq!(response.thought, Some("Let me think".to_string()));
         assert_eq!(response.content, "The answer is 42");
         assert_eq!(response.summary, Some("Calculated answer".to_string()));

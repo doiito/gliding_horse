@@ -105,9 +105,7 @@ impl VectorStore {
 
     /// Get vector bytes by ID.
     pub fn get(&self, id: u32) -> Option<&[u8]> {
-        self.slots
-            .get(id as usize)
-            .and_then(|slot| slot.as_deref())
+        self.slots.get(id as usize).and_then(|slot| slot.as_deref())
     }
 
     /// Mark slot as deleted (tombstone). Does NOT reclaim space.
@@ -169,7 +167,11 @@ impl VectorStore {
         }
         fs::rename(&tmp_path, path)?;
 
-        info!("VectorStore persisted: {} bytes -> {}", bytes.len(), path.display());
+        info!(
+            "VectorStore persisted: {} bytes -> {}",
+            bytes.len(),
+            path.display()
+        );
         Ok(())
     }
 
@@ -184,11 +186,10 @@ impl VectorStore {
 
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let data: PersistentStore = bincode::deserialize_from(reader).map_err(|e| {
-            EngineError::StorageError {
+        let data: PersistentStore =
+            bincode::deserialize_from(reader).map_err(|e| EngineError::StorageError {
                 message: format!("Store deserialization: {e}"),
-            }
-        })?;
+            })?;
 
         info!(
             "VectorStore loaded: {} slots, {} active, {} bytes/elem",

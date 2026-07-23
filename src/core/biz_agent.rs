@@ -73,9 +73,15 @@ impl BizAgent {
         }
     }
 
-    pub fn agent_id(&self) -> &str { &self.instance.agent_id }
-    pub fn role(&self) -> AgentRole { self.instance.role }
-    pub fn status(&self) -> &AgentStatus { &self.instance.status }
+    pub fn agent_id(&self) -> &str {
+        &self.instance.agent_id
+    }
+    pub fn role(&self) -> AgentRole {
+        self.instance.role
+    }
+    pub fn status(&self) -> &AgentStatus {
+        &self.instance.status
+    }
 
     /// Main entry: execute task.
     /// In orchestrator mode, delegates to decompose→sub-agents→aggregate.
@@ -109,10 +115,10 @@ impl BizAgent {
     /// Single Agent direct execution, delegates to AgentRunner.execute().
     /// AgentRunner.execute() internally creates and manages an L1 session.
     async fn execute_mono(&self, context: TaskContext) -> TaskResult {
-        let result: Result<TaskResult, CoreError> = self.runner.execute(
-            &mut self.instance.clone(),
-            context,
-        ).await;
+        let result: Result<TaskResult, CoreError> = self
+            .runner
+            .execute(&mut self.instance.clone(), context)
+            .await;
 
         match result {
             Ok(r) => r,
@@ -178,17 +184,14 @@ impl BizAgent {
                 let sub_id = format!("{}_sub_{}", self.agent_id(), i);
                 let runner = self.runner.clone();
                 let agent_md = self.agent_md.clone();
-                let config = AgentConfig { orchestrator_mode: false, ..self.config.clone() };
+                let config = AgentConfig {
+                    orchestrator_mode: false,
+                    ..self.config.clone()
+                };
                 let role = self.role();
 
                 let handle = tokio::spawn(async move {
-                    let sub = BizAgent::new(
-                        sub_id,
-                        role,
-                        &agent_md,
-                        runner,
-                        config,
-                    );
+                    let sub = BizAgent::new(sub_id, role, &agent_md, runner, config);
                     sub.execute_mono(sub_ctx).await
                 });
 
@@ -198,7 +201,11 @@ impl BizAgent {
             for handle in handles {
                 match handle.await {
                     Ok(result) => {
-                        session.add_summary("assistant", &format!("[Subtask] {}", result.summary), None);
+                        session.add_summary(
+                            "assistant",
+                            &format!("[Subtask] {}", result.summary),
+                            None,
+                        );
                         self.sub_results.push(result);
                     }
                     Err(e) => {
@@ -228,10 +235,17 @@ impl BizAgent {
                     self.role(),
                     &self.agent_md,
                     self.runner.clone(),
-                    AgentConfig { orchestrator_mode: false, ..self.config.clone() },
+                    AgentConfig {
+                        orchestrator_mode: false,
+                        ..self.config.clone()
+                    },
                 );
                 let result = sub.execute_mono(sub_ctx).await;
-                session.add_summary("assistant", &format!("[Subtask{}] {}", i, result.summary), None);
+                session.add_summary(
+                    "assistant",
+                    &format!("[Subtask{}] {}", i, result.summary),
+                    None,
+                );
                 self.sub_results.push(result);
             }
         }
@@ -273,7 +287,12 @@ impl BizAgent {
     }
 
     /// Generic LLM decomposition method
-    async fn decompose_with_llm(&self, context: &TaskContext, phase: &str, instruction: &str) -> Vec<TaskContext> {
+    async fn decompose_with_llm(
+        &self,
+        context: &TaskContext,
+        phase: &str,
+        instruction: &str,
+    ) -> Vec<TaskContext> {
         let prompt = format!(
             r#"You are a task decomposition expert. Please decompose the following {} task into multiple independent sub-tasks.
 
@@ -302,20 +321,26 @@ Output only the JSON array, no other content."#,
             phase, context.objective, instruction
         );
 
-        let messages = vec![
-            crate::gateway::unified_gateway::ChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            }
-        ];
+        let messages = vec![crate::gateway::unified_gateway::ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
 
-        let model = self.runner.gateway.get_model(&self.role().to_string().to_lowercase());
-        
-        match self.runner.gateway.chat_with_params(&model, messages, None, None, None, None).await {
+        let model = self
+            .runner
+            .gateway
+            .get_model(&self.role().to_string().to_lowercase());
+
+        match self
+            .runner
+            .gateway
+            .chat_with_params(&model, messages, None, None, None, None)
+            .await
+        {
             Ok(response) => {
                 if let Some(choice) = response.choices.first() {
                     if let Some(content) = &choice.message.content {
@@ -352,10 +377,11 @@ Output only the JSON array, no other content."#,
                     .iter()
                     .enumerate()
                     .filter_map(|(i, task)| {
-                        let desc = task.get("description")
+                        let desc = task
+                            .get("description")
                             .and_then(|d| d.as_str())
                             .unwrap_or(&context.objective);
-                        
+
                         Some(TaskContext {
                             task_iri: context.task_iri.clone(),
                             objective: format!("[Sub-{}#{}] {}", self.role(), i, desc),
@@ -363,7 +389,7 @@ Output only the JSON array, no other content."#,
                         })
                     })
                     .collect();
-                
+
                 if sub_tasks.is_empty() {
                     vec![context.clone()]
                 } else {
@@ -391,17 +417,18 @@ Output only the JSON array, no other content."#,
 
     async fn aggregate_with_llm(&self, context: &TaskContext, phase: &str) -> TaskResult {
         let simple_result = self.aggregate_results(phase);
-        
+
         if self.sub_results.len() <= 1 {
             return simple_result;
         }
-        
-        let sub_summaries: Vec<String> = self.sub_results
+
+        let sub_summaries: Vec<String> = self
+            .sub_results
             .iter()
             .enumerate()
             .map(|(i, r)| format!("Sub-task{} [{}]: {}", i + 1, r.status, r.summary))
             .collect();
-        
+
         let prompt = format!(
             r#"You are a result aggregation expert. Please summarize the results of multiple sub-tasks from the following {} phase.
 
@@ -421,23 +448,31 @@ Output the aggregation result as JSON:
 }}
 
 Output only the JSON, no other content."#,
-            phase, context.objective, sub_summaries.join("\n")
+            phase,
+            context.objective,
+            sub_summaries.join("\n")
         );
 
-        let messages = vec![
-            crate::gateway::unified_gateway::ChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            }
-        ];
+        let messages = vec![crate::gateway::unified_gateway::ChatMessage {
+            role: "user".to_string(),
+            content: prompt,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
 
-        let model = self.runner.gateway.get_model(&self.role().to_string().to_lowercase());
-        
-        match self.runner.gateway.chat_with_params(&model, messages, None, None, None, None).await {
+        let model = self
+            .runner
+            .gateway
+            .get_model(&self.role().to_string().to_lowercase());
+
+        match self
+            .runner
+            .gateway
+            .chat_with_params(&model, messages, None, None, None, None)
+            .await
+        {
             Ok(response) => {
                 if let Some(choice) = response.choices.first() {
                     if let Some(content) = &choice.message.content {
@@ -470,12 +505,14 @@ Output only the JSON, no other content."#,
 
         match serde_json::from_str::<Value>(&json_str) {
             Ok(parsed) => {
-                let summary = parsed.get("summary")
+                let summary = parsed
+                    .get("summary")
                     .and_then(|s| s.as_str())
                     .unwrap_or(&fallback.summary)
                     .to_string();
-                
-                let status = parsed.get("overall_status")
+
+                let status = parsed
+                    .get("overall_status")
                     .and_then(|s| s.as_str())
                     .unwrap_or(&fallback.status)
                     .to_string();
@@ -484,7 +521,9 @@ Output only the JSON, no other content."#,
                 if let Some(findings) = parsed.get("key_findings").and_then(|f| f.as_array()) {
                     artifacts.push(json!({"type": "key_findings", "items": findings}));
                 }
-                if let Some(recommendations) = parsed.get("recommendations").and_then(|r| r.as_array()) {
+                if let Some(recommendations) =
+                    parsed.get("recommendations").and_then(|r| r.as_array())
+                {
                     artifacts.push(json!({"type": "recommendations", "items": recommendations}));
                 }
 
@@ -513,7 +552,11 @@ Output only the JSON, no other content."#,
 
     fn aggregate_results(&self, _phase: &str) -> TaskResult {
         let total = self.sub_results.len();
-        let successes = self.sub_results.iter().filter(|r| r.status == "success").count();
+        let successes = self
+            .sub_results
+            .iter()
+            .filter(|r| r.status == "success")
+            .count();
         let mut all_errors = Vec::new();
 
         let mut summary_parts = Vec::new();
@@ -532,7 +575,11 @@ Output only the JSON, no other content."#,
 
         TaskResult {
             task_iri: String::new(),
-            status: if successes == total { "success".to_string() } else { "partial".to_string() },
+            status: if successes == total {
+                "success".to_string()
+            } else {
+                "partial".to_string()
+            },
             summary,
             output: None,
             jsonld_output: None,

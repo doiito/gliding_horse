@@ -96,8 +96,8 @@ impl TemplateManager {
                         .trim_end_matches(".md")
                         .to_string();
 
-                    let content = std::fs::read_to_string(&path)
-                        .map_err(|e| CoreError::Internal {
+                    let content =
+                        std::fs::read_to_string(&path).map_err(|e| CoreError::Internal {
                             message: format!("Failed to read template {}: {}", path.display(), e),
                         })?;
 
@@ -138,13 +138,13 @@ impl TemplateManager {
                         .trim_end_matches(".json")
                         .to_string();
 
-                    let content = std::fs::read_to_string(&path)
-                        .map_err(|e| CoreError::Internal {
+                    let content =
+                        std::fs::read_to_string(&path).map_err(|e| CoreError::Internal {
                             message: format!("Failed to read schema {}: {}", path.display(), e),
                         })?;
 
-                    let schema: Value = serde_json::from_str(&content)
-                        .map_err(|e| CoreError::InvalidJsonLd {
+                    let schema: Value =
+                        serde_json::from_str(&content).map_err(|e| CoreError::InvalidJsonLd {
                             message: format!("Invalid JSON schema {}: {}", path.display(), e),
                         })?;
 
@@ -200,7 +200,11 @@ impl TemplateManager {
         self.schemas.read().get(name).cloned()
     }
 
-    pub fn load_prompt_template(&self, agent_type: &str, template_name: &str) -> Result<String, CoreError> {
+    pub fn load_prompt_template(
+        &self,
+        agent_type: &str,
+        template_name: &str,
+    ) -> Result<String, CoreError> {
         let key = if agent_type == "sa" {
             format!("prompts/sa/{}", template_name)
         } else {
@@ -213,7 +217,10 @@ impl TemplateManager {
             .map(|t| t.content.clone())
             .or_else(|| {
                 let alt_key = format!("{}/{}", agent_type, template_name);
-                self.templates.read().get(&alt_key).map(|t| t.content.clone())
+                self.templates
+                    .read()
+                    .get(&alt_key)
+                    .map(|t| t.content.clone())
             })
             .ok_or_else(|| CoreError::Internal {
                 message: format!("Template not found: {}/{}", agent_type, template_name),
@@ -239,7 +246,10 @@ impl TemplateManager {
             })
             .or_else(|| {
                 let direct_key = format!("schemas/{}", schema_name);
-                self.schemas.read().get(&direct_key).map(|s| s.schema.clone())
+                self.schemas
+                    .read()
+                    .get(&direct_key)
+                    .map(|s| s.schema.clone())
             })
             .ok_or_else(|| CoreError::Internal {
                 message: format!("Schema not found: {}/{}", agent_type, schema_name),
@@ -277,7 +287,9 @@ impl TemplateManager {
             if let Ok(schema) = self.load_schema(agent_type, schema_key) {
                 context.insert(
                     "output_schema".to_string(),
-                    serde_json::to_string_pretty(&schema).unwrap_or_default().into(),
+                    serde_json::to_string_pretty(&schema)
+                        .unwrap_or_default()
+                        .into(),
                 );
             } else {
                 warn!(agent_type = %agent_type, schema = %schema_key, "Schema not found, skipping schema inclusion");
@@ -304,7 +316,12 @@ impl TemplateManager {
         result
     }
 
-    pub fn validate_output(&self, agent_type: &str, schema_name: &str, output: &Value) -> Result<bool, CoreError> {
+    pub fn validate_output(
+        &self,
+        agent_type: &str,
+        schema_name: &str,
+        output: &Value,
+    ) -> Result<bool, CoreError> {
         let schema = self.load_schema(agent_type, schema_name)?;
 
         let compiled = jsonschema::JSONSchema::options()
@@ -366,19 +383,35 @@ impl TemplateManager {
 
     pub fn get_template_path(&self, agent_type: &str, template_name: &str) -> PathBuf {
         if agent_type == "sa" {
-            self.template_dir.join("prompts").join("sa").join(format!("{}.md", template_name))
+            self.template_dir
+                .join("prompts")
+                .join("sa")
+                .join(format!("{}.md", template_name))
         } else {
-            self.template_dir.join("prompts").join("workers").join(agent_type).join(format!("{}.md", template_name))
+            self.template_dir
+                .join("prompts")
+                .join("workers")
+                .join(agent_type)
+                .join(format!("{}.md", template_name))
         }
     }
 
     pub fn get_schema_path(&self, agent_type: &str, schema_name: &str) -> PathBuf {
         if agent_type == "sa" {
-            self.template_dir.join("schemas").join("sa").join(format!("{}.json", schema_name))
+            self.template_dir
+                .join("schemas")
+                .join("sa")
+                .join(format!("{}.json", schema_name))
         } else if agent_type == "workers" {
-            self.template_dir.join("schemas").join("workers").join(format!("{}.json", schema_name))
+            self.template_dir
+                .join("schemas")
+                .join("workers")
+                .join(format!("{}.json", schema_name))
         } else {
-            self.template_dir.join("schemas").join(agent_type).join(format!("{}.json", schema_name))
+            self.template_dir
+                .join("schemas")
+                .join(agent_type)
+                .join(format!("{}.json", schema_name))
         }
     }
 
@@ -402,12 +435,18 @@ pub fn build_system_prompt(
     additional_constraints: &HashMap<String, String>,
 ) -> Result<String, CoreError> {
     let mut vars = HashMap::new();
-    vars.insert("task_description".to_string(), Value::String(task_description.to_string()));
+    vars.insert(
+        "task_description".to_string(),
+        Value::String(task_description.to_string()),
+    );
     vars.insert(
         "available_skills".to_string(),
         Value::String(available_skills.join(", ")),
     );
-    vars.insert("context_summary".to_string(), Value::String(context_summary.to_string()));
+    vars.insert(
+        "context_summary".to_string(),
+        Value::String(context_summary.to_string()),
+    );
     for (k, v) in additional_constraints {
         vars.insert(k.clone(), Value::String(v.clone()));
     }
@@ -439,9 +478,14 @@ mod tests {
     #[test]
     fn test_render_with_json() {
         let mut vars = HashMap::new();
-        vars.insert("config".to_string(), Value::Object(vec![
-            ("key".to_string(), Value::String("value".to_string())),
-        ].into_iter().collect()));
+        vars.insert(
+            "config".to_string(),
+            Value::Object(
+                vec![("key".to_string(), Value::String("value".to_string()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
 
         let result = TemplateManager::render_string("Config: {config}", &vars);
         assert!(result.contains("key"));
@@ -451,7 +495,11 @@ mod tests {
     #[test]
     fn test_add_and_get() {
         let engine = TemplateManager::new(Path::new("/nonexistent")).unwrap();
-        engine.add_template("da/system", "You are a DA agent. Task: {task_description}", "da");
+        engine.add_template(
+            "da/system",
+            "You are a DA agent. Task: {task_description}",
+            "da",
+        );
 
         let template = engine.get_template("da/system");
         assert!(template.is_some());
@@ -461,12 +509,15 @@ mod tests {
     #[test]
     fn test_add_and_get_schema() {
         let engine = TemplateManager::new(Path::new("/nonexistent")).unwrap();
-        engine.add_schema("test/output", json!({
-            "type": "object",
-            "properties": {
-                "status": {"type": "string"}
-            }
-        }));
+        engine.add_schema(
+            "test/output",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"}
+                }
+            }),
+        );
 
         let schema = engine.get_schema("test/output");
         assert!(schema.is_some());
@@ -475,13 +526,16 @@ mod tests {
     #[test]
     fn test_validate_output() {
         let engine = TemplateManager::new(Path::new("/nonexistent")).unwrap();
-        engine.add_schema("test/output", json!({
-            "type": "object",
-            "properties": {
-                "status": {"type": "string"}
-            },
-            "required": ["status"]
-        }));
+        engine.add_schema(
+            "test/output",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"}
+                },
+                "required": ["status"]
+            }),
+        );
 
         let valid = json!({"status": "success"});
         let result = engine.validate_output("test", "output", &valid).unwrap();
@@ -502,13 +556,18 @@ mod tests {
         );
 
         let mut vars = HashMap::new();
-        vars.insert("task_description".to_string(), Value::String("Build a web app".to_string()));
+        vars.insert(
+            "task_description".to_string(),
+            Value::String("Build a web app".to_string()),
+        );
         vars.insert(
             "available_skills".to_string(),
             Value::String("file_read, http_request".to_string()),
         );
 
-        let result = engine.render_prompt("sa", "system", &vars, false, None).unwrap();
+        let result = engine
+            .render_prompt("sa", "system", &vars, false, None)
+            .unwrap();
         assert!(result.contains("Build a web app"));
         assert!(result.contains("file_read, http_request"));
     }

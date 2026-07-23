@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use glidinghorse::config::settings::AgentSettings;
 use glidinghorse::core::agent_instance::{AgentInstance, AgentRole};
 use glidinghorse::core::agent_runner::{AgentRunner, TaskContext};
 use glidinghorse::core::event_bus::EventBus;
@@ -20,7 +21,6 @@ use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::skill_registry::SkillRegistry;
-use glidinghorse::config::settings::AgentSettings;
 use glidinghorse::CoreConfig;
 
 const OUTPUT: &str = "/tmp/agent_os_generated";
@@ -40,7 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all(OUTPUT)?;
     let key = std::env::var("DEEPSEEK_API_KEY")?;
-    let url = std::env::var("DEEPSEEK_API_URL").unwrap_or_else(|_| "https://api.deepseek.com".to_string());
+    let url = std::env::var("DEEPSEEK_API_URL")
+        .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
 
     // 基础设施
     let gateway_settings = glidinghorse::config::GatewaySettings {
@@ -57,13 +58,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l0 = Arc::new(L0Store::new(&format!("{}/l0", OUTPUT))?);
     let l2 = Arc::new(Blackboard::new()?);
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
-    let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(l0.clone(), l2.clone(), proj.clone(), CoreConfig::default())));
+    let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
+        l0.clone(),
+        l2.clone(),
+        proj.clone(),
+        CoreConfig::default(),
+    )));
     let skills = Arc::new(SkillRegistry::new());
-    let tmpl = Arc::new(TemplateEngine::new(Path::new("src/templates/templates"))
-        .unwrap_or_else(|_| TemplateEngine::new(Path::new("/nonexistent")).unwrap()));
+    let tmpl = Arc::new(
+        TemplateEngine::new(Path::new("src/templates/templates"))
+            .unwrap_or_else(|_| TemplateEngine::new(Path::new("/nonexistent")).unwrap()),
+    );
     let agent_settings = AgentSettings::default();
     let runner = Arc::new(AgentRunner::new(
-        gw, skills.clone(), l2.clone(), l0.clone(), mm, tmpl, agent_settings,
+        gw,
+        skills.clone(),
+        l2.clone(),
+        l0.clone(),
+        mm,
+        tmpl,
+        agent_settings,
     ));
 
     // 测试 API 连通性
@@ -75,12 +89,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SA 分析任务
     let sa = SupervisorAgent::new(
-        runner.clone(), Arc::new(TemplateEngine::new(Path::new("/nonexistent")).unwrap()),
-        skills.clone(), Arc::new(EventBus::new(100)), 15,
+        runner.clone(),
+        Arc::new(TemplateEngine::new(Path::new("/nonexistent")).unwrap()),
+        skills.clone(),
+        Arc::new(EventBus::new(100)),
+        15,
     );
     let plan = sa.analyze_task(USER_INPUT);
-    println!("[SA] {:?} → {}", plan.task_complexity,
-        plan.agent_sequence.iter().map(|r| r.to_string()).collect::<Vec<_>>().join("→"));
+    println!(
+        "[SA] {:?} → {}",
+        plan.task_complexity,
+        plan.agent_sequence
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("→")
+    );
 
     // SyscallGate
     let mut gate = SyscallGate::new(skills, 2048);
@@ -104,12 +128,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = runner.execute(&mut agent, context).await?;
     if !result.errors.is_empty() {
-        for e in &result.errors { eprintln!("  Error: {}", e); }
+        for e in &result.errors {
+            eprintln!("  Error: {}", e);
+        }
     }
 
     // 结果
-    println!("\n[结果] status={}, turns={}, tools={}",
-        result.status, result.turn_count, result.tool_call_count);
+    println!(
+        "\n[结果] status={}, turns={}, tools={}",
+        result.status, result.turn_count, result.tool_call_count
+    );
     println!("  summary: {}", result.summary);
 
     // 验证文件
@@ -117,14 +145,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for e in std::fs::read_dir(OUTPUT)? {
         let p = e?.path();
         if p.is_file() && p.extension().map_or(false, |e| e == "py") {
-            println!("  {} ({}B)", p.file_name().unwrap_or_default().to_string_lossy(),
-                std::fs::metadata(&p)?.len());
+            println!(
+                "  {} ({}B)",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                std::fs::metadata(&p)?.len()
+            );
         }
     }
 
     // SyscallGate
-    assert!(gate.validate_call("da", "iri://skills/file_read", r#"{"path":"x"}"#).is_ok());
-    assert!(gate.validate_call("unknown", "iri://skills/file_read", r#"{"path":"x"}"#).is_err());
+    assert!(gate
+        .validate_call("da", "iri://skills/file_read", r#"{"path":"x"}"#)
+        .is_ok());
+    assert!(gate
+        .validate_call("unknown", "iri://skills/file_read", r#"{"path":"x"}"#)
+        .is_err());
     let _ = gate.sync_whitelist_to_oxigraph(&l2, "da");
     println!("  SyscallGate: ✓");
 

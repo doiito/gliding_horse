@@ -1,12 +1,14 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-        use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
+use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
-use crate::core::system_prompt::{SystemPromptBuilder, SystemPromptRegion, build_constitution_prompt, build_time_awareness_text};
+use crate::core::system_prompt::{
+    build_constitution_prompt, build_time_awareness_text, SystemPromptBuilder, SystemPromptRegion,
+};
 use crate::gateway::unified_gateway::ChatMessage;
 use crate::jsonld::{JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
@@ -15,7 +17,9 @@ use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
-use super::{TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
+use super::{
+    TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT,
+};
 
 impl super::AgentRunner {
     pub async fn execute(
@@ -133,14 +137,28 @@ impl super::AgentRunner {
 
         {
             let mut mm = self.memory_manager.lock().await;
-            if !result.as_ref().map(|r| r.tracked_actions.is_empty()).unwrap_or(true) {
+            if !result
+                .as_ref()
+                .map(|r| r.tracked_actions.is_empty())
+                .unwrap_or(true)
+            {
                 if let Ok(ref r) = result {
                     let _ = mm.archive_session_actions(&r.task_iri, &r.tracked_actions, &r.summary);
                     if !r.tracked_actions.is_empty() {
-                        let success_rate = r.tracked_actions.iter()
-                            .filter(|a| a.status == crate::core::tracked_action::ActionStatus::Success).count() as f32
+                        let success_rate = r
+                            .tracked_actions
+                            .iter()
+                            .filter(|a| {
+                                a.status == crate::core::tracked_action::ActionStatus::Success
+                            })
+                            .count() as f32
                             / r.tracked_actions.len().max(1) as f32;
-                        let _ = mm.archive_experience(&r.task_iri, &agent.role.to_string(), &r.summary, success_rate);
+                        let _ = mm.archive_experience(
+                            &r.task_iri,
+                            &agent.role.to_string(),
+                            &r.summary,
+                            success_rate,
+                        );
                     }
                 }
             }
@@ -260,20 +278,20 @@ impl super::AgentRunner {
                 .execute(HookPoint::TaskStart, &mut hook_ctx)
                 .await;
             if hook_result == HookResult::Abort {
-            return Ok(TaskResult {
-                task_iri: ctx.task_iri,
-                status: "aborted".to_string(),
-                summary: "Agent aborted by hook".to_string(),
-                output: None,
-                jsonld_output: None,
-                artifacts: Vec::new(),
-                errors: vec!["Agent aborted by hook".to_string()],
-                turn_count: 0,
-                tool_call_count: 0,
-                five_w2h_updates: None,
-                tracked_actions: Vec::new(),
-                archive_iri: None,
-            });
+                return Ok(TaskResult {
+                    task_iri: ctx.task_iri,
+                    status: "aborted".to_string(),
+                    summary: "Agent aborted by hook".to_string(),
+                    output: None,
+                    jsonld_output: None,
+                    artifacts: Vec::new(),
+                    errors: vec!["Agent aborted by hook".to_string()],
+                    turn_count: 0,
+                    tool_call_count: 0,
+                    five_w2h_updates: None,
+                    tracked_actions: Vec::new(),
+                    archive_iri: None,
+                });
             }
         }
 
@@ -378,7 +396,11 @@ impl super::AgentRunner {
             .iter()
             .map(|(name, result)| {
                 let truncated = if result.len() > 2000 {
-                    format!("{}...\n[truncated, original {} chars]", &result[..2000], result.len())
+                    format!(
+                        "{}...\n[truncated, original {} chars]",
+                        &result[..2000],
+                        result.len()
+                    )
                 } else {
                     result.clone()
                 };
@@ -406,7 +428,9 @@ Output the summary report directly, not in JSON format."#,
             prompt_parts.join("\n\n"),
         );
 
-        let model = self.gateway.get_model(&agent.role.to_string().to_lowercase());
+        let model = self
+            .gateway
+            .get_model(&agent.role.to_string().to_lowercase());
         let req_messages = vec![ChatMessage {
             role: "user".to_string(),
             content: prompt,
@@ -416,7 +440,11 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         }];
 
-        match self.gateway.chat_with_params(&model, req_messages, None, None, None, None).await {
+        match self
+            .gateway
+            .chat_with_params(&model, req_messages, None, None, None, None)
+            .await
+        {
             Ok(response) => {
                 if let Some(choice) = response.choices.first() {
                     if let Some(content) = &choice.message.content {
@@ -436,7 +464,6 @@ Output the summary report directly, not in JSON format."#,
             }
         }
     }
-
 
     async fn exec(
         &self,
@@ -460,7 +487,10 @@ Output the summary report directly, not in JSON format."#,
 
         // Region 2: Time awareness — current time and session context
         {
-            let session_start = sess.created_at().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            let session_start = sess
+                .created_at()
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string();
             let time_text = build_time_awareness_text(Some(&session_start));
             prompt_builder.set_region(SystemPromptRegion::TimeAwareness, time_text);
         }
@@ -495,7 +525,9 @@ Output the summary report directly, not in JSON format."#,
             policy_text.push_str("- For files already read, their content is already in your context. No need to re-confirm or re-verify\n");
 
             // Inject methodology discipline (PA/CA/AA specific)
-            if let Some(methodology_addendum) = MethodologyPromptInjector::build_for_role(agent.role) {
+            if let Some(methodology_addendum) =
+                MethodologyPromptInjector::build_for_role(agent.role)
+            {
                 policy_text.push_str(&methodology_addendum);
             }
             // Inject active methodology persuasive directives
@@ -593,21 +625,20 @@ Output the summary report directly, not in JSON format."#,
             .to_string()
         };
 
-        let mut messages: Vec<ChatMessage> = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: system_content,
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-        ];
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+            role: "system".to_string(),
+            content: system_content,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
 
         {
             let executor = self.tool_executor.read();
             if let Some(wm) = executor.get_workspace_monitor() {
-                wm.snapshots().create_snapshot("pre_task", Some(&ctx.task_iri));
+                wm.snapshots()
+                    .create_snapshot("pre_task", Some(&ctx.task_iri));
                 wm.inject_file_perception(Some(&ctx.objective));
             }
         }
@@ -657,11 +688,15 @@ Output the summary report directly, not in JSON format."#,
             for msg in resumed.iter().skip(1) {
                 messages.push(msg.clone());
             }
-            info!("[resume] restored {} history messages from checkpoint", resumed.len().saturating_sub(1));
+            info!(
+                "[resume] restored {} history messages from checkpoint",
+                resumed.len().saturating_sub(1)
+            );
         }
 
         // New user message placed after history as continue instruction
-        let resume_task_parts = if ctx.expected_output.is_empty() && ctx.success_criteria.is_empty() {
+        let resume_task_parts = if ctx.expected_output.is_empty() && ctx.success_criteria.is_empty()
+        {
             format!("Current Task: {}", ctx.objective)
         } else {
             let mut parts = vec![format!("Current Task: {}", ctx.objective)];
@@ -709,13 +744,14 @@ Output the summary report directly, not in JSON format."#,
         let mut recovery_mode_active = false;
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
         // Track error count per tool, early terminate if same tool fails repeatedly
-        let mut tool_error_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        let mut tool_recovery_injected: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut action_tracker = crate::core::tracked_action::ActionTracker::new(
-            &ctx.task_iri,
-            &agent.role.to_string(),
-        );
-        let checkpoint_manager = crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
+        let mut tool_error_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        let mut tool_recovery_injected: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut action_tracker =
+            crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string());
+        let checkpoint_manager =
+            crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
 
         // Track the richest content turn (used for passing archive_iri across agents, pointing to substantive content rather than final turn summary)
         let mut best_content_len: usize = 0;
@@ -741,11 +777,19 @@ Output the summary report directly, not in JSON format."#,
                 "tc": ctx.resumed_tool_count,
                 "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
                 "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
-            }).to_string(),
+            })
+            .to_string(),
             &[start_role_str.clone()],
             Some(&start_role_str),
-            None, None, None, None, None, None,
-            None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ) {
             warn!("[checkpoint] initial save failed: {}", e);
         }
@@ -759,7 +803,10 @@ Output the summary report directly, not in JSON format."#,
             // --- Soft limit phase 1: Early warning (~8 turns remaining) ---
             if !soft_limit_early_warning_sent && turn >= effective_max_turns.saturating_sub(8) {
                 soft_limit_early_warning_sent = true;
-                warn!("[turn {}] soft limit warning: ~8 turns remaining (max={})", turn, effective_max_turns);
+                warn!(
+                    "[turn {}] soft limit warning: ~8 turns remaining (max={})",
+                    turn, effective_max_turns
+                );
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: "【Turn Limit Notice】Please control execution turns. Limited turns remain. Focus on the core task, avoid unnecessary tool calls, and finish as soon as possible.".to_string(),
@@ -772,7 +819,10 @@ Output the summary report directly, not in JSON format."#,
             // --- Soft limit phase 2: Final warning (~3 turns remaining) ---
             if !soft_limit_final_warning_sent && turn >= effective_max_turns.saturating_sub(3) {
                 soft_limit_final_warning_sent = true;
-                warn!("[turn {}] soft limit final warning: ~3 turns remaining (max={})", turn, effective_max_turns);
+                warn!(
+                    "[turn {}] soft limit final warning: ~3 turns remaining (max={})",
+                    turn, effective_max_turns
+                );
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: "【Turn Limit Urgent】Only 3 turns remaining. Please finish your current work and output the final result immediately. Do not initiate new tool calls.".to_string(),
@@ -789,14 +839,22 @@ Output the summary report directly, not in JSON format."#,
                     warn!("[turn {}] max turns {} reached, injecting force-finish directive (no truncation)", turn, effective_max_turns);
                     errs.push("max turns reached".to_string());
                     if let Some(ref event_bus) = self.event_bus {
-                        let _ = event_bus.emit(&ctx.task_iri, "AGENT_BLOCKED", &agent.agent_id, &serde_json::json!({"iterations": turn}).to_string()).await;
+                        let _ = event_bus
+                            .emit(
+                                &ctx.task_iri,
+                                "AGENT_BLOCKED",
+                                &agent.agent_id,
+                                &serde_json::json!({"iterations": turn}).to_string(),
+                            )
+                            .await;
                     }
                     let max_role_str = agent.role.to_string();
                     let tool_error_str = serde_json::json!({
                         "error_counts": tool_error_counts,
                         "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
                     }).to_string();
-                    let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                    let action_str =
+                        serde_json::to_string(&action_tracker.actions).unwrap_or_default();
                     if let Err(e) = checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("max_turns_{}", agent.role),
@@ -828,13 +886,17 @@ Output the summary report directly, not in JSON format."#,
                     // Don't break, let this turn's LLM respond to the force-finish directive
                 } else {
                     // Force-finish already injected, LLM still hasn't completed -> hard stop, take last assistant reply
-                    warn!("[turn {}] LLM still not completed after force-finish, hard stopping", turn);
+                    warn!(
+                        "[turn {}] LLM still not completed after force-finish, hard stopping",
+                        turn
+                    );
                     let force_role_str = agent.role.to_string();
                     let tool_error_str = serde_json::json!({
                         "error_counts": tool_error_counts,
                         "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
                     }).to_string();
-                    let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                    let action_str =
+                        serde_json::to_string(&action_tracker.actions).unwrap_or_default();
                     let _ = checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("force_end_{}", agent.role),
@@ -843,31 +905,56 @@ Output the summary report directly, not in JSON format."#,
                         &serde_json::json!({
                             "turn": turn,
                             "tc": tc,
-                        }).to_string(),
+                        })
+                        .to_string(),
                         &[force_role_str.clone()],
                         Some(&force_role_str),
-                        None, None, None, None, None, None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                         Some(&tool_error_str),
                         Some(&action_str),
                         None,
                     );
                     // Fallback: if no turn has substantive content, aggregate tool results via LLM
-                    let (force_summary, force_output, force_archive) =
-                        if !best_content_str.is_empty() {
-                            let s = Self::generate_auto_summary(&best_content_str);
-                            (s, Some(Value::String(best_content_str.clone())),
-                             if !best_content_iri.is_empty() { Some(best_content_iri.clone()) } else { None })
-                        } else if let Some((agg_summary, agg_content)) =
-                            self.aggregate_tool_results(&messages, agent, &ctx).await
-                        {
-                            (agg_summary, Some(Value::String(agg_content)),
-                             if !best_content_iri.is_empty() { Some(best_content_iri.clone()) } else { None })
-                        } else if let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") {
-                            (Self::generate_auto_summary(&last.content),
-                             Some(Value::String(last.content.clone())), None)
-                        } else {
-                            ("Task not completed".to_string(), None, None)
-                        };
+                    let (force_summary, force_output, force_archive) = if !best_content_str
+                        .is_empty()
+                    {
+                        let s = Self::generate_auto_summary(&best_content_str);
+                        (
+                            s,
+                            Some(Value::String(best_content_str.clone())),
+                            if !best_content_iri.is_empty() {
+                                Some(best_content_iri.clone())
+                            } else {
+                                None
+                            },
+                        )
+                    } else if let Some((agg_summary, agg_content)) =
+                        self.aggregate_tool_results(&messages, agent, &ctx).await
+                    {
+                        (
+                            agg_summary,
+                            Some(Value::String(agg_content)),
+                            if !best_content_iri.is_empty() {
+                                Some(best_content_iri.clone())
+                            } else {
+                                None
+                            },
+                        )
+                    } else if let Some(last) = messages.iter().rev().find(|m| m.role == "assistant")
+                    {
+                        (
+                            Self::generate_auto_summary(&last.content),
+                            Some(Value::String(last.content.clone())),
+                            None,
+                        )
+                    } else {
+                        ("Task not completed".to_string(), None, None)
+                    };
                     return Ok(TaskResult {
                         task_iri: ctx.task_iri,
                         status: "partial_success".to_string(),
@@ -892,7 +979,8 @@ Output the summary report directly, not in JSON format."#,
                 let tool_error_str = serde_json::json!({
                     "error_counts": tool_error_counts,
                     "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
-                }).to_string();
+                })
+                .to_string();
                 let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
                 if let Err(e) = checkpoint_manager.create_ext(
                     &ctx.task_iri,
@@ -904,10 +992,16 @@ Output the summary report directly, not in JSON format."#,
                         "tc": tc,
                         "prompt_tokens": self.total_prompt_tokens.load(Ordering::Relaxed),
                         "completion_tokens": self.total_completion_tokens.load(Ordering::Relaxed),
-                    }).to_string(),
+                    })
+                    .to_string(),
                     &[turn_role_str.clone()],
                     Some(&turn_role_str),
-                    None, None, None, None, None, None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     Some(&tool_error_str),
                     Some(&action_str),
                     None,
@@ -933,7 +1027,10 @@ Output the summary report directly, not in JSON format."#,
                     tool_call_id: None,
                     reasoning_content: None,
                 });
-                info!("[consecutive_failures] triggered recovery mode: {} consecutive failures", consecutive_failures);
+                info!(
+                    "[consecutive_failures] triggered recovery mode: {} consecutive failures",
+                    consecutive_failures
+                );
                 consecutive_failures = 0;
                 continue;
             }
@@ -960,7 +1057,12 @@ Output the summary report directly, not in JSON format."#,
                             tool_call_id: None,
                             reasoning_content: None,
                         });
-                        sess.add_supplement("user", &entry.content, entry.embedding.clone(), Some(entry.relevance_score));
+                        sess.add_supplement(
+                            "user",
+                            &entry.content,
+                            entry.embedding.clone(),
+                            Some(entry.relevance_score),
+                        );
                     }
                 }
             }
@@ -997,7 +1099,8 @@ Output the summary report directly, not in JSON format."#,
             }
 
             // Use ContextWindowManager for dual-dimension compression based on message count and tokens
-            let context_window_compressed = if let Some(ref cwm_lock) = self.context_window_manager {
+            let context_window_compressed = if let Some(ref cwm_lock) = self.context_window_manager
+            {
                 let cwm = cwm_lock.lock().expect("cwm_lock Mutex poisoned");
                 if cwm.should_compress(messages.len(), &messages) {
                     let (compressed, summary_text) = cwm.compress_messages(&messages);
@@ -1096,7 +1199,9 @@ Output the summary report directly, not in JSON format."#,
                 if let Some(sys_msg) = messages.first_mut() {
                     if sys_msg.role == "system" {
                         // Replace rather than append: remove old ToolGuard block to prevent cumulative bloat per turn
-                        if let Some(pos) = sys_msg.content.find("\n\n[ToolGuard Constraint Directive]") {
+                        if let Some(pos) =
+                            sys_msg.content.find("\n\n[ToolGuard Constraint Directive]")
+                        {
                             sys_msg.content.truncate(pos);
                         }
                         sys_msg.content.push_str(&prompt);
@@ -1125,7 +1230,11 @@ Output the summary report directly, not in JSON format."#,
                             .tool_executor
                             .read()
                             .tool_definitions_for_role(&agent.role.to_string());
-                        if current_tools.is_empty() { None } else { Some(current_tools) }
+                        if current_tools.is_empty() {
+                            None
+                        } else {
+                            Some(current_tools)
+                        }
                     },
                     None,
                 )
@@ -1136,10 +1245,14 @@ Output the summary report directly, not in JSON format."#,
 
             // Accumulate token usage
             if let Some(ref usage) = response.usage {
-                self.total_prompt_tokens.fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
-                self.total_completion_tokens.fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
-                self.last_prompt_tokens.store(usage.prompt_tokens as u64, Ordering::Relaxed);
-                self.last_completion_tokens.store(usage.completion_tokens as u64, Ordering::Relaxed);
+                self.total_prompt_tokens
+                    .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.total_completion_tokens
+                    .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                self.last_prompt_tokens
+                    .store(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.last_completion_tokens
+                    .store(usage.completion_tokens as u64, Ordering::Relaxed);
             }
 
             {
@@ -1179,9 +1292,15 @@ Output the summary report directly, not in JSON format."#,
             );
 
             if !parsed.is_valid_json && finish != "tool_calls" {
-                warn!("[turn {}] LLM response is not valid JSON, using fallback", turn);
+                warn!(
+                    "[turn {}] LLM response is not valid JSON, using fallback",
+                    turn
+                );
                 consecutive_failures += 1;
-                debug!("[consecutive_failures] JSON parse failed: {}/3", consecutive_failures);
+                debug!(
+                    "[consecutive_failures] JSON parse failed: {}/3",
+                    consecutive_failures
+                );
             }
 
             let mut action = parsed
@@ -1223,17 +1342,23 @@ Output the summary report directly, not in JSON format."#,
                     timestamp: chrono::Utc::now().timestamp_millis(),
                     event: ExecutionEventKind::Thought(crate::core::execution_event::Thought {
                         agent_id: agent.agent_id.clone(),
-                        thought: if thought_content.is_empty() { parsed.content.clone() } else { thought_content },
+                        thought: if thought_content.is_empty() {
+                            parsed.content.clone()
+                        } else {
+                            thought_content
+                        },
                         action: action.clone(),
                         emphasis: parsed.emphasis.clone(),
                     }),
                 };
-                let _ = event_bus.emit(
-                    &ctx.task_iri,
-                    "THOUGHT",
-                    &agent.agent_id,
-                    &serde_json::to_string(&thought_event).unwrap_or_default(),
-                ).await;
+                let _ = event_bus
+                    .emit(
+                        &ctx.task_iri,
+                        "THOUGHT",
+                        &agent.agent_id,
+                        &serde_json::to_string(&thought_event).unwrap_or_default(),
+                    )
+                    .await;
             }
 
             // Save emphasis content to L0 persistent memory
@@ -1285,14 +1410,11 @@ Output the summary report directly, not in JSON format."#,
                     .await;
             }
 
-            let task_id = ctx.task_iri
+            let task_id = ctx
+                .task_iri
                 .strip_prefix("iri://task/")
                 .unwrap_or_else(|| ctx.task_iri.strip_prefix("iri://").unwrap_or(&ctx.task_iri));
-            let node_iri = format!(
-                "iri://task/{}/turn_{}",
-                task_id,
-                turn
-            );
+            let node_iri = format!("iri://task/{}/turn_{}", task_id, turn);
             if parsed.content.len() > best_content_len {
                 best_content_len = parsed.content.len();
                 best_content_str = parsed.content.clone();
@@ -1351,7 +1473,9 @@ Output the summary report directly, not in JSON format."#,
                 .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
             let l1_turn = sess.add_summary(&agent.role.to_string(), &summary_text, l0_iri.clone());
             // Compute turn embedding and relevance_score
-            if let (Some(ref embedder), Some(ref tracker_lock)) = (&self.embedder, &self.relevance_tracker) {
+            if let (Some(ref embedder), Some(ref tracker_lock)) =
+                (&self.embedder, &self.relevance_tracker)
+            {
                 if let Ok(emb) = embedder.embed(&summary_text).await {
                     let mut tracker = tracker_lock.lock().unwrap();
                     let score = tracker.on_new_input(&emb);
@@ -1389,17 +1513,23 @@ Output the summary report directly, not in JSON format."#,
                     // aggregate from tool results in messages to ensure subsequent agent can read a valid plan
                     let (final_summary, output_value) =
                         if !parsed.content.trim().is_empty() {
-                            (parsed.summary.clone()
-                                .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content)),
-                             Value::String(parsed.content.clone()))
+                            (
+                                parsed.summary.clone().unwrap_or_else(|| {
+                                    Self::generate_auto_summary(&parsed.content)
+                                }),
+                                Value::String(parsed.content.clone()),
+                            )
                         } else if let Some((agg_summary, agg_content)) =
                             self.aggregate_tool_results(&messages, agent, &ctx).await
                         {
                             (agg_summary, Value::String(agg_content))
                         } else {
-                            (parsed.summary.clone()
-                                .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content)),
-                             Value::String(parsed.content.clone()))
+                            (
+                                parsed.summary.clone().unwrap_or_else(|| {
+                                    Self::generate_auto_summary(&parsed.content)
+                                }),
+                                Value::String(parsed.content.clone()),
+                            )
                         };
                     let jsonld_output =
                         self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
@@ -1439,7 +1569,8 @@ Output the summary report directly, not in JSON format."#,
                         "error_counts": tool_error_counts,
                         "recovery_injected": tool_recovery_injected.iter().cloned().collect::<Vec<_>>(),
                     }).to_string();
-                    let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
+                    let action_str =
+                        serde_json::to_string(&action_tracker.actions).unwrap_or_default();
                     if let Err(e) = checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("finish_{}", agent.role),
@@ -1486,25 +1617,34 @@ Output the summary report directly, not in JSON format."#,
                 "tool_call" => {
                     // After soft limit phase 3: intercept tool calls, force current output as final result
                     if soft_limit_force_finish {
-                        warn!("[force-finish] intercepted tool_call={:?}, forcing final output", 
+                        warn!(
+                            "[force-finish] intercepted tool_call={:?}, forcing final output",
                             choice.message.tool_calls.as_ref().map(|c| {
-                                c.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>()
-                            }));
+                                c.iter()
+                                    .map(|t| t.function.name.as_str())
+                                    .collect::<Vec<_>>()
+                            })
+                        );
                         // If parsed.content is empty (tool_calls-only response), try LLM aggregation of existing tool results
-                        let (final_summary, output_value) =
-                            if !parsed.content.trim().is_empty() {
-                                (parsed.summary.clone()
-                                    .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content)),
-                                 Value::String(parsed.content.clone()))
-                            } else if let Some((agg_summary, agg_content)) =
-                                self.aggregate_tool_results(&messages, agent, &ctx).await
-                            {
-                                (agg_summary, Value::String(agg_content))
-                            } else {
-                                (parsed.summary.clone()
-                                    .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content)),
-                                 Value::String(parsed.content.clone()))
-                            };
+                        let (final_summary, output_value) = if !parsed.content.trim().is_empty() {
+                            (
+                                parsed.summary.clone().unwrap_or_else(|| {
+                                    Self::generate_auto_summary(&parsed.content)
+                                }),
+                                Value::String(parsed.content.clone()),
+                            )
+                        } else if let Some((agg_summary, agg_content)) =
+                            self.aggregate_tool_results(&messages, agent, &ctx).await
+                        {
+                            (agg_summary, Value::String(agg_content))
+                        } else {
+                            (
+                                parsed.summary.clone().unwrap_or_else(|| {
+                                    Self::generate_auto_summary(&parsed.content)
+                                }),
+                                Value::String(parsed.content.clone()),
+                            )
+                        };
                         let jsonld_output =
                             self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
                         let intercept_archive = if !best_content_iri.is_empty() {
@@ -1512,7 +1652,11 @@ Output the summary report directly, not in JSON format."#,
                         } else {
                             None
                         };
-                        let force_status = if soft_limit_force_finish && errs.iter().any(|e| e.contains("max turns") || e.contains("force-finish")) {
+                        let force_status = if soft_limit_force_finish
+                            && errs
+                                .iter()
+                                .any(|e| e.contains("max turns") || e.contains("force-finish"))
+                        {
                             "partial_success"
                         } else {
                             "success"
@@ -1547,8 +1691,15 @@ Output the summary report directly, not in JSON format."#,
                                 .collect();
 
                             let force_finish = if let Some(ref tc) = self.tool_controller {
-                                let tool_calls: Vec<(String, Value)> = calls.iter()
-                                    .map(|c| (c.function.name.clone(), serde_json::from_str(&c.function.arguments).unwrap_or_default()))
+                                let tool_calls: Vec<(String, Value)> = calls
+                                    .iter()
+                                    .map(|c| {
+                                        (
+                                            c.function.name.clone(),
+                                            serde_json::from_str(&c.function.arguments)
+                                                .unwrap_or_default(),
+                                        )
+                                    })
                                     .collect();
                                 tc.should_force_finish(&tool_calls, &agent.role)
                             } else {
@@ -1564,17 +1715,23 @@ Output the summary report directly, not in JSON format."#,
 
                                 let (final_summary, output_value) =
                                     if !parsed.content.trim().is_empty() {
-                                        (parsed.summary.clone()
-                                            .unwrap_or_else(|| "PA has formulated a plan".to_string()),
-                                         Value::String(parsed.content.clone()))
+                                        (
+                                            parsed.summary.clone().unwrap_or_else(|| {
+                                                "PA has formulated a plan".to_string()
+                                            }),
+                                            Value::String(parsed.content.clone()),
+                                        )
                                     } else if let Some((agg_summary, agg_content)) =
                                         self.aggregate_tool_results(&messages, agent, &ctx).await
                                     {
                                         (agg_summary, Value::String(agg_content))
                                     } else {
-                                        (parsed.summary.clone()
-                                            .unwrap_or_else(|| "PA has formulated a plan".to_string()),
-                                         Value::String(parsed.content.clone()))
+                                        (
+                                            parsed.summary.clone().unwrap_or_else(|| {
+                                                "PA has formulated a plan".to_string()
+                                            }),
+                                            Value::String(parsed.content.clone()),
+                                        )
                                     };
                                 let jsonld_output = self.apply_output_mapping(
                                     &output_value,
@@ -1604,7 +1761,9 @@ Output the summary report directly, not in JSON format."#,
                             }
                         }
 
-                        let asst_summary = parsed.summary.clone()
+                        let asst_summary = parsed
+                            .summary
+                            .clone()
                             .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
                         messages.push(ChatMessage {
                             role: "assistant".to_string(),
@@ -1645,20 +1804,24 @@ Output the summary report directly, not in JSON format."#,
                                     event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
                                     task_iri: ctx.task_iri.clone(),
                                     timestamp: chrono::Utc::now().timestamp_millis(),
-                                    event: ExecutionEventKind::ToolCall(crate::core::execution_event::ToolCall {
-                                        call_id: c.id.clone(),
-                                        tool_name: name.clone(),
-                                        arguments_json: args_raw.clone(),
-                                        agent_id: agent.agent_id.clone(),
-                                        sequence: tc,
-                                    }),
+                                    event: ExecutionEventKind::ToolCall(
+                                        crate::core::execution_event::ToolCall {
+                                            call_id: c.id.clone(),
+                                            tool_name: name.clone(),
+                                            arguments_json: args_raw.clone(),
+                                            agent_id: agent.agent_id.clone(),
+                                            sequence: tc,
+                                        },
+                                    ),
                                 };
-                                let _ = event_bus.emit(
-                                    &ctx.task_iri,
-                                    "TOOL_CALL",
-                                    &agent.agent_id,
-                                    &serde_json::to_string(&tce).unwrap_or_default(),
-                                ).await;
+                                let _ = event_bus
+                                    .emit(
+                                        &ctx.task_iri,
+                                        "TOOL_CALL",
+                                        &agent.agent_id,
+                                        &serde_json::to_string(&tce).unwrap_or_default(),
+                                    )
+                                    .await;
                             }
 
                             {
@@ -1673,7 +1836,9 @@ Output the summary report directly, not in JSON format."#,
                                     .execute(HookPoint::SkillBefore, &mut hook_ctx)
                                     .await;
                                 // Capture ToolGuard pre-injections for next LLM call
-                                if let Some(injections) = hook_ctx.metadata.remove("guard_pre_injections") {
+                                if let Some(injections) =
+                                    hook_ctx.metadata.remove("guard_pre_injections")
+                                {
                                     if let Value::Array(arr) = injections {
                                         for v in arr {
                                             if let Some(s) = v.as_str() {
@@ -1684,26 +1849,42 @@ Output the summary report directly, not in JSON format."#,
                                 }
                             }
 
-                            let handler = {
-                                let executor = self.tool_executor.read();
-                                executor.try_get_handler(name)
-                            };
                             let started_at = std::time::Instant::now();
                             let args_clone = args.clone();
-                            let result = match handler {
-                                Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
-                                None => json!({"error": format!("Tool not found: {}", name)}),
-                            };
-                            action_tracker.record(name, &args_clone, &result, started_at.elapsed().as_secs_f64());
+                            // Clone before awaiting to keep the executor lock
+                            // out of the handler's async I/O path.  Unlike a
+                            // direct handler call this also applies executor
+                            // permission, syscall and hook policies.
+                            let executor = self.tool_executor.read().clone();
+                            let result = executor
+                                .execute_with_security_context(
+                                    name,
+                                    args,
+                                    crate::skill_graph::security::SecurityContext::new(
+                                        &agent.agent_id,
+                                        &agent.role.to_string(),
+                                    )
+                                    .with_task(&ctx.task_iri),
+                                )
+                                .await
+                                .unwrap_or_else(|e| json!({"error": e}));
+                            action_tracker.record(
+                                name,
+                                &args_clone,
+                                &result,
+                                started_at.elapsed().as_secs_f64(),
+                            );
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
-                            let mut result_str = self.route_tool_result(
-                                &raw_result_str,
-                                name,
-                                &c.id,
-                            ).await;
+                            let mut result_str =
+                                self.route_tool_result(&raw_result_str, name, &c.id).await;
 
-                            debug!("  [tool] {} result: {} bytes (raw: {} bytes)", name, result_str.len(), raw_result_str.len());
+                            debug!(
+                                "  [tool] {} result: {} bytes (raw: {} bytes)",
+                                name,
+                                result_str.len(),
+                                raw_result_str.len()
+                            );
 
                             // Emit tool_result event for TUI display
                             if let Some(ref event_bus) = self.event_bus {
@@ -1711,22 +1892,26 @@ Output the summary report directly, not in JSON format."#,
                                     event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
                                     task_iri: ctx.task_iri.clone(),
                                     timestamp: chrono::Utc::now().timestamp_millis(),
-                                    event: ExecutionEventKind::ToolResult(crate::core::execution_event::ToolResult {
-                                        call_id: c.id.clone(),
-                                        tool_name: name.clone(),
-                                        result: result_str.clone(),
-                                        success: result.get("error").is_none(),
-                                        result_size_bytes: result_str.len() as u32,
-                                        duration_ms: 0,
-                                        agent_id: agent.agent_id.clone(),
-                                    }),
+                                    event: ExecutionEventKind::ToolResult(
+                                        crate::core::execution_event::ToolResult {
+                                            call_id: c.id.clone(),
+                                            tool_name: name.clone(),
+                                            result: result_str.clone(),
+                                            success: result.get("error").is_none(),
+                                            result_size_bytes: result_str.len() as u32,
+                                            duration_ms: 0,
+                                            agent_id: agent.agent_id.clone(),
+                                        },
+                                    ),
                                 };
-                                let _ = event_bus.emit(
-                                    &ctx.task_iri,
-                                    "TOOL_RESULT",
-                                    &agent.agent_id,
-                                    &serde_json::to_string(&tre).unwrap_or_default(),
-                                ).await;
+                                let _ = event_bus
+                                    .emit(
+                                        &ctx.task_iri,
+                                        "TOOL_RESULT",
+                                        &agent.agent_id,
+                                        &serde_json::to_string(&tre).unwrap_or_default(),
+                                    )
+                                    .await;
                             }
 
                             if let Some(ref compressor_lock) = self.tool_result_compressor {
@@ -1766,9 +1951,13 @@ Output the summary report directly, not in JSON format."#,
                                     // consecutive_failures only tracks LLM-level failures (JSON parse failures, etc.).
                                     // Tool errors are normal operational feedback -- LLM has received the error and can adjust strategy.
                                     // Repeated failure of the same tool is handled by the independent tool_error_counts counter.
-                                    let tool_count = tool_error_counts.entry(name.clone()).or_insert(0);
+                                    let tool_count =
+                                        tool_error_counts.entry(name.clone()).or_insert(0);
                                     *tool_count += 1;
-                                    debug!("[tool_error] {} failure count: {}/3", name, *tool_count);
+                                    debug!(
+                                        "[tool_error] {} failure count: {}/3",
+                                        name, *tool_count
+                                    );
                                     if *tool_count >= 3 && !tool_recovery_injected.contains(name) {
                                         warn!("[tool_error] {} failed {} consecutive times, injecting recovery guidance", name, *tool_count);
                                         tool_recovery_injected.insert(name.clone());
@@ -1781,12 +1970,22 @@ Output the summary report directly, not in JSON format."#,
                                     }
                                 }
                                 if let Some(ref event_bus) = self.event_bus {
-                                    let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err, "tool": name}).to_string()).await;
+                                    let _ = event_bus
+                                        .emit(
+                                            &ctx.task_iri,
+                                            "AGENT_ERROR",
+                                            &agent.agent_id,
+                                            &serde_json::json!({"error": err, "tool": name})
+                                                .to_string(),
+                                        )
+                                        .await;
                                 }
                             } else {
                                 info!("[tool] {} succeeded", name);
                                 if recovery_mode_active {
-                                    info!("[consecutive_failures] recovery mode exited successfully");
+                                    info!(
+                                        "[consecutive_failures] recovery mode exited successfully"
+                                    );
                                 }
                                 consecutive_failures = 0;
                                 recovery_mode_active = false;
@@ -1804,12 +2003,15 @@ Output the summary report directly, not in JSON format."#,
                                 .with_task(&ctx.task_iri, &ctx.task_iri)
                                 .with_data("tool_name", Value::String(name.clone()))
                                 .with_data("tool_result", Value::String(raw_result_str.clone()));
-                                let hook_result = self.hook_manager
+                                let hook_result = self
+                                    .hook_manager
                                     .execute(HookPoint::SkillAfter, &mut hook_ctx)
                                     .await;
 
                                 if hook_result == HookResult::Abort {
-                                    let guard_msg = hook_ctx.error.unwrap_or_else(|| "Tool result rejected by guard".to_string());
+                                    let guard_msg = hook_ctx.error.unwrap_or_else(|| {
+                                        "Tool result rejected by guard".to_string()
+                                    });
                                     warn!("[tool] {} ToolGuard intercepted: {}", name, guard_msg);
                                     messages.push(ChatMessage {
                                         role: "tool".to_string(),
@@ -1853,7 +2055,9 @@ Output the summary report directly, not in JSON format."#,
                         continue;
                     } else {
                         warn!("[ReAct] action=tool_call but no tool_calls, continuing to think");
-                        let asst_summary = parsed.summary.clone()
+                        let asst_summary = parsed
+                            .summary
+                            .clone()
                             .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
                         messages.push(ChatMessage {
                             role: "assistant".to_string(),
@@ -1881,7 +2085,9 @@ Output the summary report directly, not in JSON format."#,
                     }
                 }
                 "continue" => {
-                    let asst_summary = parsed.summary.clone()
+                    let asst_summary = parsed
+                        .summary
+                        .clone()
                         .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
                     messages.push(ChatMessage {
                         role: "assistant".to_string(),
@@ -1909,7 +2115,9 @@ Output the summary report directly, not in JSON format."#,
                 }
                 _ => {
                     warn!("[ReAct] unknown action: {}, continuing to think", action);
-                    let asst_summary = parsed.summary.clone()
+                    let asst_summary = parsed
+                        .summary
+                        .clone()
                         .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
                     messages.push(ChatMessage {
                         role: "assistant".to_string(),
@@ -1942,19 +2150,36 @@ Output the summary report directly, not in JSON format."#,
         // Prefer the best content turn's output (with substantive content) over the last assistant reply's short summary
         let (unfinished_status, unfinished_summary, unfinished_output, unfinished_archive) =
             if !best_content_str.is_empty() {
-                ("partial_success".to_string(),
-                 Self::generate_auto_summary(&best_content_str),
-                 Some(Value::String(best_content_str.clone())),
-                 if !best_content_iri.is_empty() { Some(best_content_iri.clone()) } else { None })
+                (
+                    "partial_success".to_string(),
+                    Self::generate_auto_summary(&best_content_str),
+                    Some(Value::String(best_content_str.clone())),
+                    if !best_content_iri.is_empty() {
+                        Some(best_content_iri.clone())
+                    } else {
+                        None
+                    },
+                )
             } else if let Some((agg_summary, agg_content)) =
                 self.aggregate_tool_results(&messages, agent, &ctx).await
             {
-                ("partial_success".to_string(), agg_summary, Some(Value::String(agg_content)),
-                 if !best_content_iri.is_empty() { Some(best_content_iri.clone()) } else { None })
+                (
+                    "partial_success".to_string(),
+                    agg_summary,
+                    Some(Value::String(agg_content)),
+                    if !best_content_iri.is_empty() {
+                        Some(best_content_iri.clone())
+                    } else {
+                        None
+                    },
+                )
             } else if let Some(last) = messages.iter().rev().find(|m| m.role == "assistant") {
-                ("partial_success".to_string(),
-                 Self::generate_auto_summary(&last.content),
-                 Some(Value::String(last.content.clone())), None)
+                (
+                    "partial_success".to_string(),
+                    Self::generate_auto_summary(&last.content),
+                    Some(Value::String(last.content.clone())),
+                    None,
+                )
             } else if tc > 0 {
                 ("partial_success".to_string(),
                  format!("Task partially completed. Executed {} turns, {} tool calls, {} remaining. Errors: {}.", turn, tc, effective_max_turns.saturating_sub(turn), errs.len()),
@@ -1988,55 +2213,59 @@ Output the summary report directly, not in JSON format."#,
             .filter(|w| w.len() >= 3)
             .collect();
 
-        let dynamic_query;
-        let sparql: &str = if keywords.is_empty() {
-            "\
-                SELECT DISTINCT ?s ?label ?type WHERE {\
+        // Query the two dataset scopes with static SPARQL and filter keywords
+        // below. This avoids interpolating task text into SPARQL and keeps
+        // default/named-graph coverage exactly identical.
+        let sparql = "\
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\
+            SELECT DISTINCT ?s ?label ?type WHERE {\
+                {\
                     ?s a ?type .\
                     OPTIONAL { ?s rdfs:label ?label }\
                     OPTIONAL { ?s <http://schema.org/name> ?label }\
-                } ORDER BY DESC(?label) LIMIT 10\
-            "
-        } else {
-            let keyword_filters: String = keywords
-                .iter()
-                .map(|k| {
-                    format!(
-                        "{{ ?s <http://schema.org/name> ?name . FILTER(CONTAINS(LCASE(STR(?name)), LCASE(\"{}\"))) }} \
-                         UNION {{ ?s rdfs:label ?label . FILTER(CONTAINS(LCASE(STR(?label)), LCASE(\"{}\"))) }} \
-                         UNION {{ FILTER(CONTAINS(LCASE(STR(?s)), LCASE(\"{}\"))) }}",
-                        k, k, k
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" UNION ");
+                } UNION { GRAPH ?graph {\
+                    ?s a ?type .\
+                    OPTIONAL { ?s rdfs:label ?label }\
+                    OPTIONAL { ?s <http://schema.org/name> ?label }\
+                }}\
+            } ORDER BY DESC(?label) LIMIT 50\
+        ";
 
-            dynamic_query = format!(
-                "\
-                    SELECT DISTINCT ?s ?label ?type WHERE {{\
-                        {{ {} }} \
-                        OPTIONAL {{ ?s rdfs:label ?label }} \
-                        OPTIONAL {{ ?s a ?type }} \
-                    }} LIMIT 10\
-                ",
-                keyword_filters
-            );
-            dynamic_query.as_str()
+        use oxigraph::sparql::{QueryResults as Qr, QuerySolution, SparqlEvaluator};
+        let query = match SparqlEvaluator::new().parse_query(sparql) {
+            Ok(query) => query,
+            Err(_) => return String::new(),
         };
-
-        use oxigraph::sparql::QueryResults as Qr;
-        use oxigraph::sparql::QuerySolution;
-        let solutions: Vec<QuerySolution> = match store.query(sparql) {
+        let solutions: Vec<QuerySolution> = match query.on_store(store).execute() {
             Ok(Qr::Solutions(it)) => it.filter_map(Result::ok).collect(),
             _ => return String::new(),
         };
 
         let mut lines: Vec<String> = Vec::new();
         for solution in &solutions {
-            let s = solution.get("s").map(|v| format!("{}", v)).unwrap_or_default();
-            let label = solution.get("label").map(|v| format!("{}", v)).unwrap_or_default();
-            let type_ = solution.get("type").map(|v| format!("{}", v)).unwrap_or_default();
+            let s = solution
+                .get("s")
+                .map(|v| format!("{}", v))
+                .unwrap_or_default();
+            let label = solution
+                .get("label")
+                .map(|v| format!("{}", v))
+                .unwrap_or_default();
+            let type_ = solution
+                .get("type")
+                .map(|v| format!("{}", v))
+                .unwrap_or_default();
             if s.is_empty() {
+                continue;
+            }
+            if !keywords.is_empty()
+                && !keywords.iter().any(|keyword| {
+                    let keyword = keyword.to_lowercase();
+                    s.to_lowercase().contains(&keyword)
+                        || label.to_lowercase().contains(&keyword)
+                        || type_.to_lowercase().contains(&keyword)
+                })
+            {
                 continue;
             }
             let name = if !label.is_empty() { label } else { s.clone() };
@@ -2060,5 +2289,61 @@ Output the summary report directly, not in JSON format."#,
         );
         result.push_str(&lines.join("\n"));
         result
+    }
+}
+
+#[cfg(test)]
+mod kg_context_tests {
+    use crate::core::agent_runner::AgentRunner;
+    use oxigraph::model::{GraphName, Literal, NamedNode, Quad};
+    use oxigraph::store::Store;
+
+    #[test]
+    fn kg_context_includes_default_and_named_graph_entities() {
+        let store = Store::new().unwrap();
+        let rdf_type = NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").unwrap();
+        let schema_name = NamedNode::new("http://schema.org/name").unwrap();
+        let entity_type = NamedNode::new("https://example.org/Type").unwrap();
+
+        let default_subject = NamedNode::new("https://example.org/default").unwrap();
+        store
+            .insert(&Quad::new(
+                default_subject.clone(),
+                rdf_type.clone(),
+                entity_type.clone(),
+                GraphName::DefaultGraph,
+            ))
+            .unwrap();
+        store
+            .insert(&Quad::new(
+                default_subject,
+                schema_name.clone(),
+                Literal::new_simple_literal("Default Alpha"),
+                GraphName::DefaultGraph,
+            ))
+            .unwrap();
+
+        let named_subject = NamedNode::new("https://example.org/named").unwrap();
+        let graph = NamedNode::new("https://example.org/graph").unwrap();
+        store
+            .insert(&Quad::new(
+                named_subject.clone(),
+                rdf_type,
+                entity_type,
+                graph.clone(),
+            ))
+            .unwrap();
+        store
+            .insert(&Quad::new(
+                named_subject,
+                schema_name,
+                Literal::new_simple_literal("Named Alpha"),
+                graph,
+            ))
+            .unwrap();
+
+        let context = AgentRunner::build_kg_context(&store, "find alpha information");
+        assert!(context.contains("Default Alpha"), "{context}");
+        assert!(context.contains("Named Alpha"), "{context}");
     }
 }

@@ -1,8 +1,8 @@
 use crate::core::CoreError;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l2_blackboard::Blackboard;
-use crate::CoreConfig;
 use crate::skill_graph::types::*;
+use crate::CoreConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -109,29 +109,44 @@ impl BootstrapEngine {
         }
     }
 
-    pub async fn learn_from_task(&self, request: LearnRequest) -> Result<BootstrapResult, CoreError> {
+    pub async fn learn_from_task(
+        &self,
+        request: LearnRequest,
+    ) -> Result<BootstrapResult, CoreError> {
         if request.quality_score < self.config.min_quality_score {
-            return Err(CoreError::ValidationFailed { message: format!(
-                "Quality score {} below minimum {}",
-                request.quality_score, self.config.min_quality_score
-            ) });
+            return Err(CoreError::ValidationFailed {
+                message: format!(
+                    "Quality score {} below minimum {}",
+                    request.quality_score, self.config.min_quality_score
+                ),
+            });
         }
 
         if !request.outcome.success {
-            return Err(CoreError::ValidationFailed { message:
-                "Cannot learn from failed task execution".to_string()
+            return Err(CoreError::ValidationFailed {
+                message: "Cannot learn from failed task execution".to_string(),
+            });
+        }
+
+        if request.execution_steps.len() > self.config.max_skill_complexity as usize {
+            return Err(CoreError::ValidationFailed {
+                message: format!(
+                    "Execution has {} steps, exceeding maximum skill complexity {}",
+                    request.execution_steps.len(),
+                    self.config.max_skill_complexity,
+                ),
             });
         }
 
         let skill_iri = self.generate_skill_iri(&request.task_iri);
         let skill_name = self.extract_skill_name(&request.task_description);
-        
+
         let w2h = self.build_5w2h_from_execution(&request);
         let content = self.build_content_from_steps(&request.execution_steps);
-        
+
         let security_info = SkillSecurityInfo::new(SkillSource::BootstrapLearn)
             .with_trust_level(TrustLevel::from_success_rate(request.quality_score));
-        
+
         let mut skill = SkillGraphNode::new(&skill_iri, &skill_name, &request.task_description)
             .with_node_type(SkillNodeType::Bootstrap)
             .with_5w2h(w2h)
@@ -142,18 +157,18 @@ impl BootstrapEngine {
         skill.tags = self.extract_tags(&request);
         skill.graph_meta.avg_token_consumption = request.outcome.tokens_used;
 
-        let bootstrap_source = BootstrapSource::new(
-            BootstrapSourceType::TaskExecution,
-            &request.agent_id,
-        )
-        .with_task(&request.task_iri)
-        .with_quality_score(request.quality_score);
+        let bootstrap_source =
+            BootstrapSource::new(BootstrapSourceType::TaskExecution, &request.agent_id)
+                .with_task(&request.task_iri)
+                .with_quality_score(request.quality_score);
 
         self.store_skill(&skill, StorageTier::L0Permanent).await?;
 
         {
             let mut meta = self.bootstrap_meta.write().await;
-            let entry = meta.entry(skill_iri.clone()).or_insert_with(SkillBootstrapMeta::new);
+            let entry = meta
+                .entry(skill_iri.clone())
+                .or_insert_with(SkillBootstrapMeta::new);
             entry.record_learn(bootstrap_source);
         }
 
@@ -171,33 +186,36 @@ impl BootstrapEngine {
 
     pub async fn reduce_skill(&self, request: ReduceRequest) -> Result<BootstrapResult, CoreError> {
         let source_skill = self.retrieve_skill(&request.source_skill_iri).await?;
-        
+
         let reduced_iri = format!("{}:reduced", request.source_skill_iri);
         let reduced_name = format!("{} (Reduced)", source_skill.name);
-        
+
         let reduced_content = self.reduce_content(
             &source_skill.content,
             &request.context,
             &request.focus_areas,
         );
-        
+
         let reduced_w2h = self.reduce_5w2h(&source_skill.w2h, &request.context);
-        
+
         let security_info = SkillSecurityInfo::new(SkillSource::BootstrapReduce)
             .with_trust_level(source_skill.get_trust_level());
-        
-        let mut reduced_skill = SkillGraphNode::new(&reduced_iri, &reduced_name, &source_skill.description)
-            .with_node_type(SkillNodeType::Bootstrap)
-            .with_5w2h(reduced_w2h)
-            .with_security_info(security_info)
-            .with_storage_tier(StorageTier::L2Blackboard);
+
+        let mut reduced_skill =
+            SkillGraphNode::new(&reduced_iri, &reduced_name, &source_skill.description)
+                .with_node_type(SkillNodeType::Bootstrap)
+                .with_5w2h(reduced_w2h)
+                .with_security_info(security_info)
+                .with_storage_tier(StorageTier::L2Blackboard);
 
         reduced_skill.content = reduced_content;
         reduced_skill.tags = self.filter_tags(&source_skill.tags, &request.focus_areas);
-        
+
         {
             let mut meta = self.bootstrap_meta.write().await;
-            let entry = meta.entry(reduced_iri.clone()).or_insert_with(SkillBootstrapMeta::new);
+            let entry = meta
+                .entry(reduced_iri.clone())
+                .or_insert_with(SkillBootstrapMeta::new);
             entry.set_parent(&request.source_skill_iri);
             entry.record_reduce(&reduced_iri);
         }
@@ -209,7 +227,8 @@ impl BootstrapEngine {
             }
         }
 
-        self.store_skill(&reduced_skill, StorageTier::L2Blackboard).await?;
+        self.store_skill(&reduced_skill, StorageTier::L2Blackboard)
+            .await?;
 
         let quality_score = self.calculate_reduce_quality(&source_skill, &reduced_skill);
 
@@ -230,9 +249,9 @@ impl BootstrapEngine {
         tokens_used: u32,
     ) -> Result<(), CoreError> {
         let mut skill = self.retrieve_skill(skill_iri).await?;
-        
+
         skill.graph_meta.record_usage(success);
-        skill.graph_meta.avg_token_consumption = 
+        skill.graph_meta.avg_token_consumption =
             (skill.graph_meta.avg_token_consumption + tokens_used) / 2;
 
         if let Some(ref mut security_info) = skill.security_info {
@@ -258,31 +277,38 @@ impl BootstrapEngine {
         Ok(meta.keys().cloned().collect())
     }
 
-    pub async fn check_auto_reduce(&self, skill_iri: &str) -> Result<Option<ReduceRequest>, CoreError> {
+    pub async fn check_auto_reduce(
+        &self,
+        skill_iri: &str,
+    ) -> Result<Option<ReduceRequest>, CoreError> {
         if !self.config.enable_auto_reduce {
             return Ok(None);
         }
 
-        let meta = self.bootstrap_meta.read().await;
-        if let Some(bootstrap_meta) = meta.get(skill_iri) {
-            if bootstrap_meta.learn_count >= self.config.reduce_threshold_uses {
-                let skill = self.retrieve_skill(skill_iri).await?;
-                
-                return Ok(Some(ReduceRequest {
-                    source_skill_iri: skill_iri.to_string(),
-                    context: "Auto-reduce based on usage patterns".to_string(),
-                    focus_areas: skill.tags.clone(),
-                    agent_id: "system:auto-reduce".to_string(),
-                }));
-            }
+        // `learn_count` measures how many bootstrap requests created a node,
+        // not how often this particular skill was exercised. Reduction is a
+        // usage-driven suggestion, so its evidence must come from the
+        // persisted SkillGraphMeta updated by `update_skill_quality`.
+        let skill = self.retrieve_skill(skill_iri).await?;
+        if skill.graph_meta.usage_count < self.config.reduce_threshold_uses
+            || skill.graph_meta.success_rate < self.config.min_success_rate
+        {
+            return Ok(None);
         }
 
-        Ok(None)
+        Ok(Some(ReduceRequest {
+            source_skill_iri: skill_iri.to_string(),
+            context: "Auto-reduce based on observed successful usage patterns".to_string(),
+            focus_areas: skill.tags.clone(),
+            agent_id: "system:auto-reduce".to_string(),
+        }))
     }
 
     fn generate_skill_iri(&self, task_iri: &str) -> String {
-        format!("iri://skills/bootstrap/{}", 
-            task_iri.replace("iri://task/", "").replace("/", "-"))
+        format!(
+            "iri://skills/bootstrap/{}",
+            task_iri.replace("iri://task/", "").replace("/", "-")
+        )
     }
 
     fn extract_skill_name(&self, description: &str) -> String {
@@ -324,11 +350,7 @@ impl BootstrapEngine {
             .iter()
             .enumerate()
             .map(|(i, step)| {
-                let mut skill_step = SkillStep::new(
-                    &format!("step-{}", i),
-                    i as u32,
-                    &step.action,
-                );
+                let mut skill_step = SkillStep::new(&format!("step-{}", i), i as u32, &step.action);
                 if let Some(ref tool) = step.tool_used {
                     skill_step = skill_step.with_reference(&format!("tool:{}", tool));
                 }
@@ -348,13 +370,13 @@ impl BootstrapEngine {
 
     fn extract_tags(&self, request: &LearnRequest) -> Vec<String> {
         let mut tags = vec!["bootstrap".to_string(), "learned".to_string()];
-        
+
         for step in &request.execution_steps {
             if let Some(ref tool) = step.tool_used {
                 tags.push(format!("tool:{}", tool));
             }
         }
-        
+
         tags.sort();
         tags.dedup();
         tags
@@ -367,12 +389,13 @@ impl BootstrapEngine {
         focus_areas: &[String],
     ) -> Option<SkillContent> {
         content.as_ref().map(|c| {
-            let filtered_steps: Vec<SkillStep> = c.steps
+            let filtered_steps: Vec<SkillStep> = c
+                .steps
                 .iter()
                 .filter(|step| {
-                    focus_areas.iter().any(|focus| {
-                        step.action.to_lowercase().contains(&focus.to_lowercase())
-                    })
+                    focus_areas
+                        .iter()
+                        .any(|focus| step.action.to_lowercase().contains(&focus.to_lowercase()))
                 })
                 .cloned()
                 .collect();
@@ -408,9 +431,9 @@ impl BootstrapEngine {
         let mut filtered: Vec<String> = tags
             .iter()
             .filter(|tag| {
-                focus_areas.iter().any(|focus| {
-                    tag.to_lowercase().contains(&focus.to_lowercase())
-                })
+                focus_areas
+                    .iter()
+                    .any(|focus| tag.to_lowercase().contains(&focus.to_lowercase()))
             })
             .cloned()
             .collect();
@@ -419,32 +442,44 @@ impl BootstrapEngine {
     }
 
     fn calculate_reduce_quality(&self, original: &SkillGraphNode, reduced: &SkillGraphNode) -> f32 {
-        let original_steps = original.content.as_ref().map(|c| c.steps.len()).unwrap_or(0);
+        let original_steps = original
+            .content
+            .as_ref()
+            .map(|c| c.steps.len())
+            .unwrap_or(0);
         let reduced_steps = reduced.content.as_ref().map(|c| c.steps.len()).unwrap_or(0);
-        
+
         if original_steps == 0 {
             return 0.5;
         }
 
         let efficiency_gain = 1.0 - (reduced_steps as f32 / original_steps as f32);
         let trust_factor = reduced.get_trust_level() as u8 as f32 / 4.0;
-        
+
         (0.5 + efficiency_gain * 0.3 + trust_factor * 0.2).min(1.0)
     }
 
-    async fn store_skill(&self, skill: &SkillGraphNode, tier: StorageTier) -> Result<(), CoreError> {
+    async fn store_skill(
+        &self,
+        skill: &SkillGraphNode,
+        tier: StorageTier,
+    ) -> Result<(), CoreError> {
         match tier {
             StorageTier::L0Permanent => {
                 let store = self.l0_store.read().await;
-                let json = serde_json::to_string(skill)
-                    .map_err(|e| CoreError::ValidationFailed { message: format!("JSON error: {}", e) })?;
+                let json =
+                    serde_json::to_string(skill).map_err(|e| CoreError::ValidationFailed {
+                        message: format!("JSON error: {}", e),
+                    })?;
                 store.store(&skill.skill_iri, &json)?;
             }
             StorageTier::L2Blackboard => {
                 let blackboard = self.l2_blackboard.read().await;
                 let json_ld = skill.to_json_ld();
-                let json_str = serde_json::to_string(&json_ld)
-                    .map_err(|e| CoreError::ValidationFailed { message: format!("JSON error: {}", e) })?;
+                let json_str =
+                    serde_json::to_string(&json_ld).map_err(|e| CoreError::ValidationFailed {
+                        message: format!("JSON error: {}", e),
+                    })?;
                 blackboard.write_node(&skill.skill_iri, &json_str, &self.core_config)?;
             }
             _ => {}
@@ -456,8 +491,11 @@ impl BootstrapEngine {
         {
             let store = self.l0_store.read().await;
             if let Some(entry) = store.retrieve(skill_iri)? {
-                let skill: SkillGraphNode = serde_json::from_str(&entry.content)
-                    .map_err(|e| CoreError::ValidationFailed { message: format!("JSON parse error: {}", e) })?;
+                let skill: SkillGraphNode = serde_json::from_str(&entry.content).map_err(|e| {
+                    CoreError::ValidationFailed {
+                        message: format!("JSON parse error: {}", e),
+                    }
+                })?;
                 return Ok(skill);
             }
         }
@@ -470,26 +508,34 @@ impl BootstrapEngine {
             }
         }
 
-        Err(CoreError::SkillNotFound { iri: skill_iri.to_string() })
+        Err(CoreError::SkillNotFound {
+            iri: skill_iri.to_string(),
+        })
     }
 
     async fn index_to_l2(&self, skill: &SkillGraphNode) -> Result<(), CoreError> {
         let blackboard = self.l2_blackboard.read().await;
         let json_ld = skill.to_json_ld();
-        let json_str = serde_json::to_string(&json_ld)
-            .map_err(|e| CoreError::ValidationFailed { message: format!("JSON error: {}", e) })?;
+        let json_str =
+            serde_json::to_string(&json_ld).map_err(|e| CoreError::ValidationFailed {
+                message: format!("JSON error: {}", e),
+            })?;
         blackboard.write_node(&skill.skill_iri, &json_str, &self.core_config)?;
         Ok(())
     }
 
     fn json_ld_to_skill(&self, json_ld: &str) -> Result<SkillGraphNode, CoreError> {
-        let parsed: serde_json::Value = serde_json::from_str(json_ld)
-            .map_err(|e| CoreError::ValidationFailed { message: format!("JSON parse error: {}", e) })?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_ld).map_err(|e| CoreError::ValidationFailed {
+                message: format!("JSON parse error: {}", e),
+            })?;
 
         let skill_iri = parsed
             .get("@id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| CoreError::ValidationFailed { message: "Missing @id".to_string() })?
+            .ok_or_else(|| CoreError::ValidationFailed {
+                message: "Missing @id".to_string(),
+            })?
             .to_string();
 
         let name = parsed
@@ -511,6 +557,18 @@ impl BootstrapEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_engine(config: BootstrapConfig) -> (BootstrapEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(RwLock::new(
+            L0Store::new(dir.path().to_str().unwrap()).unwrap(),
+        ));
+        let l2 = Arc::new(RwLock::new(Blackboard::new().unwrap()));
+        (
+            BootstrapEngine::new(l0, l2, CoreConfig::default(), config),
+            dir,
+        )
+    }
 
     fn create_test_learn_request() -> LearnRequest {
         LearnRequest {
@@ -602,5 +660,65 @@ mod tests {
         };
 
         assert_eq!(request.focus_areas.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_reduce_requires_observed_usage_and_success_rate() {
+        let config = BootstrapConfig {
+            reduce_threshold_uses: 2,
+            min_success_rate: 0.8,
+            ..BootstrapConfig::default()
+        };
+        let (engine, _dir) = test_engine(config);
+        let learned = engine
+            .learn_from_task(create_test_learn_request())
+            .await
+            .unwrap();
+
+        // One bootstrap creation is not two uses of the created skill.
+        assert!(engine
+            .check_auto_reduce(&learned.skill_iri)
+            .await
+            .unwrap()
+            .is_none());
+
+        engine
+            .update_skill_quality(&learned.skill_iri, true, 100)
+            .await
+            .unwrap();
+        engine
+            .update_skill_quality(&learned.skill_iri, true, 100)
+            .await
+            .unwrap();
+        assert!(engine
+            .check_auto_reduce(&learned.skill_iri)
+            .await
+            .unwrap()
+            .is_some());
+
+        // A later failure lowers the empirical success rate below the policy
+        // threshold and suppresses the suggestion again.
+        engine
+            .update_skill_quality(&learned.skill_iri, false, 100)
+            .await
+            .unwrap();
+        assert!(engine
+            .check_auto_reduce(&learned.skill_iri)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn learn_rejects_overly_complex_skill() {
+        let (engine, _dir) = test_engine(BootstrapConfig {
+            max_skill_complexity: 1,
+            ..BootstrapConfig::default()
+        });
+        let error = engine
+            .learn_from_task(create_test_learn_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::ValidationFailed { .. }));
     }
 }

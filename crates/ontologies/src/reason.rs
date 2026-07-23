@@ -510,9 +510,7 @@ impl Reasoner {
             .filter(|t| !original.contains(t))
             .filter(|&&(_, p, _)| p == rdf_type)
             .take(10)
-            .map(|&(s, _, o)| {
-                format!("{} a {}", interner.resolve(s), interner.resolve(o))
-            })
+            .map(|&(s, _, o)| format!("{} a {}", interner.resolve(s), interner.resolve(o)))
             .collect();
 
         let mut result = serde_json::json!({

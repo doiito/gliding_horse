@@ -40,15 +40,21 @@ impl IndexEntry {
     }
 
     pub fn matches_tag(&self, tag: &str) -> bool {
-        self.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        self.tags
+            .iter()
+            .any(|t| t.to_lowercase() == tag.to_lowercase())
     }
 
     pub fn matches_stack(&self, stack: &str) -> bool {
-        self.stack.iter().any(|s| s.to_lowercase() == stack.to_lowercase())
+        self.stack
+            .iter()
+            .any(|s| s.to_lowercase() == stack.to_lowercase())
     }
 
     pub fn matches_role(&self, role: &str) -> bool {
-        self.role.as_ref().map_or(false, |r| r.to_lowercase() == role.to_lowercase())
+        self.role
+            .as_ref()
+            .map_or(false, |r| r.to_lowercase() == role.to_lowercase())
     }
 
     pub fn matches_maturity(&self, allowed: &[&str]) -> bool {
@@ -106,8 +112,13 @@ impl PreAggregatedIndex {
         }
 
         self.compute_transitive_deps(&skill.skill_iri, &skill.links);
-        debug!("Indexing skill: {} (tags={}, stack={}, role={:?})", 
-            iri, skill.tags.len(), skill.w2h.where_.target_stack.len(), skill.w2h.who.required_agent_role);
+        debug!(
+            "Indexing skill: {} (tags={}, stack={}, role={:?})",
+            iri,
+            skill.tags.len(),
+            skill.w2h.where_.target_stack.len(),
+            skill.w2h.who.required_agent_role
+        );
     }
 
     pub fn remove_skill(&self, skill_iri: &str) {
@@ -167,7 +178,9 @@ impl PreAggregatedIndex {
     }
 
     pub fn get_summary(&self, skill_iri: &str) -> Option<IndexEntry> {
-        self.skill_summaries.get(skill_iri).map(|e| e.value().clone())
+        self.skill_summaries
+            .get(skill_iri)
+            .map(|e| e.value().clone())
     }
 
     pub fn find_by_tags_intersection(&self, tags: &[&str]) -> Vec<String> {
@@ -197,7 +210,8 @@ impl PreAggregatedIndex {
         let mut candidates: Option<HashSet<String>> = None;
 
         if !tags.is_empty() {
-            let tag_results: HashSet<String> = self.find_by_tags_intersection(tags).into_iter().collect();
+            let tag_results: HashSet<String> =
+                self.find_by_tags_intersection(tags).into_iter().collect();
             candidates = Some(tag_results);
         }
 
@@ -217,8 +231,12 @@ impl PreAggregatedIndex {
             });
         }
 
-        let candidates = candidates
-            .unwrap_or_else(|| self.skill_summaries.iter().map(|e| e.key().clone()).collect());
+        let candidates = candidates.unwrap_or_else(|| {
+            self.skill_summaries
+                .iter()
+                .map(|e| e.key().clone())
+                .collect()
+        });
 
         candidates
             .into_iter()
@@ -229,7 +247,8 @@ impl PreAggregatedIndex {
                             return false;
                         }
                     }
-                    if !allowed_maturities.is_empty() && !entry.matches_maturity(allowed_maturities) {
+                    if !allowed_maturities.is_empty() && !entry.matches_maturity(allowed_maturities)
+                    {
                         return false;
                     }
                     true
@@ -255,7 +274,9 @@ impl PreAggregatedIndex {
         }
 
         if !deps.is_empty() {
-            self.transitive_deps.write().insert(skill_iri.to_string(), deps);
+            self.transitive_deps
+                .write()
+                .insert(skill_iri.to_string(), deps);
         }
 
         let affected: Vec<String> = self
@@ -315,9 +336,15 @@ pub struct IndexStats {
 mod tests {
     use super::*;
 
-    fn create_test_skill(iri: &str, name: &str, tags: Vec<&str>, stack: Vec<&str>, role: Option<&str>) -> SkillGraphNode {
-        let mut skill = SkillGraphNode::new(iri, name, &format!("{} description", name))
-            .with_5w2h(Skill5W2H {
+    fn create_test_skill(
+        iri: &str,
+        name: &str,
+        tags: Vec<&str>,
+        stack: Vec<&str>,
+        role: Option<&str>,
+    ) -> SkillGraphNode {
+        let mut skill =
+            SkillGraphNode::new(iri, name, &format!("{} description", name)).with_5w2h(Skill5W2H {
                 what: name.to_string(),
                 why: format!("Why {}", name),
                 who: SkillRole {
@@ -352,7 +379,13 @@ mod tests {
     #[test]
     fn test_tag_index() {
         let index = PreAggregatedIndex::new();
-        let skill = create_test_skill("iri://skills/jwt", "JWT Auth", vec!["auth", "jwt", "rust"], vec!["rust"], Some("DA"));
+        let skill = create_test_skill(
+            "iri://skills/jwt",
+            "JWT Auth",
+            vec!["auth", "jwt", "rust"],
+            vec!["rust"],
+            Some("DA"),
+        );
         index.index_skill(&skill);
 
         let result = index.find_by_tag("auth");
@@ -365,7 +398,13 @@ mod tests {
     #[test]
     fn test_stack_index() {
         let index = PreAggregatedIndex::new();
-        let skill = create_test_skill("iri://skills/jwt", "JWT Auth", vec!["auth"], vec!["rust", "axum"], Some("DA"));
+        let skill = create_test_skill(
+            "iri://skills/jwt",
+            "JWT Auth",
+            vec!["auth"],
+            vec!["rust", "axum"],
+            Some("DA"),
+        );
         index.index_skill(&skill);
 
         let result = index.find_by_stack("rust");
@@ -378,7 +417,13 @@ mod tests {
     #[test]
     fn test_role_index() {
         let index = PreAggregatedIndex::new();
-        let skill = create_test_skill("iri://skills/jwt", "JWT Auth", vec!["auth"], vec!["rust"], Some("DA"));
+        let skill = create_test_skill(
+            "iri://skills/jwt",
+            "JWT Auth",
+            vec!["auth"],
+            vec!["rust"],
+            Some("DA"),
+        );
         index.index_skill(&skill);
 
         let result = index.find_by_role("DA");
@@ -408,8 +453,20 @@ mod tests {
     #[test]
     fn test_find_by_criteria() {
         let index = PreAggregatedIndex::new();
-        let s1 = create_test_skill("iri://skills/s1", "S1", vec!["auth"], vec!["rust"], Some("DA"));
-        let s2 = create_test_skill("iri://skills/s2", "S2", vec!["auth"], vec!["python"], Some("PA"));
+        let s1 = create_test_skill(
+            "iri://skills/s1",
+            "S1",
+            vec!["auth"],
+            vec!["rust"],
+            Some("DA"),
+        );
+        let s2 = create_test_skill(
+            "iri://skills/s2",
+            "S2",
+            vec!["auth"],
+            vec!["python"],
+            Some("PA"),
+        );
         index.index_skill(&s1);
         index.index_skill(&s2);
 
@@ -423,7 +480,13 @@ mod tests {
     #[test]
     fn test_remove_skill() {
         let index = PreAggregatedIndex::new();
-        let skill = create_test_skill("iri://skills/jwt", "JWT Auth", vec!["auth"], vec!["rust"], Some("DA"));
+        let skill = create_test_skill(
+            "iri://skills/jwt",
+            "JWT Auth",
+            vec!["auth"],
+            vec!["rust"],
+            Some("DA"),
+        );
         index.index_skill(&skill);
 
         assert_eq!(index.find_by_tag("auth").len(), 1);
@@ -465,7 +528,13 @@ mod tests {
     #[test]
     fn test_index_stats() {
         let index = PreAggregatedIndex::new();
-        let skill = create_test_skill("iri://skills/jwt", "JWT Auth", vec!["auth", "jwt"], vec!["rust"], Some("DA"));
+        let skill = create_test_skill(
+            "iri://skills/jwt",
+            "JWT Auth",
+            vec!["auth", "jwt"],
+            vec!["rust"],
+            Some("DA"),
+        );
         index.index_skill(&skill);
 
         let stats = index.stats();

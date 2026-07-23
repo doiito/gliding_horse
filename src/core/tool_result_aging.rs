@@ -95,18 +95,14 @@ impl ToolResultAging {
                 } else {
                     // No micro-tool, use brief summary
                     let preview: String = msg.content.chars().take(150).collect();
-                    messages[msg_idx].content = format!(
-                        "[Old result {} bytes] {}...",
-                        original_len, preview
-                    );
+                    messages[msg_idx].content =
+                        format!("[Old result {} bytes] {}...", original_len, preview);
                 }
             } else {
                 // Oldest batch: replace with brief summary directly
                 let preview: String = msg.content.chars().take(100).collect();
-                messages[msg_idx].content = format!(
-                    "[Historical result {} bytes] {}...",
-                    original_len, preview
-                );
+                messages[msg_idx].content =
+                    format!("[Historical result {} bytes] {}...", original_len, preview);
             }
 
             freed += original_len.saturating_sub(messages[msg_idx].content.len());
@@ -176,12 +172,31 @@ mod tests {
         // call_0/1 rev_position 4/3 < microtool_end(6) → [Old result] prefix
         assert_eq!(aged, 2, "should age 2 oldest results");
 
-        let contents: Vec<&str> = msgs.iter().filter(|m| m.role == "tool").map(|m| m.content.as_str()).collect();
-        assert!(contents[0].starts_with("[Old result"), "call_0 oldest should be compressed");
-        assert!(contents[1].starts_with("[Old result"), "call_1 oldest should be compressed");
-        assert!(contents[2].starts_with("x"), "call_2 should remain full (recent)");
-        assert!(contents[3].starts_with("x"), "call_3 should remain full (recent)");
-        assert!(contents[4].starts_with("x"), "call_4 should remain full (recent)");
+        let contents: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents[0].starts_with("[Old result"),
+            "call_0 oldest should be compressed"
+        );
+        assert!(
+            contents[1].starts_with("[Old result"),
+            "call_1 oldest should be compressed"
+        );
+        assert!(
+            contents[2].starts_with("x"),
+            "call_2 should remain full (recent)"
+        );
+        assert!(
+            contents[3].starts_with("x"),
+            "call_3 should remain full (recent)"
+        );
+        assert!(
+            contents[4].starts_with("x"),
+            "call_4 should remain full (recent)"
+        );
     }
 
     #[test]
@@ -209,13 +224,26 @@ mod tests {
         // call_0(rev=3) < keep_full? NO, < microtool_end(3)? NO → oldest → [Historical result]
         assert_eq!(aged, 3);
 
-        let contents: Vec<&str> = msgs.iter().filter(|m| m.role == "tool").map(|m| m.content.as_str()).collect();
+        let contents: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_str())
+            .collect();
         // call_0 (idx 0 in msgs, oldest): rev=3 >= microtool_end → [Historical result]
-        assert!(contents[0].starts_with("[Historical result"), "call_0 oldest should be brief summary");
+        assert!(
+            contents[0].starts_with("[Historical result"),
+            "call_0 oldest should be brief summary"
+        );
         // call_1 (idx 1): rev=2 < microtool_end → [Old result]
-        assert!(contents[1].starts_with("[Old result"), "call_1 should be in microtool range");
+        assert!(
+            contents[1].starts_with("[Old result"),
+            "call_1 should be in microtool range"
+        );
         // call_2 (idx 2): rev=1 < microtool_end → [Old result]
-        assert!(contents[2].starts_with("[Old result"), "call_2 should be in microtool range");
+        assert!(
+            contents[2].starts_with("[Old result"),
+            "call_2 should be in microtool range"
+        );
         // call_3 (idx 3, newest): rev=0 < keep_full → kept full
         assert!(contents[3].starts_with("y"), "call_3 newest should be full");
     }

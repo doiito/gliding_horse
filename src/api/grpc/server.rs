@@ -1,20 +1,27 @@
-use std::sync::Arc;
-use std::pin::Pin;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
-use tonic::{Request, Response, Status};
-use tokio_stream::Stream;
 use tokio::sync::{mpsc, RwLock};
+use tokio_stream::Stream;
+use tonic::{Request, Response, Status};
 
+use crate::batch::extractor::ExtractorPipeline;
 use crate::batch::manager::BatchAgentManager;
-use crate::core::sa::SupervisorAgent;
+use crate::batch::prompt::DynamicPromptEngine;
+use crate::batch::types::{BatchMetrics, PromptContext};
+use crate::batch::BatchEventJournal;
+use crate::config::settings::Settings;
 use crate::core::agent_runner::AgentRunner;
-use crate::core::event_bus::EventBus;
 use crate::core::checkpoint::CheckpointManager;
+use crate::core::event_bus::EventBus;
 use crate::core::execution_event::ExecutionEventEmitter;
 use crate::core::execution_event::ExecutionEventKind;
 use crate::core::execution_event::ExecutionState;
+use crate::core::sa::SupervisorAgent;
+use crate::core::TaskFinalizer;
 use crate::gateway::unified_gateway::UnifiedGateway;
 use crate::memory::consistency_engine::ConsistencyEngine;
 use crate::memory::l0_store::L0Store;
@@ -29,7 +36,6 @@ use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
-use crate::config::settings::Settings;
 use crate::CoreConfig;
 
 pub mod seapp {
@@ -56,55 +62,216 @@ pub struct AgentOSService {
     unified_graph: Arc<UnifiedGraphStore>,
     execution_states: Arc<RwLock<HashMap<String, ExecutionState>>>,
     /// Batch Agent manager, post-new async initialization
-    batch_manager: tokio::sync::Mutex<Option<BatchAgentManager>>,
+    batch_manager: Arc<tokio::sync::Mutex<Option<BatchAgentManager>>>,
     /// Skill graph store for background maintenance (archive + re-index)
     skill_graph: Option<Arc<SkillGraphStore>>,
+}
+
+/// Bring the graph projection up to the registry's baseline without
+/// overwriting an evolved/persisted node with the same IRI.  Keeping this as a
+/// helper makes the root gRPC bootstrap contract independently testable.
+fn bootstrap_skill_graph_from_registry(
+    registry: &SkillRegistry,
+    graph: &SkillGraphStore,
+) -> Result<usize, crate::CoreError> {
+    let mut inserted = 0;
+    for meta in registry.list_all_skills() {
+        if graph.get_skill(&meta.skill_iri).is_some() {
+            continue;
+        }
+        graph.register_skill(crate::skill_graph::types::SkillGraphNode::from_skill_meta(
+            &meta,
+        ))?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+/// Keep root-service RDF state beside its configured L0 data.  This avoids a
+/// second unrelated process-wide default path and gives L0/UnifiedGraph the
+/// same deployment lifetime.
+fn unified_graph_path(settings: &Settings) -> PathBuf {
+    PathBuf::from(&settings.memory.l0.path).join("unified-graph")
+}
+
+async fn execute_batch_agent(
+    manager: &mut BatchAgentManager,
+    pipeline: &ExtractorPipeline,
+    agent_name: &str,
+    context: &PromptContext,
+) -> bool {
+    match manager.execute_ready(agent_name, pipeline, context).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(agent = %agent_name, %error, "Batch execution did not complete");
+            false
+        }
+    }
+}
+
+async fn run_batch_agents_for_event(
+    batch_manager: &Arc<tokio::sync::Mutex<Option<BatchAgentManager>>>,
+    pipeline: &ExtractorPipeline,
+    event: &crate::core::event_bus::Event,
+    context: &PromptContext,
+    journal: &BatchEventJournal,
+) {
+    let mut guard = batch_manager.lock().await;
+    let Some(manager) = guard.as_mut() else {
+        return;
+    };
+    // A CustomEvent is itself a trigger, so execute each explicitly matched
+    // agent after enqueueing. Other trigger kinds are evaluated by the tick.
+    let names = manager.enqueue_custom_event(event);
+    if names.is_empty() {
+        return;
+    }
+    match journal.record(event) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(event_id = %event.event_id, "Skipping duplicate pending batch event");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, event_id = %event.event_id, "Batch event was not journaled; refusing execution");
+            return;
+        }
+    }
+    let mut complete = true;
+    for name in names {
+        complete &= execute_batch_agent(manager, pipeline, &name, context).await;
+    }
+    if complete {
+        if let Err(error) = journal.acknowledge(&event.event_id) {
+            tracing::warn!(%error, event_id = %event.event_id, "Batch event completed but journal acknowledgement failed");
+        }
+    }
+}
+
+async fn run_ready_batch_agents(
+    batch_manager: &Arc<tokio::sync::Mutex<Option<BatchAgentManager>>>,
+    pipeline: &ExtractorPipeline,
+    context: &PromptContext,
+) {
+    let mut guard = batch_manager.lock().await;
+    let Some(manager) = guard.as_mut() else {
+        return;
+    };
+    let names: Vec<String> = manager
+        .list_agents()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for name in names {
+        if !manager.evaluate_triggers(&name).await.is_empty() {
+            let _ = execute_batch_agent(manager, pipeline, &name, context).await;
+        }
+    }
+}
+
+async fn replay_pending_batch_events(
+    batch_manager: &Arc<tokio::sync::Mutex<Option<BatchAgentManager>>>,
+    pipeline: &ExtractorPipeline,
+    journal: &BatchEventJournal,
+) {
+    let pending = match journal.pending(10_000) {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!(%error, "Failed to read pending batch journal events");
+            return;
+        }
+    };
+    for envelope in pending {
+        let event = envelope.into_event();
+        let context = PromptContext {
+            context_summary: Some(event.payload.clone()),
+            ..Default::default()
+        };
+        let mut guard = batch_manager.lock().await;
+        let Some(manager) = guard.as_mut() else {
+            return;
+        };
+        let names = manager.enqueue_custom_event(&event);
+        let mut complete = !names.is_empty();
+        for name in names {
+            complete &= execute_batch_agent(manager, pipeline, &name, &context).await;
+        }
+        drop(guard);
+        if complete {
+            if let Err(error) = journal.acknowledge(&event.event_id) {
+                tracing::warn!(%error, event_id = %event.event_id, "Failed to acknowledge replayed batch event");
+            }
+        }
+    }
 }
 
 impl AgentOSService {
     pub fn new(settings: Settings) -> Result<Self, String> {
         let gateway = Arc::new(
             UnifiedGateway::new(&settings.gateway)
-                .map_err(|e| format!("Gateway init failed: {}", e))?
+                .map_err(|e| format!("Gateway init failed: {}", e))?,
         );
 
         let l0 = Arc::new(
-            L0Store::new(&settings.memory.l0.path)
-                .map_err(|e| format!("L0 init failed: {}", e))?
+            L0Store::new(&settings.memory.l0.path).map_err(|e| format!("L0 init failed: {}", e))?,
         );
 
         let unified_graph = Arc::new(
-            UnifiedGraphStore::new().map_err(|e| format!("UnifiedGraph init failed: {}", e))?
+            UnifiedGraphStore::new_persistent(unified_graph_path(&settings))
+                .map_err(|e| format!("UnifiedGraph init failed: {}", e))?,
         );
 
         let blackboard = Arc::new(
-            Blackboard::with_store(unified_graph.store()).map_err(|e| format!("L2 init failed: {}", e))?
+            Blackboard::with_store(unified_graph.store())
+                .map_err(|e| format!("L2 init failed: {}", e))?,
         );
-        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), settings.memory.l3.max_size));
+        let projection = Arc::new(ProjectionEngine::new(
+            blackboard.clone(),
+            settings.memory.l3.max_size,
+        ));
         let skills = Arc::new(SkillRegistry::new());
-        let templates_path = settings.agents.template_path
+        let templates_path = settings
+            .agents
+            .template_path
             .as_deref()
             .unwrap_or("src/templates/templates");
         let templates = Arc::new(
-            TemplateEngine::new(std::path::Path::new(templates_path))
-                .map_err(|e| format!("Template engine init failed (path={}): {}", templates_path, e))?
+            TemplateEngine::new(std::path::Path::new(templates_path)).map_err(|e| {
+                format!(
+                    "Template engine init failed (path={}): {}",
+                    templates_path, e
+                )
+            })?,
         );
         let event_bus = Arc::new(EventBus::new(settings.agents.event_bus_capacity));
 
         let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
         let consistency = Arc::new(ConsistencyEngine::new(
-            memory_bus.clone(), l0.clone(), blackboard.clone(), projection.clone(),
+            memory_bus.clone(),
+            l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
         ));
         let scheduler = Arc::new(MemoryScheduler::new(
-            l0.clone(), blackboard.clone(), projection.clone(), consistency.clone(), memory_bus.clone(),
+            l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
+            consistency.clone(),
+            memory_bus.clone(),
         ));
         let prefetch = Arc::new(PrefetchEngine::new(
-            memory_bus.clone(), blackboard.clone(), projection.clone(),
+            memory_bus.clone(),
+            blackboard.clone(),
+            projection.clone(),
         ));
 
-        let memory_manager = Arc::new(tokio::sync::Mutex::new(
-            MemoryManager::with_scheduler(l0.clone(), blackboard.clone(), projection.clone(), CoreConfig::default(), scheduler.clone()),
-        ));
+        let memory_manager = Arc::new(tokio::sync::Mutex::new(MemoryManager::with_scheduler(
+            l0.clone(),
+            blackboard.clone(),
+            projection.clone(),
+            CoreConfig::default(),
+            scheduler.clone(),
+        )));
 
         let checkpoints = Arc::new(CheckpointManager::new());
 
@@ -132,7 +299,10 @@ impl AgentOSService {
 
         let eb_5w2h = event_bus.clone();
         eb_5w2h.spawn_consumer(
-            vec!["DEADLINE_APPROACHING".to_string(), "BUDGET_EXCEEDED".to_string()],
+            vec![
+                "DEADLINE_APPROACHING".to_string(),
+                "BUDGET_EXCEEDED".to_string(),
+            ],
             move |event| {
                 let et = event.event_type.clone();
                 async move {
@@ -149,7 +319,10 @@ impl AgentOSService {
         let l0_inv = l0.clone();
         let bb_inv = blackboard.clone();
         eb_invalidate.spawn_consumer(
-            vec!["MEMORY_INVALIDATE".to_string(), "CACHE_INVALIDATE".to_string()],
+            vec![
+                "MEMORY_INVALIDATE".to_string(),
+                "CACHE_INVALIDATE".to_string(),
+            ],
             move |event| {
                 let bb = bb_inv.clone();
                 let l0 = l0_inv.clone();
@@ -168,7 +341,10 @@ impl AgentOSService {
         let bb_prefetch = blackboard.clone();
         let proj_prefetch = projection.clone();
         eb_prefetch.spawn_consumer(
-            vec!["MEMORY_PREFETCH".to_string(), "PREFETCH_REQUEST".to_string()],
+            vec![
+                "MEMORY_PREFETCH".to_string(),
+                "PREFETCH_REQUEST".to_string(),
+            ],
             move |event| {
                 let bb = bb_prefetch.clone();
                 let proj = proj_prefetch.clone();
@@ -191,25 +367,23 @@ impl AgentOSService {
                 "TASK_FAILED".to_string(),
                 "AGENT_ERROR".to_string(),
             ],
-            move |event| {
-                async move {
-                    match event.event_type.as_str() {
-                        "TASK_FAILED" | "AGENT_ERROR" => {
-                            tracing::warn!(
-                                event_type = %event.event_type,
-                                task_iri = %event.task_iri,
-                                source = %event.source_agent_iri,
-                                "Task failure event"
-                            );
-                        }
-                        _ => {
-                            tracing::info!(
-                                event_type = %event.event_type,
-                                task_iri = %event.task_iri,
-                                source = %event.source_agent_iri,
-                                "Task lifecycle event"
-                            );
-                        }
+            move |event| async move {
+                match event.event_type.as_str() {
+                    "TASK_FAILED" | "AGENT_ERROR" => {
+                        tracing::warn!(
+                            event_type = %event.event_type,
+                            task_iri = %event.task_iri,
+                            source = %event.source_agent_iri,
+                            "Task failure event"
+                        );
+                    }
+                    _ => {
+                        tracing::info!(
+                            event_type = %event.event_type,
+                            task_iri = %event.task_iri,
+                            source = %event.source_agent_iri,
+                            "Task lifecycle event"
+                        );
                     }
                 }
             },
@@ -222,6 +396,18 @@ impl AgentOSService {
                 .with_l0_store(l0.clone())
                 .with_oxi_store(unified_graph.store()),
         );
+        if let Err(error) = skill_graph.hydrate_from_l0() {
+            tracing::warn!(%error, "Failed to hydrate persisted skill graph; continuing with bootstrap skills");
+        }
+        match bootstrap_skill_graph_from_registry(skills.as_ref(), skill_graph.as_ref()) {
+            Ok(inserted) if inserted > 0 => {
+                tracing::info!(inserted, "Bootstrapped root gRPC skill graph from registry")
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "Failed to bootstrap root gRPC skill graph from registry")
+            }
+        }
         let batch_mgr = {
             let mut mgr = BatchAgentManager::new()
                 .with_event_bus(event_bus.clone())
@@ -234,7 +420,9 @@ impl AgentOSService {
                 let err = results.len() - ok;
                 tracing::info!(
                     "BatchAgent registration complete: {} OK, {} failed, {} total configs",
-                    ok, err, results.len()
+                    ok,
+                    err,
+                    results.len()
                 );
                 for r in results.iter().filter_map(|r| r.as_ref().err()) {
                     tracing::warn!("BatchAgent registration failed: {:?}", r);
@@ -258,15 +446,15 @@ impl AgentOSService {
             prefetch,
             unified_graph,
             execution_states: Arc::new(RwLock::new(HashMap::new())),
-            batch_manager: tokio::sync::Mutex::new(Some(batch_mgr)),
+            batch_manager: Arc::new(tokio::sync::Mutex::new(Some(batch_mgr))),
             skill_graph: Some(skill_graph),
         };
 
         Ok(s)
     }
 
-/// Assemble axum HTTP/SSE routes, reusing the service's runtime shared state (EventBus / Blackboard /
-/// SkillRegistry etc.), so HTTP `/api/v1/tasks/stream` and gRPC task execution share the same event bus.
+    /// Assemble axum HTTP/SSE routes, reusing the service's runtime shared state (EventBus / Blackboard /
+    /// SkillRegistry etc.), so HTTP `/api/v1/tasks/stream` and gRPC task execution share the same event bus.
     pub fn build_http_router(&self) -> axum::Router {
         use crate::core::core_types::SemanticCore;
         use crate::core::validation::ValidationEngine;
@@ -298,6 +486,49 @@ impl AgentOSService {
         }
         drop(guard);
 
+        // A batch configuration only receives events it explicitly names via a
+        // CustomEvent trigger. The adapter turns such events into window entries,
+        // evaluates the configured trigger, and runs exactly one ready batch.
+        // A periodic tick performs the same evaluation for cron/window triggers.
+        let batch_manager = self.batch_manager.clone();
+        let event_bus = self.event_bus.clone();
+        let journal = BatchEventJournal::new(self.l0.clone());
+        let prompt_engine = Arc::new(DynamicPromptEngine::new(
+            self.templates.clone(),
+            Some(self.l0.clone()),
+        ));
+        let pipeline = Arc::new(ExtractorPipeline::new(
+            self.gateway.clone(),
+            prompt_engine,
+            Arc::new(std::sync::Mutex::new(BatchMetrics::default())),
+        ));
+        replay_pending_batch_events(&batch_manager, pipeline.as_ref(), &journal).await;
+        tokio::spawn(async move {
+            let mut events = event_bus.subscribe();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    received = events.recv() => match received {
+                        Ok(event) => {
+                            let context = PromptContext {
+                                context_summary: Some(event.payload.clone()),
+                                ..Default::default()
+                            };
+                            run_batch_agents_for_event(&batch_manager, &pipeline, &event, &context, &journal).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(lagged = n, "Batch event adapter lagged; missed events are not replayed");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = tick.tick() => {
+                        run_ready_batch_agents(&batch_manager, &pipeline, &PromptContext::default()).await;
+                    }
+                }
+            }
+        });
+        tracing::info!("Batch event/cron adapter spawned");
+
         // ── Background maintenance: archive + re-index every 30 minutes ──
         if let Some(ref sg) = self.skill_graph {
             let sg_clone = sg.clone();
@@ -311,7 +542,10 @@ impl AgentOSService {
                     match sg_clone.archive_cold_skills(&cutoff) {
                         Ok(archived) => {
                             if archived > 0 {
-                                tracing::info!(archived = archived, "Maintenance: archived cold skills");
+                                tracing::info!(
+                                    archived = archived,
+                                    "Maintenance: archived cold skills"
+                                );
                             }
                         }
                         Err(e) => tracing::warn!("Maintenance: archive_cold_skills failed: {}", e),
@@ -321,38 +555,55 @@ impl AgentOSService {
                     let stale_age = chrono::Duration::hours(4);
                     let reindexed = sg_clone.reindex_stale_skills(&stale_age);
                     if reindexed > 0 {
-                        tracing::info!(reindexed = reindexed, "Maintenance: re-indexed stale skills");
+                        tracing::info!(
+                            reindexed = reindexed,
+                            "Maintenance: re-indexed stale skills"
+                        );
                     }
                 }
             });
-            tracing::info!("Background maintenance task spawned (archive=48h, reindex=4h, interval=30min)");
+            tracing::info!(
+                "Background maintenance task spawned (archive=48h, reindex=4h, interval=30min)"
+            );
         }
     }
 
     fn create_sa(&self, settings: &Settings) -> SupervisorAgent {
         // initialize WorkspaceMonitor (if workspace root is configured)
-        let workspace_root_path: Option<std::path::PathBuf> = settings.workspace.root.as_ref().map(|s| std::path::PathBuf::from(s));
-        let workspace_monitor_opt: Option<Arc<WorkspaceMonitor>> = if let Some(ref ws_root) = workspace_root_path {
-            let ws_config = WorkspaceMonitorConfig {
-                workspace_root: ws_root.clone(),
-                exclude_patterns: settings.workspace.exclude_patterns.clone(),
-                watch_enabled: settings.workspace.watch_enabled,
-                content_store_max_bytes: settings.workspace.content_store_max_bytes,
-                ..Default::default()
+        let workspace_root_path: Option<std::path::PathBuf> = settings
+            .workspace
+            .root
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s));
+        let workspace_monitor_opt: Option<Arc<WorkspaceMonitor>> =
+            if let Some(ref ws_root) = workspace_root_path {
+                let ws_config = WorkspaceMonitorConfig {
+                    workspace_root: ws_root.clone(),
+                    exclude_patterns: settings.workspace.exclude_patterns.clone(),
+                    watch_enabled: settings.workspace.watch_enabled,
+                    content_store_max_bytes: settings.workspace.content_store_max_bytes,
+                    ..Default::default()
+                };
+                match WorkspaceMonitor::initialize(
+                    ws_config,
+                    Some(self.blackboard.clone()),
+                    Some(self.event_bus.clone()),
+                ) {
+                    Ok(ws) => {
+                        tracing::info!(root = %ws_root.display(), "WorkspaceMonitor initialized");
+                        Some(Arc::new(ws))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "WorkspaceMonitor init failed: {}, using default workspace settings",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
             };
-            match WorkspaceMonitor::initialize(ws_config, Some(self.blackboard.clone()), Some(self.event_bus.clone())) {
-                Ok(ws) => {
-                    tracing::info!(root = %ws_root.display(), "WorkspaceMonitor initialized");
-                    Some(Arc::new(ws))
-                }
-                Err(e) => {
-                    tracing::warn!("WorkspaceMonitor init failed: {}, using default workspace settings", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         let mut runner_builder = AgentRunner::new(
             self.gateway.clone(),
@@ -382,6 +633,7 @@ impl AgentOSService {
             if let Some(ref sg) = self.skill_graph {
                 executor.set_shared_skill_graph(sg.clone());
             }
+            executor.set_shared_skill_registry(self.skills.clone());
             if let Some(ref wm) = workspace_monitor_opt {
                 executor.set_workspace_monitor(wm.clone());
             }
@@ -404,7 +656,11 @@ impl AgentOSService {
             settings.agents.max_pdca_cycles,
         );
 
-        sa = sa.with_memory(Some(self.blackboard.clone()), Some(self.prefetch.clone()), Some(self.scheduler.clone()));
+        sa = sa.with_memory(
+            Some(self.blackboard.clone()),
+            Some(self.prefetch.clone()),
+            Some(self.scheduler.clone()),
+        );
         sa
     }
 
@@ -420,18 +676,11 @@ trait RequestSettings {
 }
 
 impl AgentOSService {
-    pub async fn send_supplementary_input(
-        &self,
-        task_iri: &str,
-        content: &str,
-    ) {
+    pub async fn send_supplementary_input(&self, task_iri: &str, content: &str) {
         tracing::info!(task_iri = %task_iri, "Received user supplementary input");
-        self.event_bus.emit(
-            task_iri,
-            "USER_SUPPLEMENTARY_INPUT",
-            "external",
-            content,
-        ).await;
+        self.event_bus
+            .emit(task_iri, "USER_SUPPLEMENTARY_INPUT", "external", content)
+            .await;
     }
 }
 
@@ -445,10 +694,22 @@ impl RequestSettings for ExecuteStageRequest {
         }
         if !self.llm_model.is_empty() {
             settings.gateway.default_model = self.llm_model.clone();
-            settings.gateway.model_mapping.insert("default".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("planning".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("execution".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("analysis".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("default".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("planning".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("execution".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("analysis".to_string(), self.llm_model.clone());
         }
     }
 }
@@ -463,10 +724,22 @@ impl RequestSettings for ChatStreamRequest {
         }
         if !self.llm_model.is_empty() {
             settings.gateway.default_model = self.llm_model.clone();
-            settings.gateway.model_mapping.insert("default".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("planning".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("execution".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("analysis".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("default".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("planning".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("execution".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("analysis".to_string(), self.llm_model.clone());
         }
     }
 }
@@ -481,10 +754,22 @@ impl RequestSettings for ExecuteTaskStreamRequest {
         }
         if !self.llm_model.is_empty() {
             settings.gateway.default_model = self.llm_model.clone();
-            settings.gateway.model_mapping.insert("default".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("planning".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("execution".to_string(), self.llm_model.clone());
-            settings.gateway.model_mapping.insert("analysis".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("default".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("planning".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("execution".to_string(), self.llm_model.clone());
+            settings
+                .gateway
+                .model_mapping
+                .insert("analysis".to_string(), self.llm_model.clone());
         }
     }
 }
@@ -492,7 +777,8 @@ impl RequestSettings for ExecuteTaskStreamRequest {
 #[tonic::async_trait]
 impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
     type ChatStreamStream = Pin<Box<dyn Stream<Item = Result<ChatStreamChunk, Status>> + Send>>;
-    type ExecuteTaskStreamStream = Pin<Box<dyn Stream<Item = Result<seapp::ExecutionEvent, Status>> + Send>>;
+    type ExecuteTaskStreamStream =
+        Pin<Box<dyn Stream<Item = Result<seapp::ExecutionEvent, Status>> + Send>>;
 
     async fn execute_stage(
         &self,
@@ -509,8 +795,18 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             req.task_iri
         };
 
-        let result = sa.process_task(&req.prompt, &task_iri).await
-            .map_err(|e| Status::internal(format!("SA execution failed: {}", e)))?;
+        let result = match sa.process_task(&req.prompt, &task_iri).await {
+            Ok(result) => result,
+            Err(error) => {
+                TaskFinalizer::new(self.event_bus.clone())
+                    .finalize_error(&task_iri, &error.to_string())
+                    .await;
+                return Err(Status::internal(format!("SA execution failed: {}", error)));
+            }
+        };
+        TaskFinalizer::new(self.event_bus.clone())
+            .finalize(&task_iri, &result)
+            .await;
 
         let output_bytes = match &result.output {
             Some(v) => serde_json::to_vec(v).unwrap_or_default(),
@@ -544,43 +840,59 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             req.task_iri.clone()
         };
 
-        let _ = tx.send(Ok(ChatStreamChunk {
-            content: String::new(),
-            done: false,
-            status: "processing".to_string(),
-        })).await;
+        let _ = tx
+            .send(Ok(ChatStreamChunk {
+                content: String::new(),
+                done: false,
+                status: "processing".to_string(),
+            }))
+            .await;
 
         match sa.process_task(&req.prompt, &task_iri).await {
             Ok(result) => {
+                TaskFinalizer::new(self.event_bus.clone())
+                    .finalize(&task_iri, &result)
+                    .await;
                 let content = extract_content(&result);
 
                 let chunk_size = 20;
                 let chars: Vec<char> = content.chars().collect();
                 for chunk in chars.chunks(chunk_size) {
                     let chunk_str: String = chunk.iter().collect();
-                    if tx.send(Ok(ChatStreamChunk {
-                        content: chunk_str,
-                        done: false,
-                        status: "streaming".to_string(),
-                    })).await.is_err() {
+                    if tx
+                        .send(Ok(ChatStreamChunk {
+                            content: chunk_str,
+                            done: false,
+                            status: "streaming".to_string(),
+                        }))
+                        .await
+                        .is_err()
+                    {
                         return Ok(Response::new(Box::pin(
-                            tokio_stream::wrappers::ReceiverStream::new(rx)
+                            tokio_stream::wrappers::ReceiverStream::new(rx),
                         )));
                     }
                 }
 
-                let _ = tx.send(Ok(ChatStreamChunk {
-                    content: String::new(),
-                    done: true,
-                    status: result.status.clone(),
-                })).await;
+                let _ = tx
+                    .send(Ok(ChatStreamChunk {
+                        content: String::new(),
+                        done: true,
+                        status: result.status.clone(),
+                    }))
+                    .await;
             }
             Err(e) => {
-                let _ = tx.send(Ok(ChatStreamChunk {
-                    content: format!("Error: {}", e),
-                    done: true,
-                    status: "error".to_string(),
-                })).await;
+                TaskFinalizer::new(self.event_bus.clone())
+                    .finalize_error(&task_iri, &e.to_string())
+                    .await;
+                let _ = tx
+                    .send(Ok(ChatStreamChunk {
+                        content: format!("Error: {}", e),
+                        done: true,
+                        status: "error".to_string(),
+                    }))
+                    .await;
             }
         }
 
@@ -643,23 +955,21 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
             }
         });
 
-        let settings_clone = settings.clone();
         let sa_settings = settings.clone();
+        // Build from this service's shared stores before spawning. Creating a
+        // new AgentOSService here used a second EventBus/Batch manager and
+        // silently bypassed the runtime initialized by `init_batch_system`.
+        let mut sa = self.create_sa(&sa_settings);
         let prompt = req.prompt.clone();
         let task_iri_for_task = task_iri.clone();
         let _tx_for_task = tx.clone();
         let event_bus_for_task = self.event_bus.clone();
 
         tokio::spawn(async move {
-            let mut sa = {
-                let service = AgentOSService::new(settings_clone).expect("AgentOSService::new failed");
-                service.create_sa(&sa_settings)
-            };
-
             let emitter = ExecutionEventEmitter::with_options(
                 &task_iri_for_task,
                 None,
-                Some(event_bus_for_task),
+                Some(event_bus_for_task.clone()),
                 include_thought,
                 include_tool_calls,
             );
@@ -668,9 +978,15 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
 
             match sa.process_task(&prompt, &task_iri_for_task).await {
                 Ok(result) => {
+                    TaskFinalizer::new(event_bus_for_task.clone())
+                        .finalize(&task_iri_for_task, &result)
+                        .await;
                     emitter.emit_completion(&result.status, &result.summary, result.output.clone());
                 }
                 Err(e) => {
+                    TaskFinalizer::new(event_bus_for_task.clone())
+                        .finalize_error(&task_iri_for_task, &e.to_string())
+                        .await;
                     emitter.emit_error("ExecutionError", &e.to_string(), "SA", false);
                     emitter.emit_completion("failed", &e.to_string(), None);
                 }
@@ -755,13 +1071,17 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                 },
                 estimated_remaining_ms: 0,
             }),
-            phase_history: state.phase_history.iter().map(|p| PhaseHistoryEntry {
-                phase: p.phase.clone(),
-                agent_id: p.agent_id.clone(),
-                started_at: p.started_at,
-                completed_at: p.completed_at.unwrap_or(0),
-                status: p.status.clone(),
-            }).collect(),
+            phase_history: state
+                .phase_history
+                .iter()
+                .map(|p| PhaseHistoryEntry {
+                    phase: p.phase.clone(),
+                    agent_id: p.agent_id.clone(),
+                    started_at: p.started_at,
+                    completed_at: p.completed_at.unwrap_or(0),
+                    status: p.status.clone(),
+                })
+                .collect(),
         };
 
         Ok(Response::new(status))
@@ -797,7 +1117,12 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
     }
 }
 
-fn convert_event_bus_to_grpc(event: &crate::core::event_bus::Event) -> Option<(crate::core::execution_event::ExecutionEvent, seapp::ExecutionEvent)> {
+fn convert_event_bus_to_grpc(
+    event: &crate::core::event_bus::Event,
+) -> Option<(
+    crate::core::execution_event::ExecutionEvent,
+    seapp::ExecutionEvent,
+)> {
     use crate::core::event_bus::EventType;
     use crate::core::execution_event::ExecutionEvent as CoreExecutionEvent;
 
@@ -805,92 +1130,116 @@ fn convert_event_bus_to_grpc(event: &crate::core::event_bus::Event) -> Option<(c
     let timestamp = event.timestamp.timestamp_millis();
 
     let kind = match event_type {
-        EventType::PlanStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "idle".to_string(),
-            to_phase: "plan".to_string(),
-            agent_role: "PA".to_string(),
-            reason: "Plan phase started".to_string(),
-        }),
-        EventType::PlanCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "plan".to_string(),
-            to_phase: "do".to_string(),
-            agent_role: "PA".to_string(),
-            reason: "Plan phase completed".to_string(),
-        }),
-        EventType::DoStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "plan".to_string(),
-            to_phase: "do".to_string(),
-            agent_role: "DA".to_string(),
-            reason: "Do phase started".to_string(),
-        }),
-        EventType::DoCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "do".to_string(),
-            to_phase: "check".to_string(),
-            agent_role: "DA".to_string(),
-            reason: "Do phase completed".to_string(),
-        }),
-        EventType::CheckStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "do".to_string(),
-            to_phase: "check".to_string(),
-            agent_role: "CA".to_string(),
-            reason: "Check phase started".to_string(),
-        }),
-        EventType::CheckCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "check".to_string(),
-            to_phase: "act".to_string(),
-            agent_role: "CA".to_string(),
-            reason: "Check phase completed".to_string(),
-        }),
-        EventType::ActStarted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "check".to_string(),
-            to_phase: "act".to_string(),
-            agent_role: "AA".to_string(),
-            reason: "Act phase started".to_string(),
-        }),
-        EventType::ActCompleted => ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
-            from_phase: "act".to_string(),
-            to_phase: "completed".to_string(),
-            agent_role: "AA".to_string(),
-            reason: "Act phase completed".to_string(),
-        }),
-        EventType::AgentStarted => ExecutionEventKind::AgentStatus(crate::core::execution_event::AgentStatus {
-            agent_id: event.source_agent_iri.clone(),
-            role: "unknown".to_string(),
-            status: "running".to_string(),
-            turn: 0,
-            iteration: 0,
-            timestamp: None,
-        }),
-        EventType::AgentCompleted => ExecutionEventKind::AgentStatus(crate::core::execution_event::AgentStatus {
-            agent_id: event.source_agent_iri.clone(),
-            role: "unknown".to_string(),
-            status: "completed".to_string(),
-            turn: 0,
-            iteration: 0,
-            timestamp: None,
-        }),
+        EventType::PlanStarted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "idle".to_string(),
+                to_phase: "plan".to_string(),
+                agent_role: "PA".to_string(),
+                reason: "Plan phase started".to_string(),
+            })
+        }
+        EventType::PlanCompleted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "plan".to_string(),
+                to_phase: "do".to_string(),
+                agent_role: "PA".to_string(),
+                reason: "Plan phase completed".to_string(),
+            })
+        }
+        EventType::DoStarted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "plan".to_string(),
+                to_phase: "do".to_string(),
+                agent_role: "DA".to_string(),
+                reason: "Do phase started".to_string(),
+            })
+        }
+        EventType::DoCompleted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "do".to_string(),
+                to_phase: "check".to_string(),
+                agent_role: "DA".to_string(),
+                reason: "Do phase completed".to_string(),
+            })
+        }
+        EventType::CheckStarted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "do".to_string(),
+                to_phase: "check".to_string(),
+                agent_role: "CA".to_string(),
+                reason: "Check phase started".to_string(),
+            })
+        }
+        EventType::CheckCompleted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "check".to_string(),
+                to_phase: "act".to_string(),
+                agent_role: "CA".to_string(),
+                reason: "Check phase completed".to_string(),
+            })
+        }
+        EventType::ActStarted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "check".to_string(),
+                to_phase: "act".to_string(),
+                agent_role: "AA".to_string(),
+                reason: "Act phase started".to_string(),
+            })
+        }
+        EventType::ActCompleted => {
+            ExecutionEventKind::PhaseChange(crate::core::execution_event::PhaseChange {
+                from_phase: "act".to_string(),
+                to_phase: "completed".to_string(),
+                agent_role: "AA".to_string(),
+                reason: "Act phase completed".to_string(),
+            })
+        }
+        EventType::AgentStarted => {
+            ExecutionEventKind::AgentStatus(crate::core::execution_event::AgentStatus {
+                agent_id: event.source_agent_iri.clone(),
+                role: "unknown".to_string(),
+                status: "running".to_string(),
+                turn: 0,
+                iteration: 0,
+                timestamp: None,
+            })
+        }
+        EventType::AgentCompleted => {
+            ExecutionEventKind::AgentStatus(crate::core::execution_event::AgentStatus {
+                agent_id: event.source_agent_iri.clone(),
+                role: "unknown".to_string(),
+                status: "completed".to_string(),
+                turn: 0,
+                iteration: 0,
+                timestamp: None,
+            })
+        }
         EventType::AgentError => ExecutionEventKind::Error(crate::core::execution_event::Error {
             error_type: "AgentError".to_string(),
             message: event.payload.clone(),
             agent_id: event.source_agent_iri.clone(),
             recoverable: false,
         }),
-        EventType::TaskCompleted => ExecutionEventKind::Completion(crate::core::execution_event::Completion {
-            status: "success".to_string(),
-            summary: event.payload.clone(),
-            total_turns: 0,
-            total_tool_calls: 0,
-            total_tokens: 0,
-            output_json: None,
-        }),
-        EventType::TaskFailed => ExecutionEventKind::Completion(crate::core::execution_event::Completion {
-            status: "failed".to_string(),
-            summary: event.payload.clone(),
-            total_turns: 0,
-            total_tool_calls: 0,
-            total_tokens: 0,
-            output_json: None,
-        }),
+        EventType::TaskCompleted => {
+            ExecutionEventKind::Completion(crate::core::execution_event::Completion {
+                status: "success".to_string(),
+                summary: event.payload.clone(),
+                total_turns: 0,
+                total_tool_calls: 0,
+                total_tokens: 0,
+                output_json: None,
+            })
+        }
+        EventType::TaskFailed => {
+            ExecutionEventKind::Completion(crate::core::execution_event::Completion {
+                status: "failed".to_string(),
+                summary: event.payload.clone(),
+                total_turns: 0,
+                total_tool_calls: 0,
+                total_tokens: 0,
+                output_json: None,
+            })
+        }
         _ => return None,
     };
 
@@ -975,7 +1324,10 @@ fn kind_to_proto_event(kind: ExecutionEventKind) -> seapp::execution_event::Even
             total_turns: c.total_turns as i32,
             total_tool_calls: c.total_tool_calls as i32,
             total_tokens: c.total_tokens as i32,
-            output_json: c.output_json.map(|v| serde_json::to_string(&v).unwrap_or_default()).unwrap_or_default(),
+            output_json: c
+                .output_json
+                .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                .unwrap_or_default(),
         }),
     }
 }
@@ -1019,7 +1371,50 @@ fn extract_content(result: &crate::core::agent_runner::TaskResult) -> String {
 
 fn clean_content(text: &str) -> String {
     let re = regex::Regex::new(r#"\{[^}]*"thought"[^}]*\}"#).ok();
-    let cleaned = re.map(|r| r.replace_all(text, "").to_string()).unwrap_or_else(|| text.to_string());
+    let cleaned = re
+        .map(|r| r.replace_all(text, "").to_string())
+        .unwrap_or_else(|| text.to_string());
     let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() { text.to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        text.to_string()
+    } else {
+        cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_grpc_bootstrap_populates_missing_registry_skills_without_overwrite() {
+        let registry = SkillRegistry::new();
+        let graph = SkillGraphStore::new();
+        let first = registry.list_all_skills().into_iter().next().unwrap();
+        let mut evolved = crate::skill_graph::types::SkillGraphNode::from_skill_meta(&first);
+        evolved.description = "persisted evolution must survive bootstrap".to_string();
+        graph.register_skill(evolved).unwrap();
+
+        let inserted = bootstrap_skill_graph_from_registry(&registry, &graph).unwrap();
+        assert_eq!(inserted, registry.list_all_skills().len() - 1);
+        assert_eq!(
+            graph.list_all_skills().len(),
+            registry.list_all_skills().len()
+        );
+        assert_eq!(
+            graph.get_skill(&first.skill_iri).unwrap().description,
+            "persisted evolution must survive bootstrap"
+        );
+    }
+
+    #[test]
+    fn root_grpc_unified_graph_path_is_scoped_to_l0_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.memory.l0.path = dir.path().join("l0").to_string_lossy().to_string();
+        assert_eq!(
+            unified_graph_path(&settings),
+            dir.path().join("l0/unified-graph")
+        );
+    }
 }

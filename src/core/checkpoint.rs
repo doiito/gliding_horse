@@ -23,7 +23,6 @@ pub struct CheckpointData {
     pub agent_state_json: String,
 
     // ── Extension fields (Option ensures backward compatibility with old checkpoints) ──
-
     /// The currently executing agent role (PA/DA/CA/AA), used by resume to decide which phases to skip
     pub current_role: Option<String>,
 
@@ -94,11 +93,11 @@ impl CheckpointManager {
             seq
         );
 
-        let nodes: Vec<serde_json::Value> =
-            serde_json::from_str(nodes_json).unwrap_or_default();
+        let nodes: Vec<serde_json::Value> = serde_json::from_str(nodes_json).unwrap_or_default();
         let node_count = nodes.len() as i32;
-        let total_size_bytes =
-            nodes_json.len() as i32 + session_messages_json.len() as i32 + agent_state_json.len() as i32;
+        let total_size_bytes = nodes_json.len() as i32
+            + session_messages_json.len() as i32
+            + agent_state_json.len() as i32;
 
         let checkpoint = CheckpointData {
             checkpoint_iri: checkpoint_iri.clone(),
@@ -167,19 +166,36 @@ impl CheckpointManager {
             seq
         );
 
-        let nodes: Vec<serde_json::Value> =
-            serde_json::from_str(nodes_json).unwrap_or_default();
+        let nodes: Vec<serde_json::Value> = serde_json::from_str(nodes_json).unwrap_or_default();
         let node_count = nodes.len() as i32;
 
-        let mut total = nodes_json.len() as i32 + session_messages_json.len() as i32 + agent_state_json.len() as i32;
-        if let Some(v) = five_w2h_json { total += v.len() as i32; }
-        if let Some(v) = cycle_state_json { total += v.len() as i32; }
-        if let Some(v) = completed_nodes_json { total += v.len() as i32; }
-        if let Some(v) = pending_approvals_json { total += v.len() as i32; }
-        if let Some(v) = supplement_json { total += v.len() as i32; }
-        if let Some(v) = tool_error_json { total += v.len() as i32; }
-        if let Some(v) = action_tracker_json { total += v.len() as i32; }
-        if let Some(v) = perception_anomaly_json { total += v.len() as i32; }
+        let mut total = nodes_json.len() as i32
+            + session_messages_json.len() as i32
+            + agent_state_json.len() as i32;
+        if let Some(v) = five_w2h_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = cycle_state_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = completed_nodes_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = pending_approvals_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = supplement_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = tool_error_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = action_tracker_json {
+            total += v.len() as i32;
+        }
+        if let Some(v) = perception_anomaly_json {
+            total += v.len() as i32;
+        }
 
         let checkpoint = CheckpointData {
             checkpoint_iri: checkpoint_iri.clone(),
@@ -250,7 +266,10 @@ impl CheckpointManager {
     ///   "start_<Role>" / "turn_<Role>_N" / "finish_<Role>" / "max_turns_<Role>"
     ///   "force_end_<Role>" / "step_complete_<Role>" / "pre_dispatch_<Role>"
     ///   or "unknown"
-    pub fn restore_latest_with_phase(&self, task_iri: &str) -> Result<Option<(CheckpointData, String)>, CoreError> {
+    pub fn restore_latest_with_phase(
+        &self,
+        task_iri: &str,
+    ) -> Result<Option<(CheckpointData, String)>, CoreError> {
         let cp = self.restore_latest(task_iri)?;
         Ok(cp.map(|c| {
             let phase = parse_checkpoint_phase(&c.name);
@@ -261,7 +280,8 @@ impl CheckpointManager {
     /// Restore the latest checkpoint for a given task and infer which phases are done based on the phase.
     /// Returns (checkpoint, skip_roles) — skip_roles is the list of AgentRoles to skip during resume.
     pub fn restore_latest_with_skip_roles(
-        &self, task_iri: &str,
+        &self,
+        task_iri: &str,
     ) -> Result<Option<(CheckpointData, Vec<String>)>, CoreError> {
         let cp = self.restore_latest(task_iri)?;
         Ok(cp.map(|c| {
@@ -329,7 +349,11 @@ impl CheckpointManager {
     }
 
     pub fn checkpoint_count(&self) -> u64 {
-        self.task_checkpoints.read().values().map(|v| v.len() as u64).sum()
+        self.task_checkpoints
+            .read()
+            .values()
+            .map(|v| v.len() as u64)
+            .sum()
     }
 }
 
@@ -337,8 +361,16 @@ impl CheckpointManager {
 /// Examples: "start_DA" → "start_DA", "turn_CA_5" → "turn_CA_5", "finish_PA" → "finish_PA"
 ///       "step_complete_Do" → "step_complete_Do", "unknown_xxx" → "unknown"
 pub fn parse_checkpoint_phase(name: &str) -> String {
-    let known_prefixes = ["start_", "turn_", "finish_", "max_turns_", "force_end_",
-                          "step_complete_", "pre_dispatch_", "plan_created_"];
+    let known_prefixes = [
+        "start_",
+        "turn_",
+        "finish_",
+        "max_turns_",
+        "force_end_",
+        "step_complete_",
+        "pre_dispatch_",
+        "plan_created_",
+    ];
     for prefix in &known_prefixes {
         if name.starts_with(prefix) {
             // Extract the role portion: "start_DA" → extract "DA" portion as phase
@@ -347,7 +379,10 @@ pub fn parse_checkpoint_phase(name: &str) -> String {
             if *prefix == "turn_" {
                 // "turn_DA_5" → split by _, take first part
                 if let Some(role) = rest.split('_').next() {
-                    if matches!(role, "PA" | "DA" | "CA" | "AA" | "Plan" | "Do" | "Check" | "Act") {
+                    if matches!(
+                        role,
+                        "PA" | "DA" | "CA" | "AA" | "Plan" | "Do" | "Check" | "Act"
+                    ) {
                         return format!("turn_{}", role);
                     }
                 }
@@ -372,9 +407,9 @@ pub fn compute_skip_roles_from_phase(name: &str, current_role: Option<&str>) -> 
     let all_roles = ["Plan", "Do", "Check", "Act", "PA", "DA", "CA", "AA"];
 
     // Prefer current_role
-    let active_role = current_role.and_then(|r| {
-        all_roles.iter().find(|ar| ar.eq_ignore_ascii_case(r))
-    }).copied();
+    let active_role = current_role
+        .and_then(|r| all_roles.iter().find(|ar| ar.eq_ignore_ascii_case(r)))
+        .copied();
 
     // Extract role from name
     let name_role = {
@@ -449,8 +484,8 @@ mod tests {
 
     #[test]
     fn test_list_via_l0_scan_cross_process() {
-        use std::sync::Arc;
         use crate::memory::l0_store::L0Store;
+        use std::sync::Arc;
 
         let dir = tempfile::TempDir::new().unwrap();
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
@@ -464,7 +499,8 @@ mod tests {
             r#"[{"role":"user","content":"hello"}]"#,
             r#"{"turn":3}"#,
             &["DA".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
         // New CheckpointManager (simulating cross-process: new instance, empty memory index)
         let mgr2 = CheckpointManager::with_persistence(l0.clone());
@@ -485,7 +521,10 @@ mod tests {
         assert_eq!(parse_checkpoint_phase("start_DA"), "start_DA");
         assert_eq!(parse_checkpoint_phase("turn_DA_5"), "turn_DA");
         assert_eq!(parse_checkpoint_phase("finish_CA"), "finish_CA");
-        assert_eq!(parse_checkpoint_phase("step_complete_Do"), "step_complete_Do");
+        assert_eq!(
+            parse_checkpoint_phase("step_complete_Do"),
+            "step_complete_Do"
+        );
         assert_eq!(parse_checkpoint_phase("max_turns_Plan"), "max_turns_Plan");
         assert_eq!(parse_checkpoint_phase("force_end_Act"), "force_end_Act");
         assert_eq!(parse_checkpoint_phase("unknown_xxx"), "unknown");
@@ -536,24 +575,26 @@ mod tests {
     #[test]
     fn test_create_ext_roundtrip() {
         let manager = CheckpointManager::new();
-        let cp = manager.create_ext(
-            "iri://task/roundtrip",
-            "step_complete_DA",
-            "[]",
-            "[]",
-            r#"{"turn":5}"#,
-            &["DA".to_string(), "step_complete".to_string()],
-            Some("DA"),
-            Some(r#"{"what":"test"}"#),
-            Some("prev summary here"),
-            Some(r#"{"phase":"Executing"}"#),
-            Some(r#"{"node1":{"status":"ok"}}"#),
-            Some(r#"{"approval1":true}"#),
-            None,
-            Some(r#"{"bash":3}"#),
-            Some(r#"[]"#),
-            None,
-        ).unwrap();
+        let cp = manager
+            .create_ext(
+                "iri://task/roundtrip",
+                "step_complete_DA",
+                "[]",
+                "[]",
+                r#"{"turn":5}"#,
+                &["DA".to_string(), "step_complete".to_string()],
+                Some("DA"),
+                Some(r#"{"what":"test"}"#),
+                Some("prev summary here"),
+                Some(r#"{"phase":"Executing"}"#),
+                Some(r#"{"node1":{"status":"ok"}}"#),
+                Some(r#"{"approval1":true}"#),
+                None,
+                Some(r#"{"bash":3}"#),
+                Some(r#"[]"#),
+                None,
+            )
+            .unwrap();
 
         assert_eq!(cp.name, "step_complete_DA");
         assert_eq!(cp.current_role.as_deref(), Some("DA"));

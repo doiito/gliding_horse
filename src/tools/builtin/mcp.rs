@@ -69,9 +69,7 @@ pub fn mcp_server_signature(config: &McpServerConfig) -> Option<String> {
             command.extend(config.args.clone());
             Some(format!("stdio:{}", render_command_signature(&command)))
         }
-        McpServerConfig::Http(config) => {
-            Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url)))
-        }
+        McpServerConfig::Http(config) => Some(format!("url:{}", unwrap_ccr_proxy_url(&config.url))),
     }
 }
 
@@ -168,8 +166,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::config::{
-        McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig,
-        ScopedMcpServerConfig,
+        McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig, ScopedMcpServerConfig,
     };
 
     use super::{
@@ -227,17 +224,13 @@ mod tests {
             url: "https://vendor.example/mcp".to_string(),
             headers: BTreeMap::from([("Authorization".to_string(), "Bearer token".to_string())]),
         });
-        let hash_a = scoped_mcp_config_hash(&ScopedMcpServerConfig {
-            config: base,
-        });
+        let hash_a = scoped_mcp_config_hash(&ScopedMcpServerConfig { config: base });
 
         let changed = McpServerConfig::Http(McpRemoteServerConfig {
             url: "https://vendor.example/v2/mcp".to_string(),
             headers: BTreeMap::new(),
         });
-        let hash_b = scoped_mcp_config_hash(&ScopedMcpServerConfig {
-            config: changed,
-        });
+        let hash_b = scoped_mcp_config_hash(&ScopedMcpServerConfig { config: changed });
         assert_ne!(hash_a, hash_b);
     }
 }

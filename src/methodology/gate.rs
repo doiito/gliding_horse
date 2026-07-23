@@ -5,8 +5,8 @@ use tracing::debug;
 
 use crate::core::constitution::{ActivationCondition, ConstitutionRegistry};
 use crate::methodology::{
-    evolution::{EvolutionEngineHandle, ViolationReporter}, MethodologyDefinition, MethodologyRegistry,
-    RedFlagEntry, MethodologyType,
+    evolution::{EvolutionEngineHandle, ViolationReporter},
+    MethodologyDefinition, MethodologyRegistry, MethodologyType, RedFlagEntry,
 };
 use crate::tools::hooks::{FunctionHook, HookContext, HookManager, HookPoint, HookResult};
 use crate::tools::tool_guard::ToolCategory;
@@ -110,7 +110,11 @@ impl MethodologyGate {
     ///
     /// Returns the newly activated methodologies (for immediate use).
     /// Call this from a hook handler to keep the gate in sync with execution context.
-    pub fn on_hook_trigger(&mut self, point: HookPoint, context: &HookContext) -> Vec<ActivatedMethodology> {
+    pub fn on_hook_trigger(
+        &mut self,
+        point: HookPoint,
+        context: &HookContext,
+    ) -> Vec<ActivatedMethodology> {
         let mut newly_active = Vec::new();
 
         for (idx, methodology) in self.registry.all().iter().enumerate() {
@@ -190,8 +194,15 @@ impl MethodologyGate {
         match condition {
             ActivationCondition::Always => Some(TriggerSource::Always),
             ActivationCondition::OnToolCategory(categories) => {
-                let tool_name = context.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-                if categories.iter().any(|c| tool_name.contains(c) || category_matches_tool(c, tool_name)) {
+                let tool_name = context
+                    .data
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if categories
+                    .iter()
+                    .any(|c| tool_name.contains(c) || category_matches_tool(c, tool_name))
+                {
                     Some(TriggerSource::ToolCategory(ToolCategory::Meta))
                 } else {
                     None
@@ -206,7 +217,11 @@ impl MethodologyGate {
             }
             ActivationCondition::OnPhaseEnd(phase) => {
                 if point == HookPoint::PhaseEnd {
-                    let ctx_phase = context.data.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                    let ctx_phase = context
+                        .data
+                        .get("phase")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if ctx_phase == *phase {
                         Some(TriggerSource::PhaseEnd(phase.to_string()))
                     } else {
@@ -241,7 +256,11 @@ impl MethodologyGate {
 
     /// Manually activate a methodology by ID.
     pub fn activate(&mut self, methodology_id: &str, source: TriggerSource) -> Option<usize> {
-        let idx = self.registry.all().iter().position(|m| m.id == methodology_id)?;
+        let idx = self
+            .registry
+            .all()
+            .iter()
+            .position(|m| m.id == methodology_id)?;
         if self.active.iter().any(|a| a.registry_index == idx) {
             return Some(idx);
         }
@@ -271,7 +290,10 @@ impl MethodologyGate {
     }
 
     /// Get the definition for an activated methodology.
-    pub fn get_definition(&self, activated: &ActivatedMethodology) -> Option<&MethodologyDefinition> {
+    pub fn get_definition(
+        &self,
+        activated: &ActivatedMethodology,
+    ) -> Option<&MethodologyDefinition> {
         self.registry.all().get(activated.registry_index)
     }
 
@@ -289,15 +311,23 @@ impl MethodologyGate {
 
     /// Check if a specific methodology is active.
     pub fn is_active(&self, methodology_id: &str) -> bool {
-        self.active.iter().any(|a| a.methodology_id == methodology_id)
+        self.active
+            .iter()
+            .any(|a| a.methodology_id == methodology_id)
     }
 
     /// Get active methodologies for a specific domain.
-    pub fn active_for_domain(&self, domain: &str) -> Vec<(&ActivatedMethodology, &MethodologyDefinition)> {
+    pub fn active_for_domain(
+        &self,
+        domain: &str,
+    ) -> Vec<(&ActivatedMethodology, &MethodologyDefinition)> {
         self.active
             .iter()
             .filter_map(|a| {
-                self.registry.all().get(a.registry_index).map(|def| (a, def))
+                self.registry
+                    .all()
+                    .get(a.registry_index)
+                    .map(|def| (a, def))
             })
             .filter(|(_, def)| def.domain == domain || def.domain == "general")
             .collect()
@@ -349,15 +379,18 @@ impl MethodologyGate {
             };
 
             for ap in def.anti_patterns {
-                let is_match = ap.gate_before.to_lowercase().contains(&tool_name.to_lowercase())
+                let is_match = ap
+                    .gate_before
+                    .to_lowercase()
+                    .contains(&tool_name.to_lowercase())
                     || tool_name_matches_gate(tool_name, ap.gate_before);
 
                 if !is_match {
                     continue;
                 }
 
-                let should_block = ap.gate_action.starts_with("STOP")
-                    || ap.gate_action.starts_with("ABORT");
+                let should_block =
+                    ap.gate_action.starts_with("STOP") || ap.gate_action.starts_with("ABORT");
 
                 results.push(AntiPatternGateResult {
                     methodology_id: def.id.to_string(),
@@ -409,7 +442,8 @@ impl MethodologyGate {
         methodology_id: &str,
         condition: ActivationCondition,
     ) {
-        self.bindings.retain(|b| b.constitution_id != constitution_id || b.methodology_id != methodology_id);
+        self.bindings
+            .retain(|b| b.constitution_id != constitution_id || b.methodology_id != methodology_id);
         self.bindings.push(ConstitutionMethodologyBinding {
             constitution_id: constitution_id.to_string(),
             methodology_id: methodology_id.to_string(),
@@ -435,7 +469,10 @@ impl MethodologyGate {
                 }
             }
         }
-        debug!(bindings_registered = count, "MethodologyGate: Constitution bindings registered");
+        debug!(
+            bindings_registered = count,
+            "MethodologyGate: Constitution bindings registered"
+        );
     }
 
     /// Get all registered constitution bindings.
@@ -598,9 +635,8 @@ impl MethodologyGateHandle {
                     let inner = evo.inner();
                     let mut e = inner.write();
                     for ap in &anti_patterns {
-                        let record = ViolationReporter::from_anti_pattern(
-                            ap, role, None, timestamp,
-                        );
+                        let record =
+                            ViolationReporter::from_anti_pattern(ap, role, None, timestamp);
                         e.record_violation(record);
                     }
                 }
@@ -608,7 +644,8 @@ impl MethodologyGateHandle {
                 let blocking: Vec<_> = anti_patterns.iter().filter(|r| r.should_block).collect();
 
                 if !blocking.is_empty() {
-                    let messages: Vec<String> = blocking.iter().map(|r| r.message.clone()).collect();
+                    let messages: Vec<String> =
+                        blocking.iter().map(|r| r.message.clone()).collect();
                     ctx.metadata.insert(
                         "methodology_anti_patterns".to_string(),
                         Value::Array(messages.into_iter().map(Value::String).collect()),
@@ -627,7 +664,8 @@ impl MethodologyGateHandle {
                     return HookResult::Abort;
                 }
 
-                let warnings: Vec<String> = anti_patterns.iter()
+                let warnings: Vec<String> = anti_patterns
+                    .iter()
                     .filter(|r| !r.should_block)
                     .map(|r| r.message.clone())
                     .collect();
@@ -658,14 +696,50 @@ fn tool_name_matches_gate(tool_name: &str, gate_before: &str) -> bool {
     }
 
     let tool_keywords: &[(&str, &[&str])] = &[
-        ("glob", &["glob", "目录遍历", "文件搜索", "find", "directory traversal", "file search"]),
-        ("grep_search", &["grep", "搜索", "search", "内容查找", "content search"]),
-        ("bash", &["bash", "shell", "命令", "终端", "执行", "command", "terminal"]),
-        ("file_read", &["read", "文件读取", "file_read", "reading file"]),
-        ("file_write", &["write", "文件写入", "创建文件", "file_write", "writing file"]),
-        ("file_edit", &["edit", "编辑", "修改文件", "file_edit", "editing file"]),
+        (
+            "glob",
+            &[
+                "glob",
+                "目录遍历",
+                "文件搜索",
+                "find",
+                "directory traversal",
+                "file search",
+            ],
+        ),
+        (
+            "grep_search",
+            &["grep", "搜索", "search", "内容查找", "content search"],
+        ),
+        (
+            "bash",
+            &[
+                "bash", "shell", "命令", "终端", "执行", "command", "terminal",
+            ],
+        ),
+        (
+            "file_read",
+            &["read", "文件读取", "file_read", "reading file"],
+        ),
+        (
+            "file_write",
+            &[
+                "write",
+                "文件写入",
+                "创建文件",
+                "file_write",
+                "writing file",
+            ],
+        ),
+        (
+            "file_edit",
+            &["edit", "编辑", "修改文件", "file_edit", "editing file"],
+        ),
         ("web_fetch", &["fetch", "网络", "http", "web", "website"]),
-        ("web_search", &["web_search", "网络搜索", "搜索", "internet search"]),
+        (
+            "web_search",
+            &["web_search", "网络搜索", "搜索", "internet search"],
+        ),
     ];
 
     for (key, keywords) in tool_keywords {
@@ -732,30 +806,39 @@ impl MethodologyDefinition {
 
         // Red flags
         if !self.red_flags.is_empty() {
-            let flags: Vec<serde_json::Value> = self.red_flags.iter().map(|rf| {
-                let mut f = serde_json::json!({
-                    "methodology:pattern": rf.pattern,
-                    "methodology:severity": format!("{:?}", rf.severity),
-                });
-                if let Some(check) = rf.rationalization_check {
-                    f["methodology:rationalizationCheck"] = serde_json::Value::String(check.to_string());
-                }
-                f
-            }).collect();
+            let flags: Vec<serde_json::Value> = self
+                .red_flags
+                .iter()
+                .map(|rf| {
+                    let mut f = serde_json::json!({
+                        "methodology:pattern": rf.pattern,
+                        "methodology:severity": format!("{:?}", rf.severity),
+                    });
+                    if let Some(check) = rf.rationalization_check {
+                        f["methodology:rationalizationCheck"] =
+                            serde_json::Value::String(check.to_string());
+                    }
+                    f
+                })
+                .collect();
             node["methodology:redFlags"] = serde_json::Value::Array(flags);
         }
 
         // Anti-patterns
         if !self.anti_patterns.is_empty() {
-            let aps: Vec<serde_json::Value> = self.anti_patterns.iter().map(|ap| {
-                serde_json::json!({
-                    "methodology:antiPatternName": ap.name,
-                    "methodology:antiPatternDescription": ap.description,
-                    "methodology:gateBefore": ap.gate_before,
-                    "methodology:gateAsk": ap.gate_ask,
-                    "methodology:gateAction": ap.gate_action,
+            let aps: Vec<serde_json::Value> = self
+                .anti_patterns
+                .iter()
+                .map(|ap| {
+                    serde_json::json!({
+                        "methodology:antiPatternName": ap.name,
+                        "methodology:antiPatternDescription": ap.description,
+                        "methodology:gateBefore": ap.gate_before,
+                        "methodology:gateAsk": ap.gate_ask,
+                        "methodology:gateAction": ap.gate_action,
+                    })
                 })
-            }).collect();
+                .collect();
             node["methodology:antiPatterns"] = serde_json::Value::Array(aps);
         }
 
@@ -767,12 +850,16 @@ impl MethodologyDefinition {
 
         // Related methodologies
         if !self.related.is_empty() {
-            let related: Vec<serde_json::Value> = self.related.iter().map(|r| {
-                serde_json::json!({
-                    "@id": format!("https://gliding.horse/methodology/{}", r.replace(':', "/")),
-                    "methodology:id": r,
+            let related: Vec<serde_json::Value> = self
+                .related
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "@id": format!("https://gliding.horse/methodology/{}", r.replace(':', "/")),
+                        "methodology:id": r,
+                    })
                 })
-            }).collect();
+                .collect();
             node["methodology:related"] = serde_json::Value::Array(related);
         }
 
@@ -781,17 +868,60 @@ impl MethodologyDefinition {
 
     pub fn to_kg_quads(&self) -> Vec<crate::knowledge_graph::types::RdfQuad> {
         use crate::knowledge_graph::types::{RdfQuad, RdfValue};
-        let id_iri = format!("https://gliding.horse/methodology/{}", self.id.replace(':', "/"));
+        let id_iri = format!(
+            "https://gliding.horse/methodology/{}",
+            self.id.replace(':', "/")
+        );
 
         let mut quads = vec![
-            RdfQuad { subject: id_iri.clone(), predicate: "rdf:type".into(), object: RdfValue::Iri("methodology:Methodology".into()), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "rdfs:label".into(), object: RdfValue::Literal(self.name.to_string()), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "methodology:id".into(), object: RdfValue::Literal(self.id.to_string()), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "schema:description".into(), object: RdfValue::Literal(self.description.to_string()), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "methodology:type".into(), object: RdfValue::Literal(format!("{:?}", self.methodology_type)), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "methodology:domain".into(), object: RdfValue::Literal(self.domain.to_string()), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "methodology:source".into(), object: RdfValue::Literal(self.source.to_string()), graph: None },
-            RdfQuad { subject: id_iri.clone(), predicate: "methodology:activation".into(), object: RdfValue::Literal(format!("{:?}", self.activation)), graph: None },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "rdf:type".into(),
+                object: RdfValue::Iri("methodology:Methodology".into()),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "rdfs:label".into(),
+                object: RdfValue::Literal(self.name.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:id".into(),
+                object: RdfValue::Literal(self.id.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "schema:description".into(),
+                object: RdfValue::Literal(self.description.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:type".into(),
+                object: RdfValue::Literal(format!("{:?}", self.methodology_type)),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:domain".into(),
+                object: RdfValue::Literal(self.domain.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:source".into(),
+                object: RdfValue::Literal(self.source.to_string()),
+                graph: None,
+            },
+            RdfQuad {
+                subject: id_iri.clone(),
+                predicate: "methodology:activation".into(),
+                object: RdfValue::Literal(format!("{:?}", self.activation)),
+                graph: None,
+            },
         ];
 
         for rf in self.red_flags {
@@ -855,7 +985,6 @@ impl crate::core::constitution::ConstitutionRole {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn test_gate() -> MethodologyGate {
         MethodologyGate::new(MethodologyRegistry::new(), 20)
@@ -877,17 +1006,25 @@ mod tests {
         let ctx = test_context(HookPoint::AgentInit, "SA", None);
         let activated = gate.on_hook_trigger(HookPoint::AgentInit, &ctx);
 
-        let always_ids: Vec<&str> = gate.registry().all().iter()
+        let always_ids: Vec<&str> = gate
+            .registry()
+            .all()
+            .iter()
             .filter(|m| matches!(m.activation, ActivationCondition::Always))
             .map(|m| m.id)
             .collect();
 
-        let activated_ids: Vec<&str> = activated.iter()
+        let activated_ids: Vec<&str> = activated
+            .iter()
             .map(|a| a.methodology_id.as_str())
             .collect();
 
         for id in &always_ids {
-            assert!(activated_ids.contains(id), "Always-active methodology {} was not activated", id);
+            assert!(
+                activated_ids.contains(id),
+                "Always-active methodology {} was not activated",
+                id
+            );
         }
     }
 
@@ -899,7 +1036,8 @@ mod tests {
 
         let activated = gate.on_hook_trigger(HookPoint::TaskError, &ctx);
 
-        let activated_ids: Vec<&str> = activated.iter()
+        let activated_ids: Vec<&str> = activated
+            .iter()
             .map(|a| a.methodology_id.as_str())
             .collect();
 
@@ -915,7 +1053,8 @@ mod tests {
         let ctx = test_context(HookPoint::AgentInit, "SA", None);
         let activated = gate.on_hook_trigger(HookPoint::AgentInit, &ctx);
 
-        let activated_ids: Vec<&str> = activated.iter()
+        let activated_ids: Vec<&str> = activated
+            .iter()
             .map(|a| a.methodology_id.as_str())
             .collect();
 
@@ -969,8 +1108,13 @@ mod tests {
         gate.activate("methodology:index-priority", TriggerSource::Manual);
 
         let rationalizations = gate.active_rationalizations();
-        assert!(!rationalizations.is_empty(), "index-priority should have rationalization checks");
-        assert!(rationalizations.iter().any(|(_, _, check)| check.contains("directory")));
+        assert!(
+            !rationalizations.is_empty(),
+            "index-priority should have rationalization checks"
+        );
+        assert!(rationalizations
+            .iter()
+            .any(|(_, _, check)| check.contains("directory")));
     }
 
     // ─── Anti-Pattern Gate Checks ───
@@ -981,11 +1125,17 @@ mod tests {
         gate.activate("methodology:index-priority", TriggerSource::Manual);
 
         let results = gate.check_anti_patterns_for_tool("glob");
-        assert!(!results.is_empty(), "glob should trigger index-priority anti-pattern");
+        assert!(
+            !results.is_empty(),
+            "glob should trigger index-priority anti-pattern"
+        );
 
         gate.activate("methodology:cost-awareness", TriggerSource::Manual);
         let bash_results = gate.check_anti_patterns_for_tool("bash");
-        assert!(!bash_results.is_empty(), "bash should trigger cost-awareness anti-pattern");
+        assert!(
+            !bash_results.is_empty(),
+            "bash should trigger cost-awareness anti-pattern"
+        );
     }
 
     #[test]
@@ -996,7 +1146,9 @@ mod tests {
         let results = gate.check_anti_patterns_for_tool("bash");
         let blocking: Vec<_> = results.iter().filter(|r| r.should_block).collect();
         assert!(
-            blocking.is_empty() || blocking[0].gate_action.contains("STOP") || blocking[0].gate_action.contains("ABORT"),
+            blocking.is_empty()
+                || blocking[0].gate_action.contains("STOP")
+                || blocking[0].gate_action.contains("ABORT"),
             "boundary enforcement anti-patterns should block"
         );
     }
@@ -1005,7 +1157,10 @@ mod tests {
     fn test_no_false_positive_anti_pattern() {
         let gate = test_gate();
         let results = gate.check_anti_patterns_for_tool("bash");
-        assert!(results.is_empty(), "Without active methodologies, no anti-patterns should fire");
+        assert!(
+            results.is_empty(),
+            "Without active methodologies, no anti-patterns should fire"
+        );
     }
 
     // ─── Persuasion ───
@@ -1013,10 +1168,16 @@ mod tests {
     #[test]
     fn test_persuasive_directives() {
         let mut gate = test_gate();
-        gate.activate("methodology:verification-before-completion", TriggerSource::Manual);
+        gate.activate(
+            "methodology:verification-before-completion",
+            TriggerSource::Manual,
+        );
 
         let directives = gate.persuasive_directives();
-        assert!(!directives.is_empty(), "verification should have persuasion directives");
+        assert!(
+            !directives.is_empty(),
+            "verification should have persuasion directives"
+        );
         assert!(directives.iter().any(|d| d.contains("Always verify")));
     }
 
@@ -1026,8 +1187,10 @@ mod tests {
         gate.activate("methodology:test-driven-development", TriggerSource::Manual);
 
         let directives = gate.persuasive_directives();
-        assert!(directives.iter().any(|d| d.contains("Strict Discipline")),
-            "Discipline-type methodologies should use Strict Discipline prefix");
+        assert!(
+            directives.iter().any(|d| d.contains("Strict Discipline")),
+            "Discipline-type methodologies should use Strict Discipline prefix"
+        );
     }
 
     // ─── Constitution Binding ───
@@ -1072,7 +1235,11 @@ mod tests {
             ActivationCondition::OnTaskError,
         );
 
-        assert_eq!(gate.binding_count(), 1, "Duplicate bindings should be deduplicated");
+        assert_eq!(
+            gate.binding_count(),
+            1,
+            "Duplicate bindings should be deduplicated"
+        );
     }
 
     // ─── Max Active Limit ───
@@ -1082,10 +1249,17 @@ mod tests {
         let mut gate = test_gate();
         gate.max_active = 2;
 
-        assert!(gate.activate("methodology:index-priority", TriggerSource::Manual).is_some());
-        assert!(gate.activate("methodology:cost-awareness", TriggerSource::Manual).is_some());
-        assert!(gate.activate("methodology:least-privilege", TriggerSource::Manual).is_none(),
-            "Should hit max active limit");
+        assert!(gate
+            .activate("methodology:index-priority", TriggerSource::Manual)
+            .is_some());
+        assert!(gate
+            .activate("methodology:cost-awareness", TriggerSource::Manual)
+            .is_some());
+        assert!(
+            gate.activate("methodology:least-privilege", TriggerSource::Manual)
+                .is_none(),
+            "Should hit max active limit"
+        );
 
         assert_eq!(gate.active_count(), 2);
     }
@@ -1101,8 +1275,14 @@ mod tests {
         let prog = gate.active_for_domain("programming");
         let general = gate.active_for_domain("general");
 
-        assert!(!prog.is_empty(), "Should have programming domain methodologies");
-        assert!(!general.is_empty(), "Should have general domain methodologies");
+        assert!(
+            !prog.is_empty(),
+            "Should have programming domain methodologies"
+        );
+        assert!(
+            !general.is_empty(),
+            "Should have general domain methodologies"
+        );
     }
 
     // ─── JSON-LD Serialization ───
@@ -1126,8 +1306,11 @@ mod tests {
         let registry = MethodologyRegistry::new();
         for methodology in registry.all() {
             let json = methodology.to_json_ld();
-            assert_eq!(json["methodology:id"], methodology.id,
-                "JSON-LD id mismatch for {}", methodology.id);
+            assert_eq!(
+                json["methodology:id"], methodology.id,
+                "JSON-LD id mismatch for {}",
+                methodology.id
+            );
         }
     }
 
@@ -1139,8 +1322,10 @@ mod tests {
         let ctx = test_context(HookPoint::AgentInit, "SA", None);
         gate.on_hook_trigger(HookPoint::AgentInit, &ctx);
 
-        assert!(gate.is_active("methodology:complexity-assessment"),
-            "complexity-assessment should be active for SA role");
+        assert!(
+            gate.is_active("methodology:complexity-assessment"),
+            "complexity-assessment should be active for SA role"
+        );
     }
 
     #[test]
@@ -1151,8 +1336,10 @@ mod tests {
 
         gate.on_hook_trigger(HookPoint::PhaseEnd, &ctx);
 
-        assert!(gate.is_active("methodology:verification-before-completion"),
-            "verification-before-completion should activate on PhaseEnd(ACT)");
+        assert!(
+            gate.is_active("methodology:verification-before-completion"),
+            "verification-before-completion should activate on PhaseEnd(ACT)"
+        );
     }
 
     // ─── Edge Cases ───
@@ -1168,7 +1355,10 @@ mod tests {
     fn test_activate_nonexistent() {
         let mut gate = test_gate();
         let result = gate.activate("methodology:nonexistent", TriggerSource::Manual);
-        assert!(result.is_none(), "Activating nonexistent methodology should return None");
+        assert!(
+            result.is_none(),
+            "Activating nonexistent methodology should return None"
+        );
     }
 
     #[test]

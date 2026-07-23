@@ -6,8 +6,8 @@ use tracing::{info, warn};
 use crate::core::agent_instance::AgentRole;
 use crate::CoreError;
 
-use super::agent::SupervisorAgent;
 use super::actions::parse_or_repair_json;
+use super::agent::SupervisorAgent;
 use super::types::*;
 
 impl SupervisorAgent {
@@ -44,10 +44,16 @@ impl SupervisorAgent {
         info!(cycle_id = %cycle_id, task_iri = %task_iri, input = %user_input, "Cycle started");
 
         self.event_bus
-            .emit(task_iri, "CYCLE_STARTED", "SA", &serde_json::json!({
-                "cycle_id": &cycle_id,
-                "user_input": user_input,
-            }).to_string())
+            .emit(
+                task_iri,
+                "CYCLE_STARTED",
+                "SA",
+                &serde_json::json!({
+                    "cycle_id": &cycle_id,
+                    "user_input": user_input,
+                })
+                .to_string(),
+            )
             .await;
 
         Ok(cycle_id)
@@ -68,17 +74,34 @@ impl SupervisorAgent {
                 "Simple query: single DA agent".to_string(),
             ),
             TaskComplexity::Standard => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+                vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ],
                 vec![],
                 "Standard task: PA → DA → CA → AA".to_string(),
             ),
             TaskComplexity::Complex => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+                vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ],
                 vec![],
                 "Complex task: PA → DA → CA → AA with full validation".to_string(),
             ),
             TaskComplexity::Exploratory => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Do, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+                vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Do,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ],
                 vec![vec![AgentRole::Do, AgentRole::Do, AgentRole::Do]],
                 "Exploratory: PA → [DA1, DA2, DA3] → CA → AA".to_string(),
             ),
@@ -91,9 +114,18 @@ impl SupervisorAgent {
                 // Recursive: only 1 round of SA-level PDCA.
                 // DA internally executes micro-recursion via execute_recursive_sub_cycle
                 // Sub-task decomposition, no SA-level multi-round replay needed.
-                let seq = vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act];
-                (seq, vec![], "Recursive: 1 PDCA with DA-internal sub-cycles".to_string())
-            },
+                let seq = vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ];
+                (
+                    seq,
+                    vec![],
+                    "Recursive: 1 PDCA with DA-internal sub-cycles".to_string(),
+                )
+            }
         };
 
         let steps = self.generate_default_steps(&agent_sequence);
@@ -134,17 +166,34 @@ impl SupervisorAgent {
                 "Simple query: single DA agent".to_string(),
             ),
             TaskComplexity::Standard => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+                vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ],
                 vec![],
                 "Standard task: PA → DA → CA → AA".to_string(),
             ),
             TaskComplexity::Complex => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+                vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ],
                 vec![],
                 "Complex task: PA → DA → CA → AA with full validation".to_string(),
             ),
             TaskComplexity::Exploratory => (
-                vec![AgentRole::Plan, AgentRole::Do, AgentRole::Do, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+                vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Do,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ],
                 vec![vec![AgentRole::Do, AgentRole::Do, AgentRole::Do]],
                 "Exploratory: PA → [DA1, DA2, DA3] → CA → AA".to_string(),
             ),
@@ -157,9 +206,18 @@ impl SupervisorAgent {
                 // Recursive: only 1 round of SA-level PDCA (same as Standard).
                 // DA internally executes micro-recursion via execute_recursive_sub_cycle
                 // Sub-task decomposition, no SA-level multi-round replay needed.
-                let seq = vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act];
-                (seq, vec![], "Recursive: 1 PDCA with DA-internal sub-cycles".to_string())
-            },
+                let seq = vec![
+                    AgentRole::Plan,
+                    AgentRole::Do,
+                    AgentRole::Check,
+                    AgentRole::Act,
+                ];
+                (
+                    seq,
+                    vec![],
+                    "Recursive: 1 PDCA with DA-internal sub-cycles".to_string(),
+                )
+            }
         };
 
         let steps = self.generate_default_steps(&agent_sequence);
@@ -190,7 +248,12 @@ impl SupervisorAgent {
     /// Build resume mode execution plan: standard PDCA sequence
     /// execute_plan will skip completed phases based on resumed_messages
     pub(super) fn build_resume_plan(&self) -> ExecutionPlan {
-        let agent_sequence = vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act];
+        let agent_sequence = vec![
+            AgentRole::Plan,
+            AgentRole::Do,
+            AgentRole::Check,
+            AgentRole::Act,
+        ];
         let steps = self.generate_default_steps(&agent_sequence);
         ExecutionPlan {
             plan_id: format!("plan_resume_{}", uuid::Uuid::new_v4().hyphenated()),
@@ -217,7 +280,8 @@ impl SupervisorAgent {
                 let (objective, expected_output, success_criteria) = match role {
                     AgentRole::Plan => (
                         "Analyze task requirements, create detailed execution plan".to_string(),
-                        "JSON-formatted plan with steps, dependencies, resource requirements".to_string(),
+                        "JSON-formatted plan with steps, dependencies, resource requirements"
+                            .to_string(),
                         "Plan is clear, steps complete, dependencies explicit".to_string(),
                     ),
                     AgentRole::Do => (
@@ -242,7 +306,11 @@ impl SupervisorAgent {
                     role: *role,
                     objective,
                     expected_output,
-                    dependencies: if i > 0 { vec![format!("step_{}", i)] } else { vec![] },
+                    dependencies: if i > 0 {
+                        vec![format!("step_{}", i)]
+                    } else {
+                        vec![]
+                    },
                     tools_allowed: vec![],
                     success_criteria,
                 }
@@ -250,7 +318,10 @@ impl SupervisorAgent {
             .collect()
     }
 
-    pub(super) async fn extract_5w2h_from_input(&self, user_input: &str) -> crate::core::five_w2h::Task5W2H {
+    pub(super) async fn extract_5w2h_from_input(
+        &self,
+        user_input: &str,
+    ) -> crate::core::five_w2h::Task5W2H {
         use crate::core::five_w2h::*;
 
         if user_input.len() < 20 && !user_input.contains(' ') {
@@ -292,17 +363,43 @@ Output only JSON, no other content."#,
             reasoning_content: None,
         }];
 
-        match self.runner.gateway.chat_with_params(&model, messages, Some(0.3), Some(500), None, None).await {
+        match self
+            .runner
+            .gateway
+            .chat_with_params(&model, messages, Some(0.3), Some(500), None, None)
+            .await
+        {
             Ok(response) => {
-                if let Some(content) = response.choices.first().and_then(|c| c.message.content.clone()) {
+                if let Some(content) = response
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.content.clone())
+                {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let what = parsed.get("what").and_then(|v| v.as_str()).unwrap_or(user_input).to_string();
-                        let why_desc = parsed.get("why_description").and_then(|v| v.as_str()).unwrap_or("User task").to_string();
-                        let success_criteria = parsed.get("success_criteria")
+                        let what = parsed
+                            .get("what")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(user_input)
+                            .to_string();
+                        let why_desc = parsed
+                            .get("why_description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("User task")
+                            .to_string();
+                        let success_criteria = parsed
+                            .get("success_criteria")
                             .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
-                        let priority = match parsed.get("priority").and_then(|v| v.as_str()).unwrap_or("medium") {
+                        let priority = match parsed
+                            .get("priority")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("medium")
+                        {
                             "high" => Priority::High,
                             "low" => Priority::Low,
                             _ => Priority::Medium,
@@ -312,9 +409,14 @@ Output only JSON, no other content."#,
                         w2h.why.success_criteria = success_criteria;
                         w2h.why.priority = priority;
 
-                        let deadline = parsed.get("deadline").and_then(|v| v.as_str())
+                        let deadline = parsed
+                            .get("deadline")
+                            .and_then(|v| v.as_str())
                             .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
-                        let estimated_duration = parsed.get("estimated_duration").and_then(|v| v.as_str()).map(String::from);
+                        let estimated_duration = parsed
+                            .get("estimated_duration")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                         if deadline.is_some() || estimated_duration.is_some() {
                             w2h = w2h.with_when(WhenDetail {
                                 deadline,
@@ -326,7 +428,8 @@ Output only JSON, no other content."#,
                         }
 
                         // ── who ──
-                        if let Some(role_str) = parsed.get("required_role").and_then(|v| v.as_str()) {
+                        if let Some(role_str) = parsed.get("required_role").and_then(|v| v.as_str())
+                        {
                             w2h = w2h.with_who(WhoDetail {
                                 requestor: None,
                                 assignees: vec![],
@@ -337,8 +440,14 @@ Output only JSON, no other content."#,
                         }
 
                         // ── where (data_sources) ──
-                        let data_sources: Vec<String> = parsed.get("data_sources").and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        let data_sources: Vec<String> = parsed
+                            .get("data_sources")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         if !data_sources.is_empty() {
                             w2h = w2h.with_where(WhereDetail {
@@ -350,8 +459,14 @@ Output only JSON, no other content."#,
                         }
 
                         // ── how (preferred_skills) ──
-                        let preferred_skills: Vec<String> = parsed.get("preferred_skills").and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        let preferred_skills: Vec<String> = parsed
+                            .get("preferred_skills")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         if !preferred_skills.is_empty() {
                             w2h = w2h.with_how(HowDetail {
@@ -386,7 +501,12 @@ Output only JSON, no other content."#,
         Task5W2H::new(user_input, "User task")
     }
 
-    pub async fn analyze_task_with_llm(&self, user_input: &str, five_w2h: &crate::core::five_w2h::Task5W2H, experience_hints: &[String]) -> ExecutionPlan {
+    pub async fn analyze_task_with_llm(
+        &self,
+        user_input: &str,
+        five_w2h: &crate::core::five_w2h::Task5W2H,
+        experience_hints: &[String],
+    ) -> ExecutionPlan {
         // First detect recursive/complex tasks via keyword classifier (keyword path captures Recursive more reliably than LLM)
         let keyword_complexity = self.classify_complexity(user_input);
         if keyword_complexity == TaskComplexity::Recursive {
@@ -397,8 +517,13 @@ Output only JSON, no other content."#,
         let enhanced_input = if experience_hints.is_empty() {
             user_input.to_string()
         } else {
-            format!("## Historical Experience Reference\n{}\n\n## Current Task\n{}",
-                experience_hints.iter().map(|h| format!("- {}", h)).collect::<Vec<_>>().join("\n"),
+            format!(
+                "## Historical Experience Reference\n{}\n\n## Current Task\n{}",
+                experience_hints
+                    .iter()
+                    .map(|h| format!("- {}", h))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 user_input
             )
         };
@@ -411,30 +536,42 @@ Output only JSON, no other content."#,
                 } else {
                     TaskComplexity::Complex
                 }
-            },
+            }
             crate::core::five_w2h::Priority::Medium => TaskComplexity::Standard,
             crate::core::five_w2h::Priority::Low => TaskComplexity::Simple,
         };
 
-        match self.generate_detailed_plan_with_llm(&enhanced_input, five_w2h).await {
+        match self
+            .generate_detailed_plan_with_llm(&enhanced_input, five_w2h)
+            .await
+        {
             Ok(mut plan) => {
                 info!(plan_id = %plan.plan_id, steps = plan.steps.len(), "LLM generated detailed plan successfully");
                 // If keyword classifier says Complex but LLM returned wrong complexity, fix it
-                if keyword_complexity == TaskComplexity::Complex && plan.task_complexity != TaskComplexity::Complex {
+                if keyword_complexity == TaskComplexity::Complex
+                    && plan.task_complexity != TaskComplexity::Complex
+                {
                     plan.task_complexity = TaskComplexity::Complex;
                     plan.max_recursion_depth = 2;
                 }
                 return plan;
             }
             Err(e) => {
-                warn!("LLM failed to generate detailed plan: {}, using default plan", e);
+                warn!(
+                    "LLM failed to generate detailed plan: {}, using default plan",
+                    e
+                );
             }
         }
 
         self.build_plan_from_complexity(complexity)
     }
 
-    async fn generate_detailed_plan_with_llm(&self, user_input: &str, five_w2h: &crate::core::five_w2h::Task5W2H) -> Result<ExecutionPlan, CoreError> {
+    async fn generate_detailed_plan_with_llm(
+        &self,
+        user_input: &str,
+        five_w2h: &crate::core::five_w2h::Task5W2H,
+    ) -> Result<ExecutionPlan, CoreError> {
         let mut w2h_section = String::new();
 
         if let Some(ref who) = five_w2h.who {
@@ -454,7 +591,10 @@ Output only JSON, no other content."#,
 
         if let Some(ref where_) = five_w2h.where_ {
             if !where_.data_sources.is_empty() {
-                w2h_section.push_str(&format!("\n- Data Sources: {}", where_.data_sources.join(", ")));
+                w2h_section.push_str(&format!(
+                    "\n- Data Sources: {}",
+                    where_.data_sources.join(", ")
+                ));
             }
             if let Some(ref env) = where_.execution_environment {
                 w2h_section.push_str(&format!("\n- Execution Environment: {}", env));
@@ -463,10 +603,16 @@ Output only JSON, no other content."#,
 
         if let Some(ref how) = five_w2h.how {
             if !how.preferred_skills.is_empty() {
-                w2h_section.push_str(&format!("\n- Preferred Skills: {}", how.preferred_skills.join(", ")));
+                w2h_section.push_str(&format!(
+                    "\n- Preferred Skills: {}",
+                    how.preferred_skills.join(", ")
+                ));
             }
             if !how.forbidden_tools.is_empty() {
-                w2h_section.push_str(&format!("\n- Forbidden Tools: {}", how.forbidden_tools.join(", ")));
+                w2h_section.push_str(&format!(
+                    "\n- Forbidden Tools: {}",
+                    how.forbidden_tools.join(", ")
+                ));
             }
         }
 
@@ -480,7 +626,10 @@ Output only JSON, no other content."#,
         }
 
         if !five_w2h.why.success_criteria.is_empty() {
-            w2h_section.push_str(&format!("\n- Success Criteria: {}", five_w2h.why.success_criteria.join(", ")));
+            w2h_section.push_str(&format!(
+                "\n- Success Criteria: {}",
+                five_w2h.why.success_criteria.join(", ")
+            ));
         }
 
         w2h_section.push_str(&format!("\n- Priority: {:?}", five_w2h.why.priority));
@@ -494,9 +643,11 @@ Output only JSON, no other content."#,
         let sa_constitution_prompt = {
             use crate::core::constitution::{ConstitutionRegistry, ConstitutionRole};
             let registry = ConstitutionRegistry::new();
-            let constitution_text = registry.build_prompt_for_role_exact(ConstitutionRole::Supervisor);
+            let constitution_text =
+                registry.build_prompt_for_role_exact(ConstitutionRole::Supervisor);
             // Inject methodology layer discipline (includes auto-trigger protocol, always-active methodology)
-            let methodology_text = crate::methodology::integration::MethodologyPromptInjector::build_for_sa();
+            let methodology_text =
+                crate::methodology::integration::MethodologyPromptInjector::build_for_sa();
             format!("{}\n{}", constitution_text, methodology_text)
         };
 
@@ -565,18 +716,19 @@ Output only JSON, no other content."#,
             reasoning_content: None,
         }];
 
-        let response = self.runner.gateway.chat_with_params(
-            &model,
-            messages,
-            Some(0.3),
-            Some(2000),
-            None,
-            None,
-        ).await?;
+        let response = self
+            .runner
+            .gateway
+            .chat_with_params(&model, messages, Some(0.3), Some(2000), None, None)
+            .await?;
 
-        let content = response.choices.first()
+        let content = response
+            .choices
+            .first()
             .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| CoreError::Internal { message: "No response content".to_string() })?;
+            .ok_or_else(|| CoreError::Internal {
+                message: "No response content".to_string(),
+            })?;
 
         self.parse_llm_plan(&content)
     }
@@ -592,7 +744,9 @@ Output only JSON, no other content."#,
                 trimmed.to_string()
             }
         } else {
-            return Err(CoreError::Internal { message: "No JSON found in LLM plan response".to_string() });
+            return Err(CoreError::Internal {
+                message: "No JSON found in LLM plan response".to_string(),
+            });
         };
 
         #[derive(Deserialize)]
@@ -614,8 +768,10 @@ Output only JSON, no other content."#,
             success_criteria: String,
         }
 
-        let parsed: LlmPlanResponse = parse_or_repair_json(&json_str)
-            .map_err(|e| CoreError::Internal { message: format!("JSON parse error after repair attempt: {}", e) })?;
+        let parsed: LlmPlanResponse =
+            parse_or_repair_json(&json_str).map_err(|e| CoreError::Internal {
+                message: format!("JSON parse error after repair attempt: {}", e),
+            })?;
 
         let complexity = match parsed.complexity.as_str() {
             "simple" => TaskComplexity::Simple,
@@ -626,28 +782,37 @@ Output only JSON, no other content."#,
             _ => TaskComplexity::Standard,
         };
 
-        let steps: Vec<PlanStep> = parsed.steps.into_iter().map(|s| {
-            let role = match s.role.as_str() {
-                "Plan" => AgentRole::Plan,
-                "Do" => AgentRole::Do,
-                "Check" => AgentRole::Check,
-                "Act" => AgentRole::Act,
-                _ => AgentRole::Do,
-            };
-            PlanStep {
-                step_id: s.step_id,
-                role,
-                objective: s.objective,
-                expected_output: s.expected_output,
-                dependencies: s.dependencies,
-                tools_allowed: s.tools_allowed,
-                success_criteria: s.success_criteria,
-            }
-        }).collect();
+        let steps: Vec<PlanStep> = parsed
+            .steps
+            .into_iter()
+            .map(|s| {
+                let role = match s.role.as_str() {
+                    "Plan" => AgentRole::Plan,
+                    "Do" => AgentRole::Do,
+                    "Check" => AgentRole::Check,
+                    "Act" => AgentRole::Act,
+                    _ => AgentRole::Do,
+                };
+                PlanStep {
+                    step_id: s.step_id,
+                    role,
+                    objective: s.objective,
+                    expected_output: s.expected_output,
+                    dependencies: s.dependencies,
+                    tools_allowed: s.tools_allowed,
+                    success_criteria: s.success_criteria,
+                }
+            })
+            .collect();
 
         let max_plan_steps = 8;
         let steps = if steps.len() > max_plan_steps {
-            warn!("Plan step count {} exceeds limit {}, truncating to first {} steps", steps.len(), max_plan_steps, max_plan_steps);
+            warn!(
+                "Plan step count {} exceeds limit {}, truncating to first {} steps",
+                steps.len(),
+                max_plan_steps,
+                max_plan_steps
+            );
             steps.into_iter().take(max_plan_steps).collect()
         } else {
             steps
@@ -713,16 +878,15 @@ Complexity definitions:
             reasoning_content: None,
         }];
 
-        let response = self.runner.gateway.chat_with_params(
-            &model,
-            messages,
-            Some(0.3),
-            Some(200),
-            None,
-            None,
-        ).await?;
+        let response = self
+            .runner
+            .gateway
+            .chat_with_params(&model, messages, Some(0.3), Some(200), None, None)
+            .await?;
 
-        let content = response.choices.first()
+        let content = response
+            .choices
+            .first()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
 
@@ -751,7 +915,9 @@ Complexity definitions:
             return Ok(TaskComplexity::Emergency);
         }
 
-        Err(CoreError::Internal { message: "Failed to parse LLM classification".to_string() })
+        Err(CoreError::Internal {
+            message: "Failed to parse LLM classification".to_string(),
+        })
     }
 
     pub(super) fn classify_complexity(&self, user_input: &str) -> TaskComplexity {
@@ -763,23 +929,36 @@ Complexity definitions:
         }
 
         // Emergency: emergency fix category
-        let emergency_keywords = ["fix", "bug", "error", "crash", "urgent", "broken", "repair",
-            "repair", "urgent", "crash", "fault"];
+        let emergency_keywords = [
+            "fix", "bug", "error", "crash", "urgent", "broken", "repair", "repair", "urgent",
+            "crash", "fault",
+        ];
         if emergency_keywords.iter().any(|k| lower.contains(k)) {
             return TaskComplexity::Emergency;
         }
 
         // Recursive decomposition: complex multi-step tasks, requires DA internal micro PDCA sub-cycles
         let recursive_keywords = [
-            "refactor", "rewrite", "migrate",
-            "split into", "decompose",
+            "refactor",
+            "rewrite",
+            "migrate",
+            "split into",
+            "decompose",
             "multi-phase",
-            "end-to-end", "full-stack",
+            "end-to-end",
+            "full-stack",
             // Project building category
-            "develop", "create",
-            "implement", "building", "build",
-            "program", "project", "app",
-            "website", "system", "platform",
+            "develop",
+            "create",
+            "implement",
+            "building",
+            "build",
+            "program",
+            "project",
+            "app",
+            "website",
+            "system",
+            "platform",
             "generate",
         ];
         if recursive_keywords.iter().any(|k| lower.contains(k)) {
@@ -787,16 +966,12 @@ Complexity definitions:
         }
 
         // Exploratory task → Exploratory (prioritized over research_patterns)
-        let exploratory_keywords = [
-            "research", "explore", "investigate",
-        ];
+        let exploratory_keywords = ["research", "explore", "investigate"];
         if exploratory_keywords.iter().any(|k| lower.contains(k)) {
             return TaskComplexity::Exploratory;
         }
 
-        let compare_keywords = [
-            "compare",
-        ];
+        let compare_keywords = ["compare"];
         if compare_keywords.iter().any(|k| lower.contains(k)) {
             let multi_patterns = ["different", "various", "multiple", "several"];
             if multi_patterns.iter().any(|p| lower.contains(p)) {
@@ -808,7 +983,13 @@ Complexity definitions:
         // Research/analysis questions → Standard or Complex
         let research_patterns: [&str; 0] = [];
         if research_patterns.iter().any(|p| lower.contains(p)) {
-            let deep_patterns = ["deep", "thorough", "comprehensive", "systematic", "in-depth"];
+            let deep_patterns = [
+                "deep",
+                "thorough",
+                "comprehensive",
+                "systematic",
+                "in-depth",
+            ];
             if deep_patterns.iter().any(|p| lower.contains(p)) {
                 return TaskComplexity::Complex;
             }
@@ -817,21 +998,21 @@ Complexity definitions:
 
         // Simple: simple fact query, answerable in one sentence
         let simple_query_patterns: [&str; 0] = [];
-        let is_simple_query = user_input.len() < 50 
+        let is_simple_query = user_input.len() < 50
             && simple_query_patterns.iter().any(|p| lower.contains(p))
             && !lower.contains("application")
             && !lower.contains("scenario")
             && !lower.contains("analysis")
             && !lower.contains("implementation")
             && !lower.contains("design");
-        
+
         if is_simple_query {
             return TaskComplexity::Simple;
         }
 
         // English simple query
         if user_input.len() < 50
-            && (lower.starts_with("what is") 
+            && (lower.starts_with("what is")
                 || lower.starts_with("who is")
                 || lower.starts_with("where is")
                 || lower.starts_with("when is"))

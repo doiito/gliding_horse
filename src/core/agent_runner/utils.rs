@@ -5,16 +5,21 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
+use crate::core::system_prompt::{
+    build_constitution_prompt, build_time_awareness_text, SystemPromptBuilder, SystemPromptRegion,
+};
 use crate::gateway::unified_gateway::ChatMessage;
 use crate::jsonld::{generate_iri, validate_jsonld_node, JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
+use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
-use crate::core::system_prompt::{SystemPromptBuilder, SystemPromptRegion, build_constitution_prompt, build_time_awareness_text};
-use crate::methodology::integration::MethodologyPromptInjector;
 use crate::CoreError;
 
-use super::{LlmParsedResponse, TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
+use super::{
+    LlmParsedResponse, TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT,
+    LLM_RESPONSE_FORMAT_WITH_THOUGHT,
+};
 
 impl super::AgentRunner {
     /// Utility: extract summary from agent output.
@@ -377,7 +382,7 @@ impl super::AgentRunner {
                 for item in arr {
                     if let Some(s) = item.as_str() {
                         if !s.is_empty() {
-                             emphasis_items.push(format!("[Constraint] {}", s));
+                            emphasis_items.push(format!("[Constraint] {}", s));
                         }
                     }
                 }
@@ -389,15 +394,34 @@ impl super::AgentRunner {
 
     fn extract_emphasis_by_keywords(text: &str) -> Vec<String> {
         let keywords = [
-            "must", "important", "critical", "make sure", "don't forget", "remember", "always",
-            "forbidden", "not allowed", "caution", "never", "absolutely not",
-            "MUST", "IMPORTANT", "CRITICAL", "NEVER", "ALWAYS",
-            "REQUIRED", "MANDATORY", "ESSENTIAL", "WARNING",
+            "must",
+            "important",
+            "critical",
+            "make sure",
+            "don't forget",
+            "remember",
+            "always",
+            "forbidden",
+            "not allowed",
+            "caution",
+            "never",
+            "absolutely not",
+            "MUST",
+            "IMPORTANT",
+            "CRITICAL",
+            "NEVER",
+            "ALWAYS",
+            "REQUIRED",
+            "MANDATORY",
+            "ESSENTIAL",
+            "WARNING",
         ];
         let mut results = Vec::new();
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
             for keyword in &keywords {
                 if trimmed.contains(keyword) {
                     let clean = if trimmed.len() > 200 {
@@ -495,7 +519,10 @@ impl super::AgentRunner {
         self.blackboard
             .write_node(&node_iri, &node_json.to_string(), &cfg)?;
 
-        info!("[L2] Storing JSON-LD node: {} for task {}", node_iri, task_iri);
+        info!(
+            "[L2] Storing JSON-LD node: {} for task {}",
+            node_iri, task_iri
+        );
         Ok(node_iri)
     }
 
@@ -529,7 +556,9 @@ impl super::AgentRunner {
             }
         }
 
-        let result = self.execute_streaming_inner(agent, ctx, session, on_event).await;
+        let result = self
+            .execute_streaming_inner(agent, ctx, session, on_event)
+            .await;
 
         session = result.1;
 
@@ -551,7 +580,6 @@ impl super::AgentRunner {
     where
         F: FnMut(&crate::llm::StreamEvent) + Send,
     {
-
         let model = self
             .gateway
             .get_model(&agent.role.to_string().to_lowercase());
@@ -565,7 +593,10 @@ impl super::AgentRunner {
 
         // Region 2: Time awareness — current time and session context
         {
-            let session_start = session.created_at().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            let session_start = session
+                .created_at()
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string();
             let time_text = build_time_awareness_text(Some(&session_start));
             prompt_builder.set_region(SystemPromptRegion::TimeAwareness, time_text);
         }
@@ -594,9 +625,10 @@ impl super::AgentRunner {
             policy_text.push_str("- Check Agent (CA) special note: Your audit report may only contain content related to the current task. If you discover irrelevant files, ignore them and do not include them in the report\n");
             policy_text.push_str("- Decision Agent (AA) special note: Do not actively explore files. Your decisions must be based solely on CA audit results — ignore any irrelevant content in the audit results\n");
 
-
             // Inject methodology discipline (PA/CA/AA specific)
-            if let Some(methodology_addendum) = MethodologyPromptInjector::build_for_role(agent.role) {
+            if let Some(methodology_addendum) =
+                MethodologyPromptInjector::build_for_role(agent.role)
+            {
                 policy_text.push_str(&methodology_addendum);
             }
             // Inject persuasive directives for active methodologies
@@ -720,7 +752,8 @@ impl super::AgentRunner {
         let mut turn = 0u32;
         let mut errs = Vec::new();
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
-        let mut tool_error_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut tool_error_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
         let mut last_content = String::new();
         let mut last_thought = String::new();
         let mut last_summary = String::new();
@@ -739,7 +772,8 @@ impl super::AgentRunner {
                 guard_pending_pre_injections.clear();
             }
 
-            let mut stream = match self.gateway
+            let mut stream = match self
+                .gateway
                 .stream_chat_with_params(
                     &model,
                     running_messages.clone(),
@@ -751,15 +785,19 @@ impl super::AgentRunner {
                             .tool_executor
                             .read()
                             .tool_definitions_for_role(&agent.role.to_string());
-                        if current_tools.is_empty() { None } else { Some(current_tools) }
+                        if current_tools.is_empty() {
+                            None
+                        } else {
+                            Some(current_tools)
+                        }
                     },
                     None,
                 )
                 .await
-                {
-                    Ok(s) => s,
-                    Err(e) => return (Err(e), session),
-                };
+            {
+                Ok(s) => s,
+                Err(e) => return (Err(e), session),
+            };
 
             let mut accumulator = crate::llm::StreamAccumulator::new();
 
@@ -773,7 +811,11 @@ impl super::AgentRunner {
                         }
                     }
                     Ok(None) => break Ok(()),
-                    Err(e) => break Err(CoreError::Internal { message: e.to_string() }),
+                    Err(e) => {
+                        break Err(CoreError::Internal {
+                            message: e.to_string(),
+                        })
+                    }
                 }
             };
             if let Err(e) = stream_result {
@@ -784,10 +826,14 @@ impl super::AgentRunner {
 
             // Accumulate token usage from streaming response
             if let Some(ref usage) = stream_response.usage {
-                self.total_prompt_tokens.fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
-                self.total_completion_tokens.fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
-                self.last_prompt_tokens.store(usage.prompt_tokens as u64, Ordering::Relaxed);
-                self.last_completion_tokens.store(usage.completion_tokens as u64, Ordering::Relaxed);
+                self.total_prompt_tokens
+                    .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.total_completion_tokens
+                    .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+                self.last_prompt_tokens
+                    .store(usage.prompt_tokens as u64, Ordering::Relaxed);
+                self.last_completion_tokens
+                    .store(usage.completion_tokens as u64, Ordering::Relaxed);
             }
 
             let parsed = self.parse_llm_response(
@@ -807,7 +853,8 @@ impl super::AgentRunner {
                                 .filter(|name| !ToolExecutor::is_pa_readonly_tool(name))
                                 .collect();
                             let force_finish = if let Some(ref tc) = self.tool_controller {
-                                let tc_calls: Vec<(String, Value)> = tool_calls.iter()
+                                let tc_calls: Vec<(String, Value)> = tool_calls
+                                    .iter()
                                     .map(|c| (c.name.clone(), c.arguments.clone()))
                                     .collect();
                                 tc.should_force_finish(&tc_calls, &agent.role)
@@ -815,12 +862,17 @@ impl super::AgentRunner {
                                 !write_tools.is_empty()
                             };
                             if force_finish {
-                                warn!("[PA Streaming] Write operation tool calls blocked: {:?}", write_tools);
+                                warn!(
+                                    "[PA Streaming] Write operation tool calls blocked: {:?}",
+                                    write_tools
+                                );
                                 break;
                             }
                         }
 
-                        let asst_summary = parsed.summary.clone()
+                        let asst_summary = parsed
+                            .summary
+                            .clone()
                             .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
                         running_messages.push(ChatMessage {
                             role: "assistant".to_string(),
@@ -832,10 +884,12 @@ impl super::AgentRunner {
                                     .map(|c| crate::gateway::unified_gateway::ToolCallPayload {
                                         id: c.id.clone(),
                                         call_type: "function".to_string(),
-                                        function: crate::gateway::unified_gateway::ToolCallFunction {
-                                            name: c.name.clone(),
-                                            arguments: serde_json::to_string(&c.arguments).unwrap_or_default(),
-                                        },
+                                        function:
+                                            crate::gateway::unified_gateway::ToolCallFunction {
+                                                name: c.name.clone(),
+                                                arguments: serde_json::to_string(&c.arguments)
+                                                    .unwrap_or_default(),
+                                            },
                                     })
                                     .collect(),
                             ),
@@ -861,7 +915,9 @@ impl super::AgentRunner {
                                     .execute(HookPoint::SkillBefore, &mut hook_ctx)
                                     .await;
                                 // Capture ToolGuard pre-injections for next streaming turn
-                                if let Some(injections) = hook_ctx.metadata.remove("guard_pre_injections") {
+                                if let Some(injections) =
+                                    hook_ctx.metadata.remove("guard_pre_injections")
+                                {
                                     if let Value::Array(arr) = injections {
                                         for v in arr {
                                             if let Some(s) = v.as_str() {
@@ -872,16 +928,26 @@ impl super::AgentRunner {
                                 }
                             }
 
-                            let handler = {
-                                let executor = self.tool_executor.read();
-                                executor.try_get_handler(name)
-                            };
-                            let result = match handler {
-                                Some(f) => f(args).await.unwrap_or_else(|e| json!({"error": e})),
-                                None => json!({"error": format!("Tool not found: {}", name)}),
-                            };
+                            // Clone the executor before awaiting so the
+                            // shared lock is not held across handler I/O.
+                            // This path enforces ToolExecutor policies/gates
+                            // while retaining micro-tool fallback behavior.
+                            let executor = self.tool_executor.read().clone();
+                            let result = executor
+                                .execute_with_security_context(
+                                    name,
+                                    args,
+                                    crate::skill_graph::security::SecurityContext::new(
+                                        &agent.agent_id,
+                                        &agent.role.to_string(),
+                                    )
+                                    .with_task(&ctx.task_iri),
+                                )
+                                .await
+                                .unwrap_or_else(|e| json!({"error": e}));
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
-                            let mut result_str = self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            let mut result_str =
+                                self.route_tool_result(&raw_result_str, name, &c.id).await;
 
                             // SkillAfter hook
                             let guard_aborted = {
@@ -893,12 +959,15 @@ impl super::AgentRunner {
                                 .with_task(&ctx.task_iri, &ctx.task_iri)
                                 .with_data("tool_name", Value::String(name.clone()))
                                 .with_data("tool_result", Value::String(raw_result_str.clone()));
-                                let hook_result = self.hook_manager
+                                let hook_result = self
+                                    .hook_manager
                                     .execute(HookPoint::SkillAfter, &mut hook_ctx)
                                     .await;
 
                                 if hook_result == HookResult::Abort {
-                                    Some(hook_ctx.error.unwrap_or_else(|| "Tool result rejected by guard".to_string()))
+                                    Some(hook_ctx.error.unwrap_or_else(|| {
+                                        "Tool result rejected by guard".to_string()
+                                    }))
                                 } else {
                                     None
                                 }
@@ -912,9 +981,13 @@ impl super::AgentRunner {
                                 warn!("[Streaming] tool {} failed: {}", name, err_msg);
                                 errs.push(format!("{}: {}", name, err_msg));
                                 if !is_tool_not_found {
-                                    let tool_count = tool_error_counts.entry(name.clone()).or_insert(0);
+                                    let tool_count =
+                                        tool_error_counts.entry(name.clone()).or_insert(0);
                                     *tool_count += 1;
-                                    debug!("[Streaming][tool_error] {} failure count: {}/3", name, *tool_count);
+                                    debug!(
+                                        "[Streaming][tool_error] {} failure count: {}/3",
+                                        name, *tool_count
+                                    );
                                     if *tool_count >= 3 {
                                         *tool_count = 999;
                                         result_str = format!(
@@ -931,7 +1004,15 @@ impl super::AgentRunner {
                                     );
                                 }
                                 if let Some(ref event_bus) = self.event_bus {
-                                    let _ = event_bus.emit(&ctx.task_iri, "AGENT_ERROR", &agent.agent_id, &serde_json::json!({"error": err_msg, "tool": name}).to_string()).await;
+                                    let _ = event_bus
+                                        .emit(
+                                            &ctx.task_iri,
+                                            "AGENT_ERROR",
+                                            &agent.agent_id,
+                                            &serde_json::json!({"error": err_msg, "tool": name})
+                                                .to_string(),
+                                        )
+                                        .await;
                                 }
                             } else {
                                 info!("[Streaming] tool {} succeeded", name);
@@ -969,10 +1050,13 @@ impl super::AgentRunner {
                         turn += 1;
 
                         // Check if compression is needed after each tool call (consistent with exec() behavior)
-                        let cwm_did_compress = if let Some(ref cwm_lock) = self.context_window_manager {
+                        let cwm_did_compress = if let Some(ref cwm_lock) =
+                            self.context_window_manager
+                        {
                             if let Ok(cwm) = cwm_lock.lock() {
                                 if cwm.should_compress(running_messages.len(), &running_messages) {
-                                    let (compressed, _summary) = cwm.compress_messages(&running_messages);
+                                    let (compressed, _summary) =
+                                        cwm.compress_messages(&running_messages);
                                     let orig_count = running_messages.len();
                                     running_messages = compressed;
                                     debug!(
@@ -996,7 +1080,8 @@ impl super::AgentRunner {
                             let system_msg = running_messages.first().cloned();
                             let kept_recent = running_messages.len().saturating_sub(15);
 
-                            let mut recent: Vec<_> = running_messages.drain(kept_recent..).collect();
+                            let mut recent: Vec<_> =
+                                running_messages.drain(kept_recent..).collect();
 
                             while !recent.is_empty() {
                                 let first = &recent[0];
@@ -1074,10 +1159,14 @@ impl super::AgentRunner {
                 _ => {
                     last_content = parsed.content.clone();
                     last_thought = parsed.thought.clone().unwrap_or_default();
-                    last_summary = parsed.summary.clone()
+                    last_summary = parsed
+                        .summary
+                        .clone()
                         .unwrap_or_else(|| Self::generate_auto_summary(&parsed.content));
-                    info!("AgentRunner streaming finished: role={}, tools={}, turn={}",
-                        agent.role, tc, turn);
+                    info!(
+                        "AgentRunner streaming finished: role={}, tools={}, turn={}",
+                        agent.role, tc, turn
+                    );
                     break;
                 }
             }
@@ -1098,13 +1187,11 @@ impl super::AgentRunner {
             )
             .ok();
 
-        let l1_turn = session.add_summary(
-            &agent.role.to_string(),
-            &last_summary,
-            l0_iri.clone(),
-        );
+        let l1_turn = session.add_summary(&agent.role.to_string(), &last_summary, l0_iri.clone());
         // Compute turn embedding and relevance_score
-        if let (Some(ref embedder), Some(ref tracker_lock)) = (&self.embedder, &self.relevance_tracker) {
+        if let (Some(ref embedder), Some(ref tracker_lock)) =
+            (&self.embedder, &self.relevance_tracker)
+        {
             if let Ok(emb) = embedder.embed(&last_summary).await {
                 let mut tracker = tracker_lock.lock().unwrap();
                 let score = tracker.on_new_input(&emb);
@@ -1113,7 +1200,8 @@ impl super::AgentRunner {
             }
         }
 
-        let task_id = ctx.task_iri
+        let task_id = ctx
+            .task_iri
             .strip_prefix("iri://task/")
             .unwrap_or_else(|| ctx.task_iri.strip_prefix("iri://").unwrap_or(&ctx.task_iri));
         let node_iri = format!("iri://task/{}/turn_{}", task_id, turn);
@@ -1133,25 +1221,30 @@ impl super::AgentRunner {
 
         info!("AgentRunner streaming finished: {} tools", tc);
 
-        (Ok(TaskResult {
-            task_iri: ctx.task_iri,
-            status: "success".to_string(),
-            summary: final_summary,
-            output: Some(output_value),
-            jsonld_output,
-            artifacts: vec![],
-            errors: errs,
-            turn_count: turn,
-            tool_call_count: tc,
-            five_w2h_updates: None,
+        (
+            Ok(TaskResult {
+                task_iri: ctx.task_iri,
+                status: "success".to_string(),
+                summary: final_summary,
+                output: Some(output_value),
+                jsonld_output,
+                artifacts: vec![],
+                errors: errs,
+                turn_count: turn,
+                tool_call_count: tc,
+                five_w2h_updates: None,
                 tracked_actions: Vec::new(),
-            archive_iri: None,
-        }), session)
+                archive_iri: None,
+            }),
+            session,
+        )
     }
 
     /// Store micro-tool data to both memory and L0 persistent storage
     fn store_micro_tool_data_persistent(&self, storage_key: &str, data: serde_json::Value) {
-        self.tool_executor.write().store_micro_tool_data(storage_key, data.clone());
+        self.tool_executor
+            .write()
+            .store_micro_tool_data(storage_key, data.clone());
         // L0 persistence for cross-session availability
         if let Ok(data_str) = serde_json::to_string(&data) {
             let _ = self.l0_store.store(storage_key, &data_str);
@@ -1164,11 +1257,11 @@ impl super::AgentRunner {
         tool_name: &str,
         call_id: &str,
     ) -> String {
+        use crate::tools::result_router::graphify::GraphifyEngine;
+        use crate::tools::result_router::micro_tools::MicroToolGenerator;
         use crate::tools::result_router::router::ResultRouter;
         use crate::tools::result_router::summary;
         use crate::tools::result_router::RouteDecision;
-        use crate::tools::result_router::graphify::GraphifyEngine;
-        use crate::tools::result_router::micro_tools::MicroToolGenerator;
         use crate::tools::tool_executor::MicroToolContext;
 
         let settings = crate::config::settings::ToolResultRouterSettings::default();
@@ -1182,10 +1275,13 @@ impl super::AgentRunner {
                 // Small result: pass through but attach IRI metadata
                 // Pre-register micro-tool for results exceeding prepare_threshold, in preparation for reference compression
                 if result_str.len() > settings.prepare_threshold {
-                    self.store_micro_tool_data_persistent(&iri, serde_json::json!({
-                        "content": result_str,
-                        "tool_name": tool_name,
-                    }));
+                    self.store_micro_tool_data_persistent(
+                        &iri,
+                        serde_json::json!({
+                            "content": result_str,
+                            "tool_name": tool_name,
+                        }),
+                    );
                     let read_tool_name = format!("read_full_result_{}", call_id);
                     let ctx = MicroToolContext {
                         call_id: call_id.to_string(),
@@ -1217,10 +1313,13 @@ impl super::AgentRunner {
                     summary::smart_truncate(result_str, max_chars)
                 };
                 // Persist full result to memory + L0
-                self.store_micro_tool_data_persistent(&iri, serde_json::json!({
-                    "content": result_str,
-                    "tool_name": tool_name,
-                }));
+                self.store_micro_tool_data_persistent(
+                    &iri,
+                    serde_json::json!({
+                        "content": result_str,
+                        "tool_name": tool_name,
+                    }),
+                );
                 let read_tool_name = format!("read_full_result_{}", call_id);
                 let ctx = MicroToolContext {
                     call_id: call_id.to_string(),
@@ -1244,29 +1343,44 @@ impl super::AgentRunner {
                 summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
             }
 
-            RouteDecision::Graphify { call_id: g_call_id, graph_name } => {
-                let parsed: Option<serde_json::Value> = serde_json::from_str(result_str.trim()).ok();
+            RouteDecision::Graphify {
+                call_id: g_call_id,
+                graph_name,
+            } => {
+                let parsed: Option<serde_json::Value> =
+                    serde_json::from_str(result_str.trim()).ok();
                 match parsed {
                     Some(json_val) => {
                         self.store_micro_tool_data_persistent(&iri, json_val.clone());
                         let engine_result = match &self.unified_graph_store {
-                            Some(store) => GraphifyEngine::with_shared_store(store.clone(), settings.max_graph_entities),
+                            Some(store) => GraphifyEngine::with_shared_store(
+                                store.clone(),
+                                settings.max_graph_entities,
+                            ),
                             None => GraphifyEngine::new(settings.max_graph_entities),
                         };
                         match engine_result {
                             Ok(mut engine) => {
                                 let graphify_result = engine.graphify_json(
-                                    &json_val, &g_call_id, settings.max_graph_entities,
+                                    &json_val,
+                                    &g_call_id,
+                                    settings.max_graph_entities,
                                 );
                                 let analysis = crate::tools::result_router::SchemaAnalysis {
-                                    entity_types: graphify_result.entity_types.iter().map(|t| (t.clone(), 0)).collect(),
+                                    entity_types: graphify_result
+                                        .entity_types
+                                        .iter()
+                                        .map(|t| (t.clone(), 0))
+                                        .collect(),
                                     relation_types: vec![],
                                     property_names: vec![],
                                     total_entities: graphify_result.entity_count,
                                     total_relations: graphify_result.relation_count,
                                 };
                                 let micro_tools = MicroToolGenerator::generate_from_schema(
-                                    &analysis, &g_call_id, settings.max_micro_tools,
+                                    &analysis,
+                                    &g_call_id,
+                                    settings.max_micro_tools,
                                 );
                                 for mt in &micro_tools {
                                     let ctx = MicroToolContext {
@@ -1276,34 +1390,62 @@ impl super::AgentRunner {
                                         entity_types: vec![],
                                         preview_size: settings.preview_size,
                                     };
-                                    self.tool_executor.write().register_micro_tool(&mt.name, ctx);
+                                    self.tool_executor
+                                        .write()
+                                        .register_micro_tool(&mt.name, ctx);
                                 }
                                 info!(
                                     "[ResultRouter] Graphified: {} entities, {} relations, {} micro-tools, graph={}",
                                     graphify_result.entity_count, graphify_result.relation_count,
                                     micro_tools.len(), graph_name,
                                 );
-                                summary::format_iri_message(tool_name, call_id, &graphify_result.summary, result_str.len())
+                                summary::format_iri_message(
+                                    tool_name,
+                                    call_id,
+                                    &graphify_result.summary,
+                                    result_str.len(),
+                                )
                             }
                             Err(e) => {
                                 warn!("[ResultRouter] Graphification failed: {}, falling back to IRI format", e);
-                                let truncated = summary::smart_truncate(result_str, settings.threshold_large);
-                                summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
+                                let truncated =
+                                    summary::smart_truncate(result_str, settings.threshold_large);
+                                summary::format_iri_message(
+                                    tool_name,
+                                    call_id,
+                                    &truncated,
+                                    result_str.len(),
+                                )
                             }
                         }
                     }
                     None => {
-                        let text_summary = summary::generate_text_summary(result_str, tool_name, settings.preview_size);
-                        summary::format_iri_message(tool_name, call_id, &text_summary, result_str.len())
+                        let text_summary = summary::generate_text_summary(
+                            result_str,
+                            tool_name,
+                            settings.preview_size,
+                        );
+                        summary::format_iri_message(
+                            tool_name,
+                            call_id,
+                            &text_summary,
+                            result_str.len(),
+                        )
                     }
                 }
             }
 
-            RouteDecision::Summarize { call_id: s_call_id, preview_size } => {
-                self.store_micro_tool_data_persistent(&iri, serde_json::json!({
-                    "content": result_str,
-                    "tool_name": tool_name,
-                }));
+            RouteDecision::Summarize {
+                call_id: s_call_id,
+                preview_size,
+            } => {
+                self.store_micro_tool_data_persistent(
+                    &iri,
+                    serde_json::json!({
+                        "content": result_str,
+                        "tool_name": tool_name,
+                    }),
+                );
 
                 let read_tool_name = format!("read_full_result_{}", s_call_id);
                 let ctx = MicroToolContext {
@@ -1313,7 +1455,9 @@ impl super::AgentRunner {
                     entity_types: vec![],
                     preview_size,
                 };
-                self.tool_executor.write().register_micro_tool(&read_tool_name, ctx);
+                self.tool_executor
+                    .write()
+                    .register_micro_tool(&read_tool_name, ctx);
 
                 let preview = summary::generate_text_summary(result_str, tool_name, preview_size);
                 info!(
@@ -1327,11 +1471,9 @@ impl super::AgentRunner {
 
     /// Reference compression: for tool messages exceeding the threshold, replace with a lightweight reference if a corresponding micro-tool exists.
     /// Call after ToolResultCompressor::compress_tool_messages.
-    pub(super) fn compress_tool_results_with_microtools(
-        &self,
-        messages: &mut Vec<ChatMessage>,
-    ) {
-        let threshold = self.tool_result_compressor
+    pub(super) fn compress_tool_results_with_microtools(&self, messages: &mut Vec<ChatMessage>) {
+        let threshold = self
+            .tool_result_compressor
             .as_ref()
             .and_then(|c| c.lock().ok())
             .map(|c| c.compress_tool_result_threshold())
@@ -1363,7 +1505,9 @@ impl super::AgentRunner {
                 );
                 debug!(
                     "[tool_compress] Reference compression: {} ({} bytes -> {} bytes)",
-                    micro_tool_name, original_size, msg.content.len(),
+                    micro_tool_name,
+                    original_size,
+                    msg.content.len(),
                 );
             }
         }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use hyperspace_engine::hyper_vector::{EmbeddingVector, MetricKind};
 
 use crate::skill_graph::graph_store::SkillGraphStore;
-use crate::skill_graph::types::{SkillLinkType, SkillGraphNode};
+use crate::skill_graph::types::{SkillGraphNode, SkillLinkType};
 
 /// Generates Poincaré structural embeddings from skill graph topology.
 ///
@@ -62,10 +62,7 @@ impl SkillGraphEmbedder {
             })
             .collect();
 
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
         scored
     }
@@ -122,13 +119,17 @@ impl SkillGraphEmbedder {
         }
 
         // Verify norm < 1.0 (debug-only to avoid perf hit)
-        debug_assert!({
-            let sq: f64 = coords.iter().map(|c| c * c).sum();
-            sq < 1.0
-        }, "Poincaré embedding norm must be < 1.0, got {:.4}", {
-            let sq: f64 = coords.iter().map(|c| c * c).sum();
-            sq.sqrt()
-        });
+        debug_assert!(
+            {
+                let sq: f64 = coords.iter().map(|c| c * c).sum();
+                sq < 1.0
+            },
+            "Poincaré embedding norm must be < 1.0, got {:.4}",
+            {
+                let sq: f64 = coords.iter().map(|c| c * c).sum();
+                sq.sqrt()
+            }
+        );
 
         coords
     }
@@ -338,15 +339,13 @@ mod tests {
 
         let mut unique_iris: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (iri, _) in &ranked {
-            assert!(
-                unique_iris.insert(iri),
-                "Duplicate IRI in results: {}",
-                iri
-            );
+            assert!(unique_iris.insert(iri), "Duplicate IRI in results: {}", iri);
         }
 
         assert!(
-            ranked.iter().any(|(iri, _)| iri == "iri://skills/python-basics"),
+            ranked
+                .iter()
+                .any(|(iri, _)| iri == "iri://skills/python-basics"),
             "Same-depth skill should appear in results"
         );
     }
@@ -395,7 +394,9 @@ mod tests {
 
         let ranked = embedder.rank_by_similarity("iri://skills/rust-basics", 10);
         assert!(
-            ranked.iter().all(|(iri, _)| iri != "iri://skills/rust-basics"),
+            ranked
+                .iter()
+                .all(|(iri, _)| iri != "iri://skills/rust-basics"),
             "Self should not appear in results"
         );
     }

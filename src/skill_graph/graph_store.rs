@@ -83,6 +83,31 @@ impl SkillGraphStore {
         self
     }
 
+    /// Restore full skill nodes persisted by this store in L0. RDF sync is an
+    /// interoperability projection and does not contain every node field, so
+    /// it must not be used as the recovery source of truth.
+    pub fn hydrate_from_l0(&self) -> Result<usize, CoreError> {
+        let Some(l0_store) = &self.l0_store else {
+            return Ok(0);
+        };
+        let entries = l0_store.scan_iri_prefix("iri://skills/", usize::MAX)?;
+        let mut restored = 0;
+        for entry in entries {
+            let Ok(skill) = serde_json::from_str::<SkillGraphNode>(&entry.content) else {
+                continue;
+            };
+            if skill.skill_iri != entry.iri {
+                warn!(entry_iri = %entry.iri, skill_iri = %skill.skill_iri, "Ignoring mismatched persisted skill node");
+                continue;
+            }
+            self.index.index_skill(&skill);
+            self.skills.write().insert(skill.skill_iri.clone(), skill);
+            restored += 1;
+        }
+        info!(restored, "Hydrated skill graph from L0");
+        Ok(restored)
+    }
+
     pub fn get_index(&self) -> &PreAggregatedIndex {
         &self.index
     }
@@ -125,7 +150,7 @@ impl SkillGraphStore {
 
         self.index.index_skill(&skill);
         self.skills.write().insert(iri.clone(), skill.clone());
-        self.emit_mutation(GraphMutation::SkillRegistered(skill));
+        self.emit_mutation(GraphMutation::SkillRegistered(skill.clone()));
 
         // P0-1: sync to Oxigraph
         if let Some(skill) = self.skills.read().get(&iri) {
@@ -136,7 +161,9 @@ impl SkillGraphStore {
             let now = Utc::now();
             let entry = crate::memory::l0_store::L0Entry {
                 iri: iri.clone(),
-                content: format!("skill:{}", iri),
+                content: serde_json::to_string(&skill).map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to serialize skill graph node: {}", e),
+                })?,
                 importance: 0.5,
                 access_count: 0,
                 created_at: now,
@@ -151,7 +178,7 @@ impl SkillGraphStore {
                 jsonld_types: vec!["skill:Skill".to_string()],
                 hyperspace_point_id: None,
             };
-            l0_store.store(&iri, &serde_json::to_string(&entry).unwrap_or_default())?;
+            l0_store.store_entry(&entry)?;
             debug!("Skill written to L0 store: {}", iri);
         }
 
@@ -171,6 +198,29 @@ impl SkillGraphStore {
             self.sync_skill_delete(&iri);
             self.sync_skill_insert(&skill);
             self.skills.write().insert(iri, skill.clone());
+            if let Some(ref l0_store) = self.l0_store {
+                let now = Utc::now();
+                l0_store.store_entry(&crate::memory::l0_store::L0Entry {
+                    iri: skill.skill_iri.clone(),
+                    content: serde_json::to_string(&skill).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to serialize skill graph node: {}", e),
+                        }
+                    })?,
+                    importance: 0.5,
+                    access_count: 0,
+                    created_at: now,
+                    last_accessed: now,
+                    tags: vec!["skill".to_string(), "skill_graph".to_string()],
+                    metadata: serde_json::Map::new(),
+                    mesi_state: crate::memory::l0_store::MesiState::Shared,
+                    content_hash: String::new(),
+                    named_graph: Some(SKILL_GRAPH_NAMED_GRAPH.to_string()),
+                    jsonld_context: None,
+                    jsonld_types: vec!["skill:Skill".to_string()],
+                    hyperspace_point_id: None,
+                })?;
+            }
             self.emit_mutation(GraphMutation::SkillUpdated { old, new: skill });
             Ok(())
         } else {
@@ -181,18 +231,43 @@ impl SkillGraphStore {
     }
 
     pub fn remove_skill(&self, skill_iri: &str) -> Result<(), CoreError> {
-        if let Some(removed) = self.skills.write().remove(skill_iri) {
-            self.index.remove_skill(skill_iri);
-            // P0-1: sync delete from Oxigraph
-            self.sync_skill_delete(skill_iri);
-            info!("Skill removed from graph: {}", skill_iri);
-            self.emit_mutation(GraphMutation::SkillRemoved(removed));
-            Ok(())
-        } else {
-            Err(CoreError::SkillNotFound {
+        let removed = self
+            .get_skill(skill_iri)
+            .ok_or_else(|| CoreError::SkillNotFound {
                 iri: format!("Skill not found: {}", skill_iri),
+            })?;
+
+        // Persist cleanup of incoming links before deleting the target node.
+        // Otherwise a hydrate after restart recreates dangling references even
+        // if the removed node itself is gone.
+        let mut affected = self
+            .skills
+            .read()
+            .values()
+            .filter(|skill| {
+                skill.skill_iri != skill_iri
+                    && skill.links.iter().any(|link| link.target_iri == skill_iri)
             })
+            .cloned()
+            .collect::<Vec<_>>();
+        for skill in &mut affected {
+            skill.links.retain(|link| link.target_iri != skill_iri);
+            self.update_skill(skill.clone())?;
         }
+
+        // L0 is the recovery source of truth. Delete it before removing the
+        // in-memory node so an L0 failure cannot report a successful delete
+        // that will be undone by the next hydrate.
+        if let Some(l0_store) = &self.l0_store {
+            l0_store.delete(skill_iri)?;
+        }
+        self.skills.write().remove(skill_iri);
+        self.index.remove_skill(skill_iri);
+        // P0-1: sync delete from Oxigraph
+        self.sync_skill_delete(skill_iri);
+        info!("Skill removed from graph: {}", skill_iri);
+        self.emit_mutation(GraphMutation::SkillRemoved(removed));
+        Ok(())
     }
 
     pub fn add_link(
@@ -203,35 +278,79 @@ impl SkillGraphStore {
         strength: LinkStrength,
         description: &str,
     ) -> Result<(), CoreError> {
-        let mut skills = self.skills.write();
-        
-        if let Some(source) = skills.get_mut(source_iri) {
-            source.links.push(SkillLink {
-                link_type,
-                target_iri: target_iri.to_string(),
-                strength,
-                description: description.to_string(),
-            });
-            debug!("Adding link: {} -> {} ({:?})", source_iri, target_iri, link_type);
-
-            let updated = skills.get(source_iri).cloned();
-            drop(skills);
-            if let Some(skill) = updated {
-                self.index.update_skill(&skill);
-                // P0-1: sync link triple to Oxigraph
-                self.sync_skill_insert(&skill);
-            }
-            self.emit_mutation(GraphMutation::LinkAdded {
-                source: source_iri.to_string(),
-                target: target_iri.to_string(),
-                link_type,
-            });
-            Ok(())
-        } else {
-            Err(CoreError::SkillNotFound {
+        let mut source = self
+            .get_skill(source_iri)
+            .ok_or_else(|| CoreError::SkillNotFound {
                 iri: format!("Source skill not found: {}", source_iri),
-            })
+            })?;
+        if self.get_skill(target_iri).is_none() {
+            return Err(CoreError::SkillNotFound {
+                iri: format!("Target skill not found: {}", target_iri),
+            });
         }
+
+        source.links.push(SkillLink {
+            link_type,
+            target_iri: target_iri.to_string(),
+            strength,
+            description: description.to_string(),
+        });
+        debug!(
+            "Adding link: {} -> {} ({:?})",
+            source_iri, target_iri, link_type
+        );
+
+        // Do not mutate the in-memory map directly here. `update_skill` is
+        // the single write path that keeps the in-memory graph, index,
+        // Oxigraph projection and full L0 recovery record consistent.
+        self.update_skill(source.clone())?;
+        self.emit_mutation(GraphMutation::LinkAdded {
+            source: source_iri.to_string(),
+            target: target_iri.to_string(),
+            link_type,
+            source_after: source,
+        });
+        Ok(())
+    }
+
+    /// Remove one exact relation through the same authoritative write path as
+    /// additions.  Matching the full relation prevents a governed removal of
+    /// one edge from silently deleting parallel relations of the same type.
+    pub fn remove_link(
+        &self,
+        source_iri: &str,
+        target_iri: &str,
+        link_type: SkillLinkType,
+        strength: LinkStrength,
+        description: &str,
+    ) -> Result<(), CoreError> {
+        let mut source = self
+            .get_skill(source_iri)
+            .ok_or_else(|| CoreError::SkillNotFound {
+                iri: format!("Source skill not found: {}", source_iri),
+            })?;
+        let before = source.links.len();
+        source.links.retain(|link| {
+            !(link.target_iri == target_iri
+                && link.link_type == link_type
+                && link.strength == strength
+                && link.description == description)
+        });
+        if source.links.len() == before {
+            return Err(CoreError::NodeNotFound {
+                iri: format!(
+                    "Link not found: {} -> {} ({:?}, {:?})",
+                    source_iri, target_iri, link_type, strength
+                ),
+            });
+        }
+        self.update_skill(source)?;
+        self.emit_mutation(GraphMutation::LinkRemoved {
+            source: source_iri.to_string(),
+            target: target_iri.to_string(),
+            link_type,
+        });
+        Ok(())
     }
 
     pub fn traverse_links(
@@ -307,7 +426,7 @@ impl SkillGraphStore {
 
     pub fn find_alternatives(&self, skill_iri: &str) -> Vec<(String, String)> {
         let skills = self.skills.read();
-        
+
         if let Some(skill) = skills.get(skill_iri) {
             skill
                 .get_alternatives()
@@ -327,12 +446,11 @@ impl SkillGraphStore {
         agent_role: Option<&str>,
         min_success_rate: Option<f32>,
     ) -> Vec<SkillGraphNode> {
-        let role_candidates: Option<Vec<String>> = agent_role.map(|role| {
-            self.index.find_by_role(role)
-        });
+        let role_candidates: Option<Vec<String>> =
+            agent_role.map(|role| self.index.find_by_role(role));
 
         let skills = self.skills.read();
-        
+
         skills
             .values()
             .filter(|skill| {
@@ -355,7 +473,13 @@ impl SkillGraphStore {
                 }
 
                 if let Some(p) = phase {
-                    if !skill.w2h.when.applicable_phases.iter().any(|ph| ph.to_lowercase() == p.to_lowercase()) {
+                    if !skill
+                        .w2h
+                        .when
+                        .applicable_phases
+                        .iter()
+                        .any(|ph| ph.to_lowercase() == p.to_lowercase())
+                    {
                         return false;
                     }
                 }
@@ -387,7 +511,10 @@ impl SkillGraphStore {
             .values()
             .filter(|skill| {
                 tags.iter().all(|tag| {
-                    skill.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+                    skill
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase() == tag.to_lowercase())
                 })
             })
             .cloned()
@@ -410,6 +537,19 @@ impl SkillGraphStore {
         self.mocs.read().values().cloned().collect()
     }
 
+    /// Remove a map-of-content node.  This is primarily used by controlled
+    /// snapshot restoration, which must replace (rather than merge) state.
+    pub fn remove_moc(&self, moc_iri: &str) -> Result<(), CoreError> {
+        if self.mocs.write().remove(moc_iri).is_some() {
+            self.emit_mutation(GraphMutation::MOCRemoved(moc_iri.to_string()));
+            Ok(())
+        } else {
+            Err(CoreError::NodeNotFound {
+                iri: moc_iri.to_string(),
+            })
+        }
+    }
+
     pub fn create_fragment(
         &self,
         fragment_iri: &str,
@@ -418,20 +558,24 @@ impl SkillGraphStore {
         recommendation: &str,
         discoverer: Option<&str>,
     ) -> Result<KnowledgeFragment, CoreError> {
-        let mut fragment = KnowledgeFragment::new(fragment_iri, attached_to, problem, recommendation);
-        
+        let mut fragment =
+            KnowledgeFragment::new(fragment_iri, attached_to, problem, recommendation);
+
         if let Some(d) = discoverer {
             fragment = fragment.with_discoverer(d);
         }
 
-        info!("Creating knowledge fragment: {} -> {}", attached_to, fragment_iri);
-        
-        self.fragments.write().insert(fragment_iri.to_string(), fragment.clone());
-        
-        let skill_clone = {
-            self.skills.read().get(attached_to).cloned()
-        };
-        
+        info!(
+            "Creating knowledge fragment: {} -> {}",
+            attached_to, fragment_iri
+        );
+
+        self.fragments
+            .write()
+            .insert(fragment_iri.to_string(), fragment.clone());
+
+        let skill_clone = { self.skills.read().get(attached_to).cloned() };
+
         if let Some(mut skill) = skill_clone {
             skill.graph_meta.known_failure_modes.push(FailureMode {
                 mode: problem.to_string(),
@@ -458,9 +602,32 @@ impl SkillGraphStore {
         self.fragments.read().values().cloned().collect()
     }
 
+    /// Insert a fully materialized fragment without modifying its attached
+    /// skill.  Snapshot restoration uses this path because the snapshot's
+    /// skill already contains its failure-mode metadata; using
+    /// `create_fragment` would duplicate that metadata.
+    pub fn register_fragment(&self, fragment: KnowledgeFragment) -> Result<(), CoreError> {
+        self.fragments
+            .write()
+            .insert(fragment.fragment_iri.clone(), fragment);
+        Ok(())
+    }
+
+    /// Remove a knowledge fragment without changing the attached skill's
+    /// historical failure-mode metadata.
+    pub fn remove_fragment(&self, fragment_iri: &str) -> Result<(), CoreError> {
+        if self.fragments.write().remove(fragment_iri).is_some() {
+            Ok(())
+        } else {
+            Err(CoreError::NodeNotFound {
+                iri: fragment_iri.to_string(),
+            })
+        }
+    }
+
     pub fn record_skill_usage(&self, skill_iri: &str, success: bool) -> Result<(), CoreError> {
         let mut skills = self.skills.write();
-        
+
         if let Some(skill) = skills.get_mut(skill_iri) {
             skill.graph_meta.record_usage(success);
             debug!(
@@ -534,15 +701,19 @@ impl SkillGraphStore {
                 })
             }
             DisclosureLevel::LinksExpanded => {
-                let links: Vec<Value> = skill.links.iter().map(|l| {
-                    serde_json::json!({
-                        "type": format!("{:?}", l.link_type),
-                        "target": l.target_iri,
-                        "strength": format!("{:?}", l.strength),
-                        "description": l.description
+                let links: Vec<Value> = skill
+                    .links
+                    .iter()
+                    .map(|l| {
+                        serde_json::json!({
+                            "type": format!("{:?}", l.link_type),
+                            "target": l.target_iri,
+                            "strength": format!("{:?}", l.strength),
+                            "description": l.description
+                        })
                     })
-                }).collect();
-                
+                    .collect();
+
                 serde_json::json!({
                     "@id": skill.skill_iri,
                     "name": skill.name,
@@ -553,16 +724,23 @@ impl SkillGraphStore {
                 })
             }
             DisclosureLevel::SchemaSteps => {
-                let steps: Vec<Value> = skill.content.as_ref().map(|c| {
-                    c.steps.iter().map(|s| {
-                        serde_json::json!({
-                            "step_id": s.step_id,
-                            "order": s.order,
-                            "action": s.action
-                        })
-                    }).collect()
-                }).unwrap_or_default();
-                
+                let steps: Vec<Value> = skill
+                    .content
+                    .as_ref()
+                    .map(|c| {
+                        c.steps
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "step_id": s.step_id,
+                                    "order": s.order,
+                                    "action": s.action
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 serde_json::json!({
                     "@id": skill.skill_iri,
                     "name": skill.name,
@@ -576,9 +754,7 @@ impl SkillGraphStore {
                     }))
                 })
             }
-            DisclosureLevel::FullContent => {
-                skill.to_json_ld()
-            }
+            DisclosureLevel::FullContent => skill.to_json_ld(),
         })
     }
 
@@ -599,7 +775,10 @@ impl SkillGraphStore {
     /// in the in-memory graph — only the tier label changes.
     ///
     /// Returns the number of skills archived.
-    pub fn archive_cold_skills(&self, cutoff: &chrono::DateTime<chrono::Utc>) -> Result<usize, CoreError> {
+    pub fn archive_cold_skills(
+        &self,
+        cutoff: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, CoreError> {
         let cold_iris: Vec<String> = self
             .list_all_skills()
             .into_iter()
@@ -640,7 +819,9 @@ impl SkillGraphStore {
                     metadata: serde_json::Map::new(),
                     mesi_state: crate::memory::l0_store::MesiState::Exclusive,
                     content_hash: String::new(),
-                    named_graph: Some(crate::skill_graph::graph_store::SKILL_GRAPH_NAMED_GRAPH.to_string()),
+                    named_graph: Some(
+                        crate::skill_graph::graph_store::SKILL_GRAPH_NAMED_GRAPH.to_string(),
+                    ),
                     jsonld_context: None,
                     jsonld_types: vec!["skill:Skill".to_string()],
                     hyperspace_point_id: None,
@@ -665,9 +846,7 @@ impl SkillGraphStore {
         let cutoff = Utc::now() - *max_age;
         self.list_all_skills()
             .into_iter()
-            .filter(|s| {
-                s.storage_tier != StorageTier::L1Session && s.updated_at < cutoff
-            })
+            .filter(|s| s.storage_tier != StorageTier::L1Session && s.updated_at < cutoff)
             .collect()
     }
 
@@ -741,7 +920,10 @@ impl SkillGraphStore {
             if let Some(skill) = skills.get(comp_iri) {
                 resolved.push(skill.clone());
             } else {
-                warn!("Hyperedge {} references missing skill {}", hyperedge_id, comp_iri);
+                warn!(
+                    "Hyperedge {} references missing skill {}",
+                    hyperedge_id, comp_iri
+                );
             }
         }
         Ok(resolved)
@@ -770,7 +952,10 @@ impl SkillGraphStore {
         for (target, components) in target_to_components {
             if components.len() >= 2 {
                 let he = Hyperedge::new(
-                    &format!("hyperedge:composite/{}", target.trim_start_matches("iri://skills/")),
+                    &format!(
+                        "hyperedge:composite/{}",
+                        target.trim_start_matches("iri://skills/")
+                    ),
                     &format!("Hyperedge for {}", target),
                     &format!("Migrated from Composition links targeting {}", target),
                     components,
@@ -790,11 +975,7 @@ impl SkillGraphStore {
     // ── P1-4: Temporal Versioning ───────────────────────────────────────
 
     pub fn snapshot(&self, label: &str) -> Result<String, CoreError> {
-        let snapshot_id = format!(
-            "snapshot:{}_{}",
-            label,
-            Utc::now().format("%Y%m%d_%H%M%S")
-        );
+        let snapshot_id = format!("snapshot:{}_{}", label, Utc::now().format("%Y%m%d_%H%M%S"));
 
         let skill_count = self.skills.read().len();
         let record = SnapshotRecord {
@@ -852,7 +1033,11 @@ impl SkillGraphStore {
             .into_iter()
             .map(|(iri, score)| FusedHit { iri, score })
             .collect();
-        fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        fused.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         fused
     }
 
@@ -911,7 +1096,11 @@ impl SkillGraphStore {
                         return matches
                             .into_iter()
                             .map(|m| {
-                                (m.skill.skill_iri.clone(), SkillLinkType::Related, m.relevance_score)
+                                (
+                                    m.skill.skill_iri.clone(),
+                                    SkillLinkType::Related,
+                                    m.relevance_score,
+                                )
                             })
                             .collect();
                     }
@@ -934,8 +1123,8 @@ impl SkillGraphStore {
                 let common_tags = source_tags.intersection(&other_tags).count();
 
                 if common_tags > 0 {
-                    let similarity = common_tags as f32
-                        / ((source_tags.len() + other_tags.len()) as f32 / 2.0);
+                    let similarity =
+                        common_tags as f32 / ((source_tags.len() + other_tags.len()) as f32 / 2.0);
 
                     if similarity > 0.3 {
                         suggestions.push((other_iri.clone(), SkillLinkType::Related, similarity));
@@ -1053,7 +1242,9 @@ impl SkillGraphStore {
         };
         if let (Some(old), Some(new)) = (old, new) {
             self.index.remove_skill(skill_iri);
-            self.skills.write().insert(skill_iri.to_string(), new.clone());
+            self.skills
+                .write()
+                .insert(skill_iri.to_string(), new.clone());
             info!("Skill marked as deprecated: {}", skill_iri);
             self.emit_mutation(GraphMutation::SkillUpdated { old, new });
             Ok(())
@@ -1067,13 +1258,7 @@ impl SkillGraphStore {
     /// Batch add multiple links. Returns count of successfully added links.
     pub fn batch_add_links(
         &self,
-        links: &[(
-            String,
-            String,
-            SkillLinkType,
-            LinkStrength,
-            String,
-        )],
+        links: &[(String, String, SkillLinkType, LinkStrength, String)],
     ) -> usize {
         let mut success_count = 0usize;
         for (source, target, link_type, strength, description) in links {
@@ -1101,6 +1286,7 @@ impl Default for SkillGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::l0_store::L0Store;
 
     #[test]
     fn test_register_skill_records_timeline_mutation() {
@@ -1123,16 +1309,93 @@ mod tests {
     }
 
     #[test]
+    fn test_hydrate_from_l0_restores_full_skill_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let source = SkillGraphStore::new().with_l0_store(l0.clone());
+        let mut skill = SkillGraphNode::new("iri://skills/persisted", "Persisted", "full node");
+        skill.tags.push("evolved".to_string());
+        source.register_skill(skill.clone()).unwrap();
+
+        let restored = SkillGraphStore::new().with_l0_store(l0);
+        assert_eq!(restored.hydrate_from_l0().unwrap(), 1);
+        assert_eq!(
+            restored.get_skill(&skill.skill_iri).unwrap().tags,
+            skill.tags
+        );
+    }
+
+    #[test]
+    fn test_add_link_is_persisted_for_hydration() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let source = SkillGraphStore::new().with_l0_store(l0.clone());
+        source
+            .register_skill(SkillGraphNode::new("iri://skills/a", "A", "source"))
+            .unwrap();
+        source
+            .register_skill(SkillGraphNode::new("iri://skills/b", "B", "target"))
+            .unwrap();
+        source
+            .add_link(
+                "iri://skills/a",
+                "iri://skills/b",
+                SkillLinkType::Related,
+                LinkStrength::Recommended,
+                "persist this relation",
+            )
+            .unwrap();
+
+        let restored = SkillGraphStore::new().with_l0_store(l0);
+        assert_eq!(restored.hydrate_from_l0().unwrap(), 2);
+        let links = &restored.get_skill("iri://skills/a").unwrap().links;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target_iri, "iri://skills/b");
+        assert_eq!(links[0].description, "persist this relation");
+    }
+
+    #[test]
+    fn test_remove_skill_deletes_l0_record_and_incoming_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let store = SkillGraphStore::new().with_l0_store(l0.clone());
+        store
+            .register_skill(SkillGraphNode::new("iri://skills/a", "A", "source"))
+            .unwrap();
+        store
+            .register_skill(SkillGraphNode::new("iri://skills/b", "B", "target"))
+            .unwrap();
+        store
+            .add_link(
+                "iri://skills/a",
+                "iri://skills/b",
+                SkillLinkType::Related,
+                LinkStrength::Recommended,
+                "will be removed",
+            )
+            .unwrap();
+
+        store.remove_skill("iri://skills/b").unwrap();
+        assert!(store.get_skill("iri://skills/b").is_none());
+        assert!(store.get_skill("iri://skills/a").unwrap().links.is_empty());
+
+        let restored = SkillGraphStore::new().with_l0_store(l0);
+        assert_eq!(restored.hydrate_from_l0().unwrap(), 1);
+        assert!(restored.get_skill("iri://skills/b").is_none());
+        assert!(restored
+            .get_skill("iri://skills/a")
+            .unwrap()
+            .links
+            .is_empty());
+    }
+
+    #[test]
     fn test_register_and_get_skill() {
         let store = SkillGraphStore::new();
-        let skill = SkillGraphNode::new(
-            "iri://skills/test-skill",
-            "Test Skill",
-            "A test skill",
-        );
+        let skill = SkillGraphNode::new("iri://skills/test-skill", "Test Skill", "A test skill");
 
         store.register_skill(skill.clone()).unwrap();
-        
+
         let retrieved = store.get_skill("iri://skills/test-skill").unwrap();
         assert_eq!(retrieved.name, "Test Skill");
     }
@@ -1140,21 +1403,23 @@ mod tests {
     #[test]
     fn test_add_link() {
         let store = SkillGraphStore::new();
-        
+
         let skill1 = SkillGraphNode::new("iri://skills/skill1", "Skill 1", "First skill");
         let skill2 = SkillGraphNode::new("iri://skills/skill2", "Skill 2", "Second skill");
-        
+
         store.register_skill(skill1).unwrap();
         store.register_skill(skill2).unwrap();
-        
-        store.add_link(
-            "iri://skills/skill1",
-            "iri://skills/skill2",
-            SkillLinkType::Prerequisite,
-            LinkStrength::Required,
-            "Skill 2 is required before Skill 1",
-        ).unwrap();
-        
+
+        store
+            .add_link(
+                "iri://skills/skill1",
+                "iri://skills/skill2",
+                SkillLinkType::Prerequisite,
+                LinkStrength::Required,
+                "Skill 2 is required before Skill 1",
+            )
+            .unwrap();
+
         let skill = store.get_skill("iri://skills/skill1").unwrap();
         assert_eq!(skill.links.len(), 1);
         assert_eq!(skill.links[0].link_type, SkillLinkType::Prerequisite);
@@ -1163,46 +1428,44 @@ mod tests {
     #[test]
     fn test_resolve_dependencies() {
         let store = SkillGraphStore::new();
-        
+
         let skill_a = SkillGraphNode::new("iri://skills/a", "A", "Skill A");
         let mut skill_b = SkillGraphNode::new("iri://skills/b", "B", "Skill B");
         skill_b.add_prerequisite("iri://skills/a", "A is required");
         let mut skill_c = SkillGraphNode::new("iri://skills/c", "C", "Skill C");
         skill_c.add_prerequisite("iri://skills/b", "B is required");
-        
+
         store.register_skill(skill_a).unwrap();
         store.register_skill(skill_b).unwrap();
         store.register_skill(skill_c).unwrap();
-        
+
         let deps = store.resolve_dependencies("iri://skills/c");
-        
-        assert_eq!(deps, vec!["iri://skills/a", "iri://skills/b", "iri://skills/c"]);
+
+        assert_eq!(
+            deps,
+            vec!["iri://skills/a", "iri://skills/b", "iri://skills/c"]
+        );
     }
 
     #[test]
     fn test_find_skills_by_5w2h() {
         let store = SkillGraphStore::new();
-        
+
         let w2h = Skill5W2H::new("JWT Authentication", "Secure API access")
             .with_phase("Do")
             .with_agent_role("DA");
-        
+
         let skill = SkillGraphNode::new(
             "iri://skills/jwt-auth",
             "JWT Auth",
             "JWT authentication implementation",
-        ).with_5w2h(w2h);
-        
+        )
+        .with_5w2h(w2h);
+
         store.register_skill(skill).unwrap();
-        
-        let results = store.find_skills_by_5w2h(
-            Some("jwt"),
-            None,
-            Some("Do"),
-            Some("DA"),
-            None,
-        );
-        
+
+        let results = store.find_skills_by_5w2h(Some("jwt"), None, Some("Do"), Some("DA"), None);
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].skill_iri, "iri://skills/jwt-auth");
     }
@@ -1210,15 +1473,15 @@ mod tests {
     #[test]
     fn test_find_alternatives() {
         let store = SkillGraphStore::new();
-        
+
         let mut skill1 = SkillGraphNode::new("iri://skills/jwt", "JWT", "JWT auth");
         skill1.add_alternative("iri://skills/oauth", "OAuth is an alternative");
-        
+
         let skill2 = SkillGraphNode::new("iri://skills/oauth", "OAuth", "OAuth auth");
-        
+
         store.register_skill(skill1).unwrap();
         store.register_skill(skill2).unwrap();
-        
+
         let alts = store.find_alternatives("iri://skills/jwt");
         assert_eq!(alts.len(), 1);
         assert_eq!(alts[0].0, "iri://skills/oauth");
@@ -1227,33 +1490,36 @@ mod tests {
     #[test]
     fn test_disclosure_levels() {
         let store = SkillGraphStore::new();
-        
-        let skill = SkillGraphNode::new(
-            "iri://skills/test",
-            "Test Skill",
-            "A test skill",
-        ).with_tag("testing");
-        
+
+        let skill = SkillGraphNode::new("iri://skills/test", "Test Skill", "A test skill")
+            .with_tag("testing");
+
         store.register_skill(skill).unwrap();
-        
-        let l1 = store.get_skill_at_level("iri://skills/test", DisclosureLevel::MOCIndex).unwrap();
+
+        let l1 = store
+            .get_skill_at_level("iri://skills/test", DisclosureLevel::MOCIndex)
+            .unwrap();
         assert!(l1.get("name").is_some());
         assert!(l1.get("what").is_none());
-        
-        let l2 = store.get_skill_at_level("iri://skills/test", DisclosureLevel::Summary5W2H).unwrap();
+
+        let l2 = store
+            .get_skill_at_level("iri://skills/test", DisclosureLevel::Summary5W2H)
+            .unwrap();
         assert!(l2.get("what").is_some());
     }
 
     #[test]
     fn test_record_usage() {
         let store = SkillGraphStore::new();
-        
+
         let skill = SkillGraphNode::new("iri://skills/test", "Test", "Test skill");
         store.register_skill(skill).unwrap();
-        
+
         store.record_skill_usage("iri://skills/test", true).unwrap();
-        store.record_skill_usage("iri://skills/test", false).unwrap();
-        
+        store
+            .record_skill_usage("iri://skills/test", false)
+            .unwrap();
+
         let updated = store.get_skill("iri://skills/test").unwrap();
         assert_eq!(updated.graph_meta.usage_count, 2);
         assert_eq!(updated.graph_meta.success_rate, 0.5);
@@ -1262,17 +1528,13 @@ mod tests {
     #[test]
     fn test_moc_node() {
         let store = SkillGraphStore::new();
-        
-        let mut moc = MOCNode::new(
-            "iri://moc/auth",
-            "Authentication",
-            "Authentication skills",
-        );
+
+        let mut moc = MOCNode::new("iri://moc/auth", "Authentication", "Authentication skills");
         moc.add_entry_point("iri://skills/jwt");
         moc.add_entry_point("iri://skills/oauth");
-        
+
         store.register_moc(moc).unwrap();
-        
+
         let retrieved = store.get_moc("iri://moc/auth").unwrap();
         assert_eq!(retrieved.skill_count, 2);
     }
@@ -1280,20 +1542,22 @@ mod tests {
     #[test]
     fn test_knowledge_fragment() {
         let store = SkillGraphStore::new();
-        
+
         let skill = SkillGraphNode::new("iri://skills/jwt", "JWT", "JWT auth");
         store.register_skill(skill).unwrap();
-        
-        let fragment = store.create_fragment(
-            "iri://fragment/jwt-1",
-            "iri://skills/jwt",
-            "Token expiration issues",
-            "Use refresh tokens",
-            Some("agent:ca/001"),
-        ).unwrap();
-        
+
+        let fragment = store
+            .create_fragment(
+                "iri://fragment/jwt-1",
+                "iri://skills/jwt",
+                "Token expiration issues",
+                "Use refresh tokens",
+                Some("agent:ca/001"),
+            )
+            .unwrap();
+
         assert_eq!(fragment.problem, "Token expiration issues");
-        
+
         let fragments = store.get_fragments_for_skill("iri://skills/jwt");
         assert_eq!(fragments.len(), 1);
     }
@@ -1301,27 +1565,31 @@ mod tests {
     #[tokio::test]
     async fn test_suggest_links() {
         let store = SkillGraphStore::new();
-        
+
         let skill1 = SkillGraphNode::new("iri://skills/rust-auth", "Rust Auth", "Auth in Rust")
             .with_tag("rust")
             .with_tag("authentication");
-        
-        let skill2 = SkillGraphNode::new("iri://skills/rust-crypto", "Rust Crypto", "Crypto in Rust")
-            .with_tag("rust")
-            .with_tag("cryptography");
-        
-        let skill3 = SkillGraphNode::new("iri://skills/python-auth", "Python Auth", "Auth in Python")
-            .with_tag("python")
-            .with_tag("authentication");
-        
+
+        let skill2 =
+            SkillGraphNode::new("iri://skills/rust-crypto", "Rust Crypto", "Crypto in Rust")
+                .with_tag("rust")
+                .with_tag("cryptography");
+
+        let skill3 =
+            SkillGraphNode::new("iri://skills/python-auth", "Python Auth", "Auth in Python")
+                .with_tag("python")
+                .with_tag("authentication");
+
         store.register_skill(skill1).unwrap();
         store.register_skill(skill2).unwrap();
         store.register_skill(skill3).unwrap();
-        
+
         let suggestions = store.suggest_links("iri://skills/rust-auth", None).await;
-        
+
         assert!(!suggestions.is_empty());
-        assert!(suggestions.iter().any(|(iri, _, _)| iri == "iri://skills/rust-crypto"));
+        assert!(suggestions
+            .iter()
+            .any(|(iri, _, _)| iri == "iri://skills/rust-crypto"));
     }
 
     #[test]
@@ -1363,8 +1631,8 @@ mod tests {
         let store = Arc::new(SkillGraphStore::new());
         let embedder = SkillGraphEmbedder::new(store.clone());
 
-        let foundational = SkillGraphNode::new("iri://skills/foundation", "Foundation", "Base")
-            .with_tag("core");
+        let foundational =
+            SkillGraphNode::new("iri://skills/foundation", "Foundation", "Base").with_tag("core");
         store.register_skill(foundational).unwrap();
 
         let mut intermediate =
@@ -1374,8 +1642,7 @@ mod tests {
         store.register_skill(intermediate).unwrap();
 
         let mut advanced =
-            SkillGraphNode::new("iri://skills/advanced", "Advanced", "Top-level")
-                .with_tag("core");
+            SkillGraphNode::new("iri://skills/advanced", "Advanced", "Top-level").with_tag("core");
         advanced.add_prerequisite("iri://skills/intermediate", "Needs intermediate");
         store.register_skill(advanced).unwrap();
 
@@ -1384,15 +1651,25 @@ mod tests {
         store.register_skill(unrelated).unwrap();
 
         let results = store
-            .hybrid_skill_search("iri://skills/intermediate", vec![], vec![], 1.0, Some(&embedder))
+            .hybrid_skill_search(
+                "iri://skills/intermediate",
+                vec![],
+                vec![],
+                1.0,
+                Some(&embedder),
+            )
             .await;
         assert!(!results.is_empty(), "Should find structural neighbors");
         assert!(
-            results.iter().any(|(iri, _, _)| iri == "iri://skills/foundation"),
+            results
+                .iter()
+                .any(|(iri, _, _)| iri == "iri://skills/foundation"),
             "Foundational skill (same chain) should appear"
         );
         assert!(
-            results.iter().any(|(iri, _, _)| iri == "iri://skills/advanced"),
+            results
+                .iter()
+                .any(|(iri, _, _)| iri == "iri://skills/advanced"),
             "Advanced skill (same chain) should appear"
         );
 
@@ -1402,13 +1679,7 @@ mod tests {
             ("iri://skills/unrelated".to_string(), 0.1),
         ];
         let results = store
-            .hybrid_skill_search(
-                "iri://skills/intermediate",
-                text_only,
-                vec![],
-                1.0,
-                None,
-            )
+            .hybrid_skill_search("iri://skills/intermediate", text_only, vec![], 1.0, None)
             .await;
         assert_eq!(results.len(), 3);
         // With alpha=1.0 (pure text), foundation should be first
@@ -1442,8 +1713,7 @@ mod tests {
         let skill = SkillGraphNode::new("iri://skills/self", "Self", "Self");
         store.register_skill(skill).unwrap();
 
-        let other = SkillGraphNode::new("iri://skills/other", "Other", "Other")
-            .with_tag("related");
+        let other = SkillGraphNode::new("iri://skills/other", "Other", "Other").with_tag("related");
         store.register_skill(other).unwrap();
 
         let results = store
@@ -1479,7 +1749,11 @@ mod tests {
                 solutions.filter_map(|r| r.ok()).count()
             }
             oxigraph::sparql::QueryResults::Boolean(b) => {
-                if b { 1 } else { 0 }
+                if b {
+                    1
+                } else {
+                    0
+                }
             }
             oxigraph::sparql::QueryResults::Graph(_) => 0,
         }
@@ -1534,6 +1808,9 @@ mod tests {
 
         // Then: the skill's triples must be deleted from Oxigraph
         let after_count = count_triples(&oxi, query);
-        assert_eq!(after_count, 0, "Skill triples must be deleted from Oxigraph");
+        assert_eq!(
+            after_count, 0,
+            "Skill triples must be deleted from Oxigraph"
+        );
     }
 }

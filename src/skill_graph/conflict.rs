@@ -73,50 +73,53 @@ impl ConflictReport {
     pub fn add_conflict(&mut self, conflict: SkillConflict) {
         let severity_key = format!("{:?}", conflict.severity);
         let type_key = format!("{:?}", conflict.conflict_type);
-        
+
         *self.by_severity.entry(severity_key).or_insert(0) += 1;
         *self.by_type.entry(type_key).or_insert(0) += 1;
-        
+
         if conflict.auto_resolvable {
             self.auto_resolvable_count += 1;
         }
-        
+
         self.conflicts.push(conflict);
         self.total_conflicts += 1;
     }
 
     pub fn generate_recommendations(&mut self) {
         if self.total_conflicts == 0 {
-            self.recommendations.push("No conflicts detected. System is healthy.".to_string());
+            self.recommendations
+                .push("No conflicts detected. System is healthy.".to_string());
             return;
         }
 
         if let Some(&critical_count) = self.by_severity.get("Critical") {
             if critical_count > 0 {
-                self.recommendations.push(
-                    format!("{} critical conflicts require immediate attention", critical_count)
-                );
+                self.recommendations.push(format!(
+                    "{} critical conflicts require immediate attention",
+                    critical_count
+                ));
             }
         }
 
         if self.auto_resolvable_count > 0 {
-            self.recommendations.push(
-                format!("{} conflicts can be auto-resolved", self.auto_resolvable_count)
-            );
+            self.recommendations.push(format!(
+                "{} conflicts can be auto-resolved",
+                self.auto_resolvable_count
+            ));
         }
 
         if let Some(&resource_count) = self.by_type.get("Resource") {
             if resource_count > 0 {
-                self.recommendations.push(
-                    "Consider resource partitioning to reduce conflicts".to_string()
-                );
+                self.recommendations
+                    .push("Consider resource partitioning to reduce conflicts".to_string());
             }
         }
 
         if let Some(&semantic_count) = self.by_type.get("Semantic") {
             if semantic_count > 2 {
                 self.recommendations.push(
-                    "Multiple semantic duplicates detected. Consider skill consolidation.".to_string()
+                    "Multiple semantic duplicates detected. Consider skill consolidation."
+                        .to_string(),
                 );
             }
         }
@@ -264,9 +267,10 @@ impl ConflictDetectionEngine {
 
         for perm_a in &perms_a.permissions {
             for perm_b in &perms_b.permissions {
-                if perm_a.action == perm_b.action 
-                    && perm_a.resource_pattern == perm_b.resource_pattern 
-                    && perm_a.resource_pattern != "*" {
+                if perm_a.action == perm_b.action
+                    && perm_a.resource_pattern == perm_b.resource_pattern
+                    && perm_a.resource_pattern != "*"
+                {
                     overlapping_perms.push(perm_a.permission_id.clone());
                 }
             }
@@ -305,7 +309,9 @@ impl ConflictDetectionEngine {
 
         let description = format!(
             "Skills '{}' and '{}' have high semantic similarity ({:.2}%)",
-            skill_a.name, skill_b.name, similarity * 100.0
+            skill_a.name,
+            skill_b.name,
+            similarity * 100.0
         );
 
         Some(
@@ -357,19 +363,18 @@ impl ConflictDetectionEngine {
         let mut path = Vec::new();
         let mut cycle_skills = Vec::new();
 
-        if self.has_cycle(start_skill, all_skills, &mut visited, &mut path, &mut cycle_skills) {
-            let description = format!(
-                "Dependency cycle detected: {}",
-                cycle_skills.join(" -> ")
-            );
+        if self.has_cycle(
+            start_skill,
+            all_skills,
+            &mut visited,
+            &mut path,
+            &mut cycle_skills,
+        ) {
+            let description = format!("Dependency cycle detected: {}", cycle_skills.join(" -> "));
 
             return Some(
-                SkillConflict::new(
-                    ConflictType::Dependency,
-                    cycle_skills,
-                    &description,
-                )
-                .with_severity(ConflictSeverity::Critical),
+                SkillConflict::new(ConflictType::Dependency, cycle_skills, &description)
+                    .with_severity(ConflictSeverity::Critical),
             );
         }
 
@@ -385,7 +390,10 @@ impl ConflictDetectionEngine {
         cycle_skills: &mut Vec<String>,
     ) -> bool {
         if path.contains(&skill.skill_iri) {
-            let cycle_start = path.iter().position(|s| s == &skill.skill_iri).expect("skill_iri confirmed in path by contains() check above");
+            let cycle_start = path
+                .iter()
+                .position(|s| s == &skill.skill_iri)
+                .expect("skill_iri confirmed in path by contains() check above");
             cycle_skills.extend(path[cycle_start..].iter().cloned());
             cycle_skills.push(skill.skill_iri.clone());
             return true;
@@ -434,7 +442,11 @@ impl ConflictDetectionEngine {
         resources
     }
 
-    fn calculate_semantic_similarity(&self, skill_a: &SkillGraphNode, skill_b: &SkillGraphNode) -> f32 {
+    fn calculate_semantic_similarity(
+        &self,
+        skill_a: &SkillGraphNode,
+        skill_b: &SkillGraphNode,
+    ) -> f32 {
         let mut score = 0.0f32;
         let mut weight = 0.0f32;
 
@@ -507,27 +519,21 @@ impl ConflictDetectionEngine {
             ResolutionStrategy::PreferSystem => {
                 self.resolve_by_source(&conflict.skill_iris, &skills)?
             }
-            ResolutionStrategy::KeepBoth => {
-                ConflictResolution::new(
-                    ResolutionStrategy::KeepBoth,
-                    "Both skills retained with namespace separation",
-                )
-            }
-            ResolutionStrategy::Merge => {
-                ConflictResolution::new(
-                    ResolutionStrategy::Merge,
-                    "Skills will be merged into a composite skill",
-                )
-            }
-            ResolutionStrategy::RemoveConflict => {
-                ConflictResolution::new(
-                    ResolutionStrategy::RemoveConflict,
-                    "Conflict source will be removed",
-                )
-            }
+            ResolutionStrategy::KeepBoth => ConflictResolution::new(
+                ResolutionStrategy::KeepBoth,
+                "Both skills retained with namespace separation",
+            ),
+            ResolutionStrategy::Merge => ConflictResolution::new(
+                ResolutionStrategy::Merge,
+                "Skills will be merged into a composite skill",
+            ),
+            ResolutionStrategy::RemoveConflict => ConflictResolution::new(
+                ResolutionStrategy::RemoveConflict,
+                "Conflict source will be removed",
+            ),
             ResolutionStrategy::RequireManual => {
-                return Err(CoreError::ValidationFailed { message:
-                    "This conflict requires manual resolution".to_string()
+                return Err(CoreError::ValidationFailed {
+                    message: "This conflict requires manual resolution".to_string(),
                 });
             }
         };
@@ -566,9 +572,14 @@ impl ConflictDetectionEngine {
         match best_skill {
             Some(skill) => Ok(ConflictResolution::new(
                 ResolutionStrategy::PreferHigherTrust,
-                &format!("Selected '{}' with trust level {:?}", skill.name, best_trust),
+                &format!(
+                    "Selected '{}' with trust level {:?}",
+                    skill.name, best_trust
+                ),
             )),
-            None => Err(CoreError::ValidationFailed { message: "No skills found for resolution".to_string() }),
+            None => Err(CoreError::ValidationFailed {
+                message: "No skills found for resolution".to_string(),
+            }),
         }
     }
 
@@ -594,7 +605,9 @@ impl ConflictDetectionEngine {
                 ResolutionStrategy::PreferNewer,
                 &format!("Selected '{}' version {}", skill.name, skill.version),
             )),
-            None => Err(CoreError::ValidationFailed { message: "No skills found for resolution".to_string() }),
+            None => Err(CoreError::ValidationFailed {
+                message: "No skills found for resolution".to_string(),
+            }),
         }
     }
 
@@ -629,11 +642,8 @@ impl ConflictDetectionEngine {
     }
 
     fn compare_versions(&self, a: &str, b: &str) -> bool {
-        let parse_version = |v: &str| -> Vec<u32> {
-            v.split('.')
-                .filter_map(|s| s.parse().ok())
-                .collect()
-        };
+        let parse_version =
+            |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
         let va = parse_version(a);
         let vb = parse_version(b);
@@ -678,16 +688,16 @@ mod tests {
     #[test]
     fn test_conflict_report() {
         let mut report = ConflictReport::new();
-        
+
         let conflict = SkillConflict::new(
             ConflictType::Resource,
             vec!["iri://skills/a".to_string()],
             "Test conflict",
         );
-        
+
         report.add_conflict(conflict);
         report.generate_recommendations();
-        
+
         assert_eq!(report.total_conflicts, 1);
         assert!(!report.recommendations.is_empty());
     }
@@ -711,13 +721,13 @@ mod tests {
     #[test]
     fn test_string_similarity() {
         let engine = ConflictDetectionEngine::new(Arc::new(RwLock::new(HashMap::new())));
-        
+
         let sim = engine.string_similarity("hello world", "hello world");
         assert_eq!(sim, 1.0);
-        
+
         let sim = engine.string_similarity("hello world", "hello");
         assert!(sim >= 0.5);
-        
+
         let sim = engine.string_similarity("hello", "goodbye");
         assert!(sim < 0.5);
     }
@@ -725,7 +735,7 @@ mod tests {
     #[test]
     fn test_compare_versions() {
         let engine = ConflictDetectionEngine::new(Arc::new(RwLock::new(HashMap::new())));
-        
+
         assert!(engine.compare_versions("2.0.0", "1.0.0"));
         assert!(!engine.compare_versions("1.0.0", "2.0.0"));
         assert!(engine.compare_versions("1.1.0", "1.0.0"));
@@ -735,18 +745,20 @@ mod tests {
     #[tokio::test]
     async fn test_detect_semantic_conflict() {
         let mut skills = HashMap::new();
-        
+
         let skill_a = SkillGraphNode::new(
             "iri://skills/jwt-auth",
             "JWT Authentication",
             "Implement JWT authentication in Rust",
-        ).with_tag("authentication");
-        
+        )
+        .with_tag("authentication");
+
         let skill_b = SkillGraphNode::new(
             "iri://skills/jwt-auth-v2",
             "JWT Authentication",
             "Implement JWT authentication in Rust",
-        ).with_tag("authentication");
+        )
+        .with_tag("authentication");
 
         skills.insert(skill_a.skill_iri.clone(), skill_a);
         skills.insert(skill_b.skill_iri.clone(), skill_b);
@@ -760,18 +772,11 @@ mod tests {
     #[tokio::test]
     async fn test_no_conflict() {
         let mut skills = HashMap::new();
-        
-        let skill_a = SkillGraphNode::new(
-            "iri://skills/auth",
-            "Authentication",
-            "User authentication",
-        );
-        
-        let skill_b = SkillGraphNode::new(
-            "iri://skills/logging",
-            "Logging",
-            "Application logging",
-        );
+
+        let skill_a =
+            SkillGraphNode::new("iri://skills/auth", "Authentication", "User authentication");
+
+        let skill_b = SkillGraphNode::new("iri://skills/logging", "Logging", "Application logging");
 
         skills.insert(skill_a.skill_iri.clone(), skill_a);
         skills.insert(skill_b.skill_iri.clone(), skill_b);

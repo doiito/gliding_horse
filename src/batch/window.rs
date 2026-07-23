@@ -4,9 +4,7 @@ use chrono::{DateTime, Utc};
 use tracing::debug;
 
 use crate::batch::error::BatchError;
-use crate::batch::types::{
-    TriggerReason, WindowEntry, WindowStatus,
-};
+use crate::batch::types::{TriggerReason, WindowEntry, WindowStatus};
 
 impl WindowConfig {
     pub fn hybrid(max_messages: usize, max_seconds: u64) -> Self {
@@ -154,12 +152,14 @@ impl SlidingWindow {
         }
 
         let halves = self.entries.len() / 2;
-        let first_half: Vec<&str> = self.entries
+        let first_half: Vec<&str> = self
+            .entries
             .iter()
             .take(halves)
             .map(|e| e.content.as_str())
             .collect();
-        let second_half: Vec<&str> = self.entries
+        let second_half: Vec<&str> = self
+            .entries
             .iter()
             .skip(halves)
             .map(|e| e.content.as_str())
@@ -178,12 +178,24 @@ impl SlidingWindow {
                 .filter(|k| second_keywords.contains(k))
                 .count() as f64;
             let union = (first_keywords.len() + second_keywords.len()) as f64 - intersection;
-            if union == 0.0 { 1.0 } else { intersection / union }
+            if union == 0.0 {
+                1.0
+            } else {
+                intersection / union
+            }
         };
 
         if overlap < threshold {
-            let from = first_keywords.into_iter().take(3).collect::<Vec<_>>().join(", ");
-            let to = second_keywords.into_iter().take(3).collect::<Vec<_>>().join(", ");
+            let from = first_keywords
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let to = second_keywords
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(", ");
             return Some((from, to));
         }
 
@@ -193,23 +205,22 @@ impl SlidingWindow {
 
 fn extract_keywords(text: &str) -> Vec<String> {
     let stop_words = [
-        "a", "an", "the", "is", "are", "was", "were", "be", "been",
-        "being", "have", "has", "had", "do", "does", "did", "will",
-        "would", "could", "should", "may", "might", "shall", "can",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above",
-        "below", "between", "out", "off", "over", "under", "again",
-        "further", "then", "once", "here", "there", "when", "where",
-        "why", "how", "all", "each", "every", "both", "few", "more",
-        "most", "other", "some", "such", "no", "nor", "not", "only",
-        "own", "same", "so", "than", "too", "very", "just", "because",
-        "and", "but", "or", "if", "while", "that", "this", "it", "its",
-        "i", "me", "my", "we", "our", "you", "your", "he", "she", "they",
-        "what", "which", "who", "about", "use", "used",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "out", "off", "over", "under",
+        "again", "further", "then", "once", "here", "there", "when", "where", "why", "how", "all",
+        "each", "every", "both", "few", "more", "most", "other", "some", "such", "no", "nor",
+        "not", "only", "own", "same", "so", "than", "too", "very", "just", "because", "and", "but",
+        "or", "if", "while", "that", "this", "it", "its", "i", "me", "my", "we", "our", "you",
+        "your", "he", "she", "they", "what", "which", "who", "about", "use", "used",
     ];
 
     text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|w| w.len() > 2 && !stop_words.contains(&w.as_str()))
         .collect()
 }
@@ -262,7 +273,10 @@ mod tests {
 
         w.push(make_entry("b")).unwrap();
         w.push(make_entry("c")).unwrap();
-        assert!(matches!(w.should_trigger(), TriggerReason::WindowFull { .. }));
+        assert!(matches!(
+            w.should_trigger(),
+            TriggerReason::WindowFull { .. }
+        ));
     }
 
     #[test]
@@ -274,10 +288,14 @@ mod tests {
             intent_shift_threshold: 0.3,
         });
 
-        w.push(make_entry("Rust is great for backend web services")).unwrap();
-        w.push(make_entry("I like the Rust web framework ecosystem")).unwrap();
-        w.push(make_entry("Rust has excellent performance characteristics")).unwrap();
-        w.push(make_entry("Let me check which Rust web framework to use")).unwrap();
+        w.push(make_entry("Rust is great for backend web services"))
+            .unwrap();
+        w.push(make_entry("I like the Rust web framework ecosystem"))
+            .unwrap();
+        w.push(make_entry("Rust has excellent performance characteristics"))
+            .unwrap();
+        w.push(make_entry("Let me check which Rust web framework to use"))
+            .unwrap();
         assert!(w.detect_intent_shift(0.3).is_none());
 
         let mut w2 = SlidingWindow::new(WindowConfig {
@@ -288,11 +306,19 @@ mod tests {
         });
 
         // Different topics
-        w2.push(make_entry("The database schema needs an index on user_id")).unwrap();
-        w2.push(make_entry("We should normalize the orders table")).unwrap();
-        w2.push(make_entry("Let me deploy the docker container to kubernetes")).unwrap();
+        w2.push(make_entry("The database schema needs an index on user_id"))
+            .unwrap();
+        w2.push(make_entry("We should normalize the orders table"))
+            .unwrap();
+        w2.push(make_entry(
+            "Let me deploy the docker container to kubernetes",
+        ))
+        .unwrap();
         let shift = w2.detect_intent_shift(0.3);
-        assert!(shift.is_some(), "Expected intent shift between DB and k8s topics");
+        assert!(
+            shift.is_some(),
+            "Expected intent shift between DB and k8s topics"
+        );
     }
 
     #[test]

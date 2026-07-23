@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::causal::fused::FusedRootCauseEngine;
 use crate::config::settings::AgentSettings;
 use crate::core::constitution::ConstitutionRegistry;
 use crate::core::context_compressor::{ContextWindowManager, ToolResultCompressor};
@@ -23,11 +24,10 @@ use crate::methodology::{
     gate::{MethodologyGate, MethodologyGateHandle},
     MethodologyRegistry,
 };
-use crate::causal::fused::FusedRootCauseEngine;
 use crate::root_cause::RootCauseEngine;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::hooks::HookManager;
-use crate::tools::sharing::{SharingProtocol};
+use crate::tools::sharing::SharingProtocol;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::tools::tool_executor::ToolExecutor;
 use crate::tools::tool_guard::ToolGuard;
@@ -160,13 +160,22 @@ impl TaskContext {
         self.five_w2h_iri = iri.to_string();
         self.five_w2h_snapshot = Some(snapshot);
         if self.objective.is_empty() {
-            self.objective = self.five_w2h_snapshot.as_ref().map(|s| s.derive_objective()).unwrap_or_default();
+            self.objective = self
+                .five_w2h_snapshot
+                .as_ref()
+                .map(|s| s.derive_objective())
+                .unwrap_or_default();
         }
         self
     }
 
     /// Set historical messages restored from checkpoint (resume mode)
-    pub fn with_resumed_messages(mut self, messages: Vec<ChatMessage>, turn_count: u32, tool_count: u32) -> Self {
+    pub fn with_resumed_messages(
+        mut self,
+        messages: Vec<ChatMessage>,
+        turn_count: u32,
+        tool_count: u32,
+    ) -> Self {
         self.resumed_messages = Some(messages);
         self.resumed_turn_count = turn_count;
         self.resumed_tool_count = tool_count;
@@ -298,7 +307,10 @@ impl AgentRunner {
         templates: Arc<TemplateEngine>,
         agent_settings: AgentSettings,
     ) -> Self {
-        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), agent_settings.max_projection_size));
+        let projection = Arc::new(ProjectionEngine::new(
+            blackboard.clone(),
+            agent_settings.max_projection_size,
+        ));
         let sharing = Arc::new(SharingProtocol::new());
         let hook_manager = Arc::new(HookManager::new());
         ToolGuard::new().register_hooks(&hook_manager);
@@ -366,7 +378,9 @@ impl AgentRunner {
     }
 
     fn init_context_compressors(&mut self) {
-        use crate::config::settings::{ContextWindowSettings, ToolResultCompressorSettings, ToolResultAgingSettings};
+        use crate::config::settings::{
+            ContextWindowSettings, ToolResultAgingSettings, ToolResultCompressorSettings,
+        };
         let trc_settings = ToolResultCompressorSettings::default();
         if trc_settings.enabled {
             self.tool_result_compressor = Some(Arc::new(std::sync::Mutex::new(
@@ -399,7 +413,9 @@ impl AgentRunner {
         if let Some(ref gate) = self.methodology_gate {
             let g = gate.inner();
             let guard = g.read();
-            let kg = match crate::knowledge_graph::store::KnowledgeGraphStore::with_shared_store(store.clone()) {
+            let kg = match crate::knowledge_graph::store::KnowledgeGraphStore::with_shared_store(
+                store.clone(),
+            ) {
                 Err(e) => {
                     warn!("Failed to create KG for methodology seed: {}", e);
                     self.unified_graph_store = Some(store);
@@ -413,13 +429,19 @@ impl AgentRunner {
                     warn!("Failed to seed methodology {} into KG: {}", m.id, e);
                 }
             }
-            info!("Seeded {} methodology definitions into knowledge graph", guard.registry().all().len());
+            info!(
+                "Seeded {} methodology definitions into knowledge graph",
+                guard.registry().all().len()
+            );
         }
         self.unified_graph_store = Some(store);
         self
     }
 
-    pub fn with_tool_controller(mut self, tc: crate::core::tool_controller::ToolController) -> Self {
+    pub fn with_tool_controller(
+        mut self,
+        tc: crate::core::tool_controller::ToolController,
+    ) -> Self {
         self.tool_controller = Some(tc);
         self
     }
@@ -468,13 +490,19 @@ impl AgentRunner {
     }
 
     /// Set supplementary input store (injected by SA during creation, ensures SA and AgentRunner share the same instance)
-    pub fn with_supplement_store(mut self, store: crate::core::supplementary_store::SupplementaryInputStore) -> Self {
+    pub fn with_supplement_store(
+        mut self,
+        store: crate::core::supplementary_store::SupplementaryInputStore,
+    ) -> Self {
         self.supplement_store = store;
         self
     }
 
     /// Set up active perception store (system components like WorkspaceMonitor/BatchAgent write perception data)
-    pub fn with_perception_store(mut self, store: crate::core::perception_store::PerceptionStore) -> Self {
+    pub fn with_perception_store(
+        mut self,
+        store: crate::core::perception_store::PerceptionStore,
+    ) -> Self {
         self.perception_store = store;
         self
     }
@@ -505,7 +533,10 @@ impl AgentRunner {
     }
 
     /// Attach a SkillGraphStore — the cognitive network — for skill-related operations.
-    pub fn with_skill_graph_store(mut self, store: Arc<crate::skill_graph::graph_store::SkillGraphStore>) -> Self {
+    pub fn with_skill_graph_store(
+        mut self,
+        store: Arc<crate::skill_graph::graph_store::SkillGraphStore>,
+    ) -> Self {
         self.skill_graph_store = Some(store);
         self
     }
@@ -513,7 +544,6 @@ impl AgentRunner {
     /// Complete initialization wiring: connect AgentRunner's perception_store to WorkspaceMonitor.
     /// Called once after AgentRunner construction and all sub-components are ready.
     pub fn finalize_setup(&self) {
-        
         let executor = self.tool_executor.read();
         if let Some(wm) = executor.get_workspace_monitor() {
             wm.set_perception_store(Arc::new(self.perception_store.clone()));

@@ -65,7 +65,7 @@
 | **因果引擎 (Causal Engine)** | 全新独立因果分析子系统，包含 `CausalEngine`、`FusionEngine`、`CausalStore` 和类型化 `CausalFactor`。支持跨智能体操作的因果推理，融合多因子分析——识别根因、传播故障链、计算智能体决策的因果图。 |
 | **统一图后端 (Graph Backend)** | 整合的 `GraphBackend`（约 1200 行）替代碎片化的图存储——提供统一的节点/边 CRUD 优化接口，支持批量操作、子图提取和跨知识层的路径查找。 |
 | **图特征计算 (Graph Features)** | 新增 `graph_features` 模块，计算结构特征向量（度中心性、聚类系数、PageRank、介数中心性），并通过特征距离比较实现图相似度评分。支持跨认知快照的定量图分析。 |
-| **快照时间线 (Snapshot Timeline)** | 基于时间线的会话状态快照管理。`SnapshotTimeline` 支持时序查询、时间点恢复和基于差异的回滚——完整历史遍历的防崩溃恢复。 |
+| **快照时间线 (Snapshot Timeline)** | 技能图快照与持久化的快照后 mutation 记录，支持时间点恢复和差异查询。它仍是实验性图时间线，并非完整会话历史或防崩溃恢复系统。 |
 | **自我意识模块重构** | 自我意识（SA）模块重大重写（+410 行），增强智能体状态监控、环境感知和自适应行为。与因果引擎集成实现自动自我诊断。 |
 | **5W2H 维度审计增强** | 扩展了维度级审计功能，每个维度增加了更深层的因果归因。What/Why 失败现可链入因果引擎进行自动根因分析。 |
 | **高级特性设计文档** | 新增全面的 [`ADVANCED_FEATURES_DESIGN.md`](docs/ADVANCED_FEATURES_DESIGN.md)，涵盖图后端架构、因果推理设计、时间线快照语义和性能基准。 |
@@ -80,12 +80,12 @@
 | 特性 | 说明 |
 |------|------|
 | **HyperspaceEngine 向量引擎** | 生产级嵌入式向量引擎，支持 HNSW ANN 搜索、预写日志（WAL）、切线空间剪枝及运行时可选度量空间（Poincaré、Cosine、Euclidean、Lorentz）。 |
-| **技能图谱认知网络** | 超图组合、Poincaré 结构嵌入、PageRank/Betweenness/社区发现算法、因果故障分析、带回滚的时序版本管理、6 项形式化不变式检查、混合文本×结构搜索。 |
+| **技能图谱认知网络** | 超图组合、Poincaré 结构嵌入、PageRank/Betweenness/社区发现算法、因果故障分析、实验性的时序快照/回滚、6 项形式化不变式检查、混合文本×结构搜索。 |
 | **语义技能发现引擎** | `SkillDiscoveryEngine` 集成 HyperspaceStore 向量搜索，用余弦相似度替代纯 Jaccard 标签重叠的 `suggest_links()`，支持 BFS 路径发现、组合树构建和冲突检测。 |
-| **Oxigraph SPARQL 双向桥接** | 技能图谱与 Oxigraph RDF 存储之间通过 SPARQL INSERT/DELETE + 命名图隔离实现实时双向同步。 |
+| **Oxigraph SPARQL 桥接** | 技能图谱通过 SPARQL INSERT/DELETE 投影到 Oxigraph RDF 存储，并使用命名图隔离；尚未实现 RDF 到技能图的反向同步。 |
 | **L2 Blackboard 记忆系统** | 带 JSON-LD 线程、投影、消息包的类型化文档存储，LRU 淘汰策略，支撑长期智能体上下文。 |
 | **工作区监控器** | 实时文件系统感知引擎，10 种事件触发器，60 秒异常去重，5W2H 约束检查。 |
-| **批处理智能体管理器** | 基于滑动窗口的批处理引擎，支持可配置触发器、事件总线集成和业务域隔离。 |
+| **批处理智能体管理器** | 基于滑动窗口的批处理组件，支持可配置触发器、事件总线集成和业务域隔离；根 gRPC 服务已接线 opt-in 自定义事件及 cron/window 消费，流式请求复用共享服务状态；事件持久化重放仍待完成。 |
 | **Gliding Code TUI 终端助手** | 交互式终端 UI（ratatui v0.28），支持 Markdown 渲染、Mermaid 图表、MCP 服务器集成、断点恢复、多模型后端。 |
 
 ---
@@ -153,16 +153,16 @@
 `SkillDiscoveryEngine` 包装 `HyperspaceStore` 实现基于向量的语义技能搜索。`suggest_links()` 从 Jaccard 标签重叠优雅降级到余弦相似度搜索。内置 BFS 路径发现（`find_skill_chain()`）、组合树构建（`get_skill_tree()`）和冲突检测。
 
 ### 5. CPU 缓存记忆 — 4 层结构 + MESI 一致性
-业界首创将 CPU 缓存一致性协议应用于多智能体记忆系统。**L0** Sled 磁盘存储 → **L1** 会话上下文 → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL 投影缓存。智能预取引擎降低 90% 感知延迟。解决上下文爆炸与并发智能体间的共享内存不一致问题。
+**L0** Sled 磁盘存储 → **L1** 会话上下文 → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL 投影缓存。仓库实现了借鉴缓存一致性的协调与预取组件；目前没有已发布的端到端延迟或多智能体一致性基准。
 
-### 6. JSON-LD 通用数据总线 — W3C 标准互操作
-`@context` 鸭子类型消除技能间的字段名冲突。`@id` 实现零成本跨智能体实体合并。`@graph` 命名图支持跨子系统无锁并行写入。将互操作难题变为即插即用。
+### 6. JSON-LD 通用数据总线 — 内部互操作子集
+内部 JSON-LD 工具支持本仓库使用的 `@context`、`@id`、`@graph`、framing、校验和路由；这不是完整 JSON-LD 1.1、SHACL 或通用 RDF 互操作性声明。
 
 ### 7. 自进化技能图谱 — 自主学习
-AA 智能体每次任务完成后自动创建**知识片段**和新语义链接。`/learn`/`/reduce` 机制实现自主技能获取与归并。`BootstrapEngine` 从文件系统摄取 Markdown 格式技能。
+AA 智能体在任务完成后记录知识片段、链接和演化建议。`/learn`/`/reduce` 提供显式的技能获取与归并操作；建议不会自动应用，因为 typed patch 的验证、安全与冲突门禁尚待实现。`BootstrapEngine` 从文件系统摄取 Markdown 格式技能。
 
 ### 8. 通用知识图谱 — 统一认知骨干
-所有子系统（技能、记忆、任务、代码知识）共享同一 **Oxigraph RDF 存储**，通过命名图隔离，支持跨子系统 SPARQL 联合查询。tree-sitter 解析的代码 AST 自动转为 RDF 三元组。`SkillGraphStore` **双向 SPARQL 同步**确保认知图与语义存储实时一致。
+技能、记忆、任务和代码知识可通过命名图使用共享 **Oxigraph RDF 存储**；已接线的生产者可进行受范围约束的 SPARQL 联合查询。tree-sitter 解析的代码 AST 会转为 RDF 三元组。`SkillGraphStore` 将变更投影到语义存储；尚未实现 RDF 到技能图的反向同步。
 
 ### 9. 5W2H 维度级审计 — 精准回滚
 CA 独立审计 7 个维度。What/Why 失败 → 重新分析。How/Where 失败 → 重新规划。When/HowMuch 失败 → 条件通过。告别黑盒"通过/不通过"——精确定位问题根因。
@@ -176,8 +176,8 @@ CA 独立审计 7 个维度。What/Why 失败 → 重新分析。How/Where 失�
 ### 12. MCP 集成 — 一个协议连接一切
 标准 **Model Context Protocol** 连接 GitHub、Slack、Jira 等任意 MCP 兼容服务器。运行时动态发现工具。支持 HTTP SSE 和 stdio 两种传输模式，通过可重复 `--mcp-server` CLI 标志配置。
 
-### 13. 检查点与恢复 — 崩溃不丢上下文
-关键执行点保存会话快照，崩溃后完整恢复上下文零丢失。`--resume <task_iri>` 和 `--list-checkpoints` 命令提供显式会话管理。支持数小时/数天的长任务执行及事后回放调试。
+### 13. 检查点与恢复 — 显式会话管理
+关键执行点会保存会话检查点，`--resume <task_iri>` 和 `--list-checkpoints` 提供显式会话管理。崩溃恢复和完整长任务回放仍需故障注入与端到端验证后才能作为能力宣称。
 
 ### 14. Center + Edge 联邦 — 本地自治，全局编排
 Go Center 负责工作流编排（Temporal）、项目管理、智能体注册。Rust Edge 运行本地 LLM 执行与 Docker 沙箱。VS Code 插件提供实时开发者感知。无单点故障。

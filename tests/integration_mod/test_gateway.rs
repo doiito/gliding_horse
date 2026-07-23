@@ -1,5 +1,5 @@
-use glidinghorse::gateway::UnifiedGateway;
 use glidinghorse::config::GatewaySettings;
+use glidinghorse::gateway::UnifiedGateway;
 use std::collections::HashMap;
 
 fn test_gateway_settings() -> GatewaySettings {

@@ -5,7 +5,6 @@
 ///
 /// Architecture Layer: L1 — Enforcement
 /// See design: PR-res/superpowers-skills-full-integration-design.md §2
-
 pub mod config;
 pub mod defense;
 pub mod evidence;
@@ -17,9 +16,7 @@ pub use types::*;
 use std::sync::Arc;
 
 use crate::causal::fused::{FusedRootCause, FusedRootCauseEngine};
-use crate::tools::hooks::{
-    FunctionHook, HookManager, HookPoint, HookResult,
-};
+use crate::tools::hooks::{FunctionHook, HookManager, HookPoint, HookResult};
 
 /// RootCauseEngine — main entry point for root cause tracing and defense generation.
 ///
@@ -80,7 +77,11 @@ impl RootCauseEngine {
 
         // Step 1: Backward trace (5 levels)
         let chain = self.tracer.trace_backward(
-            error_message, source_location, context, &trace_id, agent_id,
+            error_message,
+            source_location,
+            context,
+            &trace_id,
+            agent_id,
         )?;
 
         // Step 2: Validate evidence chain
@@ -121,11 +122,17 @@ impl RootCauseEngine {
 
     // ── Sub-Operations ──
 
-    pub fn validate_evidence_chain(&self, chain: &types::TraceChain) -> Result<(), types::ChainValidationError> {
+    pub fn validate_evidence_chain(
+        &self,
+        chain: &types::TraceChain,
+    ) -> Result<(), types::ChainValidationError> {
         self.evidence.validate_chain(chain)
     }
 
-    pub fn defense_recommendations(&self, chain: &types::TraceChain) -> Vec<types::DefenseRecommendation> {
+    pub fn defense_recommendations(
+        &self,
+        chain: &types::TraceChain,
+    ) -> Vec<types::DefenseRecommendation> {
         self.defense.targeted_recommendations(chain)
     }
 
@@ -152,7 +159,7 @@ impl RootCauseEngine {
         let engine = Arc::new(self.clone_inner());
 
         // Hook 1: TaskError → auto traceback (synchronous)
-        hook_manager.register_arc(Arc::new(FunctionHook::new(
+        hook_manager.replace_arc(Arc::new(FunctionHook::new(
             "root_cause_trace",
             vec![HookPoint::TaskError],
             90,
@@ -160,7 +167,9 @@ impl RootCauseEngine {
                 let engine = engine.clone();
                 move |ctx: &mut crate::tools::hooks::HookContext| {
                     if let Some(error) = &ctx.error {
-                        let source = ctx.metadata.get("source_location")
+                        let source = ctx
+                            .metadata
+                            .get("source_location")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
                         let trace_ctx = types::TraceContext {
@@ -170,12 +179,14 @@ impl RootCauseEngine {
                         };
                         match engine.trace(error, source, &trace_ctx) {
                             Ok(result) => {
-                                ctx.data.insert("root_cause_trace".to_string(),
+                                ctx.data.insert(
+                                    "root_cause_trace".to_string(),
                                     serde_json::json!({
                                         "trace_id": result.chain.trace_id,
                                         "resolved": result.chain.resolved,
                                         "confidence": result.confidence,
-                                    }));
+                                    }),
+                                );
                                 tracing::info!(
                                     "RootCause trace complete: {} (resolved={}, confidence={:.2})",
                                     result.chain.trace_id,
@@ -185,8 +196,10 @@ impl RootCauseEngine {
                             }
                             Err(e) => {
                                 tracing::warn!("RootCause trace failed: {}", e);
-                                ctx.data.insert("root_cause_error".to_string(),
-                                    serde_json::json!(e.to_string()));
+                                ctx.data.insert(
+                                    "root_cause_error".to_string(),
+                                    serde_json::json!(e.to_string()),
+                                );
                             }
                         }
                     }
@@ -196,7 +209,7 @@ impl RootCauseEngine {
         )));
 
         // Hook 2: PhaseEnd → check unresolved traces before allowing phase transition
-        hook_manager.register_arc(Arc::new(FunctionHook::new(
+        hook_manager.replace_arc(Arc::new(FunctionHook::new(
             "root_cause_principle_check",
             vec![HookPoint::PhaseEnd],
             50,
@@ -255,7 +268,10 @@ fn extract_iri_from_error(error: &str) -> String {
     // Simple heuristic: find the first `iri:` or `http` substring
     for token in error.split_whitespace() {
         let cleaned = token.trim_matches(|c: char| c.is_ascii_punctuation());
-        if cleaned.starts_with("iri:") || cleaned.starts_with("http://") || cleaned.starts_with("https://") {
+        if cleaned.starts_with("iri:")
+            || cleaned.starts_with("http://")
+            || cleaned.starts_with("https://")
+        {
             return cleaned.to_string();
         }
     }
@@ -292,10 +308,17 @@ mod tests {
             "src/http/client.rs:42",
             &context,
         );
-        assert!(result.is_ok(), "Full trace should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Full trace should succeed: {:?}",
+            result.err()
+        );
         let traced = result.unwrap();
         assert!(!traced.chain.levels.is_empty(), "Should have trace levels");
-        assert!(!traced.defenses.is_empty(), "Should have defense recommendations");
+        assert!(
+            !traced.defenses.is_empty(),
+            "Should have defense recommendations"
+        );
         assert!(traced.confidence > 0.0, "Should have confidence");
     }
 
@@ -306,11 +329,7 @@ mod tests {
             ..Default::default()
         });
         let context = types::TraceContext::default();
-        let result = engine.trace(
-            "something unknown happened",
-            "src/main.rs:1",
-            &context,
-        );
+        let result = engine.trace("something unknown happened", "src/main.rs:1", &context);
         assert!(result.is_err(), "Should fail when confidence too low");
     }
 
@@ -325,12 +344,12 @@ mod tests {
     fn test_traced_result_structure() {
         let engine = RootCauseEngine::default();
         let context = types::TraceContext::default();
-        let result = engine.trace(
-            "permission denied",
-            "src/auth.rs:10",
-            &context,
-        ).unwrap();
+        let result = engine
+            .trace("permission denied", "src/auth.rs:10", &context)
+            .unwrap();
         assert!(result.evidence_report.contains("Evidence Chain Report"));
-        assert!(result.chain.trace_id.starts_with("trace_") || result.chain.trace_id.starts_with("rc"));
+        assert!(
+            result.chain.trace_id.starts_with("trace_") || result.chain.trace_id.starts_with("rc")
+        );
     }
 }

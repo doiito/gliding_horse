@@ -122,8 +122,10 @@ impl HookContext {
 pub trait Hook: Send + Sync {
     fn name(&self) -> &str;
     fn hook_points(&self) -> Vec<HookPoint>;
-    fn priority(&self) -> i32 { 100 }
-    
+    fn priority(&self) -> i32 {
+        100
+    }
+
     async fn execute(&self, context: &mut HookContext) -> HookResult;
 }
 
@@ -151,10 +153,16 @@ impl FunctionHook {
 
 #[async_trait]
 impl Hook for FunctionHook {
-    fn name(&self) -> &str { &self.name }
-    fn hook_points(&self) -> Vec<HookPoint> { self.hook_points.clone() }
-    fn priority(&self) -> i32 { self.priority }
-    
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn hook_points(&self) -> Vec<HookPoint> {
+        self.hook_points.clone()
+    }
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
     async fn execute(&self, context: &mut HookContext) -> HookResult {
         (self.handler)(context)
     }
@@ -164,7 +172,14 @@ pub struct AsyncFunctionHook {
     name: String,
     hook_points: Vec<HookPoint>,
     priority: i32,
-    handler: Arc<dyn Fn(&mut HookContext) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookResult> + Send>> + Send + Sync>,
+    handler: Arc<
+        dyn Fn(
+                &mut HookContext,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = HookResult> + Send>>
+            + Send
+            + Sync,
+    >,
 }
 
 impl AsyncFunctionHook {
@@ -184,10 +199,16 @@ impl AsyncFunctionHook {
 
 #[async_trait]
 impl Hook for AsyncFunctionHook {
-    fn name(&self) -> &str { &self.name }
-    fn hook_points(&self) -> Vec<HookPoint> { self.hook_points.clone() }
-    fn priority(&self) -> i32 { self.priority }
-    
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn hook_points(&self) -> Vec<HookPoint> {
+        self.hook_points.clone()
+    }
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
     async fn execute(&self, context: &mut HookContext) -> HookResult {
         (self.handler)(context).await
     }
@@ -230,7 +251,7 @@ impl TimingHook {
     pub fn new() -> Box<dyn Hook> {
         let timings = Arc::new(RwLock::new(HashMap::new()));
         let timings_clone = timings.clone();
-        
+
         Box::new(FunctionHook::new(
             "timing",
             vec![
@@ -249,7 +270,7 @@ impl TimingHook {
                     ctx.task_id.as_deref().unwrap_or("none"),
                     ctx.hook_point.as_str()
                 );
-                
+
                 match ctx.hook_point {
                     HookPoint::TaskStart | HookPoint::SkillBefore | HookPoint::LlmRequest => {
                         let mut timings = timings_clone.write();
@@ -263,7 +284,10 @@ impl TimingHook {
                         let mut timings = timings_clone.write();
                         if let Some(start) = timings.remove(&start_key) {
                             let duration = ctx.timestamp.saturating_sub(start);
-                            ctx.metadata.insert("duration_seconds".to_string(), Value::Number(duration.into()));
+                            ctx.metadata.insert(
+                                "duration_seconds".to_string(),
+                                Value::Number(duration.into()),
+                            );
                         }
                     }
                 }
@@ -286,7 +310,7 @@ impl RateLimitHook {
     pub fn new(max_calls: usize, window_seconds: u64) -> Box<dyn Hook> {
         let calls = Arc::new(RwLock::new(HashMap::new()));
         let calls_clone = calls.clone();
-        
+
         Box::new(FunctionHook::new(
             "rate_limit",
             vec![HookPoint::LlmRequest],
@@ -294,17 +318,17 @@ impl RateLimitHook {
             move |ctx| {
                 let agent_id = ctx.agent_id.clone();
                 let now = ctx.timestamp;
-                
+
                 let mut calls = calls_clone.write();
                 let entry: &mut Vec<u64> = calls.entry(agent_id.clone()).or_default();
-                
+
                 entry.retain(|&t| now.saturating_sub(t) < window_seconds);
-                
+
                 if entry.len() >= max_calls {
                     ctx.error = Some("Rate limit exceeded".to_string());
                     return HookResult::Abort;
                 }
-                
+
                 entry.push(now);
                 HookResult::Continue
             },
@@ -321,7 +345,7 @@ impl MetricsHook {
     pub fn new() -> Box<dyn Hook> {
         let metrics = Arc::new(RwLock::new(HashMap::new()));
         let metrics_clone = metrics.clone();
-        
+
         Box::new(FunctionHook::new(
             "metrics",
             vec![
@@ -334,7 +358,7 @@ impl MetricsHook {
             move |ctx| {
                 let metric_name = ctx.hook_point.as_str().to_string();
                 let mut metrics = metrics_clone.write();
-                
+
                 let entry: &mut Vec<Value> = metrics.entry(metric_name).or_default();
                 entry.push(serde_json::json!({
                     "agent_id": ctx.agent_id,
@@ -342,7 +366,7 @@ impl MetricsHook {
                     "timestamp": ctx.timestamp,
                     "metadata": ctx.metadata,
                 }));
-                
+
                 HookResult::Continue
             },
         ))
@@ -388,10 +412,30 @@ impl HookManager {
         }
     }
 
+    /// Replace every registration with the same stable hook name, then
+    /// register this hook for its declared points. This is intentionally
+    /// opt-in: ordinary hook registration remains additive, while components
+    /// that upgrade an implementation (for example RootCause → fused
+    /// RootCause) can avoid executing both implementations.
+    pub fn replace_arc(&self, hook: Arc<dyn Hook>) {
+        let hook_name = hook.name().to_string();
+        let hook_points = hook.hook_points();
+        let mut hooks = self.hooks.write();
+        for registered in hooks.values_mut() {
+            registered.retain(|existing| existing.name() != hook_name);
+        }
+        for point in hook_points {
+            let entry = hooks.entry(point).or_default();
+            entry.push(hook.clone());
+            entry.sort_by_key(|registered| registered.priority());
+        }
+    }
+
     pub async fn execute(&self, hook_point: HookPoint, context: &mut HookContext) -> HookResult {
         let hooks: Vec<Arc<dyn Hook>> = {
             let guard = self.hooks.read();
-            guard.get(&hook_point)
+            guard
+                .get(&hook_point)
                 .map(|v| v.clone())
                 .unwrap_or_default()
         };
@@ -399,9 +443,9 @@ impl HookManager {
         if hooks.is_empty() {
             return HookResult::Continue;
         }
-        
+
         let mut result = HookResult::Continue;
-        
+
         for hook in &hooks {
             match hook.execute(context).await {
                 HookResult::Continue => {}
@@ -421,7 +465,7 @@ impl HookManager {
                 }
             }
         }
-        
+
         result
     }
 
@@ -501,7 +545,8 @@ impl Default for ApprovalPoint {
         Self {
             hook_point: HookPoint::PhaseEnd,
             condition: ApprovalCondition::OnStageComplete,
-            message_template: "Stage {stage} completed, please confirm whether to continue".to_string(),
+            message_template: "Stage {stage} completed, please confirm whether to continue"
+                .to_string(),
             timeout_seconds: 3600,
             default_action: DefaultAction::Approve,
             stages: Vec::new(),
@@ -625,11 +670,17 @@ impl Default for HumanApprovalConfig {
 #[async_trait]
 pub trait ApprovalNotifier: Send + Sync {
     /// Send an approval request
-    async fn notify(&self, request: &ApprovalRequest) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    
+    async fn notify(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     /// Wait for an approval response
-    async fn wait_for_response(&self, request_id: &str, timeout: std::time::Duration) 
-        -> Option<ApprovalResponse>;
+    async fn wait_for_response(
+        &self,
+        request_id: &str,
+        timeout: std::time::Duration,
+    ) -> Option<ApprovalResponse>;
 }
 
 /// Channel-based approval notifier (for testing and in-process communication)
@@ -651,7 +702,8 @@ impl ChannelApprovalNotifier {
 
     pub fn get_pending(&self) -> Vec<ApprovalRequest> {
         let pending = self.pending.read();
-        pending.values()
+        pending
+            .values()
             .filter(|s| !s.processed && s.response.is_none())
             .map(|s| s.request.clone())
             .collect()
@@ -674,24 +726,32 @@ impl Default for ChannelApprovalNotifier {
 
 #[async_trait]
 impl ApprovalNotifier for ChannelApprovalNotifier {
-    async fn notify(&self, request: &ApprovalRequest) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn notify(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut pending = self.pending.write();
-        pending.insert(request.request_id.clone(), ApprovalState {
-            request: request.clone(),
-            response: None,
-            processed: false,
-        });
+        pending.insert(
+            request.request_id.clone(),
+            ApprovalState {
+                request: request.clone(),
+                response: None,
+                processed: false,
+            },
+        );
         Ok(())
     }
 
-    async fn wait_for_response(&self, request_id: &str, timeout: std::time::Duration) 
-        -> Option<ApprovalResponse> 
-    {
+    async fn wait_for_response(
+        &self,
+        request_id: &str,
+        timeout: std::time::Duration,
+    ) -> Option<ApprovalResponse> {
         let rx = {
             let mut guard = self.response_rx.lock();
             guard.take()
         };
-        
+
         if let Some(mut rx) = rx {
             let result = tokio::time::timeout(timeout, async {
                 while let Some(response) = rx.recv().await {
@@ -700,11 +760,14 @@ impl ApprovalNotifier for ChannelApprovalNotifier {
                     }
                 }
                 None
-            }).await.ok().flatten();
-            
+            })
+            .await
+            .ok()
+            .flatten();
+
             let mut guard = self.response_rx.lock();
             *guard = Some(rx);
-            
+
             if let Some(ref response) = result {
                 let mut pending = self.pending.write();
                 if let Some(state) = pending.get_mut(&response.request_id) {
@@ -712,10 +775,10 @@ impl ApprovalNotifier for ChannelApprovalNotifier {
                     state.processed = true;
                 }
             }
-            
+
             return result;
         }
-        
+
         None
     }
 }
@@ -731,7 +794,9 @@ impl HumanApprovalHook {
         Box::new(Self { config, notifier })
     }
 
-    pub fn with_channel_notifier(config: HumanApprovalConfig) -> (Box<Self>, Arc<ChannelApprovalNotifier>) {
+    pub fn with_channel_notifier(
+        config: HumanApprovalConfig,
+    ) -> (Box<Self>, Arc<ChannelApprovalNotifier>) {
         let notifier = Arc::new(ChannelApprovalNotifier::new());
         let hook = Box::new(Self {
             config,
@@ -774,22 +839,35 @@ impl HumanApprovalHook {
     }
 
     fn create_request(&self, ctx: &HookContext) -> ApprovalRequest {
-        let stage_id = ctx.data.get("stage_id")
+        let stage_id = ctx
+            .data
+            .get("stage_id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        
+
         let task_iri = ctx.task_iri.clone().unwrap_or_default();
-        
-        let message = ctx.error.as_ref()
+
+        let message = ctx
+            .error
+            .as_ref()
             .map(|e| format!("Execution error: {}, please confirm whether to continue", e))
-            .unwrap_or_else(|| format!("Stage {} completed, please confirm whether to continue", stage_id));
+            .unwrap_or_else(|| {
+                format!(
+                    "Stage {} completed, please confirm whether to continue",
+                    stage_id
+                )
+            });
 
         ApprovalRequest::new(
             task_iri,
             stage_id,
             message,
-            vec!["Approve".to_string(), "Reject".to_string(), "Rollback".to_string()],
+            vec![
+                "Approve".to_string(),
+                "Reject".to_string(),
+                "Rollback".to_string(),
+            ],
         )
     }
 
@@ -801,9 +879,7 @@ impl HumanApprovalHook {
             match &point.condition {
                 ApprovalCondition::Always => true,
                 ApprovalCondition::OnFailure => ctx.error.is_some(),
-                ApprovalCondition::OnStageComplete => {
-                    ctx.data.get("stage_id").is_some()
-                }
+                ApprovalCondition::OnStageComplete => ctx.data.get("stage_id").is_some(),
                 ApprovalCondition::Custom(_) => false,
             }
         })
@@ -817,7 +893,9 @@ impl Hook for HumanApprovalHook {
     }
 
     fn hook_points(&self) -> Vec<HookPoint> {
-        self.config.approval_points.iter()
+        self.config
+            .approval_points
+            .iter()
             .map(|p| p.hook_point)
             .collect()
     }
@@ -885,40 +963,77 @@ mod tests {
     #[tokio::test]
     async fn test_hook_manager() {
         let manager = HookManager::new();
-        
-        let hook = FunctionHook::new(
-            "test_hook",
-            vec![HookPoint::TaskStart],
-            100,
-            |ctx| {
-                ctx.data.insert("hooked".to_string(), Value::Bool(true));
-                HookResult::Continue
-            },
-        );
-        
+
+        let hook = FunctionHook::new("test_hook", vec![HookPoint::TaskStart], 100, |ctx| {
+            ctx.data.insert("hooked".to_string(), Value::Bool(true));
+            HookResult::Continue
+        });
+
         manager.register(Box::new(hook));
-        
+
         let mut context = HookContext::new(HookPoint::TaskStart, "agent_1", "DA");
-        
+
         let result = manager.execute(HookPoint::TaskStart, &mut context).await;
-        
+
         assert_eq!(result, HookResult::Continue);
         assert_eq!(context.data.get("hooked"), Some(&Value::Bool(true)));
+    }
+
+    #[tokio::test]
+    async fn replace_arc_removes_prior_registration_with_the_same_name() {
+        let manager = HookManager::new();
+        let old_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let new_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        manager.register_arc(Arc::new(FunctionHook::new(
+            "upgradeable_hook",
+            vec![HookPoint::TaskError],
+            10,
+            {
+                let old_calls = old_calls.clone();
+                move |_| {
+                    old_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    HookResult::Continue
+                }
+            },
+        )));
+
+        let mut before = HookContext::new(HookPoint::TaskError, "agent", "DA");
+        manager.execute(HookPoint::TaskError, &mut before).await;
+        assert_eq!(old_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        manager.replace_arc(Arc::new(FunctionHook::new(
+            "upgradeable_hook",
+            vec![HookPoint::TaskError],
+            10,
+            {
+                let new_calls = new_calls.clone();
+                move |_| {
+                    new_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    HookResult::Continue
+                }
+            },
+        )));
+
+        let mut after = HookContext::new(HookPoint::TaskError, "agent", "DA");
+        manager.execute(HookPoint::TaskError, &mut after).await;
+        assert_eq!(old_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(new_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn test_rate_limit_hook() {
         let manager = HookManager::new();
         manager.register(RateLimitHook::new(2, 60));
-        
+
         let mut ctx1 = HookContext::new(HookPoint::LlmRequest, "agent_1", "DA");
         let result1 = manager.execute(HookPoint::LlmRequest, &mut ctx1).await;
         assert_eq!(result1, HookResult::Continue);
-        
+
         let mut ctx2 = HookContext::new(HookPoint::LlmRequest, "agent_1", "DA");
         let result2 = manager.execute(HookPoint::LlmRequest, &mut ctx2).await;
         assert_eq!(result2, HookResult::Continue);
-        
+
         let mut ctx3 = HookContext::new(HookPoint::LlmRequest, "agent_1", "DA");
         let result3 = manager.execute(HookPoint::LlmRequest, &mut ctx3).await;
         assert_eq!(result3, HookResult::Abort);
@@ -929,10 +1044,13 @@ mod tests {
         let ctx = HookContext::new(HookPoint::TaskStart, "agent_1", "DA")
             .with_task("task_123", "iri://task/123")
             .with_data("key", Value::String("value".to_string()));
-        
+
         assert_eq!(ctx.agent_id, "agent_1");
         assert_eq!(ctx.agent_role, "DA");
         assert_eq!(ctx.task_id, Some("task_123".to_string()));
-        assert_eq!(ctx.data.get("key"), Some(&Value::String("value".to_string())));
+        assert_eq!(
+            ctx.data.get("key"),
+            Some(&Value::String("value".to_string()))
+        );
     }
 }

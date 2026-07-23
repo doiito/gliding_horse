@@ -17,7 +17,6 @@
 ///
 /// Architecture Layer: L4 — Self-Evolution (Iterative)
 /// See design: PR-res/superpowers-skills-full-integration-design.md §4
-
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -176,16 +175,19 @@ impl EvolutionEngine {
         }
         self.violations.push_back(record);
 
-        let metrics = self.metrics.entry(mid).or_insert_with(|| MethodologyMetrics {
-            methodology_id: mid_for_metrics,
-            activation_count: 0,
-            total_violations: 0,
-            block_count: 0,
-            warning_count: 0,
-            pass_count: 0,
-            last_activated: None,
-            effectiveness_score: 1.0,
-        });
+        let metrics = self
+            .metrics
+            .entry(mid)
+            .or_insert_with(|| MethodologyMetrics {
+                methodology_id: mid_for_metrics,
+                activation_count: 0,
+                total_violations: 0,
+                block_count: 0,
+                warning_count: 0,
+                pass_count: 0,
+                last_activated: None,
+                effectiveness_score: 1.0,
+            });
         metrics.total_violations += 1;
         if is_block {
             metrics.block_count += 1;
@@ -213,8 +215,10 @@ impl EvolutionEngine {
 
     /// Record a successful tool call (no violation).
     pub fn record_pass(&mut self, methodology_id: &str) {
-        let metrics = self.metrics.entry(methodology_id.to_string()).or_insert_with(|| {
-            MethodologyMetrics {
+        let metrics = self
+            .metrics
+            .entry(methodology_id.to_string())
+            .or_insert_with(|| MethodologyMetrics {
                 methodology_id: methodology_id.to_string(),
                 activation_count: 0,
                 total_violations: 0,
@@ -223,8 +227,7 @@ impl EvolutionEngine {
                 pass_count: 0,
                 last_activated: None,
                 effectiveness_score: 1.0,
-            }
-        });
+            });
         metrics.pass_count += 1;
         metrics.effectiveness_score = compute_effectiveness(
             metrics.activation_count,
@@ -239,8 +242,10 @@ impl EvolutionEngine {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let metrics = self.metrics.entry(methodology_id.to_string()).or_insert_with(|| {
-            MethodologyMetrics {
+        let metrics = self
+            .metrics
+            .entry(methodology_id.to_string())
+            .or_insert_with(|| MethodologyMetrics {
                 methodology_id: methodology_id.to_string(),
                 activation_count: 0,
                 total_violations: 0,
@@ -249,8 +254,7 @@ impl EvolutionEngine {
                 pass_count: 0,
                 last_activated: None,
                 effectiveness_score: 1.0,
-            }
-        });
+            });
         metrics.activation_count += 1;
         metrics.last_activated = Some(now);
         metrics.effectiveness_score = compute_effectiveness(
@@ -264,10 +268,15 @@ impl EvolutionEngine {
 
     /// Identify the most frequent violation patterns, grouped by methodology + pattern name.
     pub fn learn_patterns(&self) -> Vec<LearnedPattern> {
-        let mut groups: HashMap<(String, String, PatternType), Vec<&ViolationRecord>> = HashMap::new();
+        let mut groups: HashMap<(String, String, PatternType), Vec<&ViolationRecord>> =
+            HashMap::new();
 
         for v in &self.violations {
-            let key = (v.methodology_id.clone(), v.pattern_name.clone(), v.pattern_type);
+            let key = (
+                v.methodology_id.clone(),
+                v.pattern_name.clone(),
+                v.pattern_type,
+            );
             groups.entry(key).or_default().push(v);
         }
 
@@ -535,7 +544,13 @@ impl ViolationReporter {
 mod tests {
     use super::*;
 
-    fn sample_violation(mid: &str, pattern: &str, sev: RedFlagSeverity, role: &str, blocked: bool) -> ViolationRecord {
+    fn sample_violation(
+        mid: &str,
+        pattern: &str,
+        sev: RedFlagSeverity,
+        role: &str,
+        blocked: bool,
+    ) -> ViolationRecord {
         ViolationRecord {
             methodology_id: mid.to_string(),
             pattern_type: PatternType::AntiPattern,
@@ -558,7 +573,11 @@ mod tests {
         assert_eq!(engine.violation_count(), 0);
 
         engine.record_violation(sample_violation(
-            "methodology:index-priority", "full traversal", RedFlagSeverity::Critical, "DA", true,
+            "methodology:index-priority",
+            "full traversal",
+            RedFlagSeverity::Critical,
+            "DA",
+            true,
         ));
 
         assert_eq!(engine.violation_count(), 1);
@@ -578,7 +597,9 @@ mod tests {
         let mut engine = EvolutionEngine::new();
         engine.record_activation("methodology:systematic-debugging");
 
-        let metrics = engine.get_metrics("methodology:systematic-debugging").unwrap();
+        let metrics = engine
+            .get_metrics("methodology:systematic-debugging")
+            .unwrap();
         assert_eq!(metrics.activation_count, 1);
         assert!(metrics.last_activated.is_some());
     }
@@ -588,7 +609,11 @@ mod tests {
         let mut engine = EvolutionEngine::with_max_records(5);
         for i in 0..10 {
             engine.record_violation(sample_violation(
-                "methodology:test", &format!("pattern_{}", i), RedFlagSeverity::Info, "DA", false,
+                "methodology:test",
+                &format!("pattern_{}", i),
+                RedFlagSeverity::Info,
+                "DA",
+                false,
             ));
         }
         assert_eq!(engine.violation_count(), 5);
@@ -600,13 +625,25 @@ mod tests {
     fn test_learn_patterns_groups_by_pattern() {
         let mut engine = EvolutionEngine::new();
         engine.record_violation(sample_violation(
-            "methodology:index-priority", "full traversal", RedFlagSeverity::Critical, "DA", true,
+            "methodology:index-priority",
+            "full traversal",
+            RedFlagSeverity::Critical,
+            "DA",
+            true,
         ));
         engine.record_violation(sample_violation(
-            "methodology:index-priority", "full traversal", RedFlagSeverity::Critical, "DA", true,
+            "methodology:index-priority",
+            "full traversal",
+            RedFlagSeverity::Critical,
+            "DA",
+            true,
         ));
         engine.record_violation(sample_violation(
-            "methodology:cost-awareness", "no alternative comparison", RedFlagSeverity::Warning, "PA", false,
+            "methodology:cost-awareness",
+            "no alternative comparison",
+            RedFlagSeverity::Warning,
+            "PA",
+            false,
         ));
 
         let patterns = engine.learn_patterns();
@@ -622,7 +659,11 @@ mod tests {
         let mut engine = EvolutionEngine::new();
         for i in 0..10 {
             engine.record_violation(sample_violation(
-                "methodology:test", &format!("pattern_{}", i), RedFlagSeverity::Info, "DA", false,
+                "methodology:test",
+                &format!("pattern_{}", i),
+                RedFlagSeverity::Info,
+                "DA",
+                false,
             ));
         }
         let top = engine.top_patterns(3);
@@ -645,7 +686,11 @@ mod tests {
         engine.record_pass("methodology:test");
         engine.record_pass("methodology:test");
         engine.record_violation(sample_violation(
-            "methodology:test", "bad", RedFlagSeverity::Critical, "DA", true,
+            "methodology:test",
+            "bad",
+            RedFlagSeverity::Critical,
+            "DA",
+            true,
         ));
 
         let metrics = engine.get_metrics("methodology:test").unwrap();
@@ -674,7 +719,11 @@ mod tests {
     fn test_report_with_data() {
         let mut engine = EvolutionEngine::new();
         engine.record_violation(sample_violation(
-            "methodology:index-priority", "full traversal", RedFlagSeverity::Critical, "DA", true,
+            "methodology:index-priority",
+            "full traversal",
+            RedFlagSeverity::Critical,
+            "DA",
+            true,
         ));
         engine.record_pass("methodology:index-priority");
         engine.record_activation("methodology:index-priority");
@@ -688,7 +737,11 @@ mod tests {
     fn test_aa_briefing_not_empty() {
         let mut engine = EvolutionEngine::new();
         engine.record_violation(sample_violation(
-            "methodology:index-priority", "full traversal", RedFlagSeverity::Critical, "DA", true,
+            "methodology:index-priority",
+            "full traversal",
+            RedFlagSeverity::Critical,
+            "DA",
+            true,
         ));
         let briefing = engine.aa_evolution_briefing();
         assert!(!briefing.is_empty());
@@ -718,7 +771,8 @@ mod tests {
             message: "⚠️ Blocked".to_string(),
         };
 
-        let record = ViolationReporter::from_anti_pattern(&result, "DA", Some("task_1".to_string()), 1000);
+        let record =
+            ViolationReporter::from_anti_pattern(&result, "DA", Some("task_1".to_string()), 1000);
         assert_eq!(record.methodology_id, "methodology:test");
         assert_eq!(record.pattern_name, "Test Pattern");
         assert!(record.blocked);
@@ -741,7 +795,11 @@ mod tests {
         }
         assert_eq!(engine.violation_count(), 1000);
         let patterns = engine.learn_patterns();
-        assert_eq!(patterns.len(), 5, "Should have 5 distinct patterns from 1000 violations");
+        assert_eq!(
+            patterns.len(),
+            5,
+            "Should have 5 distinct patterns from 1000 violations"
+        );
     }
 
     #[test]

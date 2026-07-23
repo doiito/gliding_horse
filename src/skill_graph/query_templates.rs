@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::skill_graph::index::PreAggregatedIndex;
 use crate::skill_graph::types::*;
-use crate::skill_graph::graph_store::SkillGraphStore;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,7 +70,9 @@ impl QueryTemplateId {
 
     pub fn target_layer(&self) -> &'static str {
         match self {
-            Self::MocScan | Self::SkillByTag | Self::SkillByStack | Self::SkillByRole => "L2-pre-aggregated",
+            Self::MocScan | Self::SkillByTag | Self::SkillByStack | Self::SkillByRole => {
+                "L2-pre-aggregated"
+            }
             Self::SkillSummary | Self::RequiresDirect | Self::RequiresTransitive => "L2-indexed",
             Self::SkillSteps | Self::StepDetail | Self::Validation => "L3-detailed",
         }
@@ -114,14 +116,21 @@ impl QueryParams {
     }
 
     pub fn get_f32(&self, key: &str) -> Option<f32> {
-        self.params.get(key).and_then(|v| v.as_f64()).map(|v| v as f32)
+        self.params
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
     }
 
     pub fn get_str_vec(&self, key: &str) -> Vec<String> {
         self.params
             .get(key)
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -169,25 +178,33 @@ impl QueryEngine {
     fn query_moc_scan(&self, params: &QueryParams) -> QueryResult {
         let keyword = params.get_str("keyword").unwrap_or("");
         let mocs = self.graph_store.list_mocs();
-        
+
         let filtered: Vec<Value> = if keyword.is_empty() {
-            mocs.iter().map(|m| serde_json::json!({
-                "@id": m.moc_iri,
-                "name": m.name,
-                "description": m.description,
-                "skill_count": m.entry_points.len()
-            })).collect()
+            mocs.iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "@id": m.moc_iri,
+                        "name": m.name,
+                        "description": m.description,
+                        "skill_count": m.entry_points.len()
+                    })
+                })
+                .collect()
         } else {
             mocs.iter()
                 .filter(|m| {
-                    m.name.to_lowercase().contains(&keyword.to_lowercase()) ||
-                    m.description.to_lowercase().contains(&keyword.to_lowercase())
+                    m.name.to_lowercase().contains(&keyword.to_lowercase())
+                        || m.description
+                            .to_lowercase()
+                            .contains(&keyword.to_lowercase())
                 })
-                .map(|m| serde_json::json!({
-                    "@id": m.moc_iri,
-                    "name": m.name,
-                    "skill_count": m.entry_points.len()
-                }))
+                .map(|m| {
+                    serde_json::json!({
+                        "@id": m.moc_iri,
+                        "name": m.name,
+                        "skill_count": m.entry_points.len()
+                    })
+                })
                 .collect()
         };
 
@@ -204,7 +221,7 @@ impl QueryEngine {
     fn query_skill_by_tag(&self, params: &QueryParams) -> QueryResult {
         let tags = params.get_str_vec("tags");
         let min_rate = params.get_f32("min_success_rate");
-        
+
         let skill_iris = if tags.len() == 1 {
             self.index.find_by_tag(&tags[0])
         } else {
@@ -212,16 +229,19 @@ impl QueryEngine {
             self.index.find_by_tags_intersection(&tag_refs)
         };
 
-        let results: Vec<Value> = skill_iris.iter()
+        let results: Vec<Value> = skill_iris
+            .iter()
             .filter_map(|iri| self.index.get_summary(iri))
             .filter(|entry| min_rate.map_or(true, |r| entry.success_rate >= r))
-            .map(|entry| serde_json::json!({
-                "@id": entry.skill_iri,
-                "name": entry.name,
-                "what": entry.what,
-                "tags": entry.tags,
-                "success_rate": entry.success_rate
-            }))
+            .map(|entry| {
+                serde_json::json!({
+                    "@id": entry.skill_iri,
+                    "name": entry.name,
+                    "what": entry.what,
+                    "tags": entry.tags,
+                    "success_rate": entry.success_rate
+                })
+            })
             .collect();
 
         let count = results.len();
@@ -238,14 +258,17 @@ impl QueryEngine {
         let stack = params.get_str("stack").unwrap_or("");
         let skill_iris = self.index.find_by_stack(stack);
 
-        let results: Vec<Value> = skill_iris.iter()
+        let results: Vec<Value> = skill_iris
+            .iter()
             .filter_map(|iri| self.index.get_summary(iri))
-            .map(|entry| serde_json::json!({
-                "@id": entry.skill_iri,
-                "name": entry.name,
-                "stack": entry.stack,
-                "success_rate": entry.success_rate
-            }))
+            .map(|entry| {
+                serde_json::json!({
+                    "@id": entry.skill_iri,
+                    "name": entry.name,
+                    "stack": entry.stack,
+                    "success_rate": entry.success_rate
+                })
+            })
             .collect();
 
         let count = results.len();
@@ -262,14 +285,17 @@ impl QueryEngine {
         let role = params.get_str("role").unwrap_or("");
         let skill_iris = self.index.find_by_role(role);
 
-        let results: Vec<Value> = skill_iris.iter()
+        let results: Vec<Value> = skill_iris
+            .iter()
             .filter_map(|iri| self.index.get_summary(iri))
-            .map(|entry| serde_json::json!({
-                "@id": entry.skill_iri,
-                "name": entry.name,
-                "role": entry.role,
-                "success_rate": entry.success_rate
-            }))
+            .map(|entry| {
+                serde_json::json!({
+                    "@id": entry.skill_iri,
+                    "name": entry.name,
+                    "role": entry.role,
+                    "success_rate": entry.success_rate
+                })
+            })
             .collect();
 
         let count = results.len();
@@ -285,7 +311,7 @@ impl QueryEngine {
     fn query_skill_summary(&self, params: &QueryParams) -> QueryResult {
         let skill_iri = params.get_str("skill_iri").unwrap_or("");
         let level = params.get_str("level").unwrap_or("summary");
-        
+
         let disclosure = match level {
             "moc" => DisclosureLevel::MOCIndex,
             "summary" => DisclosureLevel::Summary5W2H,
@@ -307,7 +333,9 @@ impl QueryEngine {
 
     fn query_skill_steps(&self, params: &QueryParams) -> QueryResult {
         let skill_iri = params.get_str("skill_iri").unwrap_or("");
-        let data = self.graph_store.get_skill_at_level(skill_iri, DisclosureLevel::SchemaSteps);
+        let data = self
+            .graph_store
+            .get_skill_at_level(skill_iri, DisclosureLevel::SchemaSteps);
         let count = if data.is_some() { 1 } else { 0 };
 
         QueryResult {
@@ -321,7 +349,9 @@ impl QueryEngine {
 
     fn query_step_detail(&self, params: &QueryParams) -> QueryResult {
         let skill_iri = params.get_str("skill_iri").unwrap_or("");
-        let data = self.graph_store.get_skill_at_level(skill_iri, DisclosureLevel::FullContent);
+        let data = self
+            .graph_store
+            .get_skill_at_level(skill_iri, DisclosureLevel::FullContent);
         let count = if data.is_some() { 1 } else { 0 };
 
         QueryResult {
@@ -367,11 +397,13 @@ impl QueryEngine {
                 s.links
                     .iter()
                     .filter(|l| l.link_type == SkillLinkType::Prerequisite)
-                    .map(|l| serde_json::json!({
-                        "target": l.target_iri,
-                        "strength": format!("{:?}", l.strength),
-                        "description": l.description
-                    }))
+                    .map(|l| {
+                        serde_json::json!({
+                            "target": l.target_iri,
+                            "strength": format!("{:?}", l.strength),
+                            "description": l.description
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -390,9 +422,10 @@ impl QueryEngine {
         let skill_iri = params.get_str("skill_iri").unwrap_or("");
         let deps = self.index.get_transitive_deps(skill_iri);
 
-        let results: Vec<Value> = deps.iter().map(|dep| {
-            serde_json::json!({ "@id": dep })
-        }).collect();
+        let results: Vec<Value> = deps
+            .iter()
+            .map(|dep| serde_json::json!({ "@id": dep }))
+            .collect();
 
         let count = results.len();
         QueryResult {
@@ -412,15 +445,24 @@ mod tests {
 
     #[test]
     fn test_query_template_id_from_str() {
-        assert_eq!(QueryTemplateId::from_str("q:moc-scan"), Some(QueryTemplateId::MocScan));
-        assert_eq!(QueryTemplateId::from_str("q:skill-by-tag"), Some(QueryTemplateId::SkillByTag));
+        assert_eq!(
+            QueryTemplateId::from_str("q:moc-scan"),
+            Some(QueryTemplateId::MocScan)
+        );
+        assert_eq!(
+            QueryTemplateId::from_str("q:skill-by-tag"),
+            Some(QueryTemplateId::SkillByTag)
+        );
         assert_eq!(QueryTemplateId::from_str("q:unknown"), None);
     }
 
     #[test]
     fn test_query_template_id_as_str() {
         assert_eq!(QueryTemplateId::MocScan.as_str(), "q:moc-scan");
-        assert_eq!(QueryTemplateId::RequiresTransitive.as_str(), "q:requires-transitive");
+        assert_eq!(
+            QueryTemplateId::RequiresTransitive.as_str(),
+            "q:requires-transitive"
+        );
     }
 
     #[test]
@@ -433,10 +475,13 @@ mod tests {
     fn test_query_params() {
         let params = QueryParams::new()
             .with("skill_iri", Value::String("iri://skills/test".to_string()))
-            .with("tags", Value::Array(vec![
-                Value::String("auth".to_string()),
-                Value::String("jwt".to_string()),
-            ]));
+            .with(
+                "tags",
+                Value::Array(vec![
+                    Value::String("auth".to_string()),
+                    Value::String("jwt".to_string()),
+                ]),
+            );
 
         assert_eq!(params.get_str("skill_iri"), Some("iri://skills/test"));
         assert_eq!(params.get_str_vec("tags"), vec!["auth", "jwt"]);
@@ -461,15 +506,17 @@ mod tests {
         let index = Arc::new(PreAggregatedIndex::new());
         let engine = QueryEngine::new(store.clone(), index.clone());
 
-        store.register_moc(MOCNode {
-            moc_iri: "iri://moc/auth".to_string(),
-            name: "Authentication & Authorization".to_string(),
-            description: "Authentication-related skills".to_string(),
-            entry_points: vec!["iri://skills/jwt".to_string()],
-            skill_count: 1,
-            sub_categories: vec![],
-            created_at: Utc::now(),
-        }).unwrap();
+        store
+            .register_moc(MOCNode {
+                moc_iri: "iri://moc/auth".to_string(),
+                name: "Authentication & Authorization".to_string(),
+                description: "Authentication-related skills".to_string(),
+                entry_points: vec!["iri://skills/jwt".to_string()],
+                skill_count: 1,
+                sub_categories: vec![],
+                created_at: Utc::now(),
+            })
+            .unwrap();
 
         let result = engine.execute(
             QueryTemplateId::MocScan,
@@ -491,9 +538,10 @@ mod tests {
 
         let result = engine.execute(
             QueryTemplateId::SkillByTag,
-            QueryParams::new().with("tags", Value::Array(vec![
-                Value::String("auth".to_string()),
-            ])),
+            QueryParams::new().with(
+                "tags",
+                Value::Array(vec![Value::String("auth".to_string())]),
+            ),
         );
         assert_eq!(result.result_count, 1);
     }

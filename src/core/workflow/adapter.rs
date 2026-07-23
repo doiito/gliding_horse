@@ -44,7 +44,10 @@ pub fn plan_to_workflow(plan: &ExecutionPlan, _task_iri: &str) -> WorkflowDefini
         // Chain linear steps into next links
         if let Some(ref pid) = prev_id {
             // Find predecessor and set next
-            if let Some(prev_node) = nodes.iter_mut().find(|n: &&mut WorkflowNodeDef| n.id == *pid) {
+            if let Some(prev_node) = nodes
+                .iter_mut()
+                .find(|n: &&mut WorkflowNodeDef| n.id == *pid)
+            {
                 prev_node.next = Some(node_id.clone());
             }
             // Current node depends on predecessor
@@ -61,26 +64,32 @@ pub fn plan_to_workflow(plan: &ExecutionPlan, _task_iri: &str) -> WorkflowDefini
         last.final_node = true;
     }
 
-    let entry_node = nodes.first()
-        .map(|n| n.id.clone())
-        .unwrap_or_default();
+    let entry_node = nodes.first().map(|n| n.id.clone()).unwrap_or_default();
 
     // Handle parallel groups
-    let parallel_updates: Vec<(String, Vec<String>)> = plan.parallel_groups.iter()
+    let parallel_updates: Vec<(String, Vec<String>)> = plan
+        .parallel_groups
+        .iter()
         .filter(|g| g.len() > 1)
         .filter_map(|group| {
-            let role_strs: Vec<String> = group.iter()
-                .map(|r| format!("{:?}", r))
-                .collect();
-            let first_idx = nodes.iter().position(|n| role_strs.contains(&n.agent_role))?;
-            if first_idx == 0 { return None; }
+            let role_strs: Vec<String> = group.iter().map(|r| format!("{:?}", r)).collect();
+            let first_idx = nodes
+                .iter()
+                .position(|n| role_strs.contains(&n.agent_role))?;
+            if first_idx == 0 {
+                return None;
+            }
             let prev_id = nodes[first_idx - 1].id.clone();
-            let parallel_ids: Vec<String> = nodes[first_idx..].iter()
+            let parallel_ids: Vec<String> = nodes[first_idx..]
+                .iter()
                 .filter(|n| role_strs.contains(&n.agent_role))
                 .map(|n| n.id.clone())
                 .collect();
-            if parallel_ids.is_empty() { None }
-            else { Some((prev_id, parallel_ids)) }
+            if parallel_ids.is_empty() {
+                None
+            } else {
+                Some((prev_id, parallel_ids))
+            }
         })
         .collect();
 
@@ -143,7 +152,8 @@ pub fn dag_to_execution_plan(
     let order = crate::core::workflow::loader::topological_order(dag)
         .unwrap_or_else(|_| dag.graph.node_indices().collect::<Vec<_>>());
 
-    let steps: Vec<PlanStep> = order.iter()
+    let steps: Vec<PlanStep> = order
+        .iter()
         .map(|&idx| node_to_planstep(&dag.graph[idx].def))
         .collect();
 
@@ -175,7 +185,12 @@ mod tests {
     fn test_plan_to_workflow_linear() {
         let plan = ExecutionPlan {
             plan_id: "test_001".to_string(),
-            agent_sequence: vec![AgentRole::Plan, AgentRole::Do, AgentRole::Check, AgentRole::Act],
+            agent_sequence: vec![
+                AgentRole::Plan,
+                AgentRole::Do,
+                AgentRole::Check,
+                AgentRole::Act,
+            ],
             parallel_groups: vec![],
             task_complexity: crate::core::sa::TaskComplexity::Standard,
             description: "Test plan".to_string(),

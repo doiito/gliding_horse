@@ -1,5 +1,7 @@
-pub mod task_queue;
 pub mod agent_os_worker;
+pub mod task_queue;
 
-pub use task_queue::{AgentOsTask, AgentOsResult, TaskQueue, WorkerQueue, TaskContextData, LlmConfig, QueueError};
-pub use agent_os_worker::{AgentOsWorker, WorkerConfig, run_worker};
+pub use agent_os_worker::{run_worker, AgentOsWorker, WorkerConfig};
+pub use task_queue::{
+    AgentOsResult, AgentOsTask, LlmConfig, QueueError, TaskContextData, TaskQueue, WorkerQueue,
+};

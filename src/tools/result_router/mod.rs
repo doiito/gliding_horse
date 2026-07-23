@@ -1,16 +1,24 @@
-pub mod router;
-pub mod summary;
 pub mod graphify;
 pub mod micro_tools;
+pub mod router;
+pub mod summary;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteDecision {
     PassThrough,
-    Truncate { max_chars: usize },
-    Graphify { call_id: String, graph_name: String },
-    Summarize { call_id: String, preview_size: usize },
+    Truncate {
+        max_chars: usize,
+    },
+    Graphify {
+        call_id: String,
+        graph_name: String,
+    },
+    Summarize {
+        call_id: String,
+        preview_size: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -32,10 +40,19 @@ pub struct MicroToolSchema {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MicroToolType {
-    EntityTypeQuery { entity_type: String, graph_name: String },
-    EntityDetails { graph_name: String },
-    RelationTraversal { graph_name: String },
-    FullTextRead { storage_key: String },
+    EntityTypeQuery {
+        entity_type: String,
+        graph_name: String,
+    },
+    EntityDetails {
+        graph_name: String,
+    },
+    RelationTraversal {
+        graph_name: String,
+    },
+    FullTextRead {
+        storage_key: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -71,7 +71,9 @@ impl SnapshotManager {
                         if let Ok((key, value)) = result {
                             let key_str = key.value().to_string();
                             if key_str.starts_with("snapshot:") {
-                                if let Ok(snapshot) = serde_json::from_slice::<WorkspaceSnapshot>(value.value()) {
+                                if let Ok(snapshot) =
+                                    serde_json::from_slice::<WorkspaceSnapshot>(value.value())
+                                {
                                     index.insert(snapshot.snapshot_id.clone(), snapshot);
                                 }
                             }
@@ -218,18 +220,12 @@ impl SnapshotManager {
             .find_content_by_hash(hash)
             .ok_or_else(|| format!("Content not found for hash: {}", hash))?;
 
-        std::fs::write(path, &content)
-            .map_err(|e| format!("Failed to write file {}: {}", path, e))
+        std::fs::write(path, &content).map_err(|e| format!("Failed to write file {}: {}", path, e))
     }
 
     /// List available snapshots, newest first.
     pub fn list_snapshots(&self, limit: usize) -> Vec<WorkspaceSnapshot> {
-        let mut snapshots: Vec<WorkspaceSnapshot> = self
-            .index
-            .read()
-            .values()
-            .cloned()
-            .collect();
+        let mut snapshots: Vec<WorkspaceSnapshot> = self.index.read().values().cloned().collect();
         snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         snapshots.truncate(limit);
         snapshots
@@ -262,7 +258,11 @@ impl SnapshotManager {
             index.remove(&snap.snapshot_id);
         }
 
-        debug!(removed = count, kept = keep, "SnapshotManager: snapshots pruned");
+        debug!(
+            removed = count,
+            kept = keep,
+            "SnapshotManager: snapshots pruned"
+        );
         count
     }
 
@@ -301,9 +301,19 @@ mod tests {
 
     #[test]
     fn test_snapshot_lifecycle() {
-        let db = Arc::new(Builder::new().create_with_backend(InMemoryBackend::new()).unwrap());
+        let db = Arc::new(
+            Builder::new()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
         let content_store = Arc::new(crate::tools::workspace_monitor::ContentStore::new(
-            100, 65536, Some(Builder::new().create_with_backend(InMemoryBackend::new()).unwrap()),
+            100,
+            65536,
+            Some(
+                Builder::new()
+                    .create_with_backend(InMemoryBackend::new())
+                    .unwrap(),
+            ),
         ));
         let inventory = Arc::new(RwLock::new(
             crate::tools::workspace_monitor::FileInventory::new(None, None, vec![]),
@@ -324,7 +334,11 @@ mod tests {
 
     #[test]
     fn test_prune_snapshots() {
-        let db = Arc::new(Builder::new().create_with_backend(InMemoryBackend::new()).unwrap());
+        let db = Arc::new(
+            Builder::new()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
         let content_store = Arc::new(crate::tools::workspace_monitor::ContentStore::new(
             100, 65536, None,
         ));
@@ -347,7 +361,11 @@ mod tests {
 
     #[test]
     fn test_rollback_nonexistent() {
-        let db = Arc::new(Builder::new().create_with_backend(InMemoryBackend::new()).unwrap());
+        let db = Arc::new(
+            Builder::new()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
         let content_store = Arc::new(crate::tools::workspace_monitor::ContentStore::new(
             100, 65536, None,
         ));

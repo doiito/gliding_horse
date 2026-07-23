@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::batch::error::BatchError;
 use crate::batch::types::{
     BatchAgentConfig, ExtractedEntity, ExtractedRelation, ExtractionResult, PersistReport,
 };
-use crate::memory::l0_store::L0Store;
-use crate::memory::memory_manager::MemoryManager;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::knowledge_graph::types::{RdfQuad, RdfValue};
+use crate::memory::l0_store::L0Store;
+use crate::memory::memory_manager::MemoryManager;
 
 pub struct KnowledgePersister {
     kg_store: Option<Arc<KnowledgeGraphStore>>,
@@ -44,48 +44,40 @@ impl KnowledgePersister {
             new_entities: 0,
             updated_entities: 0,
             named_graph: graph.clone(),
-            task_iri: Some(format!("batch://{}", config.name)),
+            // A batch agent can produce many extractions. Keep every
+            // extraction summary addressable instead of overwriting the last
+            // one at `batch://{agent}`. This is an audit identity, not an
+            // event-id idempotency key (that belongs at the execution/journal
+            // boundary).
+            task_iri: Some(format!("batch://{}/{}", config.name, result.batch_id)),
         };
 
         // Persist entities
         if !result.entities.is_empty() {
-            match self.persist_entities(&result.entities, &config.business_domain, &graph) {
-                Ok(iris) => {
-                    report.entities_persisted = result.entities.len();
-                    report.new_entities = iris.len();
-                    debug!(
-                        agent = %config.name,
-                        entities = %result.entities.len(),
-                        "Entities persisted"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to persist entities");
-                }
-            }
+            let iris = self.persist_entities(&result.entities, &config.business_domain, &graph)?;
+            report.entities_persisted = result.entities.len();
+            report.new_entities = iris.len();
+            debug!(
+                agent = %config.name,
+                entities = %result.entities.len(),
+                "Entities persisted"
+            );
         }
 
         // Persist relations
         if !result.relations.is_empty() {
-            match self.persist_relations(&result.relations, &config.business_domain, &graph) {
-                Ok(count) => {
-                    report.relations_persisted = count;
-                    debug!(
-                        agent = %config.name,
-                        relations = %count,
-                        "Relations persisted"
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to persist relations");
-                }
-            }
+            let count =
+                self.persist_relations(&result.relations, &config.business_domain, &graph)?;
+            report.relations_persisted = count;
+            debug!(
+                agent = %config.name,
+                relations = %count,
+                "Relations persisted"
+            );
         }
 
         // Persist to memory
-        if let Err(e) = self.persist_to_memory(result, &report.task_iri.clone().unwrap_or_default()) {
-            warn!(error = %e, "Failed to persist to memory");
-        }
+        self.persist_to_memory(result, &report.task_iri.clone().unwrap_or_default())?;
 
         info!(
             agent = %config.name,
@@ -113,11 +105,11 @@ impl KnowledgePersister {
         let mut quads = Vec::new();
 
         for entity in entities {
-            let entity_iri = format!(
-                "iri://entity/batch/{}/{}",
-                sanitize_id(&entity.entity_type),
-                sanitize_id(&entity.name)
-            );
+            // Relations only identify their endpoints by entity name.  Keep
+            // the entity IRI in the batch domain namespace (rather than the
+            // entity type namespace) so the two write paths address the same
+            // RDF resource.  The type remains an RDF assertion below.
+            let entity_iri = entity_iri(domain, &entity.name);
 
             // rdf:type assertion
             quads.push(RdfQuad {
@@ -191,20 +183,9 @@ impl KnowledgePersister {
         let mut quads = Vec::new();
 
         for relation in relations {
-            let from_iri = format!(
-                "iri://entity/batch/{}/{}",
-                domain,
-                sanitize_id(&relation.from)
-            );
-            let to_iri = format!(
-                "iri://entity/batch/{}/{}",
-                domain,
-                sanitize_id(&relation.to)
-            );
-            let rel_iri = format!(
-                "https://agentos.ontology/relation/{}",
-                relation.relation
-            );
+            let from_iri = entity_iri(domain, &relation.from);
+            let to_iri = entity_iri(domain, &relation.to);
+            let rel_iri = format!("https://agentos.ontology/relation/{}", relation.relation);
 
             quads.push(RdfQuad {
                 subject: from_iri,
@@ -243,18 +224,29 @@ impl KnowledgePersister {
             })
             .to_string();
 
-            let _ = l0.store(task_iri, &summary);
+            l0.store(task_iri, &summary)
+                .map_err(|error| BatchError::MemoryOperationFailed {
+                    message: error.to_string(),
+                })?;
         }
 
         Ok(())
     }
 
     fn resolve_graph(&self, config: &BatchAgentConfig) -> String {
-        format!(
-            "graph:batch/{}/{}",
-            config.name, config.business_domain
-        )
+        format!("graph:batch/{}/{}", config.name, config.business_domain)
     }
+}
+
+/// Stable RDF identity for a batch entity. Entity type is modeled separately
+/// with `rdf:type`, because relation payloads carry names but not endpoint
+/// types.
+fn entity_iri(domain: &str, name: &str) -> String {
+    format!(
+        "iri://entity/batch/{}/{}",
+        sanitize_id(domain),
+        sanitize_id(name)
+    )
 }
 
 fn sanitize_id(s: &str) -> String {
@@ -271,11 +263,55 @@ fn sanitize_id(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn extraction_result() -> ExtractionResult {
+        ExtractionResult {
+            batch_id: "batch-test".to_string(),
+            extracted_at: chrono::Utc::now(),
+            entities: vec![ExtractedEntity {
+                name: "Alice".to_string(),
+                entity_type: "Person".to_string(),
+                description: Some("Test entity".to_string()),
+                aliases: Vec::new(),
+                confidence: 0.95,
+                source_messages: Vec::new(),
+            }],
+            relations: vec![ExtractedRelation {
+                from: "Alice".to_string(),
+                relation: "knows".to_string(),
+                to: "Alice".to_string(),
+                properties: Default::default(),
+                confidence: 0.9,
+            }],
+            intent: None,
+            key_decisions: Vec::new(),
+            context_summary: "test extraction".to_string(),
+            llm_calls: 1,
+            tokens_consumed: 1,
+            confidence_scores: Default::default(),
+            raw_response: None,
+        }
+    }
+
     #[test]
     fn test_sanitize_id() {
         assert_eq!(sanitize_id("Hello World"), "Hello_World");
         assert_eq!(sanitize_id("test-id_123"), "test-id_123");
         assert_eq!(sanitize_id("special@#$%chars"), "special____chars");
+    }
+
+    #[test]
+    fn entity_identity_is_domain_scoped_and_independent_of_entity_type() {
+        // ExtractedRelation carries endpoint names only. A Person named
+        // "Alice" and a relation endpoint named "Alice" must therefore
+        // resolve to exactly the same RDF IRI.
+        assert_eq!(
+            entity_iri("support", "Alice Smith"),
+            "iri://entity/batch/support/Alice_Smith"
+        );
+        assert_ne!(
+            entity_iri("support", "Alice Smith"),
+            entity_iri("sales", "Alice Smith")
+        );
     }
 
     #[test]
@@ -289,5 +325,64 @@ mod tests {
         let persister = KnowledgePersister::new(None, None, None);
         let graph = persister.resolve_graph(&config);
         assert_eq!(graph, "graph:batch/test_agent/test_domain");
+    }
+
+    #[tokio::test]
+    async fn persist_writes_configured_kg_and_l0_before_reporting_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let kg = Arc::new(KnowledgeGraphStore::new().unwrap());
+        let persister = KnowledgePersister::new(Some(kg.clone()), None, Some(l0.clone()));
+        let config = BatchAgentConfig {
+            name: "test_agent".to_string(),
+            business_domain: "test_domain".to_string(),
+            ..Default::default()
+        };
+
+        let report = persister
+            .persist(&extraction_result(), &config)
+            .await
+            .unwrap();
+
+        assert_eq!(report.entities_persisted, 1);
+        assert_eq!(report.relations_persisted, 1);
+        assert!(l0
+            .retrieve("batch://test_agent/batch-test")
+            .unwrap()
+            .is_some());
+        let rows = kg
+            .query_sparql(
+                "SELECT ?s WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> \"Alice\" . }",
+                Some("graph:batch/test_agent/test_domain"),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_summaries_are_not_overwritten_for_the_same_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let persister = KnowledgePersister::new(None, None, Some(l0.clone()));
+        let config = BatchAgentConfig {
+            name: "test_agent".to_string(),
+            business_domain: "test_domain".to_string(),
+            ..Default::default()
+        };
+        let first = extraction_result();
+        let mut second = extraction_result();
+        second.batch_id = "batch-second".to_string();
+
+        persister.persist(&first, &config).await.unwrap();
+        persister.persist(&second, &config).await.unwrap();
+
+        assert!(l0
+            .retrieve("batch://test_agent/batch-test")
+            .unwrap()
+            .is_some());
+        assert!(l0
+            .retrieve("batch://test_agent/batch-second")
+            .unwrap()
+            .is_some());
     }
 }

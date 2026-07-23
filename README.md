@@ -65,7 +65,7 @@ We are proud to announce the **v0.1.3 release** of Gliding Horse Agent OS.
 | **Causal Engine** | New standalone causal analysis subsystem with `CausalEngine`, `FusionEngine`, `CausalStore`, and typed `CausalFactor`. Enables causal reasoning across agent operations with fused multi-factor analysis — identifies root causes, propagates failure chains, and computes causal graphs for agent decisions. |
 | **Unified Graph Backend** | Consolidated `GraphBackend` (~1,200 LOC) replacing fragmented graph storage — provides a single, optimized interface for node/edge CRUD with batch operations, subgraph extraction, and path-finding across all knowledge layers. |
 | **Graph Features Computation** | New `graph_features` module computing structural feature vectors (degree centrality, clustering coefficient, PageRank, betweenness) and graph similarity scoring via feature-distance comparison. Enables quantitative graph analysis and comparison across cognitive snapshots. |
-| **Snapshot Timeline** | Session state snapshots with timeline-based version management. `SnapshotTimeline` enables temporal queries, point-in-time restoration, and diff-based rollback — crash-proof recovery with full history traversal. |
+| **Snapshot Timeline** | Skill-graph snapshots with durable post-snapshot mutation records, point-in-time restoration, and diff support. It is an experimental graph timeline, not a complete session-history or crash-recovery system. |
 | **Self-Awareness (SA) Overhaul** | Major rewrite of the self-awareness module (+410 lines) with enhanced monitoring of agent state, environment perception, and adaptive behavior. Integrated with the causal engine for self-diagnosis. |
 | **5W2H Dimension Audit Enhancement** | Expanded dimension-level audit in `src/core/five_w2h.rs` with deeper causal attribution per dimension. What/Why failures now chain into the causal engine for automated root-cause analysis. |
 | **Advanced Features Design** | Comprehensive [`ADVANCED_FEATURES_DESIGN.md`](docs/ADVANCED_FEATURES_DESIGN.md) document covering graph backend architecture, causal reasoning design, timeline-based snapshot semantics, and performance benchmarks. |
@@ -84,12 +84,12 @@ We are proud to announce the **v0.1.2 release** of Gliding Horse Agent OS.
 | Feature | Description |
 |---------|-------------|
 | **HyperspaceEngine** | Production-grade vector embedding engine with HNSW ANN search, Write-Ahead Log (WAL), tangent-space pruning, and runtime-switchable metrics (Poincaré, Cosine, Euclidean, Lorentz). |
-| **Skill Graph Cognitive Network** | Hypergraph composition, Poincaré structural embeddings, PageRank/betweenness/community detection algorithms, causal failure analysis, temporal versioning with rollback, formal invariant verification (6 checks), hybrid text×structural search. |
+| **Skill Graph Cognitive Network** | Hypergraph composition, Poincaré structural embeddings, PageRank/betweenness/community detection algorithms, causal failure analysis, experimental temporal snapshots/rollback, formal invariant verification (6 checks), hybrid text×structural search. |
 | **Semantic Skill Discovery** | Vector-store integration in `SkillDiscoveryEngine` — finds semantically related skills via HyperspaceStore cosine search, replaces Jaccard-only `suggest_links()` |
-| **Oxigraph SPARQL Bridge** | Real-time bidirectional sync between skill graph and Oxigraph RDF store via SPARQL INSERT/DELETE + named graph isolation |
+| **Oxigraph SPARQL Bridge** | Skill-graph-to-Oxigraph RDF projection via SPARQL INSERT/DELETE with named-graph isolation; reverse RDF-to-skill synchronization is not implemented. |
 | **L2 Blackboard Memory** | Typed document store with JSON-LD threading, projections, message packs, and LRU eviction for long-term agent context |
 | **Workspace Monitor** | Real-time file system perception engine with 10 event triggers, anomaly deduplication, and 5W2H constraint checking |
-| **Batch Agent Manager** | Sliding-window-based batch processing with configurable triggers, event bus integration, and business-domain isolation |
+| **Batch Agent Manager** | Sliding-window batch components with configurable triggers, event-bus integration, and business-domain isolation. The root gRPC service wires opt-in custom-event and cron/window consumption, including streaming requests through shared service state; its L0 event journal deduplicates, acknowledges on successful execution, and replays pending input at startup. `KnowledgePersister` is not wired to this execution path; graph-changing handlers are disabled unless `apply_graph_mutations` is explicitly enabled, and that opt-in path still lacks event-id idempotency and approval/transaction gates. |
 | **Gliding Code TUI** | Interactive terminal UI (ratatui v0.28) with Markdown rendering, MCP server support, checkpoint/resume, and multi-model backends |
 
 ---
@@ -154,16 +154,16 @@ Dynamic in-memory cognitive network with **6 semantic link types** (Prerequisite
 Dynamically selects from 7 complexity levels (L0 instant → L5 recursive → L6 emergency) via 5W2H metadata. One engine handles everything from instant queries to multi-week projects — no rigid workflows. **PA/DA/CA agent roles** with template-driven prompt construction.
 
 ### 4. CPU Cache-Inspired Memory — 4 Layers + MESI Coherence
-First-ever application of CPU cache coherence protocol to multi-agent memory. **L0** Sled disk storage → **L1** session context → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL projection cache. Intelligent prefetch engine reduces perceived latency by 90%. Solves context explosion and shared memory inconsistency across concurrent agents.
+**L0** Sled disk storage → **L1** session context → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL projection cache. The repository implements cache-inspired coordination and prefetch components; no end-to-end latency or multi-agent consistency benchmark is currently published.
 
-### 5. JSON-LD Universal Data Bus — W3C-Standard Interoperability
-`@context` duck-typing eliminates field name conflicts between skills. `@id` enables zero-cost cross-agent entity merging. `@graph` named graphs allow conflict-free parallel writes across subsystems. Turns interoperability hell into plug-and-play.
+### 5. JSON-LD Universal Data Bus — Internal Interoperability Subset
+The internal JSON-LD utilities support `@context`, `@id`, `@graph`, framing, validation and routing used by this repository. They are not a claim of complete JSON-LD 1.1, SHACL, or general RDF interoperability.
 
 ### 6. Self-Evolving Skill Graph — Autonomous Learning
-AA agents create **knowledge fragments** and new semantic links after each task completion. `/learn` and `/reduce` mechanisms enable autonomous skill acquisition and consolidation. `BootstrapEngine` ingests markdown skills from the filesystem.
+AA agents record knowledge fragments, links, and evolution suggestions after task completion. `/learn` and `/reduce` provide explicit acquisition/consolidation operations; suggestions are not automatically applied because typed-patch verification, security, and conflict gates are still pending. `BootstrapEngine` ingests markdown skills from the filesystem.
 
 ### 7. Universal Knowledge Graph — Unified Cognitive Backbone
-All subsystems (skills, memories, tasks, code knowledge) share a single **Oxigraph RDF store** via named graphs, enabling cross-subsystem SPARQL joins. Code ASTs parsed by tree-sitter are automatically converted to RDF triples. **Bidirectional SPARQL sync** from `SkillGraphStore` keeps the cognitive graph in sync with the semantic store.
+Skills, memories, tasks, and code knowledge can use the shared **Oxigraph RDF store** through named graphs, enabling scoped SPARQL joins where producers are wired to that store. Code ASTs parsed by tree-sitter are converted to RDF triples. `SkillGraphStore` projects its changes into the semantic store; reverse RDF-to-skill synchronization is not implemented.
 
 ### 8. Semantic Skill Discovery Engine
 `SkillDiscoveryEngine` wraps `HyperspaceStore` for vector-based semantic search across skills. `suggest_links()` falls back from Jaccard tag overlap to cosine similarity via embedding vectors. Includes BFS path finding (`find_skill_chain()`), composition tree construction (`get_skill_tree()`), and conflict detection.
@@ -180,8 +180,8 @@ Results >8KB auto-generate conversational micro-tools (e.g., "search_in_results"
 ### 12. MCP Integration — One Protocol to Connect Them All
 Standard **Model Context Protocol** connects GitHub, Slack, Jira, and any MCP-compatible server. Dynamic tool discovery at runtime. Supports both HTTP SSE and stdio transport modes with repeatable `--mcp-server` CLI flags.
 
-### 13. Checkpoint & Recovery — Crash-Proof Long-Running Tasks
-Session state snapshots at critical points with full restoration on crash. Enables hour/day-long agent tasks and post-mortem replay debugging. `--resume <task_iri>` and `--list-checkpoints` commands for explicit session management.
+### 13. Checkpoint & Recovery — Explicit Session Management
+Session checkpoints and `--resume <task_iri>` / `--list-checkpoints` support explicit session management. Crash recovery and complete long-running-task replay require dedicated fault-injection and end-to-end validation before being claimed.
 
 ### 14. Center + Edge Federation — Local Autonomy, Global Orchestration
 Go Center handles workflow orchestration (Temporal), project management, agent registry. Rust Edge runs local LLM execution with Docker sandbox. VS Code Plugin provides real-time developer awareness. No single point of failure.

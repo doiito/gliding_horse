@@ -5,9 +5,7 @@ use petgraph::prelude::*;
 use tracing::info;
 
 use crate::causal::store::CausalModelStore;
-use crate::causal::types::{
-    CausalInference, CausalObservation, PropagationHop, PropagationPath,
-};
+use crate::causal::types::{CausalInference, CausalObservation, PropagationHop, PropagationPath};
 use crate::graph_backend::{EdgeDescriptor, GraphBackend};
 use crate::skill_graph::types::SkillLinkType;
 
@@ -56,7 +54,8 @@ impl CausalEngine {
             return Vec::new();
         }
 
-        let observed_skills: Vec<&str> = observations.iter().map(|o| o.skill_iri.as_str()).collect();
+        let observed_skills: Vec<&str> =
+            observations.iter().map(|o| o.skill_iri.as_str()).collect();
         let observed_set: HashSet<&str> = observed_skills.iter().copied().collect();
 
         // Step 1: Extract candidate subgraph via reverse BFS
@@ -95,7 +94,7 @@ impl CausalEngine {
                     root_cause_iri: iri,
                     confidence,
                     propagation_paths: paths,
-                    alternative_causes: Vec::new(), // filled below
+                    alternative_causes: Vec::new(),    // filled below
                     observations_explained: total_obs, // all observations reachable
                     total_observations: total_obs,
                 }
@@ -248,7 +247,14 @@ impl CausalEngine {
                 if !visited.contains(next) {
                     let edge_prob = self.store.propagation_probability(current, next);
                     let effective_prob = if edge_prob == 0.0 { 0.5 } else { edge_prob };
-                    self.dfs_propagate(next, target, adj, visited, path_prob * effective_prob, best);
+                    self.dfs_propagate(
+                        next,
+                        target,
+                        adj,
+                        visited,
+                        path_prob * effective_prob,
+                        best,
+                    );
                 }
             }
         }
@@ -458,8 +464,7 @@ mod tests {
         let results = engine.infer_root_cause(&observations, 3);
         assert!(!results.is_empty(), "Should find root causes");
         assert_eq!(
-            results[0].root_cause_iri,
-            "iri://skills/root",
+            results[0].root_cause_iri, "iri://skills/root",
             "Root should be the top result"
         );
         assert!(

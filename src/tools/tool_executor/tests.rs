@@ -1,7 +1,11 @@
 use super::*;
+use crate::config::GatewaySettings;
 use crate::config::RuntimeHookConfig;
+use crate::gateway::UnifiedGateway;
 use crate::tools::builtin::hooks::HookRunner;
 use crate::tools::builtin::permissions::{PermissionMode, PermissionPolicy};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
@@ -21,9 +25,76 @@ mod tests {
 
             let input = json!({"command": "rm -rf /"});
             let result = executor.execute("bash", input).await.unwrap();
-            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            assert!(result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
                 .contains("Permission denied"));
         });
+    }
+
+    #[test]
+    fn security_context_denies_high_risk_registered_tool_and_audits_it() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("must-not-write");
+            let executor = ToolExecutor::new();
+            let registry = Arc::new(SkillRegistry::new());
+            let graph = Arc::new(SkillGraphStore::new());
+            let meta = registry.get_skill("iri://skills/file_write").unwrap();
+            graph
+                .register_skill(crate::skill_graph::types::SkillGraphNode::from_skill_meta(
+                    &meta,
+                ))
+                .unwrap();
+            let security = Arc::new(crate::skill_graph::security::SecurityEngine::new(
+                graph.clone(),
+            ));
+            executor.set_shared_skill_registry(registry);
+            executor.set_shared_skill_graph(graph);
+            executor.set_security_engine(security.clone());
+
+            let result = executor
+                .execute_with_security_context(
+                    "file_write",
+                    json!({"path": target, "content": "blocked"}),
+                    crate::skill_graph::security::SecurityContext::new("agent:test", "DA")
+                        .with_task("iri://tasks/security-test"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["error"], "Security denied");
+            assert!(!target.exists());
+            let audit = security
+                .get_audit_log(Some("iri://skills/file_write"), Some("agent:test"), 10)
+                .await;
+            assert_eq!(audit.len(), 1);
+        });
+    }
+
+    #[test]
+    fn skill_creator_gateway_is_executor_local_and_settable_after_builtin_registration() {
+        let executor = ToolExecutor::new();
+        let gateway = Arc::new(
+            UnifiedGateway::new(&GatewaySettings {
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "test".to_string(),
+                default_model: "test".to_string(),
+                timeout_seconds: 1,
+                max_retries: 0,
+                retry_base_ms: 1,
+                model_mapping: HashMap::new(),
+            })
+            .unwrap(),
+        );
+
+        executor.set_shared_skill_creator_gateway(gateway.clone());
+
+        assert!(executor
+            .shared_skill_creator_gateway
+            .read()
+            .as_ref()
+            .is_some_and(|stored| { Arc::ptr_eq(stored, &gateway) }));
     }
 
     #[test]
@@ -50,8 +121,14 @@ mod tests {
             let result = executor.execute("bash", input).await;
             assert!(result.is_ok() || result.is_err());
             if let Ok(val) = &result {
-                assert!(val.get("error").is_none() ||
-                    !val.get("error").and_then(|e| e.as_str()).unwrap_or("").contains("Permission denied"));
+                assert!(
+                    val.get("error").is_none()
+                        || !val
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("")
+                            .contains("Permission denied")
+                );
             }
         });
     }
@@ -66,7 +143,10 @@ mod tests {
 
             let input = json!({"path": "/tmp/test.txt", "content": "test"});
             let result = executor.execute("file_write", input).await.unwrap();
-            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            assert!(result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
                 .contains("Permission denied"));
         });
     }
@@ -84,7 +164,10 @@ mod tests {
 
             let input = json!({"command": "ls"});
             let result = executor.execute("bash", input).await.unwrap();
-            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            assert!(result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
                 .contains("Pre-tool hook denied"));
         });
     }
@@ -113,16 +196,15 @@ mod tests {
             let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
                 .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
             executor.set_permission_policy(policy);
-            let hook_config = RuntimeHookConfig::new(
-                vec![],
-                vec![],
-                vec![],
-            );
+            let hook_config = RuntimeHookConfig::new(vec![], vec![], vec![]);
             executor.set_hook_runner(HookRunner::new(hook_config));
 
             let input = json!({"command": "ls"});
             let result = executor.execute("bash", input).await.unwrap();
-            assert!(result.get("error").and_then(|e| e.as_str()).unwrap_or("")
+            assert!(result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
                 .contains("Permission denied"));
         });
     }
@@ -134,5 +216,52 @@ mod tests {
         assert!(ToolExecutor::is_pa_readonly_tool("grep_search"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_write"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_edit"));
+    }
+
+    #[test]
+    fn test_knowledge_tools_use_store_injected_after_builtin_registration() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let unified = crate::memory::unified_graph::UnifiedGraphStore::new().unwrap();
+            executor.set_unified_kg_store(unified.store());
+
+            executor
+                .execute(
+                    "knowledge_import_json",
+                    json!({
+                        "json_data": r#"{"id":"shared-store-check","type":"https://example.org/Concept","label":"Shared store check"}"#,
+                        "mapping_config": r#"{"id_field":"id","type_field":"type","label_field":"label"}"#
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let kg_store = executor.knowledge_graph_store();
+            let rows = kg_store
+                .read()
+                .unwrap()
+                .query_sparql("SELECT ?s WHERE { ?s ?p ?o }", Some("graph:world"))
+                .unwrap();
+
+            assert!(
+                !rows.is_empty(),
+                "knowledge tool writes must be visible through the injected shared store"
+            );
+        });
+    }
+
+    #[test]
+    fn create_skill_description_does_not_claim_automatic_executability() {
+        let executor = ToolExecutor::new();
+        let description = executor
+            .tool_descriptions
+            .iter()
+            .find(|tool| tool.name == "create_skill")
+            .expect("create_skill builtin should be registered")
+            .description
+            .to_lowercase();
+
+        assert!(description.contains("does not create an executable"));
+        assert!(!description.contains("available for use"));
     }
 }

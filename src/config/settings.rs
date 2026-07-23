@@ -1,6 +1,6 @@
 use anyhow::Result;
-use serde::Deserialize;
 use config::{Config, ConfigError, Environment};
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
@@ -47,10 +47,18 @@ pub struct WorkspaceSettings {
     pub max_debounce_wait_ms: u64,
 }
 
-fn default_content_cache_capacity() -> usize { 1000 }
-fn default_poll_interval_ms() -> u64 { 5000 }
-fn default_debounce_ms() -> u64 { 500 }
-fn default_max_debounce_wait_ms() -> u64 { 5000 }
+fn default_content_cache_capacity() -> usize {
+    1000
+}
+fn default_poll_interval_ms() -> u64 {
+    5000
+}
+fn default_debounce_ms() -> u64 {
+    500
+}
+fn default_max_debounce_wait_ms() -> u64 {
+    5000
+}
 
 impl Default for WorkspaceSettings {
     fn default() -> Self {
@@ -91,7 +99,9 @@ pub struct GatewaySettings {
     pub model_mapping: std::collections::HashMap<String, String>,
 }
 
-fn default_retry_base_ms() -> u64 { 500 }
+fn default_retry_base_ms() -> u64 {
+    500
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct MemorySettings {
@@ -170,11 +180,21 @@ pub struct PerceptionSettings {
     pub error_rate_threshold: f64,
 }
 
-fn default_simple_threshold() -> usize { 50 }
-fn default_medium_threshold() -> usize { 200 }
-fn default_cycle_timeout_secs() -> u64 { 300 }
-fn default_max_iterations_before_alert() -> usize { 10 }
-fn default_error_rate_threshold() -> f64 { 0.5 }
+fn default_simple_threshold() -> usize {
+    50
+}
+fn default_medium_threshold() -> usize {
+    200
+}
+fn default_cycle_timeout_secs() -> u64 {
+    300
+}
+fn default_max_iterations_before_alert() -> usize {
+    10
+}
+fn default_error_rate_threshold() -> f64 {
+    0.5
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentSettings {
@@ -213,15 +233,33 @@ pub struct AgentSettings {
     pub embedding_timeout_secs: u64,
 }
 
-fn default_max_pdca_cycles() -> u32 { 7 }
-fn default_max_active() -> usize { 20 }
-fn default_snapshot_frequency() -> u64 { 1000 }
-fn default_max_full_snapshots() -> usize { 10 }
-fn default_max_projection_size() -> usize { 500 }
-fn default_sa_execution_timeout_secs() -> u64 { 30 }
-fn default_tool_timeout_secs() -> u64 { 60 }
-fn default_mcp_timeout_secs() -> u64 { 30 }
-fn default_embedding_timeout_secs() -> u64 { 30 }
+fn default_max_pdca_cycles() -> u32 {
+    7
+}
+fn default_max_active() -> usize {
+    20
+}
+fn default_snapshot_frequency() -> u64 {
+    1000
+}
+fn default_max_full_snapshots() -> usize {
+    10
+}
+fn default_max_projection_size() -> usize {
+    500
+}
+fn default_sa_execution_timeout_secs() -> u64 {
+    30
+}
+fn default_tool_timeout_secs() -> u64 {
+    60
+}
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+fn default_embedding_timeout_secs() -> u64 {
+    30
+}
 
 impl Default for AgentSettings {
     fn default() -> Self {
@@ -327,16 +365,28 @@ impl LoggingSettings {
                 max_files: 10,
             },
             filters: vec![
-                LogFilter { module: "glidinghorse::core".to_string(), level: "debug".to_string() },
-                LogFilter { module: "glidinghorse::gateway".to_string(), level: "debug".to_string() },
-                LogFilter { module: "glidinghorse::memory".to_string(), level: "info".to_string() },
-                LogFilter { module: "glidinghorse::tools".to_string(), level: "info".to_string() },
-                LogFilter { module: "redb".to_string(), level: "warn".to_string() },
+                LogFilter {
+                    module: "glidinghorse::core".to_string(),
+                    level: "debug".to_string(),
+                },
+                LogFilter {
+                    module: "glidinghorse::gateway".to_string(),
+                    level: "debug".to_string(),
+                },
+                LogFilter {
+                    module: "glidinghorse::memory".to_string(),
+                    level: "info".to_string(),
+                },
+                LogFilter {
+                    module: "glidinghorse::tools".to_string(),
+                    level: "info".to_string(),
+                },
+                LogFilter {
+                    module: "redb".to_string(),
+                    level: "warn".to_string(),
+                },
             ],
-            sensitive_fields: vec![
-                "api_key".to_string(),
-                "password".to_string(),
-            ],
+            sensitive_fields: vec!["api_key".to_string(), "password".to_string()],
         }
     }
 }
@@ -355,8 +405,14 @@ impl Default for LoggingSettings {
                 max_files: 30,
             },
             filters: vec![
-                LogFilter { module: "glidinghorse::gateway".to_string(), level: "debug".to_string() },
-                LogFilter { module: "glidinghorse::core".to_string(), level: "debug".to_string() },
+                LogFilter {
+                    module: "glidinghorse::gateway".to_string(),
+                    level: "debug".to_string(),
+                },
+                LogFilter {
+                    module: "glidinghorse::core".to_string(),
+                    level: "debug".to_string(),
+                },
             ],
             sensitive_fields: vec![
                 "api_key".to_string(),
@@ -379,13 +435,15 @@ pub struct ToolResultRouterSettings {
     pub max_micro_tools: usize,
     pub sparql_query_timeout_ms: u64,
     pub auto_cleanup: bool,
-/// Persist and register micro-tool when PassThrough result exceeds this byte size,
-/// preparing for reference-based reclamation under context pressure.
+    /// Persist and register micro-tool when PassThrough result exceeds this byte size,
+    /// preparing for reference-based reclamation under context pressure.
     #[serde(default = "default_prepare_threshold")]
     pub prepare_threshold: usize,
 }
 
-fn default_prepare_threshold() -> usize { 3072 }
+fn default_prepare_threshold() -> usize {
+    3072
+}
 
 impl Default for ToolResultRouterSettings {
     fn default() -> Self {
@@ -418,8 +476,12 @@ pub struct EmbeddingSettings {
     pub fallback: FallbackEmbeddingConfig,
 }
 
-fn default_true() -> bool { true }
-fn default_provider() -> String { "ollama".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_provider() -> String {
+    "ollama".to_string()
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OllamaEmbeddingConfig {
@@ -431,9 +493,15 @@ pub struct OllamaEmbeddingConfig {
     pub dimension: usize,
 }
 
-fn default_ollama_url() -> String { "http://localhost:11434".to_string() }
-fn default_ollama_model() -> String { "nomic-embed-text".to_string() }
-fn default_ollama_dim() -> usize { 768 }
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+fn default_ollama_model() -> String {
+    "nomic-embed-text".to_string()
+}
+fn default_ollama_dim() -> usize {
+    768
+}
 
 impl Default for OllamaEmbeddingConfig {
     fn default() -> Self {
@@ -457,8 +525,12 @@ pub struct OneApiEmbeddingConfig {
     pub dimension: usize,
 }
 
-fn default_oneapi_model() -> String { "text-embedding-3-small".to_string() }
-fn default_oneapi_dim() -> usize { 1536 }
+fn default_oneapi_model() -> String {
+    "text-embedding-3-small".to_string()
+}
+fn default_oneapi_dim() -> usize {
+    1536
+}
 
 impl Default for OneApiEmbeddingConfig {
     fn default() -> Self {
@@ -477,11 +549,15 @@ pub struct FallbackEmbeddingConfig {
     pub dimension: usize,
 }
 
-fn default_fallback_dim() -> usize { 128 }
+fn default_fallback_dim() -> usize {
+    128
+}
 
 impl Default for FallbackEmbeddingConfig {
     fn default() -> Self {
-        Self { dimension: default_fallback_dim() }
+        Self {
+            dimension: default_fallback_dim(),
+        }
     }
 }
 
@@ -524,23 +600,56 @@ pub struct ToolGroupSettings {
 impl Default for ToolGroupSettings {
     fn default() -> Self {
         let mut roles = std::collections::HashMap::new();
-        roles.insert("Plan".to_string(), RoleToolConfig {
-            default: vec!["Core".to_string(), "Search".to_string(), "Knowledge".to_string(), "System".to_string()],
-            on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
-        });
-        roles.insert("Do".to_string(), RoleToolConfig {
-            default: vec!["Core".to_string(), "Write".to_string(), "Search".to_string(), "Web".to_string(), "Code".to_string(), "Skill".to_string(), "System".to_string()],
-            on_demand: vec!["Knowledge".to_string()],
-        });
-        roles.insert("Check".to_string(), RoleToolConfig {
-            default: vec!["Core".to_string(), "Search".to_string(), "Knowledge".to_string(), "System".to_string()],
-            on_demand: vec!["Web".to_string(), "Code".to_string()],
-        });
-        roles.insert("Act".to_string(), RoleToolConfig {
-            default: vec!["Core".to_string(), "System".to_string()],
-            on_demand: vec!["Search".to_string(), "Knowledge".to_string()],
-        });
-        Self { enabled: true, roles }
+        roles.insert(
+            "Plan".to_string(),
+            RoleToolConfig {
+                default: vec![
+                    "Core".to_string(),
+                    "Search".to_string(),
+                    "Knowledge".to_string(),
+                    "System".to_string(),
+                ],
+                on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
+            },
+        );
+        roles.insert(
+            "Do".to_string(),
+            RoleToolConfig {
+                default: vec![
+                    "Core".to_string(),
+                    "Write".to_string(),
+                    "Search".to_string(),
+                    "Web".to_string(),
+                    "Code".to_string(),
+                    "Skill".to_string(),
+                    "System".to_string(),
+                ],
+                on_demand: vec!["Knowledge".to_string()],
+            },
+        );
+        roles.insert(
+            "Check".to_string(),
+            RoleToolConfig {
+                default: vec![
+                    "Core".to_string(),
+                    "Search".to_string(),
+                    "Knowledge".to_string(),
+                    "System".to_string(),
+                ],
+                on_demand: vec!["Web".to_string(), "Code".to_string()],
+            },
+        );
+        roles.insert(
+            "Act".to_string(),
+            RoleToolConfig {
+                default: vec!["Core".to_string(), "System".to_string()],
+                on_demand: vec!["Search".to_string(), "Knowledge".to_string()],
+            },
+        );
+        Self {
+            enabled: true,
+            roles,
+        }
     }
 }
 
@@ -554,7 +663,10 @@ pub struct RoleToolConfig {
 
 impl Default for RoleToolConfig {
     fn default() -> Self {
-        Self { default: vec![], on_demand: vec![] }
+        Self {
+            default: vec![],
+            on_demand: vec![],
+        }
     }
 }
 
@@ -573,11 +685,19 @@ pub struct ToolResultCompressorSettings {
     pub compress_tool_result_threshold: usize,
 }
 
-fn default_compress_tool_result_threshold() -> usize { 500 }
+fn default_compress_tool_result_threshold() -> usize {
+    500
+}
 
-fn default_max_full_results() -> usize { 2 }
-fn default_max_summary_length() -> usize { 200 }
-fn default_compression_trigger() -> usize { 10 }
+fn default_max_full_results() -> usize {
+    2
+}
+fn default_max_summary_length() -> usize {
+    200
+}
+fn default_compression_trigger() -> usize {
+    10
+}
 
 impl Default for ToolResultCompressorSettings {
     fn default() -> Self {
@@ -603,10 +723,18 @@ pub struct ContextWindowSettings {
     pub preserve_recent: usize,
 }
 
-fn default_max_messages() -> usize { 30 }
-fn default_max_tokens() -> usize { 16000 }
-fn default_compression_ratio() -> f32 { 0.3 }
-fn default_preserve_recent() -> usize { 4 }
+fn default_max_messages() -> usize {
+    30
+}
+fn default_max_tokens() -> usize {
+    16000
+}
+fn default_compression_ratio() -> f32 {
+    0.3
+}
+fn default_preserve_recent() -> usize {
+    4
+}
 
 impl Default for ContextWindowSettings {
     fn default() -> Self {
@@ -634,9 +762,15 @@ pub struct ToolResultAgingSettings {
     pub compress_threshold: usize,
 }
 
-fn default_aging_keep_full() -> usize { 5 }
-fn default_aging_try_microtool() -> usize { 5 }
-fn default_aging_compress_threshold() -> usize { 500 }
+fn default_aging_keep_full() -> usize {
+    5
+}
+fn default_aging_try_microtool() -> usize {
+    5
+}
+fn default_aging_compress_threshold() -> usize {
+    500
+}
 
 impl Default for ToolResultAgingSettings {
     fn default() -> Self {
@@ -689,9 +823,15 @@ pub struct BatchSettings {
     pub agents: Vec<BatchAgentSettings>,
 }
 
-fn default_batch_default_model() -> String { "deepseek-v4-flash".to_string() }
-fn default_batch_temperature() -> f32 { 0.1 }
-fn default_batch_max_retries() -> u32 { 3 }
+fn default_batch_default_model() -> String {
+    "deepseek-v4-flash".to_string()
+}
+fn default_batch_temperature() -> f32 {
+    0.1
+}
+fn default_batch_max_retries() -> u32 {
+    3
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct BatchAgentSettings {
@@ -726,6 +866,10 @@ pub struct BatchAgentSettings {
     pub inject_user_reminders: bool,
     #[serde(default = "default_true")]
     pub inject_context_summary: bool,
+    /// Explicit opt-in: graph-changing maintenance handlers are disabled by
+    /// default until a deployment provides governance and idempotency policy.
+    #[serde(default)]
+    pub apply_graph_mutations: bool,
 
     // Maintenance Agent specific options
     #[serde(default)]
@@ -768,6 +912,7 @@ impl Default for BatchAgentSettings {
             emit_on: vec![],
             inject_user_reminders: true,
             inject_context_summary: true,
+            apply_graph_mutations: false,
             min_confidence_auto_apply: None,
             batch_size: None,
             max_candidates: None,
@@ -892,7 +1037,7 @@ impl Settings {
             .add_source(
                 Environment::with_prefix("AGENT_OS")
                     .separator("_")
-                    .try_parsing(true)
+                    .try_parsing(true),
             )
             .build()?;
 
@@ -904,7 +1049,10 @@ impl Settings {
             return Err("gateway.base_url must be set".to_string());
         }
         if self.gateway.api_key.is_empty() {
-            return Err("gateway.api_key must be set (via config.yaml or AGENT_OS_GATEWAY_API_KEY)".to_string());
+            return Err(
+                "gateway.api_key must be set (via config.yaml or AGENT_OS_GATEWAY_API_KEY)"
+                    .to_string(),
+            );
         }
         if self.gateway.default_model.is_empty() {
             return Err("gateway.default_model must be set".to_string());
@@ -928,9 +1076,18 @@ mod tests {
         assert!(settings.console_output);
         assert!(settings.file_output.enabled);
         assert_eq!(settings.file_output.prefix, "test_prefix");
-        assert!(settings.filters.iter().any(|f| f.module == "redb" && f.level == "warn"));
-        assert!(settings.filters.iter().any(|f| f.module == "glidinghorse::core" && f.level == "debug"));
-        assert!(settings.filters.iter().any(|f| f.module == "glidinghorse::memory" && f.level == "info"));
+        assert!(settings
+            .filters
+            .iter()
+            .any(|f| f.module == "redb" && f.level == "warn"));
+        assert!(settings
+            .filters
+            .iter()
+            .any(|f| f.module == "glidinghorse::core" && f.level == "debug"));
+        assert!(settings
+            .filters
+            .iter()
+            .any(|f| f.module == "glidinghorse::memory" && f.level == "info"));
     }
 
     #[test]

@@ -138,13 +138,19 @@ impl PerceptionStore {
             dedup.insert(dedup_key, now);
         }
 
-        let mut global = self.global.lock().expect("PerceptionStore global lock poisoned");
+        let mut global = self
+            .global
+            .lock()
+            .expect("PerceptionStore global lock poisoned");
         global.push(entry);
     }
 
     /// Clear all global perception entries (called on topic shift to prevent cross-task context pollution)
     pub fn clear_global(&self) {
-        let mut global = self.global.lock().expect("PerceptionStore global lock poisoned");
+        let mut global = self
+            .global
+            .lock()
+            .expect("PerceptionStore global lock poisoned");
         global.clear();
         let mut dedup = self.dedup_cache.lock().expect("dedup_cache lock poisoned");
         dedup.retain(|(source, _), _| *source != PerceptionSource::WorkspaceMonitor);
@@ -159,7 +165,10 @@ impl PerceptionStore {
 
         // 1. Get global unconsumed entries
         {
-            let mut global = self.global.lock().expect("PerceptionStore global lock poisoned");
+            let mut global = self
+                .global
+                .lock()
+                .expect("PerceptionStore global lock poisoned");
             for entry in global.iter_mut() {
                 if !entry.consumed {
                     entry.consumed = true;
@@ -186,7 +195,11 @@ impl PerceptionStore {
         }
 
         // Sort by priority, highest first
-        entries.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.timestamp.cmp(&b.timestamp)));
+        entries.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.timestamp.cmp(&b.timestamp))
+        });
 
         // Limit to 10 entries max to prevent bloat
         if entries.len() > 10 {
@@ -201,8 +214,12 @@ impl PerceptionStore {
     /// Used by ProactiveEngine to check for workspace file events during task analysis
     /// without consuming the entries (they remain available for agent context injection).
     pub fn peek_unconsumed_for_source(&self, source: PerceptionSource) -> Vec<String> {
-        let global = self.global.lock().expect("PerceptionStore global lock poisoned");
-        global.iter()
+        let global = self
+            .global
+            .lock()
+            .expect("PerceptionStore global lock poisoned");
+        global
+            .iter()
             .filter(|e| e.source == source && !e.consumed)
             .map(|e| e.render())
             .collect()
@@ -212,7 +229,10 @@ impl PerceptionStore {
     pub fn has_new(&self, task_iri: &str) -> bool {
         // Check global
         {
-            let global = self.global.lock().expect("PerceptionStore global lock poisoned");
+            let global = self
+                .global
+                .lock()
+                .expect("PerceptionStore global lock poisoned");
             if global.iter().any(|e| !e.consumed) {
                 return true;
             }
@@ -273,18 +293,24 @@ mod tests {
     #[test]
     fn test_store_and_take() {
         let store = PerceptionStore::new();
-        store.store("iri://task/test1", PerceptionEntry::new(
-            PerceptionSource::WorkspaceMonitor,
-            "3 stale files detected",
-        ));
-        store.store("iri://task/test1", PerceptionEntry::new(
-            PerceptionSource::BatchAgent,
-            "Intent shift detected: db→cache",
-        ));
+        store.store(
+            "iri://task/test1",
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "3 stale files detected"),
+        );
+        store.store(
+            "iri://task/test1",
+            PerceptionEntry::new(
+                PerceptionSource::BatchAgent,
+                "Intent shift detected: db→cache",
+            ),
+        );
 
         let text = store.take_perception_text("iri://task/test1");
         assert!(!text.is_empty(), "Should have perception text");
-        assert!(text.contains("Workspace"), "Should contain WorkspaceMonitor prefix");
+        assert!(
+            text.contains("Workspace"),
+            "Should contain WorkspaceMonitor prefix"
+        );
         assert!(text.contains("Batch"), "Should contain BatchAgent prefix");
     }
 
@@ -298,57 +324,76 @@ mod tests {
 
         // Global entries visible to any task
         let text1 = store.take_perception_text("iri://task/a");
-        assert!(!text1.is_empty(), "Global entry should be visible to task_a");
+        assert!(
+            !text1.is_empty(),
+            "Global entry should be visible to task_a"
+        );
         assert!(text1.contains("System"), "Should contain System prefix");
 
         let text2 = store.take_perception_text("iri://task/b");
-        assert!(text2.is_empty(), "Global entry should be consumed after first take");
+        assert!(
+            text2.is_empty(),
+            "Global entry should be consumed after first take"
+        );
     }
 
     #[test]
     fn test_dedup() {
         let store = PerceptionStore::new();
-        store.store("iri://task/test1", PerceptionEntry::new(
-            PerceptionSource::WorkspaceMonitor,
-            "dedup test",
-        ));
-        store.store("iri://task/test1", PerceptionEntry::new(
-            PerceptionSource::WorkspaceMonitor,
-            "dedup test", // duplicate
-        ));
+        store.store(
+            "iri://task/test1",
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "dedup test"),
+        );
+        store.store(
+            "iri://task/test1",
+            PerceptionEntry::new(
+                PerceptionSource::WorkspaceMonitor,
+                "dedup test", // duplicate
+            ),
+        );
 
         let text = store.take_perception_text("iri://task/test1");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 1, "Duplicate entries should be dedup'd to 1 line");
+        assert_eq!(
+            lines.len(),
+            1,
+            "Duplicate entries should be dedup'd to 1 line"
+        );
     }
 
     #[test]
     fn test_priority_order() {
         let store = PerceptionStore::new();
-        store.store("iri://task/t", PerceptionEntry::new(
-            PerceptionSource::WorkspaceMonitor,
-            "low priority",
-        ).with_priority(1));
-        store.store("iri://task/t", PerceptionEntry::new(
-            PerceptionSource::PerceptionEngine,
-            "high priority alert!",
-        ).with_priority(9));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "low priority")
+                .with_priority(1),
+        );
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::PerceptionEngine, "high priority alert!")
+                .with_priority(9),
+        );
 
         let text = store.take_perception_text("iri://task/t");
         // High priority should come first
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("Alert"), "High priority alert should come first");
+        assert!(
+            lines[0].contains("Alert"),
+            "High priority alert should come first"
+        );
     }
 
     #[test]
     fn test_max_10_entries() {
         let store = PerceptionStore::new();
         for i in 0..15 {
-            store.store("iri://task/t", PerceptionEntry::new(
-                PerceptionSource::System,
-                format!("entry {}", i),
-            ).with_priority(1));
+            store.store(
+                "iri://task/t",
+                PerceptionEntry::new(PerceptionSource::System, format!("entry {}", i))
+                    .with_priority(1),
+            );
         }
 
         let text = store.take_perception_text("iri://task/t");
@@ -359,10 +404,10 @@ mod tests {
     #[test]
     fn test_cleanup() {
         let store = PerceptionStore::new();
-        store.store("iri://task/t", PerceptionEntry::new(
-            PerceptionSource::System,
-            "test",
-        ));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "test"),
+        );
         store.cleanup("iri://task/t");
 
         let text = store.take_perception_text("iri://task/t");
@@ -374,10 +419,10 @@ mod tests {
         let store = PerceptionStore::new();
         assert!(!store.has_new("iri://task/t"));
 
-        store.store("iri://task/t", PerceptionEntry::new(
-            PerceptionSource::System,
-            "new entry",
-        ));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "new entry"),
+        );
         assert!(store.has_new("iri://task/t"));
 
         store.take_perception_text("iri://task/t");
@@ -397,28 +442,46 @@ mod tests {
     #[test]
     fn test_store_different_tasks_same_source_content_dedup() {
         let store = PerceptionStore::new();
-        store.store("iri://task/a", PerceptionEntry::new(PerceptionSource::System, "same content"));
+        store.store(
+            "iri://task/a",
+            PerceptionEntry::new(PerceptionSource::System, "same content"),
+        );
         // Same source+content to different task — dedup cache IS global so this is blocked
-        store.store("iri://task/b", PerceptionEntry::new(PerceptionSource::System, "same content"));
+        store.store(
+            "iri://task/b",
+            PerceptionEntry::new(PerceptionSource::System, "same content"),
+        );
 
         let text_a = store.take_perception_text("iri://task/a");
         assert!(!text_a.is_empty(), "task_a should have perception");
         let text_b = store.take_perception_text("iri://task/b");
         // task_b's store was dedup'd — so has_new should still be false
-        assert!(text_b.is_empty(), "task_b should be empty because store was dedup'd");
+        assert!(
+            text_b.is_empty(),
+            "task_b should be empty because store was dedup'd"
+        );
     }
 
     #[test]
     fn test_same_content_different_sources_allowed_across_tasks() {
         let store = PerceptionStore::new();
         // Same content but from different sources → NOT dedup'd
-        store.store("iri://task/a", PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "file changed"));
-        store.store("iri://task/b", PerceptionEntry::new(PerceptionSource::PerceptionEngine, "file changed"));
+        store.store(
+            "iri://task/a",
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "file changed"),
+        );
+        store.store(
+            "iri://task/b",
+            PerceptionEntry::new(PerceptionSource::PerceptionEngine, "file changed"),
+        );
 
         let text_a = store.take_perception_text("iri://task/a");
         assert!(!text_a.is_empty(), "task_a should have entry");
         let text_b = store.take_perception_text("iri://task/b");
-        assert!(!text_b.is_empty(), "task_b should have entry (different source)");
+        assert!(
+            !text_b.is_empty(),
+            "task_b should have entry (different source)"
+        );
     }
 
     #[test]
@@ -427,7 +490,10 @@ mod tests {
         store.store_global(PerceptionEntry::new(PerceptionSource::System, "global msg"));
 
         // global + task store with same content — should keep both
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "task specific"));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "task specific"),
+        );
 
         let text = store.take_perception_text("iri://task/t");
         let lines: Vec<&str> = text.lines().collect();
@@ -437,11 +503,17 @@ mod tests {
     #[test]
     fn test_take_empty_after_consumed() {
         let store = PerceptionStore::new();
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::System, "msg"));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "msg"),
+        );
 
         let first = store.take_perception_text("iri://task/t");
         assert!(!first.is_empty(), "First take should have content");
-        assert!(!store.has_new("iri://task/t"), "has_new should be false after take");
+        assert!(
+            !store.has_new("iri://task/t"),
+            "has_new should be false after take"
+        );
 
         let second = store.take_perception_text("iri://task/t");
         assert!(second.is_empty(), "Second take should be empty");
@@ -451,24 +523,30 @@ mod tests {
     fn test_has_new_global_only() {
         let store = PerceptionStore::new();
         assert!(!store.has_new("iri://task/x"), "No entries initially");
-        store.store_global(PerceptionEntry::new(PerceptionSource::Environment, "env event"));
-        assert!(store.has_new("iri://task/x"), "Should detect new global entry");
+        store.store_global(PerceptionEntry::new(
+            PerceptionSource::Environment,
+            "env event",
+        ));
+        assert!(
+            store.has_new("iri://task/x"),
+            "Should detect new global entry"
+        );
         store.take_perception_text("iri://task/x");
-        assert!(!store.has_new("iri://task/x"), "Should be consumed after take");
+        assert!(
+            !store.has_new("iri://task/x"),
+            "Should be consumed after take"
+        );
     }
 
     #[test]
     fn test_priority_clamping() {
-        let entry = PerceptionEntry::new(PerceptionSource::System, "test")
-            .with_priority(99);
+        let entry = PerceptionEntry::new(PerceptionSource::System, "test").with_priority(99);
         assert_eq!(entry.priority, 9, "Priority should clamp to 9");
 
-        let entry = PerceptionEntry::new(PerceptionSource::System, "test")
-            .with_priority(0);
+        let entry = PerceptionEntry::new(PerceptionSource::System, "test").with_priority(0);
         assert_eq!(entry.priority, 0, "Priority 0 should stay 0");
 
-        let entry = PerceptionEntry::new(PerceptionSource::System, "test")
-            .with_priority(5);
+        let entry = PerceptionEntry::new(PerceptionSource::System, "test").with_priority(5);
         assert_eq!(entry.priority, 5, "Priority 5 should stay 5");
     }
 
@@ -487,19 +565,35 @@ mod tests {
     #[test]
     fn test_different_sources_no_dedup() {
         let store = PerceptionStore::new();
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "same text"));
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::BatchAgent, "same text"));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "same text"),
+        );
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::BatchAgent, "same text"),
+        );
 
         let text = store.take_perception_text("iri://task/t");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "Different sources with same content should NOT dedup");
+        assert_eq!(
+            lines.len(),
+            2,
+            "Different sources with same content should NOT dedup"
+        );
     }
 
     #[test]
     fn test_dedup_cache_prevents_immediate_repeat() {
         let store = PerceptionStore::new();
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::System, "repeat"));
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::System, "repeat"));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "repeat"),
+        );
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "repeat"),
+        );
 
         let text = store.take_perception_text("iri://task/t");
         let lines: Vec<&str> = text.lines().collect();
@@ -509,8 +603,14 @@ mod tests {
     #[test]
     fn test_cleanup_removes_only_target_task() {
         let store = PerceptionStore::new();
-        store.store("iri://task/a", PerceptionEntry::new(PerceptionSource::System, "a_data"));
-        store.store("iri://task/b", PerceptionEntry::new(PerceptionSource::System, "b_data"));
+        store.store(
+            "iri://task/a",
+            PerceptionEntry::new(PerceptionSource::System, "a_data"),
+        );
+        store.store(
+            "iri://task/b",
+            PerceptionEntry::new(PerceptionSource::System, "b_data"),
+        );
 
         store.cleanup("iri://task/a");
 
@@ -519,7 +619,10 @@ mod tests {
         assert!(text_a.is_empty(), "Cleaned task should have no entries");
 
         // task_b should still have its entry (not consumed)
-        assert!(store.has_new("iri://task/b"), "Task b should still have entries");
+        assert!(
+            store.has_new("iri://task/b"),
+            "Task b should still have entries"
+        );
         let text_b = store.take_perception_text("iri://task/b");
         assert!(!text_b.is_empty(), "Task b should have perception");
     }
@@ -527,7 +630,10 @@ mod tests {
     #[test]
     fn test_evict_dedup_cache_removes_old() {
         let store = PerceptionStore::new();
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::System, "old"));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "old"),
+        );
 
         // Manually set the dedup entry to be old (>120s)
         {
@@ -547,11 +653,18 @@ mod tests {
         // After eviction the dedup cache is clean, but the original entry is still in pending.
         // Re-storing the same content adds a second entry (dedup check passes since cache was cleared).
         // Then take returns both entries.
-        store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::System, "old"));
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "old"),
+        );
         let text = store.take_perception_text("iri://task/t");
         let lines: Vec<&str> = text.lines().collect();
         // Two entries: original (step 1) + re-stored (after eviction)
-        assert_eq!(lines.len(), 2, "After eviction+restore, both entries should be present");
+        assert_eq!(
+            lines.len(),
+            2,
+            "After eviction+restore, both entries should be present"
+        );
     }
 
     #[test]
@@ -567,7 +680,10 @@ mod tests {
         let text = entry.render();
         assert!(text.contains("Batch"), "Should contain Batch prefix");
         assert!(text.contains("simple message"), "Should contain message");
-        assert!(!text.contains("details:"), "Should NOT contain details: without detail_iri");
+        assert!(
+            !text.contains("details:"),
+            "Should NOT contain details: without detail_iri"
+        );
     }
 
     #[test]
@@ -575,29 +691,50 @@ mod tests {
         let store = PerceptionStore::new();
         // 3 entries with different priorities
         store.store_global(PerceptionEntry::new(PerceptionSource::System, "low").with_priority(1));
-        store.store_global(PerceptionEntry::new(PerceptionSource::PerceptionEngine, "critical!").with_priority(9));
-        store.store_global(PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "mid").with_priority(5));
+        store.store_global(
+            PerceptionEntry::new(PerceptionSource::PerceptionEngine, "critical!").with_priority(9),
+        );
+        store.store_global(
+            PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, "mid").with_priority(5),
+        );
 
         let text = store.take_perception_text("iri://task/t");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "All 3 entries should appear");
         // First line should be the high-priority one (Alert prefix)
-        assert!(lines[0].contains("Alert"), "Highest priority should come first: got {}", lines[0]);
+        assert!(
+            lines[0].contains("Alert"),
+            "Highest priority should come first: got {}",
+            lines[0]
+        );
         // Last line should be the low priority
-        assert!(lines[2].contains("Workspace") || lines[2].contains("System"), "Lower priority should be last");
+        assert!(
+            lines[2].contains("Workspace") || lines[2].contains("System"),
+            "Lower priority should be last"
+        );
     }
 
     #[test]
     fn test_take_perception_respects_10_limit_across_global_and_task() {
         let store = PerceptionStore::new();
         for i in 0..8 {
-            store.store_global(PerceptionEntry::new(PerceptionSource::System, format!("global_{}", i)));
+            store.store_global(PerceptionEntry::new(
+                PerceptionSource::System,
+                format!("global_{}", i),
+            ));
         }
         for i in 0..8 {
-            store.store("iri://task/t", PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, format!("task_{}", i)));
+            store.store(
+                "iri://task/t",
+                PerceptionEntry::new(PerceptionSource::WorkspaceMonitor, format!("task_{}", i)),
+            );
         }
         let text = store.take_perception_text("iri://task/t");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 10, "Should cap at 10 even with 16 total entries");
+        assert_eq!(
+            lines.len(),
+            10,
+            "Should cap at 10 even with 16 total entries"
+        );
     }
 }

@@ -49,7 +49,13 @@ pub struct CliConfig {
 }
 
 impl CliConfig {
-    pub fn from_env_and_args(model: String, workspace: String, max_iterations: u32, max_pdca_cycles: u32, workflow_path: Option<String>) -> Self {
+    pub fn from_env_and_args(
+        model: String,
+        workspace: String,
+        max_iterations: u32,
+        max_pdca_cycles: u32,
+        workflow_path: Option<String>,
+    ) -> Self {
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .or_else(|_| std::env::var("AGENT_OS_GATEWAY_API_KEY"))
             .unwrap_or_else(|_| {
@@ -85,7 +91,8 @@ impl CliConfig {
         // Try to load memory limits from agent_os config file, fall back to env vars, then defaults
         let (max_l1_mb, max_l2_mb, max_l3_mb) = Self::load_memory_limits();
         let data_dir = std::env::var("GLIDING_HORSE_DATA").ok().or_else(|| {
-            std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .map(|home| format!("{}/.gliding_horse/data", home))
         });
@@ -121,11 +128,17 @@ impl CliConfig {
         }
         // Fall back to environment variables
         let l1 = std::env::var("AGENT_OS_L1_MEMORY_MB")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
         let l2 = std::env::var("AGENT_OS_L2_MEMORY_MB")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
         let l3 = std::env::var("AGENT_OS_L3_MEMORY_MB")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
         (l1, l2, l3)
     }
 

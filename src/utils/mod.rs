@@ -1,7 +1,7 @@
-pub mod jsonld;
 pub mod crypto;
-pub mod metrics;
+pub mod jsonld;
 pub mod logging;
+pub mod metrics;
 pub mod text;
 
 pub use crypto::CryptoUtils;

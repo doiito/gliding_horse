@@ -41,7 +41,8 @@ fn build_sparql_backend(node_count: usize) -> SparqlBackend {
         let s = format!("iri://skills/node_{}", i);
         let p = "iri://predicate/related";
         let o = RdfValue::Iri(format!("iri://skills/node_{}", (i + 1) % node_count));
-        kg.write_quads(&[make_quad(&s, p, o, graph)], graph).unwrap();
+        kg.write_quads(&[make_quad(&s, p, o, graph)], graph)
+            .unwrap();
     }
     SparqlBackend::new(Arc::new(kg)).with_named_graph(graph)
 }

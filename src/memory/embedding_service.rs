@@ -63,7 +63,10 @@ impl EmbeddingService for OneApiEmbeddingService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Embedding API returned error: {} - {}", status, body));
+            return Err(format!(
+                "Embedding API returned error: {} - {}",
+                status, body
+            ));
         }
         let result: EmbeddingResponse = resp
             .json()
@@ -176,7 +179,10 @@ impl EmbeddingService for OllamaEmbeddingService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Ollama Embedding API returned error: {} - {}", status, body));
+            return Err(format!(
+                "Ollama Embedding API returned error: {} - {}",
+                status, body
+            ));
         }
 
         let result: OllamaEmbedResponse = resp
@@ -202,7 +208,9 @@ pub fn create_embedding_service_from_config(
 ) -> Arc<dyn EmbeddingService> {
     if !config.enabled {
         info!("Embedding disabled, using Fallback service");
-        return Arc::new(FallbackEmbeddingService::with_dimension(config.fallback.dimension));
+        return Arc::new(FallbackEmbeddingService::with_dimension(
+            config.fallback.dimension,
+        ));
     }
 
     match config.provider.as_str() {
@@ -223,7 +231,9 @@ pub fn create_embedding_service_from_config(
         "oneapi" => {
             if config.oneapi.base_url.is_empty() || config.oneapi.api_key.is_empty() {
                 warn!("OneAPI Embedding config incomplete, falling back to Fallback");
-                return Arc::new(FallbackEmbeddingService::with_dimension(config.fallback.dimension));
+                return Arc::new(FallbackEmbeddingService::with_dimension(
+                    config.fallback.dimension,
+                ));
             }
             info!(
                 url = %config.oneapi.base_url,
@@ -240,11 +250,18 @@ pub fn create_embedding_service_from_config(
         }
         "fallback" | "" => {
             info!("Using Fallback Embedding service");
-            Arc::new(FallbackEmbeddingService::with_dimension(config.fallback.dimension))
+            Arc::new(FallbackEmbeddingService::with_dimension(
+                config.fallback.dimension,
+            ))
         }
         other => {
-            warn!(provider = other, "Unknown Embedding provider, falling back to Fallback");
-            Arc::new(FallbackEmbeddingService::with_dimension(config.fallback.dimension))
+            warn!(
+                provider = other,
+                "Unknown Embedding provider, falling back to Fallback"
+            );
+            Arc::new(FallbackEmbeddingService::with_dimension(
+                config.fallback.dimension,
+            ))
         }
     }
 }

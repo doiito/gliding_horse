@@ -174,10 +174,7 @@ impl TypeRouter {
                     "5w2h_summary".to_string(),
                     "summary_only".to_string(),
                 ])
-                .with_events(vec![
-                    "5W2H_CREATED".to_string(),
-                    "5W2H_UPDATED".to_string(),
-                ])
+                .with_events(vec!["5W2H_CREATED".to_string(), "5W2H_UPDATED".to_string()])
                 .with_sa_rules(vec![
                     "check_deadline".to_string(),
                     "check_budget".to_string(),
@@ -216,17 +213,22 @@ impl TypeRouter {
 
     pub fn find_by_capability(&self, capability: &str) -> Vec<String> {
         let capability_lower = capability.to_lowercase();
-        
+
         self.routes
             .values()
             .filter(|route| {
-                route.projection_templates.iter().any(|t| {
-                    t.to_lowercase().contains(&capability_lower)
-                }) || route.events.iter().any(|e| {
-                    e.to_lowercase().contains(&capability_lower)
-                }) || route.sa_rules.iter().any(|r| {
-                    r.to_lowercase().contains(&capability_lower)
-                })
+                route
+                    .projection_templates
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&capability_lower))
+                    || route
+                        .events
+                        .iter()
+                        .any(|e| e.to_lowercase().contains(&capability_lower))
+                    || route
+                        .sa_rules
+                        .iter()
+                        .any(|r| r.to_lowercase().contains(&capability_lower))
             })
             .map(|route| route.node_type.clone())
             .collect()
@@ -241,13 +243,16 @@ impl TypeRouter {
 
     pub fn merge_routes(&self, node_types: &[String]) -> TypeRoute {
         let matched_routes = self.match_types(node_types);
-        
+
         if matched_routes.is_empty() {
             return TypeRoute::new("Unknown".to_string());
         }
 
         if matched_routes.len() == 1 {
-            return matched_routes.into_iter().next().expect("confirmed len == 1 above");
+            return matched_routes
+                .into_iter()
+                .next()
+                .expect("confirmed len == 1 above");
         }
 
         let first_route = matched_routes.first().expect("reached only when len > 0");
@@ -313,7 +318,7 @@ mod tests {
     #[test]
     fn test_type_route_add_methods() {
         let mut route = TypeRoute::new("TestNode".to_string());
-        
+
         route.add_projection_template("template1".to_string());
         route.add_projection_template("template1".to_string());
         route.add_event("EVENT1".to_string());
@@ -338,7 +343,7 @@ mod tests {
     #[test]
     fn test_get_projection_templates() {
         let router = TypeRouter::new();
-        
+
         let templates = router.get_projection_templates("PlanNode");
         assert!(templates.contains(&"summary_only".to_string()));
         assert!(templates.contains(&"pa_init".to_string()));
@@ -351,7 +356,7 @@ mod tests {
     #[test]
     fn test_get_events() {
         let router = TypeRouter::new();
-        
+
         let events = router.get_events("PlanNode");
         assert!(events.contains(&"PLAN_CREATED".to_string()));
         assert!(events.contains(&"PLAN_UPDATED".to_string()));
@@ -364,7 +369,7 @@ mod tests {
     #[test]
     fn test_get_sa_rules() {
         let router = TypeRouter::new();
-        
+
         let rules = router.get_sa_rules("PlanNode");
         assert!(rules.contains(&"check_plan_progress".to_string()));
         assert!(rules.contains(&"validate_plan_completeness".to_string()));
@@ -376,16 +381,19 @@ mod tests {
     #[test]
     fn test_register_type() {
         let mut router = TypeRouter::new();
-        
+
         let custom_route = TypeRoute::new("CustomNode".to_string())
             .with_projection_templates(vec!["custom_template".to_string()])
             .with_events(vec!["CUSTOM_EVENT".to_string()])
             .with_sa_rules(vec!["custom_rule".to_string()]);
-        
+
         router.register_type(custom_route);
 
         assert!(router.has_type("CustomNode"));
-        assert_eq!(router.get_projection_templates("CustomNode"), vec!["custom_template"]);
+        assert_eq!(
+            router.get_projection_templates("CustomNode"),
+            vec!["custom_template"]
+        );
         assert_eq!(router.get_events("CustomNode"), vec!["CUSTOM_EVENT"]);
         assert_eq!(router.get_sa_rules("CustomNode"), vec!["custom_rule"]);
     }
@@ -393,7 +401,7 @@ mod tests {
     #[test]
     fn test_find_by_capability() {
         let router = TypeRouter::new();
-        
+
         let found = router.find_by_capability("plan");
         assert!(found.contains(&"PlanNode".to_string()));
 
@@ -408,12 +416,9 @@ mod tests {
     #[test]
     fn test_match_types() {
         let router = TypeRouter::new();
-        
-        let matched = router.match_types(&[
-            "PlanNode".to_string(),
-            "CodeArtifact".to_string(),
-        ]);
-        
+
+        let matched = router.match_types(&["PlanNode".to_string(), "CodeArtifact".to_string()]);
+
         assert_eq!(matched.len(), 2);
         assert!(matched.iter().any(|r| r.node_type == "PlanNode"));
         assert!(matched.iter().any(|r| r.node_type == "CodeArtifact"));
@@ -425,15 +430,16 @@ mod tests {
     #[test]
     fn test_merge_routes() {
         let router = TypeRouter::new();
-        
-        let merged = router.merge_routes(&[
-            "PlanNode".to_string(),
-            "CodeArtifact".to_string(),
-        ]);
+
+        let merged = router.merge_routes(&["PlanNode".to_string(), "CodeArtifact".to_string()]);
 
         assert!(merged.projection_templates.contains(&"pa_init".to_string()));
-        assert!(merged.projection_templates.contains(&"da_input".to_string()));
-        assert!(merged.projection_templates.contains(&"summary_only".to_string()));
+        assert!(merged
+            .projection_templates
+            .contains(&"da_input".to_string()));
+        assert!(merged
+            .projection_templates
+            .contains(&"summary_only".to_string()));
 
         assert!(merged.events.contains(&"PLAN_CREATED".to_string()));
         assert!(merged.events.contains(&"ARTIFACT_CREATED".to_string()));
@@ -445,9 +451,9 @@ mod tests {
     #[test]
     fn test_merge_routes_single_type() {
         let router = TypeRouter::new();
-        
+
         let merged = router.merge_routes(&["PlanNode".to_string()]);
-        
+
         assert_eq!(merged.node_type, "PlanNode");
         assert_eq!(merged.projection_templates.len(), 3);
         assert_eq!(merged.events.len(), 3);
@@ -457,9 +463,9 @@ mod tests {
     #[test]
     fn test_merge_routes_empty() {
         let router = TypeRouter::new();
-        
+
         let merged = router.merge_routes(&[]);
-        
+
         assert_eq!(merged.node_type, "Unknown");
         assert_eq!(merged.projection_templates, vec!["summary_only"]);
     }
@@ -467,7 +473,7 @@ mod tests {
     #[test]
     fn test_list_types() {
         let router = TypeRouter::new();
-        
+
         let types = router.list_types();
         assert!(types.contains(&"PlanNode".to_string()));
         assert!(types.contains(&"CodeArtifact".to_string()));

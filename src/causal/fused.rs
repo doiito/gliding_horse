@@ -178,22 +178,28 @@ impl FusedRootCauseEngine {
         } else {
             0.0
         };
-        let semantic_conf = if self.knowledge_store.is_some() && !semantic_context.neighbors.is_empty()
-        {
-            0.25
-        } else {
-            0.0
-        };
-        let fused_confidence = 0.40 * execution_conf + 0.35 * structural_conf + 0.25 * semantic_conf;
+        let semantic_conf =
+            if self.knowledge_store.is_some() && !semantic_context.neighbors.is_empty() {
+                0.25
+            } else {
+                0.0
+            };
+        let fused_confidence =
+            0.40 * execution_conf + 0.35 * structural_conf + 0.25 * semantic_conf;
         let fused_confidence = fused_confidence.min(1.0);
 
         // Recommended actions from each dimension
         let mut recommended_actions = Vec::new();
         if let Some(ref gb) = self.graph_backend {
-            let out_deg = gb.all_edges().iter().filter(|e| e.source == error_iri).count();
+            let out_deg = gb
+                .all_edges()
+                .iter()
+                .filter(|e| e.source == error_iri)
+                .count();
             if out_deg > 3 {
                 recommended_actions.push(
-                    "High out-degree node: consider adding defensive checks at all dependents".into(),
+                    "High out-degree node: consider adding defensive checks at all dependents"
+                        .into(),
                 );
             }
         }
@@ -208,9 +214,8 @@ impl FusedRootCauseEngine {
             );
         }
         if recommended_actions.is_empty() {
-            recommended_actions.push(
-                "No additional actions recommended beyond standard remediation".into(),
-            );
+            recommended_actions
+                .push("No additional actions recommended beyond standard remediation".into());
         }
 
         FusedRootCause {
@@ -227,22 +232,18 @@ impl FusedRootCauseEngine {
     }
 
     /// Collect RDF semantic context via SPARQL neighbor traversal.
-    fn collect_semantic_context(
-        &self,
-        ks: &KnowledgeGraphStore,
-        iri: &str,
-    ) -> RdfSemanticContext {
+    fn collect_semantic_context(&self, ks: &KnowledgeGraphStore, iri: &str) -> RdfSemanticContext {
         let mut ctx = RdfSemanticContext::default();
 
         // Outgoing edges: SELECT ?o WHERE { <iri> ?p ?o }
-        let sparql = format!(
-            "SELECT ?o WHERE {{ <{}> ?p ?o }} LIMIT 20",
-            iri
-        );
+        let sparql = format!("SELECT ?o WHERE {{ <{}> ?p ?o }} LIMIT 20", iri);
         if let Ok(results) = ks.query_sparql(&sparql, None) {
             for row in &results {
                 if let Some(val) = row.get("?o").and_then(|v| v.as_str()) {
-                    if val.starts_with("iri:") || val.starts_with("http") || val.starts_with("system:") {
+                    if val.starts_with("iri:")
+                        || val.starts_with("http")
+                        || val.starts_with("system:")
+                    {
                         ctx.neighbors.push(val.to_string());
                     }
                 }
@@ -250,14 +251,14 @@ impl FusedRootCauseEngine {
         }
 
         // Incoming edges: SELECT ?s WHERE { ?s ?p <iri> }
-        let sparql_in = format!(
-            "SELECT ?s WHERE {{ ?s ?p <{}> }} LIMIT 10",
-            iri
-        );
+        let sparql_in = format!("SELECT ?s WHERE {{ ?s ?p <{}> }} LIMIT 10", iri);
         if let Ok(results) = ks.query_sparql(&sparql_in, None) {
             for row in &results {
                 if let Some(val) = row.get("?s").and_then(|v| v.as_str()) {
-                    if val.starts_with("iri:") || val.starts_with("http") || val.starts_with("system:") {
+                    if val.starts_with("iri:")
+                        || val.starts_with("http")
+                        || val.starts_with("system:")
+                    {
                         ctx.neighbors.push(val.to_string());
                     }
                 }
@@ -287,7 +288,9 @@ impl FusedRootCauseEngine {
 fn bfs_from(seed: &str, edges: &[EdgeDescriptor], depth: usize) -> Vec<String> {
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for e in edges {
-        adj.entry(e.source.clone()).or_default().push(e.target.clone());
+        adj.entry(e.source.clone())
+            .or_default()
+            .push(e.target.clone());
     }
     if !adj.contains_key(seed) {
         return Vec::new();
@@ -329,17 +332,17 @@ pub fn fuse_confidence(
     (FUSE_EXECUTION_WEIGHT * trace_confidence
         + FUSE_STRUCTURAL_WEIGHT * causal_confidence
         + FUSE_SEMANTIC_WEIGHT * semantic_relevance)
-    .min(1.0)
+        .min(1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::root_cause::types::*;
-    use std::sync::Arc;
     use crate::graph_backend::PetgraphBackend;
+    use crate::root_cause::types::*;
     use crate::skill_graph::graph_store::SkillGraphStore;
     use crate::skill_graph::types::SkillGraphNode;
+    use std::sync::Arc;
 
     fn dummy_trace_chain() -> TraceChain {
         let mut chain = TraceChain::new("trace_test_001", "test_agent");
@@ -426,7 +429,10 @@ mod tests {
     #[test]
     fn test_bfs_from_empty_edges() {
         let result = bfs_from("iri://skills/a", &[], 3);
-        assert!(result.is_empty(), "BFS from empty edges should return empty");
+        assert!(
+            result.is_empty(),
+            "BFS from empty edges should return empty"
+        );
     }
 
     #[test]
@@ -437,16 +443,35 @@ mod tests {
             edge_type: "related".into(),
         }];
         let result = bfs_from("iri://skills/nonexistent", &edges, 3);
-        assert!(result.is_empty(), "BFS from nonexistent seed should return empty");
+        assert!(
+            result.is_empty(),
+            "BFS from nonexistent seed should return empty"
+        );
     }
 
     #[test]
     fn test_bfs_from_three_hops() {
         let edges = vec![
-            EdgeDescriptor { source: "iri://skills/a".into(), target: "iri://skills/b".into(), edge_type: "related".into() },
-            EdgeDescriptor { source: "iri://skills/b".into(), target: "iri://skills/c".into(), edge_type: "related".into() },
-            EdgeDescriptor { source: "iri://skills/c".into(), target: "iri://skills/d".into(), edge_type: "related".into() },
-            EdgeDescriptor { source: "iri://skills/d".into(), target: "iri://skills/e".into(), edge_type: "related".into() },
+            EdgeDescriptor {
+                source: "iri://skills/a".into(),
+                target: "iri://skills/b".into(),
+                edge_type: "related".into(),
+            },
+            EdgeDescriptor {
+                source: "iri://skills/b".into(),
+                target: "iri://skills/c".into(),
+                edge_type: "related".into(),
+            },
+            EdgeDescriptor {
+                source: "iri://skills/c".into(),
+                target: "iri://skills/d".into(),
+                edge_type: "related".into(),
+            },
+            EdgeDescriptor {
+                source: "iri://skills/d".into(),
+                target: "iri://skills/e".into(),
+                edge_type: "related".into(),
+            },
         ];
 
         // Depth 1 should reach b only
@@ -482,15 +507,19 @@ mod tests {
         store.register_skill(a).unwrap();
         store.register_skill(b).unwrap();
         store.register_skill(c).unwrap();
-        store.register_skill(SkillGraphNode::new("iri://skills/d", "D", "")).unwrap();
+        store
+            .register_skill(SkillGraphNode::new("iri://skills/d", "D", ""))
+            .unwrap();
 
         let backend = PetgraphBackend::new(store);
         let engine = FusedRootCauseEngine::new(Some(Arc::new(backend)), None);
         let chain = dummy_trace_chain();
         let result = engine.fuse(&chain, "iri://skills/a");
 
-        assert!(result.fused_root.contributing_factors.len() >= 3,
+        assert!(
+            result.fused_root.contributing_factors.len() >= 3,
             "Expected at least 3 contributing factors (a→b→c→d), got {}",
-            result.fused_root.contributing_factors.len());
+            result.fused_root.contributing_factors.len()
+        );
     }
 }

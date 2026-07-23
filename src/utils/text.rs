@@ -93,7 +93,9 @@ pub fn smart_truncate_text(text: &str, max_bytes: usize) -> String {
     } else {
         format!(
             "{}...\n\n[truncated: {} original chars, {} chars kept]",
-            truncated, text_width, truncated.width()
+            truncated,
+            text_width,
+            truncated.width()
         )
     }
 }

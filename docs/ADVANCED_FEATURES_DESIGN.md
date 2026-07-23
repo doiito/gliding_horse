@@ -1,5 +1,12 @@
 # Advanced Feature Design: Root Cause Analysis, Timeline Versioning, Temporal Hypergraph, GNN
 
+> Status (2026-07-23): this is an architecture/design proposal, not an
+> implementation inventory. `TemporalHypergraphStore` exists as an experimental
+> library component but is not wired into `SkillGraphStore` or `CausalEngine`.
+> No `src/gnn` implementation or production GNN consumer exists in this
+> workspace. The code blocks and integration diagrams below therefore describe
+> intended work, not current runtime behavior.
+
 > Design document for implementing 4 advanced skill graph features on Gliding Horse Agent OS.
 >
 > **Status**: Draft for review

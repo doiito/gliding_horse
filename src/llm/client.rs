@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::gateway::unified_gateway::{
-    ChatCompletionResponse, ChatMessage, UnifiedGateway,
-};
+use crate::gateway::unified_gateway::{ChatCompletionResponse, ChatMessage, UnifiedGateway};
 use crate::llm::message::Message;
 use crate::llm::response_parser::{self, LLMResponse, ToolCall};
 use crate::CoreError;
@@ -89,27 +87,44 @@ impl LLMClient {
 
         let response = self
             .gateway
-            .chat_with_params(model, chat_messages, temperature, max_tokens, Some(tools), None)
+            .chat_with_params(
+                model,
+                chat_messages,
+                temperature,
+                max_tokens,
+                Some(tools),
+                None,
+            )
             .await?;
 
         Self::parse_completion_response(&response)
     }
 
     /// Parse gateway response into LLMResponse
-    fn parse_completion_response(response: &ChatCompletionResponse) -> Result<LLMResponse, CoreError> {
-        let choice = response.choices.first().ok_or_else(|| CoreError::Internal {
-            message: "Empty LLM response choices".to_string(),
-        })?;
+    fn parse_completion_response(
+        response: &ChatCompletionResponse,
+    ) -> Result<LLMResponse, CoreError> {
+        let choice = response
+            .choices
+            .first()
+            .ok_or_else(|| CoreError::Internal {
+                message: "Empty LLM response choices".to_string(),
+            })?;
 
         let content = choice.message.content.as_deref().unwrap_or("");
-        let finish_reason = choice.finish_reason.as_deref().unwrap_or("stop").to_string();
+        let finish_reason = choice
+            .finish_reason
+            .as_deref()
+            .unwrap_or("stop")
+            .to_string();
 
         // Parse content JSON for structured thought/content/summary
         let mut parsed = response_parser::parse_response(content).unwrap_or_else(|_| {
             let fallback = response_parser::parse_response("{}").expect("{} is valid JSON");
             if let Ok(val) = serde_json::from_str::<Value>(content) {
                 if val.get("content").is_some() || val.get("thought").is_some() {
-                    return response_parser::parse_response(content).expect("parse_response already validated above");
+                    return response_parser::parse_response(content)
+                        .expect("parse_response already validated above");
                 }
             }
             fallback
@@ -159,7 +174,14 @@ impl LLMClient {
 
         let response = self
             .gateway
-            .chat_with_params(model, chat_messages, temperature, max_tokens, Some(tools), None)
+            .chat_with_params(
+                model,
+                chat_messages,
+                temperature,
+                max_tokens,
+                Some(tools),
+                None,
+            )
             .await?;
 
         Self::parse_completion_response(&response)

@@ -123,10 +123,12 @@ pub async fn execute_ontology_reason(input: Value) -> Result<Value, String> {
     let shared = crate::ontology::new_shared_store()
         .map_err(|e| format!("Failed to create ontology store: {}", e))?;
 
-    shared.load_turtle(&params.ttl, None)
+    shared
+        .load_turtle(&params.ttl, None)
         .map_err(|e| format!("Failed to load Turtle data: {}", e))?;
 
-    let result = shared.reason(profile, materialize)
+    let result = shared
+        .reason(profile, materialize)
         .map_err(|e| format!("Reasoning failed: {}", e))?;
 
     Ok(json!({

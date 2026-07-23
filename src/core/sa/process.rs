@@ -1,4 +1,3 @@
-
 use tracing::{info, instrument, warn};
 
 use crate::core::agent_instance::AgentRole;
@@ -15,7 +14,12 @@ impl SupervisorAgent {
         user_input: &str,
         task_iri: &str,
     ) -> Result<TaskResult, CoreError> {
-        self.process_task_with_context(user_input, task_iri, TaskContext::new(task_iri, user_input, self.max_iterations)).await
+        self.process_task_with_context(
+            user_input,
+            task_iri,
+            TaskContext::new(task_iri, user_input, self.max_iterations),
+        )
+        .await
     }
 
     /// Process task with custom TaskContext, supports resume mode
@@ -29,7 +33,9 @@ impl SupervisorAgent {
         let cycle_id = self.start_cycle(user_input, task_iri).await?;
 
         let mut five_w2h = self.extract_5w2h_from_input(user_input).await;
-        let task_id = task_iri.strip_prefix("iri://task/").unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
+        let task_id = task_iri
+            .strip_prefix("iri://task/")
+            .unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
         let five_w2h_iri = format!("iri://task/{}/5w2h", task_id);
 
         // A3: Calculate task_embedding from 5W2H → set to relevance_tracker
@@ -41,7 +47,12 @@ impl SupervisorAgent {
         }
 
         // Inject current working directory as execution environment, so LLM knows where to create files
-        if five_w2h.where_.as_ref().and_then(|w| w.execution_environment.as_ref()).is_none() {
+        if five_w2h
+            .where_
+            .as_ref()
+            .and_then(|w| w.execution_environment.as_ref())
+            .is_none()
+        {
             if let Ok(cwd) = std::env::current_dir() {
                 let cwd_str = cwd.to_string_lossy().to_string();
                 five_w2h = five_w2h.with_where(crate::core::five_w2h::WhereDetail {
@@ -57,15 +68,24 @@ impl SupervisorAgent {
         five_w2h.derive_defaults(self.max_iterations, self.max_pdca_cycles);
 
         if let Ok(json_ld) = five_w2h.to_json_ld(task_iri) {
-            let _ = self.runner.l0_store.store(&five_w2h_iri, &json_ld.to_string());
+            let _ = self
+                .runner
+                .l0_store
+                .store(&five_w2h_iri, &json_ld.to_string());
             let cfg = crate::CoreConfig::default();
             if let Some(ref bb) = self.blackboard {
-                if bb.write_node(&five_w2h_iri, &json_ld.to_string(), &cfg).is_ok() {
+                if bb
+                    .write_node(&five_w2h_iri, &json_ld.to_string(), &cfg)
+                    .is_ok()
+                {
                     tracing::debug!(five_w2h_iri = %five_w2h_iri, "5W2H written to blackboard");
                     let route = self.type_router.get_route("task:5W2H");
                     if let Some(route) = route {
                         for event in &route.events {
-                            let _ = self.event_bus.emit(task_iri, event, "system:sa", &five_w2h_iri).await;
+                            let _ = self
+                                .event_bus
+                                .emit(task_iri, event, "system:sa", &five_w2h_iri)
+                                .await;
                         }
                     }
                 }
@@ -73,7 +93,10 @@ impl SupervisorAgent {
             tracing::info!(task_iri = %task_iri, what = %five_w2h.what, "5W2H initialization complete");
         }
 
-        let perception_hints = self.perception.on_task_start(user_input, task_iri).await
+        let perception_hints = self
+            .perception
+            .on_task_start(user_input, task_iri)
+            .await
             .map(|a| a.relevant_experience_hints)
             .unwrap_or_default();
 
@@ -90,7 +113,8 @@ impl SupervisorAgent {
                 constraints: five_w2h.why.success_criteria.clone(),
             };
             let matches = de.discover_for_task(&disc_task).await;
-            let skill_hints: Vec<String> = matches.iter()
+            let skill_hints: Vec<String> = matches
+                .iter()
                 .filter_map(|m| {
                     let name = if !m.skill.name.is_empty() {
                         m.skill.name.clone()
@@ -113,17 +137,26 @@ impl SupervisorAgent {
         // Unified execution path: build ExecutionPlan from JSON-LD workflow or LLM
         let mut plan = if let Some(ref wf_jsonld) = ctx.workflow_jsonld {
             info!(task_iri = %task_iri, "Using JSON-LD workflow mode — converting through adapter to ExecutionPlan");
-            let def = crate::core::workflow::loader::load_workflow_jsonld(wf_jsonld)
-                .map_err(|e| CoreError::Internal { message: format!("Workflow parsing failed: {}", e) })?;
-            let dag = crate::core::workflow::loader::build_dag(&def)
-                .map_err(|e| CoreError::Internal { message: format!("DAG build failed: {}", e) })?;
-            let mut plan = crate::core::workflow::adapter::dag_to_execution_plan(&dag, &def, task_iri);
+            let def =
+                crate::core::workflow::loader::load_workflow_jsonld(wf_jsonld).map_err(|e| {
+                    CoreError::Internal {
+                        message: format!("Workflow parsing failed: {}", e),
+                    }
+                })?;
+            let dag = crate::core::workflow::loader::build_dag(&def).map_err(|e| {
+                CoreError::Internal {
+                    message: format!("DAG build failed: {}", e),
+                }
+            })?;
+            let mut plan =
+                crate::core::workflow::adapter::dag_to_execution_plan(&dag, &def, task_iri);
             plan.dag_jsonld = Some(wf_jsonld.clone());
             plan
         } else if ctx.resumed_messages.is_some() {
             self.build_resume_plan()
         } else {
-            self.analyze_task_with_llm(user_input, &five_w2h, &all_hints).await
+            self.analyze_task_with_llm(user_input, &five_w2h, &all_hints)
+                .await
         };
 
         // ── Verify-first optimization ──
@@ -135,9 +168,15 @@ impl SupervisorAgent {
             && ctx.resumed_messages.is_none()
             && ctx.workflow_jsonld.is_none()
             && plan.steps.len() >= 2
-            && plan.steps.iter().any(|s| matches!(s.role, AgentRole::Plan | AgentRole::Do))
+            && plan
+                .steps
+                .iter()
+                .any(|s| matches!(s.role, AgentRole::Plan | AgentRole::Do))
         {
-            let ws_summary = ctx.workspace_file_summary.as_deref().unwrap_or("workspace has files");
+            let ws_summary = ctx
+                .workspace_file_summary
+                .as_deref()
+                .unwrap_or("workspace has files");
             plan.fallback_steps = plan.steps.clone();
             plan.verify_first = true;
 
@@ -151,10 +190,13 @@ impl SupervisorAgent {
                      If not, report what is missing or needs modification.",
                     ws_summary
                 ),
-                expected_output: "Verification result: PASS (existing code sufficient) or FAIL (list gaps)".to_string(),
+                expected_output:
+                    "Verification result: PASS (existing code sufficient) or FAIL (list gaps)"
+                        .to_string(),
                 dependencies: vec![],
                 tools_allowed: vec![],
-                success_criteria: "Clear pass/fail verdict with evidence from workspace".to_string(),
+                success_criteria: "Clear pass/fail verdict with evidence from workspace"
+                    .to_string(),
             };
             let verify_aa = PlanStep {
                 step_id: "verify_aa".to_string(),
@@ -169,26 +211,40 @@ impl SupervisorAgent {
             let original_desc = plan.description.clone();
             plan.steps = vec![verify_ca, verify_aa];
             plan.agent_sequence = vec![AgentRole::Check, AgentRole::Act];
-            plan.description = format!("[Verify-first] Check existing workspace code before full PDCA. Fallback: {}", original_desc);
+            plan.description = format!(
+                "[Verify-first] Check existing workspace code before full PDCA. Fallback: {}",
+                original_desc
+            );
 
             info!(task_iri = %task_iri, ws = %ws_summary, "Verify-first: CA→AA prepended, fallback_steps={}", plan.fallback_steps.len());
         }
 
         // Adapt relevance tracker decay λ to task complexity
-        self.relevance_tracker.adapt_to_complexity(&plan.task_complexity);
+        self.relevance_tracker
+            .adapt_to_complexity(&plan.task_complexity);
 
         let step_roles: Vec<String> = plan.steps.iter().map(|s| format!("{:?}", s.role)).collect();
-        self.emit_sa_thought(task_iri,
-            &format!("Task classified. Plan: {} ({} steps: {})",
-                plan.description, plan.steps.len(), step_roles.join(" → ")),
-            "plan_created").await;
+        self.emit_sa_thought(
+            task_iri,
+            &format!(
+                "Task classified. Plan: {} ({} steps: {})",
+                plan.description,
+                plan.steps.len(),
+                step_roles.join(" → ")
+            ),
+            "plan_created",
+        )
+        .await;
 
         if let Some(cycle) = self.active_cycles.get_mut(&cycle_id) {
             cycle.phase = CyclePhase::Executing;
-            cycle.phase_history.push(format!("Plan: {}", plan.description));
+            cycle
+                .phase_history
+                .push(format!("Plan: {}", plan.description));
         }
 
-        let mut pending_interventions: Vec<crate::perception::proactive_engine::InterventionPlan> = Vec::new();
+        let mut pending_interventions: Vec<crate::perception::proactive_engine::InterventionPlan> =
+            Vec::new();
         if let Some(ref mut receiver) = self.event_receiver {
             while let Ok(event) = receiver.try_recv() {
                 if event.task_iri != task_iri {
@@ -196,7 +252,10 @@ impl SupervisorAgent {
                 }
                 match event.event_type.as_str() {
                     "INTERVENTION_REQUIRED" => {
-                        if let Ok(plan) = serde_json::from_str::<crate::perception::proactive_engine::InterventionPlan>(&event.payload) {
+                        if let Ok(plan) = serde_json::from_str::<
+                            crate::perception::proactive_engine::InterventionPlan,
+                        >(&event.payload)
+                        {
                             pending_interventions.push(plan);
                         }
                     }
@@ -204,23 +263,38 @@ impl SupervisorAgent {
                         warn!("Deadline approaching, marking task as urgent");
                     }
                     "HUMAN_APPROVAL_RESULT" => {
-                        if let Ok(result) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                            let request_id = result.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
-                            let approved = result.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if let Ok(result) =
+                            serde_json::from_str::<serde_json::Value>(&event.payload)
+                        {
+                            let request_id = result
+                                .get("request_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let approved = result
+                                .get("approved")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
                             if !request_id.is_empty() {
-                                self.pending_approvals.lock().await.insert(request_id.to_string(), approved);
+                                self.pending_approvals
+                                    .lock()
+                                    .await
+                                    .insert(request_id.to_string(), approved);
                                 info!(request_id = %request_id, approved = %approved, "Received human approval result");
                             }
                         }
                     }
                     "AGENT_ERROR" => {
-                        let plan = self.perception.on_agent_blocked(&event.source_agent_iri, task_iri);
+                        let plan = self
+                            .perception
+                            .on_agent_blocked(&event.source_agent_iri, task_iri);
                         if plan.should_interrupt {
                             pending_interventions.push(plan);
                         }
                     }
                     "THRESHOLD_EXCEEDED" => {
-                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                        if let Ok(payload) =
+                            serde_json::from_str::<serde_json::Value>(&event.payload)
+                        {
                             let plan = self.perception.on_quality_degradation(&payload, task_iri);
                             if plan.should_interrupt {
                                 pending_interventions.push(plan);
@@ -228,7 +302,9 @@ impl SupervisorAgent {
                         }
                     }
                     "CYCLE_ITERATION" => {
-                        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+                        if let Ok(payload) =
+                            serde_json::from_str::<serde_json::Value>(&event.payload)
+                        {
                             let plan = self.perception.on_progress_anomaly(&payload, task_iri);
                             if plan.should_interrupt {
                                 pending_interventions.push(plan);
@@ -243,7 +319,8 @@ impl SupervisorAgent {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(self.execution_timeout_secs),
                 self.execute_intervention(plan, task_iri),
-            ).await;
+            )
+            .await;
         }
 
         // ── Outer SA-level PDCA retry loop ──
@@ -258,20 +335,29 @@ impl SupervisorAgent {
         let mut final_result: Option<TaskResult> = None;
 
         for cycle_num in 0..max_cycles {
-            let resumed = if cycle_num == 0 { ctx.resumed_messages.clone() } else { None };
+            let resumed = if cycle_num == 0 {
+                ctx.resumed_messages.clone()
+            } else {
+                None
+            };
 
             // On retry after verify-first failed, switch to fallback_steps (full PDCA)
-            let current_plan = if cycle_num >= 1 && plan.verify_first && !plan.fallback_steps.is_empty() {
-                let mut fb = plan.clone();
-                fb.steps = plan.fallback_steps.clone();
-                fb.verify_first = false;
-                fb.agent_sequence = fb.steps.iter().map(|s| s.role).collect();
-                fb.description = format!("Fallback PDCA (verify-first CA did not pass): {}",
-                    plan.description.trim_start_matches("[Verify-first] Check existing workspace code before full PDCA. Fallback: "));
-                fb
-            } else {
-                plan.clone()
-            };
+            let current_plan =
+                if cycle_num >= 1 && plan.verify_first && !plan.fallback_steps.is_empty() {
+                    let mut fb = plan.clone();
+                    fb.steps = plan.fallback_steps.clone();
+                    fb.verify_first = false;
+                    fb.agent_sequence = fb.steps.iter().map(|s| s.role).collect();
+                    fb.description = format!(
+                    "Fallback PDCA (verify-first CA did not pass): {}",
+                    plan.description.trim_start_matches(
+                        "[Verify-first] Check existing workspace code before full PDCA. Fallback: "
+                    )
+                );
+                    fb
+                } else {
+                    plan.clone()
+                };
 
             info!(
                 task_iri = %task_iri,
@@ -282,30 +368,44 @@ impl SupervisorAgent {
             );
 
             if let Some(ref _feedback) = cycle_feedback {
-                self.emit_sa_thought(task_iri,
-                    &format!("⚠️ AA did not pass cycle #{} — restarting PDCA with feedback", cycle_num + 1),
-                    "pdca_retry_start").await;
+                self.emit_sa_thought(
+                    task_iri,
+                    &format!(
+                        "⚠️ AA did not pass cycle #{} — restarting PDCA with feedback",
+                        cycle_num + 1
+                    ),
+                    "pdca_retry_start",
+                )
+                .await;
             } else {
-                self.emit_sa_thought(task_iri,
+                self.emit_sa_thought(
+                    task_iri,
                     &format!("Starting PDCA cycle {}/{}", cycle_num + 1, max_cycles),
-                    "pdca_cycle_start").await;
+                    "pdca_cycle_start",
+                )
+                .await;
             }
 
-            let result = self.execute_plan(
-                current_plan,
-                task_iri,
-                user_input,
-                five_w2h.clone(),
-                &five_w2h_iri,
-                resumed,
-                cycle_feedback.clone(),
-            ).await?;
+            let result = self
+                .execute_plan(
+                    current_plan,
+                    task_iri,
+                    user_input,
+                    five_w2h.clone(),
+                    &five_w2h_iri,
+                    resumed,
+                    cycle_feedback.clone(),
+                )
+                .await?;
 
             if result.status == "success" {
                 info!(task_iri = %task_iri, cycle_num = cycle_num + 1, "PDCA cycle passed");
-                self.emit_sa_thought(task_iri,
+                self.emit_sa_thought(
+                    task_iri,
                     &format!("✅ PDCA cycle #{} passed — task complete", cycle_num + 1),
-                    "pdca_cycle_passed").await;
+                    "pdca_cycle_passed",
+                )
+                .await;
 
                 if let Some(scheduler) = &self.scheduler {
                     let _ = scheduler.on_task_complete(task_iri).await;
@@ -316,9 +416,15 @@ impl SupervisorAgent {
             let last_cycle = cycle_num + 1 >= max_cycles;
             if last_cycle {
                 info!(task_iri = %task_iri, cycle_num = cycle_num + 1, "All PDCA cycles exhausted");
-                self.emit_sa_thought(task_iri,
-                    &format!("⚠️ All {} PDCA cycles completed without full pass — returning last result", max_cycles),
-                    "pdca_cycles_exhausted").await;
+                self.emit_sa_thought(
+                    task_iri,
+                    &format!(
+                        "⚠️ All {} PDCA cycles completed without full pass — returning last result",
+                        max_cycles
+                    ),
+                    "pdca_cycles_exhausted",
+                )
+                .await;
                 final_result = Some(result);
                 break;
             }
@@ -327,9 +433,9 @@ impl SupervisorAgent {
             // to preserve the plan structure and focus on specific DA improvements.
             // The CA→DA correction loop (in execute_plan) already handles in-cycle fixes;
             // this SA-level feedback addresses persistent failures requiring plan adjustment.
-            let da_fixes = result.summary.contains("Dimension Audit") ||
-                result.summary.contains("execution failed") ||
-                result.summary.contains("not completed");
+            let da_fixes = result.summary.contains("Dimension Audit")
+                || result.summary.contains("execution failed")
+                || result.summary.contains("not completed");
 
             cycle_feedback = Some(if da_fixes {
                 format!(
@@ -341,7 +447,9 @@ impl SupervisorAgent {
                      1. Which specific execution steps failed or were incomplete\n\
                      2. What DA needs to do differently (more detail, different approach)\n\
                      3. Do NOT create a brand new plan — refine the existing one",
-                    cycle_num + 1, result.status, result.summary
+                    cycle_num + 1,
+                    result.status,
+                    result.summary
                 )
             } else {
                 format!(
@@ -349,7 +457,9 @@ impl SupervisorAgent {
                      AA Evaluation:\n{}\n\n\
                      ---\n\
                      Please analyze the issues above and create an improved approach.",
-                    cycle_num + 1, result.status, result.summary
+                    cycle_num + 1,
+                    result.status,
+                    result.summary
                 )
             });
             final_result = Some(result);

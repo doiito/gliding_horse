@@ -2,7 +2,6 @@
 ///
 /// Architecture Layer: L1 — Enforcement
 /// See design: PR-res/superpowers-skills-full-integration-design.md §2
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -83,12 +82,16 @@ impl TraceChain {
     }
 
     pub fn summary(&self) -> String {
-        let root = self.root_level()
+        let root = self
+            .root_level()
             .map(|l| l.description.as_str())
             .unwrap_or("Unidentified root cause");
         format!(
             "Trace[{}]: {} levels, root={}, agent={}",
-            self.trace_id, self.depth(), root, self.agent_id
+            self.trace_id,
+            self.depth(),
+            root,
+            self.agent_id
         )
     }
 }
@@ -147,8 +150,12 @@ impl std::fmt::Display for RootCauseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TraceDeadEnd { message, .. } => write!(f, "Trace dead end: {}", message),
-            Self::InvalidEvidenceChain { message, .. } => write!(f, "Invalid evidence chain: {}", message),
-            Self::InsufficientEvidence { message, .. } => write!(f, "Insufficient evidence: {}", message),
+            Self::InvalidEvidenceChain { message, .. } => {
+                write!(f, "Invalid evidence chain: {}", message)
+            }
+            Self::InsufficientEvidence { message, .. } => {
+                write!(f, "Insufficient evidence: {}", message)
+            }
             Self::Internal { message } => write!(f, "Internal error: {}", message),
         }
     }

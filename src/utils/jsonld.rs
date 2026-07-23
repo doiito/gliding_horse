@@ -27,6 +27,8 @@ pub fn extract_id(value: &Value) -> Option<String> {
 
 /// Helper to extract @type from a JSON-LD document
 pub fn extract_type(value: &Value) -> Option<String> {
-    value.get("@type").and_then(|v| v.as_str()).map(String::from)
+    value
+        .get("@type")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
-

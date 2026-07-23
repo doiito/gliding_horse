@@ -79,12 +79,45 @@ pub fn extract_namespace_from_iri(iri: &str) -> Option<String> {
 
 /// All known IRI namespaces (should match format!("iri://{}/...", ns) in code)
 pub const KNOWN_NAMESPACES: &[&str] = &[
-    "agent", "approval", "archive", "chat", "checkpoint", "concept",
-    "emphasis", "entity", "experience", "fragment", "item", "knowledge",
-    "mcp", "mem", "memory", "moc", "node", "plan", "project", "rag",
-    "schema", "sec", "session", "share", "skill", "skills", "skill-types",
-    "stage", "statement", "stream", "system", "task", "template", "test",
-    "tmpl", "exp", "adv", "tool-result", "whitelist",
+    "agent",
+    "approval",
+    "archive",
+    "chat",
+    "checkpoint",
+    "concept",
+    "emphasis",
+    "entity",
+    "experience",
+    "fragment",
+    "item",
+    "knowledge",
+    "mcp",
+    "mem",
+    "memory",
+    "moc",
+    "node",
+    "plan",
+    "project",
+    "rag",
+    "schema",
+    "sec",
+    "session",
+    "share",
+    "skill",
+    "skills",
+    "skill-types",
+    "stage",
+    "statement",
+    "stream",
+    "system",
+    "task",
+    "template",
+    "test",
+    "tmpl",
+    "exp",
+    "adv",
+    "tool-result",
+    "whitelist",
 ];
 
 pub fn is_valid_namespace(namespace: &str) -> bool {
@@ -162,7 +195,10 @@ mod tests {
         assert_eq!(result, Some(("task".to_string(), "123".to_string())));
 
         let result2 = parse_iri("iri://agent/agent-001");
-        assert_eq!(result2, Some(("agent".to_string(), "agent-001".to_string())));
+        assert_eq!(
+            result2,
+            Some(("agent".to_string(), "agent-001".to_string()))
+        );
 
         let result3 = parse_iri("invalid_iri");
         assert_eq!(result3, None);
@@ -229,15 +265,27 @@ mod tests {
 
     #[test]
     fn test_extract_id_from_iri() {
-        assert_eq!(extract_id_from_iri("iri://task/123"), Some("123".to_string()));
-        assert_eq!(extract_id_from_iri("iri://agent/agent-001"), Some("agent-001".to_string()));
+        assert_eq!(
+            extract_id_from_iri("iri://task/123"),
+            Some("123".to_string())
+        );
+        assert_eq!(
+            extract_id_from_iri("iri://agent/agent-001"),
+            Some("agent-001".to_string())
+        );
         assert_eq!(extract_id_from_iri("invalid"), None);
     }
 
     #[test]
     fn test_extract_namespace_from_iri() {
-        assert_eq!(extract_namespace_from_iri("iri://task/123"), Some("task".to_string()));
-        assert_eq!(extract_namespace_from_iri("iri://agent/agent-001"), Some("agent".to_string()));
+        assert_eq!(
+            extract_namespace_from_iri("iri://task/123"),
+            Some("task".to_string())
+        );
+        assert_eq!(
+            extract_namespace_from_iri("iri://agent/agent-001"),
+            Some("agent".to_string())
+        );
         assert_eq!(extract_namespace_from_iri("invalid"), None);
     }
 
@@ -246,9 +294,18 @@ mod tests {
         assert!(is_valid_namespace("task"));
         assert!(is_valid_namespace("agent"));
         assert!(is_valid_namespace("skill"));
-assert!(is_valid_namespace("entity"), "Extended namespace should be recognized");
-assert!(is_valid_namespace("share"), "Extended namespace should be recognized");
-assert!(is_valid_namespace("knowledge"), "Extended namespace should be recognized");
+        assert!(
+            is_valid_namespace("entity"),
+            "Extended namespace should be recognized"
+        );
+        assert!(
+            is_valid_namespace("share"),
+            "Extended namespace should be recognized"
+        );
+        assert!(
+            is_valid_namespace("knowledge"),
+            "Extended namespace should be recognized"
+        );
         assert!(!is_valid_namespace("invalid_namespace"));
     }
 

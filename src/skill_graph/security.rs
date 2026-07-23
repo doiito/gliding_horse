@@ -70,8 +70,8 @@ impl SignatureInfo {
                 message: format!("Invalid public key encoding: {}", e),
             })?;
 
-        let verifier = crate::core::validation::SignatureVerifier::new()
-            .with_public_key(public_key_bytes);
+        let verifier =
+            crate::core::validation::SignatureVerifier::new().with_public_key(public_key_bytes);
 
         verifier.verify(content, &self.signature)
     }
@@ -166,7 +166,9 @@ impl SecurityPolicy {
         if violations.is_empty() {
             SecurityDecision::Allowed
         } else {
-            SecurityDecision::Denied { reasons: violations }
+            SecurityDecision::Denied {
+                reasons: violations,
+            }
         }
     }
 }
@@ -237,6 +239,18 @@ impl SecurityEngine {
         }
     }
 
+    /// Construct an execution engine with an explicit, immutable-at-startup
+    /// allowlist of trusted built-in capabilities. User-defined skills are
+    /// never included implicitly.
+    pub fn with_whitelisted_skills(
+        graph_store: Arc<SkillGraphStore>,
+        whitelisted_skills: HashSet<String>,
+    ) -> Self {
+        let mut engine = Self::new(graph_store);
+        engine.whitelisted_skills = RwLock::new(whitelisted_skills);
+        engine
+    }
+
     fn init_default_policies(policies: &mut HashMap<String, SecurityPolicy>) {
         policies.insert(
             "default".to_string(),
@@ -272,9 +286,12 @@ impl SecurityEngine {
             skill_iri, context.agent_id
         );
 
-        let skill = self.graph_store.get_skill(skill_iri).ok_or_else(|| {
-            CoreError::SkillNotFound { iri: format!("Skill not found: {}", skill_iri) }
-        })?;
+        let skill =
+            self.graph_store
+                .get_skill(skill_iri)
+                .ok_or_else(|| CoreError::SkillNotFound {
+                    iri: format!("Skill not found: {}", skill_iri),
+                })?;
 
         let whitelisted = self.whitelisted_skills.read().await;
         if whitelisted.contains(skill_iri) {
@@ -340,9 +357,12 @@ impl SecurityEngine {
         action: PermissionAction,
         resource: &str,
     ) -> Result<bool, CoreError> {
-        let skill = self.graph_store.get_skill(skill_iri).ok_or_else(|| {
-            CoreError::SkillNotFound { iri: format!("Skill not found: {}", skill_iri) }
-        })?;
+        let skill =
+            self.graph_store
+                .get_skill(skill_iri)
+                .ok_or_else(|| CoreError::SkillNotFound {
+                    iri: format!("Skill not found: {}", skill_iri),
+                })?;
 
         if let Some(ref security_info) = skill.security_info {
             let has_permission = security_info.has_permission(action, resource);
@@ -446,13 +466,11 @@ impl SecurityEngine {
         filtered
     }
 
-    pub async fn request_approval(
-        &self,
-        skill_iri: &str,
-        context: SecurityContext,
-        reason: &str,
-    ) {
-        info!("Requesting approval: skill={}, agent={}", skill_iri, context.agent_id);
+    pub async fn request_approval(&self, skill_iri: &str, context: SecurityContext, reason: &str) {
+        info!(
+            "Requesting approval: skill={}, agent={}",
+            skill_iri, context.agent_id
+        );
 
         let mut queue = self.approval_queue.write().await;
         queue.push((skill_iri.to_string(), context, reason.to_string()));
@@ -483,13 +501,13 @@ impl SecurityEngine {
         queue.len() < initial_len
     }
 
-    pub async fn calculate_risk_score(
-        &self,
-        skill_iri: &str,
-    ) -> Result<f32, CoreError> {
-        let skill = self.graph_store.get_skill(skill_iri).ok_or_else(|| {
-            CoreError::SkillNotFound { iri: format!("Skill not found: {}", skill_iri) }
-        })?;
+    pub async fn calculate_risk_score(&self, skill_iri: &str) -> Result<f32, CoreError> {
+        let skill =
+            self.graph_store
+                .get_skill(skill_iri)
+                .ok_or_else(|| CoreError::SkillNotFound {
+                    iri: format!("Skill not found: {}", skill_iri),
+                })?;
 
         let mut risk_score = 0.0f32;
 
@@ -521,12 +539,17 @@ impl SecurityEngine {
         skill_iri: &str,
         signature_info: &SignatureInfo,
     ) -> Result<bool, CoreError> {
-        let skill = self.graph_store.get_skill(skill_iri).ok_or_else(|| {
-            CoreError::SkillNotFound { iri: skill_iri.to_string() }
-        })?;
+        let skill =
+            self.graph_store
+                .get_skill(skill_iri)
+                .ok_or_else(|| CoreError::SkillNotFound {
+                    iri: skill_iri.to_string(),
+                })?;
 
         let content = serde_json::to_string(&skill.to_json_ld()).map_err(|e| {
-            CoreError::ValidationFailed { message: format!("Failed to serialize skill: {}", e) }
+            CoreError::ValidationFailed {
+                message: format!("Failed to serialize skill: {}", e),
+            }
         })?;
 
         signature_info.verify(&content)
@@ -538,11 +561,10 @@ mod tests {
     use super::*;
 
     fn create_test_skill(iri: &str, trust_level: TrustLevel) -> SkillGraphNode {
-        let security_info = SkillSecurityInfo::new(SkillSource::UserDefined)
-            .with_trust_level(trust_level);
+        let security_info =
+            SkillSecurityInfo::new(SkillSource::UserDefined).with_trust_level(trust_level);
 
-        SkillGraphNode::new(iri, "Test Skill", "A test skill")
-            .with_security_info(security_info)
+        SkillGraphNode::new(iri, "Test Skill", "A test skill").with_security_info(security_info)
     }
 
     #[test]
@@ -565,13 +587,12 @@ mod tests {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
         let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse");
-        let public_key_b64 = base64::engine::general_purpose::STANDARD
-            .encode(key_pair.public_key().as_ref());
+        let public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(key_pair.public_key().as_ref());
 
         let content = "skill-graph-node-payload";
         let signature = key_pair.sign(content.as_bytes());
-        let signature_b64 = base64::engine::general_purpose::STANDARD
-            .encode(signature.as_ref());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.as_ref());
 
         let sig = SignatureInfo::new("ed25519", &public_key_b64, &signature_b64);
 
@@ -606,8 +627,7 @@ mod tests {
 
     #[test]
     fn test_security_policy_check_skill() {
-        let policy = SecurityPolicy::new("test", "Test")
-            .with_min_trust_level(TrustLevel::Medium);
+        let policy = SecurityPolicy::new("test", "Test").with_min_trust_level(TrustLevel::Medium);
 
         let allowed_skill = create_test_skill("iri://skills/allowed", TrustLevel::High);
         let denied_skill = create_test_skill("iri://skills/denied", TrustLevel::Low);
@@ -686,8 +706,8 @@ mod tests {
         let graph_store = Arc::new(SkillGraphStore::new());
         let engine = SecurityEngine::new(graph_store);
 
-        let policy = SecurityPolicy::new("custom", "Custom Policy")
-            .with_min_trust_level(TrustLevel::System);
+        let policy =
+            SecurityPolicy::new("custom", "Custom Policy").with_min_trust_level(TrustLevel::System);
 
         engine.add_policy(policy.clone()).await.unwrap();
 
@@ -700,6 +720,28 @@ mod tests {
 
         let retrieved = engine.get_policy("custom").await;
         assert!(retrieved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_high_risk_system_skill_is_not_silently_allowed() {
+        let graph_store = Arc::new(SkillGraphStore::new());
+        let skill = SkillGraphNode::new("iri://skills/critical", "Critical", "destructive")
+            .with_security_info(
+                SkillSecurityInfo::new(SkillSource::SystemBuiltin)
+                    .with_trust_level(TrustLevel::System)
+                    .with_risk_score(0.9),
+            );
+        graph_store.register_skill(skill).unwrap();
+        let engine = SecurityEngine::new(graph_store);
+
+        let decision = engine
+            .check_execution(
+                "iri://skills/critical",
+                &SecurityContext::new("agent:test", "DA"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(decision, SecurityDecision::Denied { .. }));
     }
 
     #[tokio::test]

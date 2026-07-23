@@ -167,23 +167,22 @@ fn extract_mermaid_blocks(content: &str) -> Vec<MermaidBlock> {
 /// Extract keywords from text for topic shift detection (stop-word filtered)
 fn extract_keywords(text: &str) -> Vec<String> {
     let stop_words = [
-        "a", "an", "the", "is", "are", "was", "were", "be", "been",
-        "being", "have", "has", "had", "do", "does", "did", "will",
-        "would", "could", "should", "may", "might", "shall", "can",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "through", "during", "before", "after", "above",
-        "below", "between", "out", "off", "over", "under", "again",
-        "further", "then", "once", "here", "there", "when", "where",
-        "why", "how", "all", "each", "every", "both", "few", "more",
-        "most", "other", "some", "such", "no", "nor", "not", "only",
-        "own", "same", "so", "than", "too", "very", "just", "because",
-        "and", "but", "or", "if", "while", "that", "this", "it", "its",
-        "i", "me", "my", "we", "our", "you", "your", "he", "she", "they",
-        "what", "which", "who", "about", "use", "used",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "out", "off", "over", "under",
+        "again", "further", "then", "once", "here", "there", "when", "where", "why", "how", "all",
+        "each", "every", "both", "few", "more", "most", "other", "some", "such", "no", "nor",
+        "not", "only", "own", "same", "so", "than", "too", "very", "just", "because", "and", "but",
+        "or", "if", "while", "that", "this", "it", "its", "i", "me", "my", "we", "our", "you",
+        "your", "he", "she", "they", "what", "which", "who", "about", "use", "used",
     ];
 
     text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|w| w.len() > 2 && !stop_words.contains(&w.as_str()))
         .collect()
 }
@@ -202,7 +201,11 @@ fn keyword_overlap(a: &str, b: &str) -> f64 {
 
     let intersection = ka.iter().filter(|k| kb.contains(k)).count() as f64;
     let union = (ka.len() + kb.len()) as f64 - intersection;
-    if union == 0.0 { 1.0 } else { intersection / union }
+    if union == 0.0 {
+        1.0
+    } else {
+        intersection / union
+    }
 }
 
 fn strip_mermaid_fences(content: &str) -> String {
@@ -984,7 +987,12 @@ impl App {
                 .load(std::sync::atomic::Ordering::Relaxed);
             // Lock-free reads from skill graph subsystems
             self.sg_nodes = self.skill_graph.skill_count();
-            self.sg_edges = self.skill_graph.list_all_skills().iter().map(|s| s.links.len()).sum();
+            self.sg_edges = self
+                .skill_graph
+                .list_all_skills()
+                .iter()
+                .map(|s| s.links.len())
+                .sum();
             self.sg_snapshots = self.timeline.snapshot_count();
             self.causal_observations = self.causal_engine.store().total_observations() as u64;
             self.timeline_pending = self.timeline.pending_mutations();
@@ -1236,7 +1244,8 @@ impl App {
 
         // Topic shift detection: compare new input with previous input
         const TOPIC_SHIFT_THRESHOLD: f64 = 0.3;
-        let is_topic_shift = if self.current_task_iri.is_some() && !self.last_user_input.is_empty() {
+        let is_topic_shift = if self.current_task_iri.is_some() && !self.last_user_input.is_empty()
+        {
             let overlap = keyword_overlap(&self.last_user_input, &input);
             overlap < TOPIC_SHIFT_THRESHOLD
         } else {
@@ -1273,7 +1282,7 @@ impl App {
             self.resumed_messages = None; // 新任务：丢弃之前对话历史
             None
         } else {
-            self.resumed_messages.take()  // 同任务：传递历史用于上下文延续
+            self.resumed_messages.take() // 同任务：传递历史用于上下文延续
         };
 
         self.rt.spawn(async move {
@@ -1356,16 +1365,14 @@ impl App {
                 // Capture this turn's conversation history so the next user input
                 // is processed with prior context. The Vec starts with a dummy
                 // "system" entry that BizAgent's resume code skips (skip(1)).
-                let mut conversation: Vec<ChatMessage> = vec![
-                    ChatMessage {
-                        role: "system".to_string(),
-                        content: String::new(),
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    },
-                ];
+                let mut conversation: Vec<ChatMessage> = vec![ChatMessage {
+                    role: "system".to_string(),
+                    content: String::new(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }];
                 // Previous turns' history (if any) accumulated in resumed_messages
                 if let Some(prev) = self.resumed_messages.take() {
                     // Skip the dummy system entry at index 0 — keep real user/assistant pairs

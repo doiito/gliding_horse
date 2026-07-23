@@ -296,13 +296,16 @@ impl WorkspaceMonitor {
                                     let entry = PerceptionEntry::new(
                                         PerceptionSource::WorkspaceMonitor,
                                         format!("New file created: {}", path),
-                                    ).with_priority(6);
+                                    )
+                                    .with_priority(6);
                                     p.store_global(entry);
                                 }
                             }
                             EventType::WorkspaceFileModified => {
                                 let inv = inventory.read();
-                                if inv.get_entry(&path).is_none() && std::path::Path::new(&path).exists() {
+                                if inv.get_entry(&path).is_none()
+                                    && std::path::Path::new(&path).exists()
+                                {
                                     drop(inv);
                                     inventory.read().add_or_update(&path);
                                 }
@@ -319,7 +322,8 @@ impl WorkspaceMonitor {
                                     let entry = PerceptionEntry::new(
                                         PerceptionSource::WorkspaceMonitor,
                                         format!("File externally modified: {}", path),
-                                    ).with_priority(6);
+                                    )
+                                    .with_priority(6);
                                     p.store_global(entry);
                                 }
                             }
@@ -337,7 +341,8 @@ impl WorkspaceMonitor {
                                     let entry = PerceptionEntry::new(
                                         PerceptionSource::WorkspaceMonitor,
                                         format!("File deleted: {}", path),
-                                    ).with_priority(5);
+                                    )
+                                    .with_priority(5);
                                     p.store_global(entry);
                                 }
                             }
@@ -345,10 +350,7 @@ impl WorkspaceMonitor {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            "WorkspaceMonitor event consumer lagged by {} events",
-                            n
-                        );
+                        tracing::warn!("WorkspaceMonitor event consumer lagged by {} events", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         tracing::error!("WorkspaceMonitor event bus connection closed");
@@ -408,14 +410,17 @@ impl WorkspaceMonitor {
                                 serde_json::Value::String(warning.clone()),
                             );
                             // Also write to metadata so ToolGuard pre-injection includes it in system prompt
-                            let injections = ctx.metadata
+                            let injections = ctx
+                                .metadata
                                 .entry("guard_pre_injections".to_string())
                                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
                             if let Some(arr) = injections.as_array_mut() {
                                 arr.push(serde_json::Value::String(warning));
                             }
                         }
-                        FileState::ReadFresh if entry.last_read_version == entry.current_version => {
+                        FileState::ReadFresh
+                            if entry.last_read_version == entry.current_version =>
+                        {
                             // File unchanged since last read — inject hint to skip full re-read
                             ctx.data.insert(
                                 "file_unchanged".to_string(),
@@ -430,7 +435,8 @@ impl WorkspaceMonitor {
                                 serde_json::Value::String(hint.clone()),
                             );
                             // Also write to metadata so ToolGuard pre-injection
-                            let injections = ctx.metadata
+                            let injections = ctx
+                                .metadata
                                 .entry("guard_pre_injections".to_string())
                                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
                             if let Some(arr) = injections.as_array_mut() {
@@ -540,14 +546,28 @@ impl WorkspaceMonitor {
             .unwrap_or_default();
 
         let score_relevance = |path: &str| -> usize {
-            if keywords.is_empty() { return 0; }
+            if keywords.is_empty() {
+                return 0;
+            }
             let path_lower = path.to_lowercase();
-            keywords.iter().filter(|k| path_lower.contains(k.as_str())).count()
+            keywords
+                .iter()
+                .filter(|k| path_lower.contains(k.as_str()))
+                .count()
         };
 
-        let mut stale: Vec<_> = all.iter().filter(|e| e.state == FileState::ReadStale).collect();
-        let mut written_unread: Vec<_> = all.iter().filter(|e| e.state == FileState::WrittenUnread).collect();
-        let discovered: Vec<_> = all.iter().filter(|e| e.state == FileState::Discovered).collect();
+        let mut stale: Vec<_> = all
+            .iter()
+            .filter(|e| e.state == FileState::ReadStale)
+            .collect();
+        let mut written_unread: Vec<_> = all
+            .iter()
+            .filter(|e| e.state == FileState::WrittenUnread)
+            .collect();
+        let discovered: Vec<_> = all
+            .iter()
+            .filter(|e| e.state == FileState::Discovered)
+            .collect();
 
         // Sort by task relevance (highest first)
         stale.sort_by(|a, b| score_relevance(&b.path).cmp(&score_relevance(&a.path)));
@@ -561,18 +581,26 @@ impl WorkspaceMonitor {
             parts.push(format!(
                 "{} externally modified{}",
                 stale.len(),
-                if names.is_empty() { String::new() } else {
+                if names.is_empty() {
+                    String::new()
+                } else {
                     format!(": {}", names.join(", "))
                 }
             ));
         }
 
         if !written_unread.is_empty() {
-            let names: Vec<&str> = written_unread.iter().take(5).map(|e| e.path.as_str()).collect();
+            let names: Vec<&str> = written_unread
+                .iter()
+                .take(5)
+                .map(|e| e.path.as_str())
+                .collect();
             parts.push(format!(
                 "{} written but not re-read{}",
                 written_unread.len(),
-                if names.is_empty() { String::new() } else {
+                if names.is_empty() {
+                    String::new()
+                } else {
                     format!(": {}", names.join(", "))
                 }
             ));
@@ -604,7 +632,8 @@ impl WorkspaceMonitor {
 
         // Count unique directories
         use std::collections::HashSet;
-        let dirs: HashSet<String> = all.iter()
+        let dirs: HashSet<String> = all
+            .iter()
             .filter_map(|e| {
                 let parent = std::path::Path::new(&e.path).parent()?;
                 Some(parent.to_string_lossy().into_owned())
@@ -612,26 +641,42 @@ impl WorkspaceMonitor {
             .collect();
 
         // Count by language
-        let mut lang_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut lang_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for entry in &all {
-            let lang = if entry.language == "unknown" { "other" } else { entry.language.as_str() };
+            let lang = if entry.language == "unknown" {
+                "other"
+            } else {
+                entry.language.as_str()
+            };
             *lang_counts.entry(lang).or_insert(0) += 1;
         }
 
         // Sort by count descending, take top 3
         let mut lang_vec: Vec<(&str, usize)> = lang_counts.into_iter().collect();
         lang_vec.sort_by(|a, b| b.1.cmp(&a.1));
-        let lang_summary = lang_vec.iter().take(3)
+        let lang_summary = lang_vec
+            .iter()
+            .take(3)
             .map(|(l, c)| format!("{} {}", c, l))
             .collect::<Vec<_>>()
             .join(", ");
 
         let summary = if lang_vec.len() > 3 {
-            format!("{} files across {} directories ({} … +{} more)",
-                total, dirs.len(), lang_summary, lang_vec.len() - 3)
+            format!(
+                "{} files across {} directories ({} … +{} more)",
+                total,
+                dirs.len(),
+                lang_summary,
+                lang_vec.len() - 3
+            )
         } else {
-            format!("{} files across {} directories ({})",
-                total, dirs.len(), lang_summary)
+            format!(
+                "{} files across {} directories ({})",
+                total,
+                dirs.len(),
+                lang_summary
+            )
         };
 
         Some(summary)
@@ -711,15 +756,26 @@ mod tests {
         ws.register_hooks(&hm);
 
         let mut ctx = HookContext::new(HookPoint::SkillBefore, "agent_1", "DA");
-        ctx.data.insert("path".to_string(), Value::String(file_path.to_string_lossy().to_string()));
+        ctx.data.insert(
+            "path".to_string(),
+            Value::String(file_path.to_string_lossy().to_string()),
+        );
 
         let result = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(hm.execute(HookPoint::SkillBefore, &mut ctx));
         assert_eq!(result, HookResult::Continue);
 
-        let warning = ctx.data.get("stale_warning").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(warning.contains("stale"), "Expected stale warning, got: {}", warning);
+        let warning = ctx
+            .data
+            .get("stale_warning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            warning.contains("stale"),
+            "Expected stale warning, got: {}",
+            warning
+        );
     }
 
     #[test]
@@ -737,7 +793,10 @@ mod tests {
         ws.register_hooks(&hm);
 
         let mut ctx = HookContext::new(HookPoint::SkillAfter, "agent_1", "DA");
-        ctx.data.insert("path".to_string(), Value::String(file_path.to_string_lossy().to_string()));
+        ctx.data.insert(
+            "path".to_string(),
+            Value::String(file_path.to_string_lossy().to_string()),
+        );
 
         let _ = tokio::runtime::Runtime::new()
             .unwrap()
@@ -778,7 +837,10 @@ mod tests {
 
         let inv = ws.inventory.read();
         let entry = inv.get_entry(&test_file.to_string_lossy());
-        assert!(entry.is_some(), "File should be in inventory after Create event");
+        assert!(
+            entry.is_some(),
+            "File should be in inventory after Create event"
+        );
     }
 
     #[tokio::test]
@@ -803,7 +865,11 @@ mod tests {
             let inv = ws.inventory.read();
             inv.add_or_update(&test_file.to_string_lossy()).unwrap();
         }
-        assert!(ws.inventory.read().get_entry(&test_file.to_string_lossy()).is_some());
+        assert!(ws
+            .inventory
+            .read()
+            .get_entry(&test_file.to_string_lossy())
+            .is_some());
 
         std::fs::remove_file(&test_file).unwrap();
 
@@ -818,7 +884,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let inv = ws.inventory.read();
-        assert!(inv.get_entry(&test_file.to_string_lossy()).is_none(), "File should be removed from inventory");
+        assert!(
+            inv.get_entry(&test_file.to_string_lossy()).is_none(),
+            "File should be removed from inventory"
+        );
     }
 
     #[test]
@@ -898,22 +967,41 @@ mod tests {
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let entry = ws.inventory.read().get_entry(&file_path_str).unwrap();
-        assert_eq!(entry.state, FileState::ReadStale, "File should be stale after modify event");
+        assert_eq!(
+            entry.state,
+            FileState::ReadStale,
+            "File should be stale after modify event"
+        );
 
         // Step 3: Hook SkillBefore read detects stale state
         let mut ctx = HookContext::new(HookPoint::SkillBefore, "agent_1", "DA");
-        ctx.data.insert("path".to_string(), Value::String(file_path_str.clone()));
+        ctx.data
+            .insert("path".to_string(), Value::String(file_path_str.clone()));
         let result = hm.execute(HookPoint::SkillBefore, &mut ctx).await;
         assert_eq!(result, HookResult::Continue);
-        let warning = ctx.data.get("stale_warning").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(warning.contains("stale"), "Expected stale warning in lifecycle: {}", warning);
+        let warning = ctx
+            .data
+            .get("stale_warning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            warning.contains("stale"),
+            "Expected stale warning in lifecycle: {}",
+            warning
+        );
 
         // Step 4: File write → SkillAfter hook marks WrittenUnread
         let mut write_ctx = HookContext::new(HookPoint::SkillAfter, "agent_1", "DA");
-        write_ctx.data.insert("path".to_string(), Value::String(file_path_str.clone()));
+        write_ctx
+            .data
+            .insert("path".to_string(), Value::String(file_path_str.clone()));
         let _ = hm.execute(HookPoint::SkillAfter, &mut write_ctx).await;
         let entry = ws.inventory.read().get_entry(&file_path_str).unwrap();
-        assert_eq!(entry.state, FileState::WrittenUnread, "File should be WrittenUnread after write hook");
+        assert_eq!(
+            entry.state,
+            FileState::WrittenUnread,
+            "File should be WrittenUnread after write hook"
+        );
 
         // Step 5: Remove file + emit remove → consumer removes from inventory
         std::fs::remove_file(&test_file).unwrap();
@@ -948,7 +1036,10 @@ mod tests {
 
         // File is ReadFresh with matching versions — hook should inject file_unchanged
         let mut ctx = HookContext::new(HookPoint::SkillBefore, "agent_1", "DA");
-        ctx.data.insert("path".to_string(), Value::String(file_path.to_string_lossy().to_string()));
+        ctx.data.insert(
+            "path".to_string(),
+            Value::String(file_path.to_string_lossy().to_string()),
+        );
 
         let result = tokio::runtime::Runtime::new()
             .unwrap()
@@ -960,8 +1051,16 @@ mod tests {
             Some(true),
             "Expected file_unchanged flag for ReadFresh file with matching version"
         );
-        let hint = ctx.data.get("file_unchanged_hint").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(hint.contains("unchanged"), "Expected unchanged hint: {}", hint);
+        let hint = ctx
+            .data
+            .get("file_unchanged_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            hint.contains("unchanged"),
+            "Expected unchanged hint: {}",
+            hint
+        );
     }
 
     #[test]
@@ -981,7 +1080,10 @@ mod tests {
         ws.register_hooks(&hm);
 
         let mut ctx = HookContext::new(HookPoint::SkillBefore, "agent_1", "DA");
-        ctx.data.insert("path".to_string(), Value::String(file_path.to_string_lossy().to_string()));
+        ctx.data.insert(
+            "path".to_string(),
+            Value::String(file_path.to_string_lossy().to_string()),
+        );
 
         let _ = tokio::runtime::Runtime::new()
             .unwrap()
@@ -1030,9 +1132,16 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        assert!(ps.has_new("iri://test_task"), "PerceptionStore should have new entry after create event");
+        assert!(
+            ps.has_new("iri://test_task"),
+            "PerceptionStore should have new entry after create event"
+        );
         let text = ps.take_perception_text("iri://test_task");
-        assert!(text.contains("New file"), "Perception text should mention file creation: {}", text);
+        assert!(
+            text.contains("New file"),
+            "Perception text should mention file creation: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -1067,9 +1176,16 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        assert!(ps.has_new("iri://test_task"), "PerceptionStore should have new entry after modify event");
+        assert!(
+            ps.has_new("iri://test_task"),
+            "PerceptionStore should have new entry after modify event"
+        );
         let text = ps.take_perception_text("iri://test_task");
-        assert!(text.contains("externally modified"), "Perception text should mention external change: {}", text);
+        assert!(
+            text.contains("externally modified"),
+            "Perception text should mention external change: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -1103,9 +1219,16 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        assert!(ps.has_new("iri://test_task"), "PerceptionStore should have new entry after remove event");
+        assert!(
+            ps.has_new("iri://test_task"),
+            "PerceptionStore should have new entry after remove event"
+        );
         let text = ps.take_perception_text("iri://test_task");
-        assert!(text.contains("File deleted"), "Perception text should mention file removal: {}", text);
+        assert!(
+            text.contains("File deleted"),
+            "Perception text should mention file removal: {}",
+            text
+        );
     }
 
     #[test]
@@ -1146,7 +1269,11 @@ mod tests {
 
         let text = ps.take_perception_text("iri://task/t");
         assert!(!text.is_empty(), "Should have perception text after inject");
-        assert!(text.contains("stale"), "Should mention stale files: {}", text);
+        assert!(
+            text.contains("stale"),
+            "Should mention stale files: {}",
+            text
+        );
     }
 
     #[test]
@@ -1184,7 +1311,11 @@ mod tests {
         let text = ws.generate_perception_text(None);
         assert!(text.is_some(), "Should generate perception text");
         let t = text.unwrap();
-        assert!(t.contains("files total"), "Should mention total file count: {}", t);
+        assert!(
+            t.contains("files total"),
+            "Should mention total file count: {}",
+            t
+        );
     }
 
     #[test]
@@ -1248,12 +1379,22 @@ mod tests {
 
         // take perception text
         let text1 = ps.take_perception_text("iri://task_full");
-        assert!(!text1.is_empty(), "Perception should be available after create event");
-        assert!(text1.contains("New file"), "Should mention new file: {}", text1);
+        assert!(
+            !text1.is_empty(),
+            "Perception should be available after create event"
+        );
+        assert!(
+            text1.contains("New file"),
+            "Should mention new file: {}",
+            text1
+        );
 
         // Second take should be empty (consumed)
         let text2 = ps.take_perception_text("iri://task_full");
-        assert!(text2.is_empty(), "Second take should be empty after consumption");
+        assert!(
+            text2.is_empty(),
+            "Second take should be empty after consumption"
+        );
     }
 
     // ── New optimization tests ──
@@ -1275,14 +1416,19 @@ mod tests {
         // First call should succeed (inside tokio runtime)
         ws.start_async_components();
 
-        assert!(ws.async_started.load(std::sync::atomic::Ordering::SeqCst),
-            "async_started should be true after first call");
+        assert!(
+            ws.async_started.load(std::sync::atomic::Ordering::SeqCst),
+            "async_started should be true after first call"
+        );
 
         // Second call must not spawn another consumer
         let old_flag = ws.async_started.load(std::sync::atomic::Ordering::SeqCst);
         ws.start_async_components();
-        assert_eq!(ws.async_started.load(std::sync::atomic::Ordering::SeqCst), old_flag,
-            "async_started unchanged after second call");
+        assert_eq!(
+            ws.async_started.load(std::sync::atomic::Ordering::SeqCst),
+            old_flag,
+            "async_started unchanged after second call"
+        );
     }
 
     #[test]
@@ -1297,7 +1443,10 @@ mod tests {
             ..WorkspaceMonitorConfig::default()
         };
         let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
-        assert!(!ws.watch_engine_active(), "No EventBus → watch_engine should be None");
+        assert!(
+            !ws.watch_engine_active(),
+            "No EventBus → watch_engine should be None"
+        );
     }
 
     #[test]
@@ -1334,7 +1483,10 @@ mod tests {
 
         // rescan should return 0 (skipped, or if native watch started, skipped)
         let count = ws.rescan();
-        assert_eq!(count, 0, "rescan should return 0 when watch engine is active or polling is fallback");
+        assert_eq!(
+            count, 0,
+            "rescan should return 0 when watch engine is active or polling is fallback"
+        );
     }
 
     #[test]
@@ -1358,7 +1510,10 @@ mod tests {
 
         // Verify it's in inventory
         let entry = ws.inventory.read().get_entry(&new_file.to_string_lossy());
-        assert!(entry.is_some(), "New file should be in inventory after rescan");
+        assert!(
+            entry.is_some(),
+            "New file should be in inventory after rescan"
+        );
     }
 
     #[test]
@@ -1405,8 +1560,14 @@ mod tests {
 
         // PerceptionStore should have an entry from rescan's inject_file_perception
         let text = ps.take_perception_text("iri://task/rescan_test");
-        assert!(!text.is_empty(), "rescan should inject perception on new files");
-        assert!(text.contains("files total"), "Perception text should contain file summary");
+        assert!(
+            !text.is_empty(),
+            "rescan should inject perception on new files"
+        );
+        assert!(
+            text.contains("files total"),
+            "Perception text should contain file summary"
+        );
     }
 
     #[test]
@@ -1421,7 +1582,10 @@ mod tests {
         let ws = WorkspaceMonitor::initialize(config, None, None).unwrap();
 
         // Empty → None
-        assert!(ws.get_file_inventory_summary().is_none(), "Empty inventory should return None");
+        assert!(
+            ws.get_file_inventory_summary().is_none(),
+            "Empty inventory should return None"
+        );
 
         // Add files
         for name in &["main.rs", "lib.rs", "README.md"] {
@@ -1431,10 +1595,21 @@ mod tests {
         ws.rescan();
 
         let summary = ws.get_file_inventory_summary();
-        assert!(summary.is_some(), "Non-empty inventory should return summary");
+        assert!(
+            summary.is_some(),
+            "Non-empty inventory should return summary"
+        );
         let s = summary.unwrap();
-        assert!(s.contains("files across"), "Summary should mention files/dirs: {}", s);
-        assert!(s.contains("rust"), "Summary should mention rust language: {}", s);
+        assert!(
+            s.contains("files across"),
+            "Summary should mention files/dirs: {}",
+            s
+        );
+        assert!(
+            s.contains("rust"),
+            "Summary should mention rust language: {}",
+            s
+        );
     }
 
     #[test]
@@ -1454,13 +1629,22 @@ mod tests {
         // Add a file so inject_file_perception has content to work with
         let file = dir.path().join("tracked.rs");
         std::fs::write(&file, "fn tracked() {}").unwrap();
-        ws.inventory.read().add_or_update(&file.to_string_lossy()).unwrap();
+        ws.inventory
+            .read()
+            .add_or_update(&file.to_string_lossy())
+            .unwrap();
 
         ws.inject_file_perception(Some("test task"));
-        assert!(ps.has_new("iri://task/check"), "Should have perception after inject");
+        assert!(
+            ps.has_new("iri://task/check"),
+            "Should have perception after inject"
+        );
 
         ws.reset_inventory();
-        assert!(!ps.has_new("iri://task/check"), "Should have no perception after reset");
+        assert!(
+            !ps.has_new("iri://task/check"),
+            "Should have no perception after reset"
+        );
     }
 
     #[test]
@@ -1514,7 +1698,11 @@ mod tests {
 
         // Reset inventory
         ws.reset_inventory();
-        assert_eq!(ws.inventory.read().total_count(), 0, "Inventory should be empty after reset");
+        assert_eq!(
+            ws.inventory.read().total_count(),
+            0,
+            "Inventory should be empty after reset"
+        );
 
         // Rescan should rediscover
         let count = ws.rescan();
@@ -1539,22 +1727,41 @@ mod tests {
         let store = crate::tools::workspace_monitor::ContentStore::new(100, 65536, None);
 
         // Read file1 via read_file (reads disk)
-        let from_disk = store.read_file(&p1s, crate::tools::workspace_monitor::ReadMode::Full).unwrap();
-        assert!(!from_disk.from_cache, "First read_file should not be from cache");
+        let from_disk = store
+            .read_file(&p1s, crate::tools::workspace_monitor::ReadMode::Full)
+            .unwrap();
+        assert!(
+            !from_disk.from_cache,
+            "First read_file should not be from cache"
+        );
 
         // Read file2 via process_content with pre-read content
         let content = std::fs::read_to_string(&p2s).unwrap();
-        let from_content = store.process_content(&p2s, &content, crate::tools::workspace_monitor::ReadMode::Full);
+        let from_content = store.process_content(
+            &p2s,
+            &content,
+            crate::tools::workspace_monitor::ReadMode::Full,
+        );
 
         // Both should have version 1 (first read)
         assert_eq!(from_disk.version, 1);
         assert_eq!(from_content.version, 1);
-        assert!(!from_content.from_cache, "First process_content should not be from cache");
+        assert!(
+            !from_content.from_cache,
+            "First process_content should not be from cache"
+        );
         assert_eq!(from_content.lines.len(), 1, "Should have 1 line of content");
 
         // Second call via process_content on SAME file should be cache hit
-        let cached = store.process_content(&p2s, &content, crate::tools::workspace_monitor::ReadMode::Full);
-        assert!(cached.from_cache, "Second process_content should return from_cache=true");
+        let cached = store.process_content(
+            &p2s,
+            &content,
+            crate::tools::workspace_monitor::ReadMode::Full,
+        );
+        assert!(
+            cached.from_cache,
+            "Second process_content should return from_cache=true"
+        );
         assert_eq!(cached.version, 1, "Version should not change on cache hit");
     }
 
@@ -1569,7 +1776,11 @@ mod tests {
 
         // First read
         let r1_content = std::fs::read_to_string(&path_str).unwrap();
-        let r1 = store.process_content(&path_str, &r1_content, crate::tools::workspace_monitor::ReadMode::Full);
+        let r1 = store.process_content(
+            &path_str,
+            &r1_content,
+            crate::tools::workspace_monitor::ReadMode::Full,
+        );
         assert_eq!(r1.version, 1);
 
         // Modify file
@@ -1577,11 +1788,18 @@ mod tests {
 
         // Read via process_content again with Diff mode
         let r2_content = std::fs::read_to_string(&path_str).unwrap();
-        let r2 = store.process_content(&path_str, &r2_content, crate::tools::workspace_monitor::ReadMode::Diff);
+        let r2 = store.process_content(
+            &path_str,
+            &r2_content,
+            crate::tools::workspace_monitor::ReadMode::Diff,
+        );
 
         assert_eq!(r2.version, 2, "Version should increment on change");
         assert!(r2.changed, "Changed flag should be true");
         assert!(r2.unified_diff.is_some(), "Diff should be computed");
-        assert!(r2.unified_diff.as_ref().unwrap().contains("modified"), "Diff should contain the modified line");
+        assert!(
+            r2.unified_diff.as_ref().unwrap().contains("modified"),
+            "Diff should contain the modified line"
+        );
     }
 }

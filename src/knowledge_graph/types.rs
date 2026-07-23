@@ -9,14 +9,37 @@ pub struct OntologyTerm {
 }
 
 impl OntologyTerm {
-    pub fn class(iri: impl Into<String>, label: impl Into<String>, description: impl Into<String>) -> Self {
-        Self { iri: iri.into(), label: label.into(), description: description.into(), term_type: OntologyTermType::Class }
+    pub fn class(
+        iri: impl Into<String>,
+        label: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            iri: iri.into(),
+            label: label.into(),
+            description: description.into(),
+            term_type: OntologyTermType::Class,
+        }
     }
-    pub fn relation(iri: impl Into<String>, label: impl Into<String>, description: impl Into<String>) -> Self {
-        Self { iri: iri.into(), label: label.into(), description: description.into(), term_type: OntologyTermType::Relation }
+    pub fn relation(
+        iri: impl Into<String>,
+        label: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            iri: iri.into(),
+            label: label.into(),
+            description: description.into(),
+            term_type: OntologyTermType::Relation,
+        }
     }
     pub fn property(iri: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { iri: iri.into(), label: label.into(), description: String::new(), term_type: OntologyTermType::Property }
+        Self {
+            iri: iri.into(),
+            label: label.into(),
+            description: String::new(),
+            term_type: OntologyTermType::Property,
+        }
     }
 }
 

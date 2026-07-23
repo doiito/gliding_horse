@@ -117,6 +117,14 @@ impl SkillSecurityInfo {
         self
     }
 
+    /// Sets the risk of the operation independently of the provenance trust.
+    /// A system-provided skill may be authentic while still requiring stricter
+    /// handling because it can perform a destructive operation.
+    pub fn with_risk_score(mut self, score: f32) -> Self {
+        self.risk_score = score.clamp(0.0, 1.0);
+        self
+    }
+
     pub fn with_permission(mut self, permission: SkillPermission) -> Self {
         self.permissions.push(permission);
         self
@@ -166,8 +174,12 @@ impl SkillSecurityInfo {
             SkillSource::Imported => 0.25,
         };
 
-        let signature_modifier = if self.signature.is_some() { -0.1f32 } else { 0.1f32 };
-        
+        let signature_modifier = if self.signature.is_some() {
+            -0.1f32
+        } else {
+            0.1f32
+        };
+
         self.risk_score = (base_score + source_modifier + signature_modifier).clamp(0.0, 1.0);
     }
 }
@@ -384,14 +396,14 @@ impl SkillGraphMeta {
     pub fn record_usage(&mut self, success: bool) {
         let old_count = self.usage_count;
         self.usage_count += 1;
-        
+
         let old_rate = self.success_rate;
         self.success_rate = if success {
             (old_rate * old_count as f32 + 1.0) / self.usage_count as f32
         } else {
             (old_rate * old_count as f32) / self.usage_count as f32
         };
-        
+
         self.last_verified_at = Some(Utc::now());
     }
 }
@@ -571,26 +583,28 @@ impl SkillGraphNode {
     }
 
     /// Convert a `SkillMeta` (from SkillRegistry) into a `SkillGraphNode`.
-    /// Tags are populated from `category` and `skill_types`; security info
-    /// maps the security_level string to a `TrustLevel`.
+    /// Tags are populated from `category` and `skill_types`. Provenance trust
+    /// and operation risk are deliberately separate: `security_level` affects
+    /// the latter and must not silently turn a critical operation into a
+    /// zero-risk system operation.
     pub fn from_skill_meta(meta: &crate::tools::skill_registry::SkillMeta) -> Self {
         let mut tags: Vec<String> = meta.skill_types.clone();
         if !tags.contains(&meta.category) {
             tags.push(meta.category.clone());
         }
 
-        let trust = match meta.security_level.as_str() {
-            "critical" => TrustLevel::System,
-            "high" => TrustLevel::High,
-            "normal" => TrustLevel::Medium,
-            "low" => TrustLevel::Low,
-            _ => TrustLevel::Medium,
+        let operation_risk = match meta.security_level.as_str() {
+            "critical" => 0.9,
+            "high" => 0.7,
+            "normal" => 0.3,
+            "low" => 0.1,
+            _ => 0.5,
         };
         let security = SkillSecurityInfo::new(SkillSource::SystemBuiltin)
-            .with_trust_level(trust);
+            .with_trust_level(TrustLevel::System)
+            .with_risk_score(operation_risk);
 
-        let w2h = Skill5W2H::new(&meta.name, &meta.description)
-            .with_agent_role("DA");
+        let w2h = Skill5W2H::new(&meta.name, &meta.description).with_agent_role("DA");
 
         Self {
             skill_iri: meta.skill_iri.clone(),
@@ -619,14 +633,18 @@ impl SkillGraphNode {
     }
 
     pub fn is_bootstrap(&self) -> bool {
-        matches!(self.node_type, SkillNodeType::Bootstrap) ||
-        self.security_info.as_ref().map_or(false, |s| 
-            matches!(s.source, SkillSource::BootstrapLearn | SkillSource::BootstrapReduce)
-        )
+        matches!(self.node_type, SkillNodeType::Bootstrap)
+            || self.security_info.as_ref().map_or(false, |s| {
+                matches!(
+                    s.source,
+                    SkillSource::BootstrapLearn | SkillSource::BootstrapReduce
+                )
+            })
     }
 
     pub fn get_trust_level(&self) -> TrustLevel {
-        self.security_info.as_ref()
+        self.security_info
+            .as_ref()
             .map(|s| s.trust_level)
             .unwrap_or(TrustLevel::Medium)
     }
@@ -1100,12 +1118,14 @@ impl MCPSkillMapping {
     }
 
     pub fn with_param_mapping(mut self, skill_param: &str, mcp_param: &str) -> Self {
-        self.parameter_mapping.insert(skill_param.to_string(), mcp_param.to_string());
+        self.parameter_mapping
+            .insert(skill_param.to_string(), mcp_param.to_string());
         self
     }
 
     pub fn with_result_mapping(mut self, skill_result: &str, mcp_result: &str) -> Self {
-        self.result_mapping.insert(skill_result.to_string(), mcp_result.to_string());
+        self.result_mapping
+            .insert(skill_result.to_string(), mcp_result.to_string());
         self
     }
 }
@@ -1171,7 +1191,10 @@ impl Hyperedge {
 
 /// P1-3 causal event type, superseded by `causal::types::CausalObservation`.
 /// Use `CausalObservation` for new code.
-#[deprecated(since = "0.1.2", note = "Use crate::causal::types::CausalObservation instead")]
+#[deprecated(
+    since = "0.1.2",
+    note = "Use crate::causal::types::CausalObservation instead"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CausalEvent {
     pub event_id: String,
@@ -1184,7 +1207,10 @@ pub struct CausalEvent {
 }
 
 /// Superseded by `causal::types::CausalInference`.
-#[deprecated(since = "0.1.2", note = "Use crate::causal::types::CausalInference instead")]
+#[deprecated(
+    since = "0.1.2",
+    note = "Use crate::causal::types::CausalInference instead"
+)]
 #[allow(deprecated)]
 #[derive(Debug, Clone)]
 pub struct CausalChain {
@@ -1194,7 +1220,10 @@ pub struct CausalChain {
 }
 
 /// Superseded by `CausalModelStore` + `CausalEngine`.
-#[deprecated(since = "0.1.2", note = "Use crate::causal::store::CausalModelStore instead")]
+#[deprecated(
+    since = "0.1.2",
+    note = "Use crate::causal::store::CausalModelStore instead"
+)]
 #[allow(deprecated)]
 #[derive(Debug, Clone)]
 pub struct SkillCausalModel {
@@ -1221,7 +1250,10 @@ impl SkillCausalModel {
     }
 
     pub fn record_failure(&mut self, skill_iri: &str, error_sig: &str) {
-        let profile = self.error_profiles.entry(skill_iri.to_string()).or_default();
+        let profile = self
+            .error_profiles
+            .entry(skill_iri.to_string())
+            .or_default();
         *profile.entry(error_sig.to_string()).or_insert(0) += 1;
     }
 
@@ -1354,7 +1386,7 @@ mod tests {
     #[test]
     fn test_skill_graph_meta() {
         let mut meta = SkillGraphMeta::new();
-        
+
         meta.record_usage(true);
         assert_eq!(meta.usage_count, 1);
         assert_eq!(meta.success_rate, 1.0);
@@ -1388,7 +1420,8 @@ mod tests {
             "iri://skills/rust-jwt-auth",
             "Key rotation causes token invalidation",
             "Use JWKS for graceful key rotation",
-        ).with_discoverer("agent:ca/inst-001");
+        )
+        .with_discoverer("agent:ca/inst-001");
 
         assert_eq!(fragment.attached_to, "iri://skills/rust-jwt-auth");
         assert!(fragment.discovered_by.is_some());
@@ -1396,17 +1429,21 @@ mod tests {
 
     #[test]
     fn test_to_json_ld() {
-        let node = SkillGraphNode::new(
-            "iri://skills/test",
-            "Test Skill",
-            "A test skill",
-        ).with_tag("testing");
+        let node = SkillGraphNode::new("iri://skills/test", "Test Skill", "A test skill")
+            .with_tag("testing");
 
         let json = node.to_json_ld();
-        
-        assert_eq!(json.get("@id").and_then(|v| v.as_str()), Some("iri://skills/test"));
+
+        assert_eq!(
+            json.get("@id").and_then(|v| v.as_str()),
+            Some("iri://skills/test")
+        );
         assert!(json.get("skill:5W2H").is_some());
-        assert!(json.get("skill:tags").and_then(|v| v.as_array()).unwrap().contains(&serde_json::json!("testing")));
+        assert!(json
+            .get("skill:tags")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .contains(&serde_json::json!("testing")));
     }
 
     #[test]
@@ -1414,7 +1451,7 @@ mod tests {
         assert!(TrustLevel::System.can_execute(TrustLevel::High));
         assert!(TrustLevel::High.can_execute(TrustLevel::Medium));
         assert!(!TrustLevel::Low.can_execute(TrustLevel::High));
-        
+
         assert_eq!(TrustLevel::from_success_rate(0.96), TrustLevel::High);
         assert_eq!(TrustLevel::from_success_rate(0.85), TrustLevel::Medium);
         assert_eq!(TrustLevel::from_success_rate(0.65), TrustLevel::Low);
@@ -1433,7 +1470,7 @@ mod tests {
             });
 
         security.update_risk_score();
-        
+
         assert!(security.has_permission(PermissionAction::Read, "/files/test.txt"));
         assert!(!security.has_permission(PermissionAction::Write, "/files/test.txt"));
         assert!(security.risk_score > 0.0);
@@ -1446,7 +1483,8 @@ mod tests {
             "agent:da/inst-001",
             "iri://skills/test",
             AuditOutcome::Success,
-        ).with_details("Execution completed successfully");
+        )
+        .with_details("Execution completed successfully");
 
         assert_eq!(entry.action, "skill_execute");
         assert_eq!(entry.outcome, AuditOutcome::Success);
@@ -1459,8 +1497,9 @@ mod tests {
             ConflictType::Resource,
             vec!["iri://skills/a".to_string(), "iri://skills/b".to_string()],
             "Both skills access the same resource",
-        ).with_severity(ConflictSeverity::High)
-         .mark_auto_resolvable();
+        )
+        .with_severity(ConflictSeverity::High)
+        .mark_auto_resolvable();
 
         assert_eq!(conflict.conflict_type, ConflictType::Resource);
         assert_eq!(conflict.severity, ConflictSeverity::High);
@@ -1473,7 +1512,8 @@ mod tests {
         let resolution = ConflictResolution::new(
             ResolutionStrategy::PreferHigherTrust,
             "Selected skill with higher trust level",
-        ).with_resolver("agent:sa/inst-001");
+        )
+        .with_resolver("agent:sa/inst-001");
 
         assert_eq!(resolution.strategy, ResolutionStrategy::PreferHigherTrust);
         assert!(resolution.resolved_by.is_some());
@@ -1481,11 +1521,9 @@ mod tests {
 
     #[test]
     fn test_bootstrap_source() {
-        let source = BootstrapSource::new(
-            BootstrapSourceType::TaskExecution,
-            "agent:da/inst-001",
-        ).with_task("iri://task/abc")
-         .with_quality_score(0.85);
+        let source = BootstrapSource::new(BootstrapSourceType::TaskExecution, "agent:da/inst-001")
+            .with_task("iri://task/abc")
+            .with_quality_score(0.85);
 
         assert_eq!(source.source_type, BootstrapSourceType::TaskExecution);
         assert!(source.task_iri.is_some());
@@ -1496,7 +1534,7 @@ mod tests {
     fn test_skill_bootstrap_meta() {
         let mut meta = SkillBootstrapMeta::new();
         let source = BootstrapSource::new(BootstrapSourceType::TaskExecution, "agent:da/inst-001");
-        
+
         meta.record_learn(source);
         meta.record_reduce("iri://skills/derived");
         meta.set_parent("iri://skills/parent");
@@ -1505,7 +1543,9 @@ mod tests {
         assert_eq!(meta.reduce_count, 1);
         assert!(meta.last_bootstrap_at.is_some());
         assert!(meta.parent_skill_iri.is_some());
-        assert!(meta.derived_skills.contains(&"iri://skills/derived".to_string()));
+        assert!(meta
+            .derived_skills
+            .contains(&"iri://skills/derived".to_string()));
     }
 
     #[test]
@@ -1514,8 +1554,9 @@ mod tests {
             "iri://skills/file-read",
             "mcp-server-filesystem",
             "read_file",
-        ).with_param_mapping("file_path", "path")
-         .with_result_mapping("content", "data");
+        )
+        .with_param_mapping("file_path", "path")
+        .with_result_mapping("content", "data");
 
         assert_eq!(mapping.skill_iri, "iri://skills/file-read");
         assert_eq!(mapping.mcp_server_id, "mcp-server-filesystem");
@@ -1526,14 +1567,15 @@ mod tests {
 
     #[test]
     fn test_skill_node_with_security() {
-        let security = SkillSecurityInfo::new(SkillSource::SystemBuiltin)
-            .with_trust_level(TrustLevel::System);
-        
+        let security =
+            SkillSecurityInfo::new(SkillSource::SystemBuiltin).with_trust_level(TrustLevel::System);
+
         let node = SkillGraphNode::new(
             "iri://skills/system-skill",
             "System Skill",
             "A system skill",
-        ).with_security_info(security);
+        )
+        .with_security_info(security);
 
         assert!(node.can_execute(TrustLevel::High));
         assert_eq!(node.get_trust_level(), TrustLevel::System);
@@ -1543,11 +1585,8 @@ mod tests {
 
     #[test]
     fn test_skill_node_mcp() {
-        let node = SkillGraphNode::new(
-            "iri://skills/mcp-skill",
-            "MCP Skill",
-            "An MCP tool skill",
-        ).with_mcp_server("mcp-server-001");
+        let node = SkillGraphNode::new("iri://skills/mcp-skill", "MCP Skill", "An MCP tool skill")
+            .with_mcp_server("mcp-server-001");
 
         assert!(node.is_mcp_tool());
         assert_eq!(node.node_type, SkillNodeType::MCPTool);
@@ -1556,11 +1595,8 @@ mod tests {
 
     #[test]
     fn test_storage_tier() {
-        let node = SkillGraphNode::new(
-            "iri://skills/test",
-            "Test",
-            "Test skill",
-        ).with_storage_tier(StorageTier::L2Blackboard);
+        let node = SkillGraphNode::new("iri://skills/test", "Test", "Test skill")
+            .with_storage_tier(StorageTier::L2Blackboard);
 
         assert_eq!(node.storage_tier, StorageTier::L2Blackboard);
     }
@@ -1573,9 +1609,13 @@ mod tests {
             "hyperedge:auth",
             "Auth Pipeline",
             "Authentication pipeline",
-            vec!["iri://skills/login".to_string(), "iri://skills/jwt".to_string()],
-        ).with_composition_type(CompositionType::Conjunction)
-         .with_weight(0.9);
+            vec![
+                "iri://skills/login".to_string(),
+                "iri://skills/jwt".to_string(),
+            ],
+        )
+        .with_composition_type(CompositionType::Conjunction)
+        .with_weight(0.9);
 
         assert_eq!(he.hyperedge_id, "hyperedge:auth");
         assert_eq!(he.components.len(), 2);
@@ -1594,11 +1634,15 @@ mod tests {
                 "iri://skills/test".to_string(),
                 "iri://skills/deploy".to_string(),
             ],
-        ).with_composition_type(CompositionType::Pipeline)
-         .with_target("iri://skills/deploy-pipeline");
+        )
+        .with_composition_type(CompositionType::Pipeline)
+        .with_target("iri://skills/deploy-pipeline");
 
         assert_eq!(he.composition_type, CompositionType::Pipeline);
-        assert_eq!(he.target_composite, Some("iri://skills/deploy-pipeline".to_string()));
+        assert_eq!(
+            he.target_composite,
+            Some("iri://skills/deploy-pipeline".to_string())
+        );
     }
 
     #[test]
@@ -1612,7 +1656,8 @@ mod tests {
                 "iri://skills/b".to_string(),
                 "iri://skills/c".to_string(),
             ],
-        ).with_composition_type(CompositionType::AtLeast(2));
+        )
+        .with_composition_type(CompositionType::AtLeast(2));
 
         assert_eq!(he.composition_type, CompositionType::AtLeast(2));
     }
@@ -1656,9 +1701,18 @@ mod tests {
     #[test]
     fn test_fused_hit_ordering() {
         let mut hits = vec![
-            FusedHit { iri: "iri://skills/a".to_string(), score: 0.5 },
-            FusedHit { iri: "iri://skills/b".to_string(), score: 0.8 },
-            FusedHit { iri: "iri://skills/c".to_string(), score: 0.3 },
+            FusedHit {
+                iri: "iri://skills/a".to_string(),
+                score: 0.5,
+            },
+            FusedHit {
+                iri: "iri://skills/b".to_string(),
+                score: 0.8,
+            },
+            FusedHit {
+                iri: "iri://skills/c".to_string(),
+                score: 0.3,
+            },
         ];
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         assert_eq!(hits[0].iri, "iri://skills/b");
@@ -1697,12 +1751,24 @@ mod tests {
 
     #[test]
     fn test_skill_link_type_sparql_uri() {
-        assert_eq!(SkillLinkType::Prerequisite.as_sparql_uri(), "skill:Prerequisite");
-        assert_eq!(SkillLinkType::Composition.as_sparql_uri(), "skill:Composition");
+        assert_eq!(
+            SkillLinkType::Prerequisite.as_sparql_uri(),
+            "skill:Prerequisite"
+        );
+        assert_eq!(
+            SkillLinkType::Composition.as_sparql_uri(),
+            "skill:Composition"
+        );
         assert_eq!(SkillLinkType::Related.as_sparql_uri(), "skill:Related");
-        assert_eq!(SkillLinkType::Alternative.as_sparql_uri(), "skill:Alternative");
+        assert_eq!(
+            SkillLinkType::Alternative.as_sparql_uri(),
+            "skill:Alternative"
+        );
         assert_eq!(SkillLinkType::Extends.as_sparql_uri(), "skill:Extends");
-        assert_eq!(SkillLinkType::Generalization.as_sparql_uri(), "skill:Generalization");
+        assert_eq!(
+            SkillLinkType::Generalization.as_sparql_uri(),
+            "skill:Generalization"
+        );
     }
 
     #[test]
@@ -1751,15 +1817,18 @@ mod tests {
         assert_eq!(node.version, "1.0.0");
         assert_eq!(node.node_type, SkillNodeType::Atomic);
         assert!(node.tags.contains(&"file".to_string()));
-        assert!(node.tags.contains(&"iri://skill-types/FileOperation".to_string()));
+        assert!(node
+            .tags
+            .contains(&"iri://skill-types/FileOperation".to_string()));
         let sec = node.security_info.expect("security_info should be set");
         assert_eq!(sec.source, SkillSource::SystemBuiltin);
-        assert_eq!(sec.trust_level, TrustLevel::Medium);
+        assert_eq!(sec.trust_level, TrustLevel::System);
+        assert!((sec.risk_score - 0.3).abs() < f32::EPSILON);
     }
 
     #[test]
     fn test_from_skill_meta_security_level_mapping() {
-        let check = |level: &str, expected: TrustLevel| {
+        let check = |level: &str, expected_risk: f32| {
             let meta = crate::tools::skill_registry::SkillMeta {
                 skill_iri: format!("iri://skills/{}", level),
                 name: level.to_string(),
@@ -1778,12 +1847,14 @@ mod tests {
                 skill_types: vec![],
             };
             let node = SkillGraphNode::from_skill_meta(&meta);
-            assert_eq!(node.security_info.unwrap().trust_level, expected);
+            let security = node.security_info.unwrap();
+            assert_eq!(security.trust_level, TrustLevel::System);
+            assert!((security.risk_score - expected_risk).abs() < f32::EPSILON);
         };
-        check("critical", TrustLevel::System);
-        check("high", TrustLevel::High);
-        check("normal", TrustLevel::Medium);
-        check("low", TrustLevel::Low);
-        check("unknown", TrustLevel::Medium);
+        check("critical", 0.9);
+        check("high", 0.7);
+        check("normal", 0.3);
+        check("low", 0.1);
+        check("unknown", 0.5);
     }
 }

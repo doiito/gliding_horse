@@ -9,14 +9,14 @@ use crate::core::perception_store::PerceptionStore;
 use crate::core::relevance_tracker::RelevanceTracker;
 use crate::core::supplementary_store::SupplementaryInputStore;
 use crate::jsonld::type_router::TypeRouter;
+use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::prefetch_engine::PrefetchEngine;
 use crate::memory::scheduler::MemoryScheduler;
-use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::EmbeddingService;
-use crate::perception::proactive_engine::ProactiveEngine;
 #[cfg(feature = "ontology")]
 use crate::ontology_bridge::OntologyBridgeManager;
+use crate::perception::proactive_engine::ProactiveEngine;
 use crate::skill_graph::discovery::SkillDiscoveryEngine;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::sharing::SharingProtocol;
@@ -65,7 +65,14 @@ impl SupervisorAgent {
         event_bus: Arc<EventBus>,
         max_iterations: u32,
     ) -> Self {
-        Self::with_pdca_cycles(runner, template_engine, skills, event_bus, max_iterations, 7)
+        Self::with_pdca_cycles(
+            runner,
+            template_engine,
+            skills,
+            event_bus,
+            max_iterations,
+            7,
+        )
     }
 
     pub fn with_pdca_cycles(
@@ -178,7 +185,9 @@ impl SupervisorAgent {
     pub fn set_model(&self, model: &str) {
         self.runner.gateway.set_default_model(model.to_string());
         for task_type in &["planning", "execution", "analysis", "default"] {
-            self.runner.gateway.set_model_mapping(task_type.to_string(), model.to_string());
+            self.runner
+                .gateway
+                .set_model_mapping(task_type.to_string(), model.to_string());
         }
     }
 

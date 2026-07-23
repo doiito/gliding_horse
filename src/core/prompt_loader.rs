@@ -26,7 +26,11 @@ pub struct PromptConfig {
 
 impl Default for PromptConfig {
     fn default() -> Self {
-        Self { user_prefix: None, role_overrides: HashMap::new(), env_refs: Vec::new() }
+        Self {
+            user_prefix: None,
+            role_overrides: HashMap::new(),
+            env_refs: Vec::new(),
+        }
     }
 }
 
@@ -39,7 +43,11 @@ pub struct PromptLoader {
 
 impl PromptLoader {
     pub fn new(config: PromptConfig, engine: Arc<TemplateEngine>) -> Self {
-        Self { config, engine, file_cache: std::sync::Mutex::new(HashMap::new()) }
+        Self {
+            config,
+            engine,
+            file_cache: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// File read cache with mtime check. Skips IO when file hasn't changed.
@@ -69,7 +77,10 @@ impl PromptLoader {
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_default();
         if !home.is_empty() {
-            let path = PathBuf::from(&home).join(".gliding_horse").join("prompts").join(&fname);
+            let path = PathBuf::from(&home)
+                .join(".gliding_horse")
+                .join("prompts")
+                .join(&fname);
             if let Some(content) = self.read_cached(&path) {
                 return self.post_process(role, &Self::render_string(&content, vars));
             }
@@ -102,7 +113,10 @@ impl PromptLoader {
         }
 
         if let Some(ref override_content) = self.config.role_overrides.get(role) {
-            result = format!("{}\n\n---\n\n## User Additional Constraints\n{}", result, override_content);
+            result = format!(
+                "{}\n\n---\n\n## User Additional Constraints\n{}",
+                result, override_content
+            );
         }
 
         result
@@ -114,7 +128,9 @@ impl PromptLoader {
             let placeholder = format!("{{{}}}", key);
             let replacement = match value {
                 Value::String(s) => s.clone(),
-                Value::Object(_) | Value::Array(_) => serde_json::to_string_pretty(value).unwrap_or_default(),
+                Value::Object(_) | Value::Array(_) => {
+                    serde_json::to_string_pretty(value).unwrap_or_default()
+                }
                 Value::Null => String::new(),
                 _ => value.to_string(),
             };

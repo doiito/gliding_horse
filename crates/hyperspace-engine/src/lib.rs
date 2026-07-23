@@ -38,11 +38,13 @@ pub mod wal;
 pub use config::HyperspaceEngineConfig;
 pub use engine::{HyperspaceEngine, HyperspaceEngineImpl, IriRegistry, SearchHit, Searcher};
 pub use error::EngineError;
-pub use filter::{compile_filter, CompiledFilter, JsonLdFilter};
+pub use filter::{compile_filter, CompiledFilter, FilterEvaluation, JsonLdFilter};
 pub use hnsw::{HnswConfig, IncrementalHNSW, SerializableNode};
 pub use hyper_vector::{EmbeddingVector, MetricKind};
 pub use jsonld_meta::JsonLdMetadataIndex;
-pub use metric::{metric_from_kind, CosineMetric, EuclideanMetric, LorentzMetric, Metric, PoincareMetric};
+pub use metric::{
+    metric_from_kind, CosineMetric, EuclideanMetric, LorentzMetric, Metric, PoincareMetric,
+};
 pub use snapshot::{load_snapshot, save_snapshot, EngineSnapshot};
 pub use storage::VectorStore;
 pub use tangent::TangentCache;

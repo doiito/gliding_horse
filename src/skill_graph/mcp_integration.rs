@@ -122,7 +122,10 @@ impl MCPRegistry {
 
     pub async fn register_server(&self, config: MCPServerConfig) -> Result<(), CoreError> {
         let server_id = config.server_id.clone();
-        info!("Registering MCP server: {} ({})", config.server_name, server_id);
+        info!(
+            "Registering MCP server: {} ({})",
+            config.server_name, server_id
+        );
 
         let mut servers = self.servers.write().await;
         servers.insert(server_id, config);
@@ -132,15 +135,15 @@ impl MCPRegistry {
     pub async fn unregister_server(&self, server_id: &str) -> Result<bool, CoreError> {
         let mut servers = self.servers.write().await;
         let removed = servers.remove(server_id).is_some();
-        
+
         if removed {
             let mut tools = self.tools.write().await;
             tools.retain(|_, tool| tool.server_id != server_id);
-            
+
             let mut mappings = self.mappings.write().await;
             mappings.retain(|_, mapping| mapping.mcp_server_id != server_id);
         }
-        
+
         Ok(removed)
     }
 
@@ -221,7 +224,10 @@ pub struct MCPIntegration {
 
 impl MCPIntegration {
     pub fn new(registry: Arc<MCPRegistry>, graph_store: Arc<SkillGraphStore>) -> Self {
-        Self { registry, graph_store }
+        Self {
+            registry,
+            graph_store,
+        }
     }
 
     pub async fn sync_tools_to_skills(
@@ -232,10 +238,9 @@ impl MCPIntegration {
 
         let server = self.registry.get_server(server_id).await;
         if server.is_none() {
-            return Err(CoreError::ValidationFailed { message: format!(
-                "MCP server not found: {}",
-                server_id
-            ) });
+            return Err(CoreError::ValidationFailed {
+                message: format!("MCP server not found: {}", server_id),
+            });
         }
         let server = server.expect("server validated non-none above");
 
@@ -254,7 +259,10 @@ impl MCPIntegration {
 
         info!(
             "MCP tool sync complete: {} (added={}, updated={}, errors={})",
-            server_id, result.tools_added, result.tools_updated, result.errors.len()
+            server_id,
+            result.tools_added,
+            result.tools_updated,
+            result.errors.len()
         );
 
         Ok(result)
@@ -297,8 +305,8 @@ impl MCPIntegration {
             },
         };
 
-        let security_info = SkillSecurityInfo::new(SkillSource::MCPExternal)
-            .with_trust_level(server.trust_level);
+        let security_info =
+            SkillSecurityInfo::new(SkillSource::MCPExternal).with_trust_level(server.trust_level);
 
         let skill = SkillGraphNode {
             skill_iri: skill_iri.clone(),
@@ -313,7 +321,11 @@ impl MCPIntegration {
             graph_meta: SkillGraphMeta::new(),
             content: Some(SkillContent {
                 summary: tool.description.clone(),
-                steps: vec![SkillStep::new("call-mcp", 1, &format!("Call MCP tool {}", tool.tool_name))],
+                steps: vec![SkillStep::new(
+                    "call-mcp",
+                    1,
+                    &format!("Call MCP tool {}", tool.tool_name),
+                )],
                 validation: Some(SkillValidation {
                     method: "MCP tool execution".to_string(),
                     success_condition: "Tool returns success".to_string(),
@@ -342,14 +354,15 @@ impl MCPIntegration {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         let mapping = self.registry.get_mapping(skill_iri).await.ok_or_else(|| {
-            CoreError::ValidationFailed { message: format!("No MCP mapping for skill: {}", skill_iri) }
+            CoreError::ValidationFailed {
+                message: format!("No MCP mapping for skill: {}", skill_iri),
+            }
         })?;
 
         if !mapping.enabled {
-            return Err(CoreError::ValidationFailed { message: format!(
-                "MCP mapping disabled for skill: {}",
-                skill_iri
-            ) });
+            return Err(CoreError::ValidationFailed {
+                message: format!("MCP mapping disabled for skill: {}", skill_iri),
+            });
         }
 
         let mcp_params = self.transform_params(&mapping, params)?;
@@ -381,9 +394,11 @@ impl MCPIntegration {
             return Ok(params);
         }
 
-        let params_obj = params.as_object().ok_or_else(|| {
-            CoreError::ValidationFailed { message: "Params must be a JSON object".to_string() }
-        })?;
+        let params_obj = params
+            .as_object()
+            .ok_or_else(|| CoreError::ValidationFailed {
+                message: "Params must be a JSON object".to_string(),
+            })?;
 
         let mut transformed = serde_json::Map::new();
         for (key, value) in params_obj {
@@ -403,9 +418,11 @@ impl MCPIntegration {
             return Ok(result);
         }
 
-        let result_obj = result.as_object().ok_or_else(|| {
-            CoreError::ValidationFailed { message: "Result must be a JSON object".to_string() }
-        })?;
+        let result_obj = result
+            .as_object()
+            .ok_or_else(|| CoreError::ValidationFailed {
+                message: "Result must be a JSON object".to_string(),
+            })?;
 
         let mut transformed = serde_json::Map::new();
         for (key, value) in result_obj {
@@ -494,7 +511,10 @@ mod tests {
 
         let retrieved = registry.get_tool("server-1", "read_file").await;
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().description, "Read a file from filesystem");
+        assert_eq!(
+            retrieved.unwrap().description,
+            "Read a file from filesystem"
+        );
 
         let tools = registry.list_tools(Some("server-1")).await;
         assert_eq!(tools.len(), 1);
@@ -504,13 +524,10 @@ mod tests {
     async fn test_mcp_registry_mapping() {
         let registry = MCPRegistry::new();
 
-        let mapping = MCPSkillMapping::new(
-            "iri://skills/file-read",
-            "filesystem-server",
-            "read_file",
-        )
-        .with_param_mapping("file_path", "path")
-        .with_result_mapping("content", "data");
+        let mapping =
+            MCPSkillMapping::new("iri://skills/file-read", "filesystem-server", "read_file")
+                .with_param_mapping("file_path", "path")
+                .with_result_mapping("content", "data");
 
         registry.create_mapping(mapping).await.unwrap();
 

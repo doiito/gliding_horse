@@ -72,7 +72,8 @@ fn scan_rust_imports(content: &str, parent: &Path) -> Vec<DiscoveredImport> {
     let mut results = Vec::new();
 
     // `mod foo;` / `pub mod foo;` / `pub(crate) mod foo;`
-    let mod_re = Regex::new(r#"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(\w+)\s*;"#).expect("valid regex literal");
+    let mod_re = Regex::new(r#"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(\w+)\s*;"#)
+        .expect("valid regex literal");
     for cap in mod_re.captures_iter(content) {
         let name = cap[1].to_string();
         // Try `name.rs` first, then `name/mod.rs`
@@ -92,7 +93,8 @@ fn scan_rust_imports(content: &str, parent: &Path) -> Vec<DiscoveredImport> {
     }
 
     // `use crate::<path>` → resolve relative to workspace src/
-    let use_crate_re = Regex::new(r#"(?m)^\s*use\s+crate::(\w+(?:::\w+)*)\s*;"#).expect("valid regex literal");
+    let use_crate_re =
+        Regex::new(r#"(?m)^\s*use\s+crate::(\w+(?:::\w+)*)\s*;"#).expect("valid regex literal");
     for cap in use_crate_re.captures_iter(content) {
         let path_str = cap[1].to_string();
         if let Some(p) = resolve_rust_module_path(&path_str, true) {
@@ -190,10 +192,9 @@ fn scan_js_imports(content: &str, parent: &Path) -> Vec<DiscoveredImport> {
     let mut results = Vec::new();
 
     // import ... from '...'  or  import ... from "..."
-    let import_re = Regex::new(
-        r#"import\s+(?:\{[^}]*\}\s+from\s+|[\w*{},]+\s+from\s+)?['"](\.[^'"]+)['"]"#,
-    )
-    .expect("valid regex literal");
+    let import_re =
+        Regex::new(r#"import\s+(?:\{[^}]*\}\s+from\s+|[\w*{},]+\s+from\s+)?['"](\.[^'"]+)['"]"#)
+            .expect("valid regex literal");
     for cap in import_re.captures_iter(content) {
         let rel = &cap[1];
         if let Some(p) = resolve_js_path(parent, rel) {
@@ -208,7 +209,8 @@ fn scan_js_imports(content: &str, parent: &Path) -> Vec<DiscoveredImport> {
     }
 
     // require('...') / require("...")
-    let require_re = Regex::new(r#"(?m)require\s*\(\s*['"](\.[^'"]+)['"]\s*\)"#).expect("valid regex literal");
+    let require_re =
+        Regex::new(r#"(?m)require\s*\(\s*['"](\.[^'"]+)['"]\s*\)"#).expect("valid regex literal");
     for cap in require_re.captures_iter(content) {
         let rel = &cap[1];
         if let Some(p) = resolve_js_path(parent, rel) {
@@ -229,7 +231,13 @@ fn resolve_js_path(parent: &Path, rel: &str) -> Option<PathBuf> {
     let p = parent.join(rel);
     // If it's a directory, look for index files
     if p.is_dir() {
-        for name in &["index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs"] {
+        for name in &[
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.jsx",
+            "index.mjs",
+        ] {
             let index = p.join(name);
             if index.exists() {
                 return Some(index);
@@ -281,7 +289,8 @@ fn scan_python_imports(content: &str, parent: &Path) -> Vec<DiscoveredImport> {
     }
 
     // `import foo` / `import foo.bar` (local only — check file exists)
-    let import_re = Regex::new(r#"(?m)^\s*import\s+(\w+(?:\.\w+)*)\s*$"#).expect("valid regex literal");
+    let import_re =
+        Regex::new(r#"(?m)^\s*import\s+(\w+(?:\.\w+)*)\s*$"#).expect("valid regex literal");
     for cap in import_re.captures_iter(content) {
         let module = &cap[1];
         let candidate = parent.join(format!("{}.py", module.replace('.', "/")));
@@ -322,7 +331,8 @@ fn scan_c_cpp_imports(content: &str, parent: &Path) -> Vec<DiscoveredImport> {
     let mut results = Vec::new();
 
     // `#include "file.h"` — local include
-    let include_local = Regex::new(r##"(?m)^\s*#include\s+"([^"]+)"##).expect("valid regex literal");
+    let include_local =
+        Regex::new(r##"(?m)^\s*#include\s+"([^"]+)"##).expect("valid regex literal");
     for cap in include_local.captures_iter(content) {
         let inc = &cap[1];
         let candidate = parent.join(inc);
@@ -386,7 +396,9 @@ pub mod bar;
         let results = scan_rust_imports(content, &dir);
         assert_eq!(results.len(), 2, "should find both existing modules");
         assert!(results.iter().any(|r| r.resolved_path.ends_with("foo.rs")));
-        assert!(results.iter().any(|r| r.resolved_path.ends_with("bar/mod.rs")));
+        assert!(results
+            .iter()
+            .any(|r| r.resolved_path.ends_with("bar/mod.rs")));
     }
 
     #[test]
@@ -442,9 +454,17 @@ const utils = require('./utils');
 import React from 'react';
 "#;
         let results = scan_js_imports(content, &dir);
-        assert_eq!(results.len(), 2, "should find both local imports, skip react");
-        assert!(results.iter().any(|r| r.resolved_path.ends_with("component.ts")));
-        assert!(results.iter().any(|r| r.resolved_path.ends_with("utils.ts")));
+        assert_eq!(
+            results.len(),
+            2,
+            "should find both local imports, skip react"
+        );
+        assert!(results
+            .iter()
+            .any(|r| r.resolved_path.ends_with("component.ts")));
+        assert!(results
+            .iter()
+            .any(|r| r.resolved_path.ends_with("utils.ts")));
     }
 
     #[test]
@@ -473,7 +493,11 @@ import os
 import sys
 "#;
         let results = scan_python_imports(content, &dir);
-        assert_eq!(results.len(), 2, "should find .models and .utils.helpers, skip stdlib");
+        assert_eq!(
+            results.len(),
+            2,
+            "should find .models and .utils.helpers, skip stdlib"
+        );
     }
 
     #[test]
@@ -486,14 +510,21 @@ import sys
 #include <stdio.h>
 "##;
         let results = scan_c_cpp_imports(content, &dir);
-        assert_eq!(results.len(), 1, "should find local include, skip system include");
+        assert_eq!(
+            results.len(),
+            1,
+            "should find local include, skip system include"
+        );
         assert!(results[0].resolved_path.ends_with("header.h"));
     }
 
     #[test]
     fn test_no_results_for_missing_files() {
         let results = scan_imports("src/main.rs", "mod nonexistent;");
-        assert!(results.is_empty(), "should return empty for non-existent files");
+        assert!(
+            results.is_empty(),
+            "should return empty for non-existent files"
+        );
     }
 
     #[test]

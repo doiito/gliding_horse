@@ -1,3 +1,4 @@
+pub mod evolution;
 /// Methodology Layer (L2) — Methodology definitions, registry, and activation conditions.
 ///
 /// A methodology is an on-demand behavioral protocol extracted from Superpowers skills.
@@ -5,10 +6,8 @@
 ///
 /// Architecture Layer: L2 — Methodology (On-Demand)
 /// See design: PR-res/superpowers-skills-full-integration-design.md §0
-
 pub mod gate;
 pub mod integration;
-pub mod evolution;
 
 use crate::core::constitution::{ActivationCondition, ConstitutionRole};
 
@@ -106,7 +105,9 @@ pub struct MethodologyRegistry {
 impl MethodologyRegistry {
     /// Create registry with all built-in methodology definitions
     pub fn new() -> Self {
-        Self { entries: builtin_methodologies() }
+        Self {
+            entries: builtin_methodologies(),
+        }
     }
 
     /// Create with custom set
@@ -126,14 +127,16 @@ impl MethodologyRegistry {
 
     /// Find methodologies matching an activation condition
     pub fn for_activation(&self, condition: &ActivationCondition) -> Vec<&MethodologyDefinition> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|m| std::mem::discriminant(&m.activation) == std::mem::discriminant(condition))
             .collect()
     }
 
     /// Get methodologies for a specific domain
     pub fn for_domain(&self, domain: &str) -> Vec<&MethodologyDefinition> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|m| m.domain == domain || m.domain == "general")
             .collect()
     }
@@ -165,11 +168,11 @@ pub fn global_registry() -> &'static MethodologyRegistry {
 ///
 /// These correspond to the 14 superpowers-main skills plus 5 new methodologies
 /// that fill gaps identified during Constitution analysis:
-    /// - Index-Priority (constitution rule "index-priority" had no Superpowers equivalent)
-    /// - Cost-Awareness (constitution rule "cost-awareness" was only implicit in DA/PA)
-    /// - Least-Privilege (constitution rule "least-privilege" had no formal protocol)
-    /// - Complexity-Assessment (constitution rule "honest-complexity-assessment" had no Superpowers equivalent)
-    /// - Boundary-Enforcement (constitution rule "boundary-rejection" + "boundary-principle" aggregation)
+/// - Index-Priority (constitution rule "index-priority" had no Superpowers equivalent)
+/// - Cost-Awareness (constitution rule "cost-awareness" was only implicit in DA/PA)
+/// - Least-Privilege (constitution rule "least-privilege" had no formal protocol)
+/// - Complexity-Assessment (constitution rule "honest-complexity-assessment" had no Superpowers equivalent)
+/// - Boundary-Enforcement (constitution rule "boundary-rejection" + "boundary-principle" aggregation)
 pub fn builtin_methodologies() -> Vec<MethodologyDefinition> {
     vec![
         // ── 1. Index-Priority (NEW) ──
@@ -566,7 +569,11 @@ mod tests {
     #[test]
     fn test_builtin_methodologies_loaded() {
         let registry = MethodologyRegistry::new();
-        assert!(registry.count() >= 10, "Expected 10+ built-in methodologies, got {}", registry.count());
+        assert!(
+            registry.count() >= 10,
+            "Expected 10+ built-in methodologies, got {}",
+            registry.count()
+        );
     }
 
     #[test]
@@ -586,7 +593,11 @@ mod tests {
             "methodology:complexity-assessment",
             "methodology:boundary-enforcement",
         ] {
-            assert!(registry.get(id).is_some(), "Missing new methodology: {}", id);
+            assert!(
+                registry.get(id).is_some(),
+                "Missing new methodology: {}",
+                id
+            );
         }
     }
 
@@ -594,8 +605,11 @@ mod tests {
     fn test_methodology_has_red_flags() {
         let registry = MethodologyRegistry::new();
         for method in registry.all() {
-            assert!(!method.red_flags.is_empty(),
-                "Methodology {} has no red flags", method.id);
+            assert!(
+                !method.red_flags.is_empty(),
+                "Methodology {} has no red flags",
+                method.id
+            );
         }
     }
 
@@ -603,8 +617,11 @@ mod tests {
     fn test_methodology_has_anti_patterns() {
         let registry = MethodologyRegistry::new();
         for method in registry.all() {
-            assert!(!method.anti_patterns.is_empty(),
-                "Methodology {} has no anti-patterns", method.id);
+            assert!(
+                !method.anti_patterns.is_empty(),
+                "Methodology {} has no anti-patterns",
+                method.id
+            );
         }
     }
 

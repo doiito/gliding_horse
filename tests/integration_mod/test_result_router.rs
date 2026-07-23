@@ -1,8 +1,8 @@
 use glidinghorse::config::settings::ToolResultRouterSettings;
-use glidinghorse::tools::result_router::router::ResultRouter;
-use glidinghorse::tools::result_router::summary;
 use glidinghorse::tools::result_router::graphify::GraphifyEngine;
 use glidinghorse::tools::result_router::micro_tools::MicroToolGenerator;
+use glidinghorse::tools::result_router::router::ResultRouter;
+use glidinghorse::tools::result_router::summary;
 use glidinghorse::tools::result_router::{RouteDecision, SchemaAnalysis};
 use serde_json::json;
 
@@ -34,7 +34,11 @@ fn test_router_large_json_graphify() {
         .map(|i| json!({"id": format!("item_{}", i), "name": format!("item_{}", i), "value": i * 10}))
         .collect();
     let result = serde_json::to_string(&items).unwrap();
-    assert!(result.len() > 32768, "result size {} should exceed threshold_large", result.len());
+    assert!(
+        result.len() > 32768,
+        "result size {} should exceed threshold_large",
+        result.len()
+    );
     let decision = router.route(&result, "test_tool", "call_3");
     assert!(matches!(decision, RouteDecision::Graphify { .. }));
 }
@@ -157,38 +161,38 @@ fn test_full_pipeline_json_graphify() {
         .map(|i| json!({"id": format!("item_{}", i), "name": format!("item_{}", i), "value": i * 10}))
         .collect();
     let result_str = serde_json::to_string(&items).unwrap();
-    assert!(result_str.len() > 32768, "result size {} should exceed threshold_large", result_str.len());
+    assert!(
+        result_str.len() > 32768,
+        "result size {} should exceed threshold_large",
+        result_str.len()
+    );
 
     let decision = router.route(&result_str, "test_tool", "pipeline_1");
     assert!(matches!(decision, RouteDecision::Graphify { .. }));
 
     if let RouteDecision::Graphify { call_id, .. } = decision {
         let mut engine = GraphifyEngine::new(settings.max_graph_entities).unwrap();
-        let graphify_result = engine.graphify_json(
-            &json!(items),
-            &call_id,
-            settings.max_graph_entities,
-        );
+        let graphify_result =
+            engine.graphify_json(&json!(items), &call_id, settings.max_graph_entities);
         assert!(graphify_result.entity_count > 0);
 
         let analysis = SchemaAnalysis {
-            entity_types: graphify_result.entity_types.iter().map(|t| (t.clone(), 0)).collect(),
+            entity_types: graphify_result
+                .entity_types
+                .iter()
+                .map(|t| (t.clone(), 0))
+                .collect(),
             relation_types: vec![],
             property_names: vec![],
             total_entities: graphify_result.entity_count,
             total_relations: graphify_result.relation_count,
         };
-        let tools = MicroToolGenerator::generate_from_schema(
-            &analysis,
-            &call_id,
-            settings.max_micro_tools,
-        );
+        let tools =
+            MicroToolGenerator::generate_from_schema(&analysis, &call_id, settings.max_micro_tools);
         assert!(!tools.is_empty());
 
-        let msg = MicroToolGenerator::format_tool_injection_message(
-            &graphify_result.summary,
-            &tools,
-        );
+        let msg =
+            MicroToolGenerator::format_tool_injection_message(&graphify_result.summary, &tools);
         assert!(msg.contains("Data summary"));
     }
 }

@@ -51,9 +51,7 @@ impl CausalModelStore {
         // 1. Update error_index
         {
             let mut idx = self.error_index.write();
-            let entries = idx
-                .entry(obs.error_signature.clone())
-                .or_default();
+            let entries = idx.entry(obs.error_signature.clone()).or_default();
             if let Some(pos) = entries.iter_mut().find(|(iri, _)| iri == &obs.skill_iri) {
                 pos.1 += 1;
             } else {
@@ -98,10 +96,7 @@ impl CausalModelStore {
     /// Batch update priors from success rates.
     /// `success_rates`: skill_iri → success_rate (0.0–1.0)
     pub fn update_priors_from_success_rates(&self, success_rates: &[(&str, f32)]) {
-        let total_failures: f32 = success_rates
-            .iter()
-            .map(|(_, rate)| 1.0 - rate)
-            .sum();
+        let total_failures: f32 = success_rates.iter().map(|(_, rate)| 1.0 - rate).sum();
         let total = total_failures.max(0.001);
 
         let mut priors = self.priors.write();
@@ -172,18 +167,20 @@ impl CausalModelStore {
                 } else {
                     0.0
                 };
-                (to, PropagationEdge { weight, observation_count: count })
+                (
+                    to,
+                    PropagationEdge {
+                        weight,
+                        observation_count: count,
+                    },
+                )
             })
             .collect()
     }
 
     /// Get prior probability for a skill.
     pub fn prior(&self, skill_iri: &str) -> f32 {
-        self.priors
-            .read()
-            .get(skill_iri)
-            .copied()
-            .unwrap_or(0.001)
+        self.priors.read().get(skill_iri).copied().unwrap_or(0.001)
     }
 
     /// List all skills that have recorded failures.
@@ -211,7 +208,10 @@ impl CausalModelStore {
     /// Total number of recorded observations.
     pub fn total_observations(&self) -> usize {
         let profiles = self.error_profiles.read();
-        profiles.values().map(|p| p.values().sum::<u32>() as usize).sum()
+        profiles
+            .values()
+            .map(|p| p.values().sum::<u32>() as usize)
+            .sum()
     }
 
     /// Clear all data (for testing).

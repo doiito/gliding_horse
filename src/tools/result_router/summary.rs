@@ -64,7 +64,8 @@ fn truncate_json_array(arr: &[Value], max_bytes: usize) -> String {
     if kept.len() < total {
         result.push_str(&format!(
             "\n\n[truncated: {} total elements, {} kept]",
-            total, kept.len()
+            total,
+            kept.len()
         ));
     }
 

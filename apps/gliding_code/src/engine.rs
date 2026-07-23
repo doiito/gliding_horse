@@ -1,4 +1,5 @@
-use std::sync::atomic::AtomicU64;
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use glidinghorse::causal::engine::CausalEngine;
@@ -6,34 +7,38 @@ use glidinghorse::causal::fused::FusedRootCauseEngine;
 use glidinghorse::causal::store::CausalModelStore;
 use glidinghorse::config::{McpServerConfig, McpStdioServerConfig};
 use glidinghorse::core::agent_runner::TaskResult;
-use glidinghorse::core::event_bus::{EventBus, Event};
+use glidinghorse::core::event_bus::{Event, EventBus};
 use glidinghorse::core::sa::SupervisorAgent;
-use glidinghorse::memory::l1_session::EvictionConfig;
 use glidinghorse::gateway::UnifiedGateway;
-use glidinghorse::graph_features::features::FeatureExtractor;
 use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend, SkillGraphSnapshotBackend};
+use glidinghorse::graph_features::features::FeatureExtractor;
 use glidinghorse::knowledge_graph::code_ast::CodeAstExtractor;
 use glidinghorse::knowledge_graph::store::KnowledgeGraphStore;
-use glidinghorse::memory::embedding_service::{create_embedding_service_from_config, FallbackEmbeddingService};
+use glidinghorse::memory::embedding_service::{
+    create_embedding_service_from_config, FallbackEmbeddingService,
+};
 use glidinghorse::memory::hyperspace_store::HyperspaceStore;
 use glidinghorse::memory::l0_store::L0Store;
+use glidinghorse::memory::l1_session::EvictionConfig;
 use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::memory::unified_graph::UnifiedGraphStore;
+use glidinghorse::ontology_bridge::{
+    FallbackStructuralEmbeddingService, LinearCrossSpaceProjection,
+    LinearCrossSpaceProjectionConfig, OntologyBridgeConfig, OntologyBridgeManager,
+};
 use glidinghorse::skill_graph::discovery::SkillDiscoveryEngine;
-use glidinghorse::skill_graph::evolution::SkillEvolutionEngine;
+use glidinghorse::skill_graph::evolution::{EvolutionProposalStore, SkillEvolutionEngine};
 use glidinghorse::skill_graph::graph_algorithms::SkillGraphAlgorithms;
 use glidinghorse::skill_graph::graph_store::SkillGraphStore;
+use glidinghorse::skill_graph::security::SecurityEngine;
 use glidinghorse::skill_graph::{LinkStrength, SkillLinkType};
 use glidinghorse::snapshots::timeline::TimelineStore;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::mcp_client::McpClient;
 use glidinghorse::tools::skill_registry::SkillRegistry;
 use glidinghorse::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
-use glidinghorse::ontology_bridge::{
-    FallbackStructuralEmbeddingService, OntologyBridgeConfig, OntologyBridgeManager,
-};
 use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -69,6 +74,9 @@ pub struct CodeCliEngine {
     skill_graph: Arc<SkillGraphStore>,
     /// Skill discovery engine (semantic search)
     discovery_engine: Arc<SkillDiscoveryEngine>,
+    /// Set after the persisted skill graph has been indexed into Hyperspace.
+    /// Kept false after a failed attempt so the next task can retry.
+    skill_vectors_ready: AtomicBool,
     /// Feature extractor (GNN topological features)
     feature_extractor: Arc<FeatureExtractor>,
     /// Causal engine (Bayesian inference on skill graph)
@@ -81,6 +89,143 @@ pub struct CodeCliEngine {
     core_config: CoreConfig,
     /// Unified Oxigraph store reference for auto-code-analysis et al.
     oxi_store: Arc<oxigraph::store::Store>,
+    /// Stable code-scan exclusions compiled from built-ins, workspace settings,
+    /// and the supported subset of the workspace `.gitignore`.
+    code_scan_exclude_patterns: Vec<String>,
+}
+
+const DEFAULT_CODE_SCAN_EXCLUSIONS: &[&str] = &[
+    ".git/",
+    ".hg/",
+    ".svn/",
+    "target/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    "__pycache__/",
+    ".venv/",
+    "venv/",
+    ".next/",
+    ".gliding_horse/",
+];
+
+fn load_code_scan_exclusions(root: &std::path::Path, configured: &[String]) -> Vec<String> {
+    let mut patterns: Vec<String> = DEFAULT_CODE_SCAN_EXCLUSIONS
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect();
+    for pattern in configured {
+        if !pattern.trim().is_empty() && !patterns.contains(pattern) {
+            patterns.push(pattern.clone());
+        }
+    }
+
+    // This intentionally shares WorkspaceMonitor's documented, small
+    // gitignore-compatible subset rather than claiming full gitignore support.
+    if let Ok(contents) = std::fs::read_to_string(root.join(".gitignore")) {
+        for line in contents.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                continue;
+            }
+            let pattern = line.strip_prefix('/').unwrap_or(line);
+            let pattern = if !pattern.contains('.') && !pattern.ends_with('/') {
+                format!("{pattern}/")
+            } else {
+                pattern.to_string()
+            };
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+    }
+    patterns
+}
+
+fn code_path_is_excluded(
+    relative_path: &std::path::Path,
+    is_directory: bool,
+    patterns: &[String],
+) -> bool {
+    let mut path = relative_path.to_string_lossy().replace('\\', "/");
+    if is_directory && !path.ends_with('/') {
+        path.push('/');
+    }
+    patterns.iter().any(|pattern| {
+        glidinghorse::tools::workspace_monitor::inventory::match_glob_pattern(&path, pattern)
+    })
+}
+
+fn collect_workspace_code_files(
+    root: &std::path::Path,
+    exclusion_patterns: &[String],
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let supported = |ext: &str| {
+        matches!(
+            ext,
+            "rs" | "py"
+                | "pyi"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "go"
+                | "java"
+                | "c"
+                | "cpp"
+                | "h"
+                | "hpp"
+        )
+    };
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let mut entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                anyhow::anyhow!(
+                    "Unable to scan workspace directory '{}': {error}",
+                    dir.display()
+                )
+            })?,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Unable to scan workspace directory '{}': {error}",
+                    dir.display()
+                ))
+            }
+        };
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                anyhow::anyhow!(
+                    "Unable to inspect workspace path '{}': {error}",
+                    path.display()
+                )
+            })?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let relative_path = path.strip_prefix(root).unwrap_or(path.as_path());
+            if file_type.is_dir() {
+                if !code_path_is_excluded(relative_path, true, exclusion_patterns) {
+                    pending.push(path);
+                }
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(supported)
+                && !code_path_is_excluded(relative_path, false, exclusion_patterns)
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 impl CodeCliEngine {
@@ -94,30 +239,48 @@ impl CodeCliEngine {
             .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace));
         // Store canonicalized path so engine.workspace() returns the real absolute path
         config.workspace = workspace_abs.to_string_lossy().to_string();
-        std::env::set_current_dir(&workspace_abs)
-            .map_err(|e| anyhow::anyhow!("无法切换到工作目录 '{}': {}", workspace_abs.display(), e))?;
+        std::env::set_current_dir(&workspace_abs).map_err(|e| {
+            anyhow::anyhow!("无法切换到工作目录 '{}': {}", workspace_abs.display(), e)
+        })?;
 
         let gateway = Arc::new(UnifiedGateway::new(&config.gateway)?);
         let dir = tempfile::TempDir::new()?;
 
-        let l0_path = config.data_dir.as_ref()
-            .map(|d| {
-                let _ = std::fs::create_dir_all(d);
-                d.clone()
+        // A configured data directory is a shared root, not a workspace
+        // identity. Keep state from separate repositories isolated below a
+        // stable, non-path-leaking hash of the canonical workspace.
+        let workspace_namespace = {
+            let digest = Sha256::digest(config.workspace.as_bytes());
+            format!("workspace-{}", hex::encode(&digest[..12]))
+        };
+        let persistent_root = config
+            .data_dir
+            .as_ref()
+            .map(|base| {
+                let root = std::path::Path::new(base).join(&workspace_namespace);
+                std::fs::create_dir_all(&root)?;
+                Ok::<_, std::io::Error>(root)
             })
+            .transpose()?;
+
+        let l0_path = persistent_root
+            .as_ref()
+            .map(|d| d.join("l0").to_string_lossy().to_string())
             .unwrap_or_else(|| dir.path().join("l0").to_string_lossy().to_string());
 
         let l0 = Arc::new(
-            L0Store::new(&l0_path)
-                .map_err(|e| anyhow::anyhow!("L0Store 创建失败: {}", e))?,
+            L0Store::new(&l0_path).map_err(|e| anyhow::anyhow!("L0Store 创建失败: {}", e))?,
         );
 
         // ── Unified Oxigraph Store — shared across Blackboard, SkillGraphStore,
         //    ToolExecutor (KnowledgeGraphStore), and KnowledgeBridge so that all
         //    subsystems operate on the same RDF store via named-graph isolation.
         let unified = Arc::new(
-            UnifiedGraphStore::new()
-                .map_err(|e| anyhow::anyhow!("UnifiedGraphStore 创建失败: {}", e))?,
+            match &persistent_root {
+                Some(root) => UnifiedGraphStore::new_persistent(root.join("unified-graph")),
+                None => UnifiedGraphStore::new(),
+            }
+            .map_err(|e| anyhow::anyhow!("UnifiedGraphStore 创建失败: {}", e))?,
         );
 
         let l2 = Arc::new(
@@ -133,24 +296,26 @@ impl CodeCliEngine {
         // Initialize HyperspaceEngine-backed vector store for semantic search
         let embed: Arc<dyn glidinghorse::memory::embedding_service::EmbeddingService> =
             match &loaded_settings {
-                Some(s) => create_embedding_service_from_config(&s.embedding, s.agents.embedding_timeout_secs),
+                Some(s) => create_embedding_service_from_config(
+                    &s.embedding,
+                    s.agents.embedding_timeout_secs,
+                ),
                 None => Arc::new(FallbackEmbeddingService::new()),
             };
-        let hyperspace_path = config.data_dir.as_ref()
-            .map(|d| format!("{}/hyperspace", d))
+        let hyperspace_path = persistent_root
+            .as_ref()
+            .map(|d| d.join("hyperspace").to_string_lossy().to_string())
             .unwrap_or_else(|| dir.path().join("hyperspace").to_string_lossy().to_string());
         let _ = std::fs::create_dir_all(&hyperspace_path);
         let vector_store = Arc::new(
-            HyperspaceStore::open(
-                std::path::Path::new(&hyperspace_path),
-                embed,
-            )
-            .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
+            HyperspaceStore::open(std::path::Path::new(&hyperspace_path), embed)
+                .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
         );
 
         // ── OntologyBridge: dual-space embedding store (text Cosine + struct Poincaré) ──
         // Uses separate data directories alongside the main HyperspaceStore.
-        let ontology_base = std::path::Path::new(&hyperspace_path).parent()
+        let ontology_base = std::path::Path::new(&hyperspace_path)
+            .parent()
             .map(|p| p.join("ontology"))
             .unwrap_or_else(|| {
                 let mut p = std::path::PathBuf::from(&hyperspace_path);
@@ -163,16 +328,30 @@ impl CodeCliEngine {
         // Reuse the same text embedding service; structural uses its own.
         let struct_embed_svc: Arc<dyn glidinghorse::ontology_bridge::StructuralEmbeddingService> =
             Arc::new(FallbackStructuralEmbeddingService::new());
-        let ontology_bridge = OntologyBridgeManager::open(OntologyBridgeConfig {
+        let mut ontology_bridge = OntologyBridgeManager::open(OntologyBridgeConfig {
             text_dir,
             struct_dir,
             embed: match &loaded_settings {
-                Some(s) => create_embedding_service_from_config(&s.embedding, s.agents.embedding_timeout_secs),
+                Some(s) => create_embedding_service_from_config(
+                    &s.embedding,
+                    s.agents.embedding_timeout_secs,
+                ),
                 None => Arc::new(FallbackEmbeddingService::new()),
             },
             struct_embed: struct_embed_svc,
         })
         .map_err(|e| anyhow::anyhow!("OntologyBridge 初始化失败: {}", e))?;
+        let projection_path = ontology_base.join("projection.json");
+        if projection_path.exists() {
+            let raw = std::fs::read_to_string(&projection_path)
+                .map_err(|e| anyhow::anyhow!("读取 Ontology projection 配置失败: {}", e))?;
+            let config: LinearCrossSpaceProjectionConfig = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("解析 Ontology projection 配置失败: {}", e))?;
+            let projection = LinearCrossSpaceProjection::from_config(config)
+                .map_err(|e| anyhow::anyhow!("Ontology projection 配置无效: {}", e))?;
+            ontology_bridge = ontology_bridge.with_cross_space_projection(Arc::new(projection));
+            info!(path = %projection_path.display(), "Ontology cross-space projection loaded");
+        }
         let ontology_bridge = Arc::new(ontology_bridge);
         info!("OntologyBridge initialised (text + structural engines)");
 
@@ -232,14 +411,22 @@ impl CodeCliEngine {
         let skills_for_engine = skills.clone();
 
         let workspace_root = std::path::PathBuf::from(&config.workspace);
+        let code_scan_exclude_patterns =
+            load_code_scan_exclusions(&workspace_root, &settings.workspace.exclude_patterns);
 
         // ── TimelineStore (temporal event recording for graph mutations) ──
         // Created before SkillGraphStore so the store can attach it and record
         // every structural mutation (otherwise TL: pending stays at 0).
-        let timeline = Arc::new(TimelineStore::new(
-            agent_settings.snapshot_frequency,
-            agent_settings.max_full_snapshots,
-        ));
+        let timeline = Arc::new(
+            TimelineStore::new(
+                agent_settings.snapshot_frequency,
+                agent_settings.max_full_snapshots,
+            )
+            .with_l0_store(l0.clone()),
+        );
+        if let Err(error) = timeline.load_persisted() {
+            tracing::warn!(%error, "Failed to load persisted timeline snapshots");
+        }
 
         // ── Skill Graph Store — cognitive network ──
         let skill_graph = Arc::new(
@@ -250,14 +437,39 @@ impl CodeCliEngine {
                 .with_timeline(timeline.clone()),
         );
 
+        if let Err(error) = skill_graph.hydrate_from_l0() {
+            tracing::warn!(%error, "Failed to hydrate persisted skill graph; continuing with bootstrap skills");
+        }
+
         // Bootstrap the SkillGraphStore with default skills from SkillRegistry
         // so that SG: N E (node/edge) metrics are non-zero from startup.
         for meta in skills.list_all_skills() {
+            if skill_graph.get_skill(&meta.skill_iri).is_some() {
+                continue;
+            }
             if let Err(e) = skill_graph.register_skill(
                 glidinghorse::skill_graph::types::SkillGraphNode::from_skill_meta(&meta),
             ) {
                 tracing::warn!("Failed to register bootstrap skill {}: {}", meta.name, e);
             }
+        }
+
+        // Resolve a process interruption after a governed AddLink commit only
+        // after the persisted graph has been hydrated and bootstrap nodes have
+        // been restored. This never creates new proposals or auto-approves
+        // them; it only finalizes/compensates a previously durable Applying
+        // record.
+        match EvolutionProposalStore::new(l0.clone()).recover_inflight(skill_graph.as_ref()) {
+            Ok(recovery) if recovery.committed + recovery.rolled_back + recovery.failed > 0 => {
+                info!(
+                    committed = recovery.committed,
+                    rolled_back = recovery.rolled_back,
+                    failed = recovery.failed,
+                    "Recovered in-flight evolution proposals"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Failed to recover in-flight evolution proposals"),
         }
 
         // ── Auto-create Related links between skills sharing skill_types ──
@@ -270,9 +482,17 @@ impl CodeCliEngine {
                 for j in (i + 1)..nodes.len() {
                     let a = &nodes[i];
                     let b = &nodes[j];
-                    let shared: Vec<&str> = a.tags.iter().filter_map(|t| {
-                        if b.tags.contains(t) { Some(t.as_str()) } else { None }
-                    }).collect();
+                    let shared: Vec<&str> = a
+                        .tags
+                        .iter()
+                        .filter_map(|t| {
+                            if b.tags.contains(t) {
+                                Some(t.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     if !shared.is_empty() {
                         let strength = if shared.len() >= 2 {
                             LinkStrength::Recommended
@@ -280,21 +500,32 @@ impl CodeCliEngine {
                             LinkStrength::Navigation
                         };
                         let desc = format!("Related via: {}", shared.join(", "));
-                        let _ = skill_graph.add_link(&a.skill_iri, &b.skill_iri, SkillLinkType::Related, strength, &desc);
+                        let _ = skill_graph.add_link(
+                            &a.skill_iri,
+                            &b.skill_iri,
+                            SkillLinkType::Related,
+                            strength,
+                            &desc,
+                        );
                         link_count += 1;
                     }
                 }
             }
             if link_count > 0 {
-                info!(link_count = link_count, "Auto-created skill graph edges from shared types");
+                info!(
+                    link_count = link_count,
+                    "Auto-created skill graph edges from shared types"
+                );
             }
         }
         let skill_graph_algorithms = Arc::new(SkillGraphAlgorithms::from_store(&skill_graph));
 
         // ── PetgraphBackend (structural dimension for FusedRootCauseEngine) ──
-        let graph_backend: Arc<dyn GraphBackend> = Arc::new(PetgraphBackend::new(skill_graph.clone()));
+        let graph_backend: Arc<dyn GraphBackend> =
+            Arc::new(PetgraphBackend::new(skill_graph.clone()));
 
         // ── AgentRunner (without fused engine — upgraded below after kg_store is available) ──
+        let skill_creator_gateway = gateway.clone();
         let mut runner = glidinghorse::core::agent_runner::AgentRunner::new(
             gateway,
             skills.clone(),
@@ -303,10 +534,12 @@ impl CodeCliEngine {
             mm_for_runner,
             tmpl.clone(),
             agent_settings.clone(),
-        ).with_prompt_loader(glidinghorse::core::prompt_loader::PromptLoader::new(
+        )
+        .with_prompt_loader(glidinghorse::core::prompt_loader::PromptLoader::new(
             Default::default(),
             tmpl.clone(),
-        )).with_workspace_root(workspace_root.clone());
+        ))
+        .with_workspace_root(workspace_root.clone());
 
         // Create FusedRootCauseEngine backed by the shared unified Oxigraph store
         let unified_kg_store = unified.store();
@@ -315,33 +548,24 @@ impl CodeCliEngine {
                 KnowledgeGraphStore::with_shared_store(unified_kg_store.clone())
                     .expect("Failed to create shared KG Store for FusedRootCauseEngine"),
             );
-            let fused_rce = FusedRootCauseEngine::new(
-                Some(graph_backend.clone()),
-                Some(fused_kg),
-            );
+            let fused_rce = FusedRootCauseEngine::new(Some(graph_backend.clone()), Some(fused_kg));
             runner = runner.with_fused_root_cause_engine(fused_rce);
         }
 
         // ── Skill Discovery Engine (semantic skill search via Hyperspace) ──
         let discovery_engine = Arc::new(
-            SkillDiscoveryEngine::new(skill_graph.clone())
-                .with_vector_store(vector_store.clone()),
+            SkillDiscoveryEngine::new(skill_graph.clone()).with_vector_store(vector_store.clone()),
         );
 
         // ── FeatureExtractor (GNN topological features for causal analysis) ──
         use glidinghorse::graph_backend::SkillGraphFeatureGraph;
-        let feature_graph = SkillGraphFeatureGraph::new(
-            skill_graph.clone(),
-            skill_graph_algorithms.clone(),
-        );
+        let feature_graph =
+            SkillGraphFeatureGraph::new(skill_graph.clone(), skill_graph_algorithms.clone());
         let feature_extractor = Arc::new(FeatureExtractor::new(Arc::new(feature_graph)));
 
         // ── CausalEngine (Bayesian causal inference on skill graph) ──
         let causal_model_store = Arc::new(CausalModelStore::new());
-        let causal_engine = Arc::new(CausalEngine::new(
-            causal_model_store,
-            graph_backend.clone(),
-        ));
+        let causal_engine = Arc::new(CausalEngine::new(causal_model_store, graph_backend.clone()));
 
         // ── SkillEvolutionEngine (usage tracking & self-improvement) ──
         let evolution_engine = Arc::new(tokio::sync::Mutex::new(
@@ -403,6 +627,23 @@ impl CodeCliEngine {
         {
             let executor = runner.tool_executor.write();
             executor.set_shared_skill_graph(skill_graph.clone());
+            executor.set_shared_skill_registry(skills.clone());
+            executor.set_shared_skill_vector_store(vector_store.clone());
+            executor.set_shared_skill_creator_gateway(skill_creator_gateway.clone());
+            let trusted_builtins = skill_graph
+                .list_all_skills()
+                .into_iter()
+                .filter(|skill| {
+                    skill.security_info.as_ref().is_some_and(|info| {
+                        info.source == glidinghorse::skill_graph::types::SkillSource::SystemBuiltin
+                    })
+                })
+                .map(|skill| skill.skill_iri)
+                .collect();
+            executor.set_security_engine(Arc::new(SecurityEngine::with_whitelisted_skills(
+                skill_graph.clone(),
+                trusted_builtins,
+            )));
         }
 
         // 注入 CausalEngine + SkillGraphStore 到 AgentRunner
@@ -433,7 +674,8 @@ impl CodeCliEngine {
         .with_discovery_engine(discovery_engine.clone())
         .with_perception_ontology_bridge(ontology_bridge.clone());
 
-        let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) = sa.token_usage_arcs();
+        let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) =
+            sa.token_usage_arcs();
 
         // MCP initialization — register HTTP and stdio servers from config
         let has_mcp = !config.mcp_servers.is_empty() || !config.mcp_stdio_servers.is_empty();
@@ -488,12 +730,14 @@ impl CodeCliEngine {
             workspace_monitor,
             skill_graph,
             discovery_engine,
+            skill_vectors_ready: AtomicBool::new(false),
             feature_extractor,
             causal_engine,
             evolution_engine,
             timeline,
             core_config,
             oxi_store: unified.store(),
+            code_scan_exclude_patterns,
         })
     }
 
@@ -556,7 +800,61 @@ impl CodeCliEngine {
         }
     }
 
+    async fn ensure_skill_vectors_indexed(&self) {
+        // The graph is authoritative and may have been hydrated from L0
+        // before this process started. Retry on a later task if embedding is
+        // temporarily unavailable, regardless of whether the task came from
+        // CLI, TUI, or resume.
+        if !self.skill_vectors_ready.swap(true, Ordering::AcqRel) {
+            match self.discovery_engine.index_all_skills().await {
+                Ok(indexed) => info!(indexed, "Skill semantic index synchronized"),
+                Err(error) => {
+                    self.skill_vectors_ready.store(false, Ordering::Release);
+                    warn!(%error, "Skill semantic index synchronization failed; will retry on next task");
+                }
+            }
+        }
+    }
+
+    /// Incrementally refresh the shared code KG from workspace source files.
+    /// Both one-shot CLI and TUI/resume call this method so entrypoint choice
+    /// cannot decide whether a changed nested source file is represented.
+    fn scan_workspace_code(&self) -> anyhow::Result<()> {
+        let root = std::path::Path::new(&self.config.workspace);
+        if !root.is_dir() {
+            return Ok(());
+        }
+        let kg_store =
+            KnowledgeGraphStore::with_shared_store(self.oxi_store.clone()).map_err(|error| {
+                anyhow::anyhow!("Failed to create KG store for code analysis: {error}")
+            })?;
+        let files = collect_workspace_code_files(root, &self.code_scan_exclude_patterns)?;
+        let mut analyzed = 0u32;
+        let mut errors = 0u32;
+        for path in files {
+            match CodeAstExtractor::extract_incremental(
+                &path.to_string_lossy(),
+                "graph:code",
+                &kg_store,
+            ) {
+                Ok(_) => analyzed += 1,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "Code analysis failed");
+                    errors += 1;
+                }
+            }
+        }
+        if analyzed > 0 || errors > 0 {
+            info!(
+                analyzed,
+                errors, "Auto code analysis complete on workspace files"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn process_task(&mut self, user_input: &str) -> anyhow::Result<(String, TaskResult)> {
+        self.ensure_skill_vectors_indexed().await;
         // 首次进入 async 上下文时完成 WorkspaceMonitor 的异步初始化
         if let Some(ref wm) = self.workspace_monitor {
             wm.start_async_components();
@@ -569,75 +867,46 @@ impl CodeCliEngine {
         let task_iri = format!("iri://task/{}", task_id);
 
         // Collect workspace file summary once for both paths
-        let ws_summary = self.workspace_monitor.as_ref()
+        let ws_summary = self
+            .workspace_monitor
+            .as_ref()
             .and_then(|wm| wm.get_file_inventory_summary());
 
-        // ── Auto code analysis: incremental AST extraction on workspace source files ──
-        {
-            let ws_root = std::path::Path::new(&self.config.workspace);
-            if ws_root.is_dir() {
-                let kg_store = KnowledgeGraphStore::with_shared_store(self.oxi_store.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to create KG store for code analysis: {}", e))?;
-                let supported = |ext: &str| -> bool {
-                    matches!(ext, "rs" | "py" | "pyi" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "h" | "hpp")
-                };
-                let mut analyzed = 0u32;
-                let mut errors = 0u32;
-                let mut dir_entries: Vec<_> = match ws_root.read_dir() {
-                    Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
-                    Err(_) => Vec::new(),
-                };
-                // Sort for deterministic order
-                dir_entries.sort_by_key(|e| e.file_name());
-                for entry in &dir_entries {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if !supported(ext) {
-                            continue;
-                        }
-                        match CodeAstExtractor::extract_incremental(
-                            &path.to_string_lossy(),
-                            "graph:code",
-                            &kg_store,
-                        ) {
-                            Ok(_) => analyzed += 1,
-                            Err(e) => {
-                                warn!("Code analysis failed for {}: {}", path.display(), e);
-                                errors += 1;
-                            }
-                        }
-                    }
-                }
-                if analyzed > 0 || errors > 0 {
-                    info!(analyzed, errors, "Auto code analysis complete on workspace files");
-                }
-            }
-        }
+        self.scan_workspace_code()?;
 
         let result = if let Some(ref wf_path) = self.config.workflow_path {
             let wf_jsonld = std::fs::read_to_string(wf_path)
                 .map_err(|e| anyhow::anyhow!("读取工作流文件 '{}' 失败: {}", wf_path, e))?;
-            let ctx = glidinghorse::core::agent_runner::TaskContext::new(&task_iri, user_input, self.config.max_iterations)
-                .with_original_task(user_input)
-                .with_workflow(&wf_jsonld);
+            let ctx = glidinghorse::core::agent_runner::TaskContext::new(
+                &task_iri,
+                user_input,
+                self.config.max_iterations,
+            )
+            .with_original_task(user_input)
+            .with_workflow(&wf_jsonld);
             let ctx = if let Some(ref summary) = ws_summary {
                 ctx.with_workspace_summary(summary)
             } else {
                 ctx
             };
-            self.sa.process_task_with_context(user_input, &task_iri, ctx).await?
+            self.sa
+                .process_task_with_context(user_input, &task_iri, ctx)
+                .await?
         } else {
-            let ctx = glidinghorse::core::agent_runner::TaskContext::new(&task_iri, user_input, self.config.max_iterations)
-                .with_original_task(user_input);
+            let ctx = glidinghorse::core::agent_runner::TaskContext::new(
+                &task_iri,
+                user_input,
+                self.config.max_iterations,
+            )
+            .with_original_task(user_input);
             let ctx = if let Some(ref summary) = ws_summary {
                 ctx.with_workspace_summary(summary)
             } else {
                 ctx
             };
-            self.sa.process_task_with_context(user_input, &task_iri, ctx).await?
+            self.sa
+                .process_task_with_context(user_input, &task_iri, ctx)
+                .await?
         };
 
         info!(
@@ -648,26 +917,58 @@ impl CodeCliEngine {
             "任务处理完成"
         );
 
+        // Every interactive entry reaches the same transport-neutral terminal
+        // event before product-specific evolution and persistence follow-ups.
+        glidinghorse::core::TaskFinalizer::new(self.event_bus.clone())
+            .finalize(&task_iri, &result)
+            .await;
+
         // Record post-task metrics for skill evolution + causal analysis
         if let Ok(mut ee) = self.evolution_engine.try_lock() {
             let success = result.status == "completed" || result.status == "success";
-            let tool_names: Vec<String> = result.tracked_actions.iter()
-                .map(|a| a.tool_name.clone())
-                .collect();
+            let mut affected_skill_iris = Vec::new();
 
-            // Track each distinct tool as a skill usage event
-            for tool_name in &tool_names {
-                let tool_iri = format!("iri://skill/tool/{}", tool_name);
-                let _ = ee.record_usage(
-                    glidinghorse::skill_graph::evolution::UsageRecord::new(
-                        &tool_iri,
-                        &task_iri,
-                        "system:sa",
-                        success,
-                    )
-                    .with_context_tag(&result.status)
-                    .with_tokens(result.turn_count * 100),
+            // Record actual action outcomes against the canonical SkillRegistry
+            // IRI. Unknown tools remain observable but are never turned into a
+            // fabricated graph node under a second IRI namespace.
+            for action in &result.tracked_actions {
+                let Some(skill_iri) = self.skills.skill_iri_for_tool_name(&action.tool_name) else {
+                    warn!(
+                        task_iri = %task_iri,
+                        tool = %action.tool_name,
+                        "No registered skill mapping for tracked tool; skipping skill evolution record"
+                    );
+                    continue;
+                };
+
+                let action_success = matches!(
+                    action.status,
+                    glidinghorse::core::tracked_action::ActionStatus::Success
                 );
+                let mut usage = glidinghorse::skill_graph::evolution::UsageRecord::new(
+                    &skill_iri,
+                    &task_iri,
+                    &action.agent_role,
+                    action_success,
+                )
+                .with_context_tag(&result.status)
+                .with_context_tag(&format!("tool:{}", action.tool_name))
+                .with_duration(action.duration_secs.ceil().min(u32::MAX as f64) as u32);
+
+                if let Some(error) = action.error.as_deref() {
+                    usage = usage.with_error(error);
+                }
+
+                if let Err(error) = ee.record_usage(usage) {
+                    warn!(
+                        task_iri = %task_iri,
+                        skill_iri = %skill_iri,
+                        error = %error,
+                        "Failed to record skill evolution usage"
+                    );
+                } else if !affected_skill_iris.contains(&skill_iri) {
+                    affected_skill_iris.push(skill_iri);
+                }
             }
 
             // When task fails, record a failure event that triggers infer_root_cause
@@ -677,25 +978,27 @@ impl CodeCliEngine {
                 } else {
                     format!("Task status: {}", result.status)
                 };
-                let _ = ee.record_usage(
-                    glidinghorse::skill_graph::evolution::UsageRecord::new(
-                        "iri://skill/task-completion",
-                        &task_iri,
-                        "system:sa",
-                        false,
-                    )
-                    .with_error(&error_msg)
-                    .with_context_tag(&result.status)
-                    .with_context_tag(&tool_names.join(",")),
-                );
+                if affected_skill_iris.is_empty() {
+                    warn!(
+                        task_iri = %task_iri,
+                        error = %error_msg,
+                        "Task failed without a mapped tracked skill; no synthetic skill usage will be recorded"
+                    );
+                }
 
                 // Phase 2: Extract causal root cause from evolution engine and
                 // publish suggestions to the event bus for observability / downstream use.
                 {
                     let suggestions = ee.get_pending_suggestions().to_vec();
                     if !suggestions.is_empty() {
-                        let causal_summary = suggestions.iter()
-                            .map(|s| format!("{} (conf={:.2}): {}", s.skill_iri, s.confidence, s.description))
+                        let causal_summary = suggestions
+                            .iter()
+                            .map(|s| {
+                                format!(
+                                    "{} (conf={:.2}): {}",
+                                    s.skill_iri, s.confidence, s.description
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join("; ");
                         info!(
@@ -706,39 +1009,75 @@ impl CodeCliEngine {
                         );
 
                         // Publish causal analysis result to event bus
-                        let serialized_suggestions: Vec<serde_json::Value> = suggestions.iter()
-                            .map(|s| serde_json::json!({
-                                "type": format!("{:?}", s.suggestion_type),
-                                "skill_iri": s.skill_iri,
-                                "description": s.description,
-                                "confidence": s.confidence,
-                            }))
+                        let serialized_suggestions: Vec<serde_json::Value> = suggestions
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "type": format!("{:?}", s.suggestion_type),
+                                    "skill_iri": s.skill_iri,
+                                    "description": s.description,
+                                    "confidence": s.confidence,
+                                    "approval": s.approval.status(),
+                                })
+                            })
                             .collect();
-                        let _ = self.event_bus.emit(
-                            &task_iri,
-                            "causal_analysis",
-                            "system:evolution_engine",
-                            &serde_json::json!({
-                                "task_iri": task_iri,
-                                "status": result.status,
-                                "errors": result.errors,
-                                "suggestions": serialized_suggestions,
-                            }).to_string(),
-                        ).await;
+                        let _ = self
+                            .event_bus
+                            .emit(
+                                &task_iri,
+                                "causal_analysis",
+                                "system:evolution_engine",
+                                &serde_json::json!({
+                                    "task_iri": task_iri,
+                                    "status": result.status,
+                                    "errors": result.errors,
+                                    "suggestions": serialized_suggestions,
+                                })
+                                .to_string(),
+                            )
+                            .await;
                     }
                 }
 
-                // Also collect preventive actions for each affected tool
-                for tool_name in &tool_names {
-                    let tool_iri = format!("iri://skill/tool/{}", tool_name);
-                    let actions = ee.suggest_preventive_action(&tool_iri);
+                // Preserve preventive actions as causal evidence. They are
+                // not SkillLinks: the previous implementation tried to link
+                // to a non-skill knowledge IRI and discarded the resulting
+                // validation error.
+                let mut preventive_actions = Vec::new();
+                for skill_iri in &affected_skill_iris {
+                    let actions = ee.suggest_preventive_action(skill_iri);
                     for action in &actions {
-                        let _ = ee.suggest_link(
-                            &tool_iri,
-                            "iri://knowledge/causal-analysis",
-                            glidinghorse::skill_graph::SkillLinkType::Related,
-                            action,
-                        );
+                        preventive_actions.push(serde_json::json!({
+                            "skill_iri": skill_iri,
+                            "action": action,
+                        }));
+                    }
+                }
+                if !preventive_actions.is_empty() {
+                    let preventive_iri = format!("{}#preventive-actions", task_iri);
+                    let preventive_json = serde_json::json!({
+                        "@id": preventive_iri,
+                        "@type": "CausalPreventiveActions",
+                        "task_iri": task_iri,
+                        "actions": preventive_actions,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+                    let event_id = self
+                        .event_bus
+                        .emit(
+                            &task_iri,
+                            "causal_preventive_actions",
+                            "system:evolution_engine",
+                            &preventive_json.to_string(),
+                        )
+                        .await;
+                    info!(task_iri = %task_iri, %event_id, "Published causal preventive actions");
+                    if let Err(error) = self.l2_bb.write_node(
+                        &preventive_iri,
+                        &preventive_json.to_string(),
+                        &self.core_config,
+                    ) {
+                        warn!(task_iri = %task_iri, %error, "Failed to write causal preventive actions");
                     }
                 }
 
@@ -747,13 +1086,17 @@ impl CodeCliEngine {
                     let suggestions = ee.get_pending_suggestions().to_vec();
                     if !suggestions.is_empty() {
                         let causal_node_iri = format!("{}#causal", task_iri);
-                        let all_suggestions: Vec<serde_json::Value> = suggestions.iter()
-                            .map(|s| serde_json::json!({
-                                "type": format!("{:?}", s.suggestion_type),
-                                "skill_iri": s.skill_iri,
-                                "description": s.description,
-                                "confidence": s.confidence,
-                            }))
+                        let all_suggestions: Vec<serde_json::Value> = suggestions
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "type": format!("{:?}", s.suggestion_type),
+                                    "skill_iri": s.skill_iri,
+                                    "description": s.description,
+                                    "confidence": s.confidence,
+                                    "approval": s.approval.status(),
+                                })
+                            })
                             .collect();
                         let causal_json = serde_json::json!({
                             "@id": causal_node_iri,
@@ -781,6 +1124,28 @@ impl CodeCliEngine {
             if let Ok(mut ee) = self.evolution_engine.try_lock() {
                 let improvements = ee.suggest_improvements().await;
                 if !improvements.is_empty() {
+                    // Persist only typed proposals. This makes suggestions
+                    // reviewable across restart while deliberately avoiding
+                    // auto-approval or graph mutation in the task path.
+                    let proposal_store = EvolutionProposalStore::new(self.l0.clone());
+                    let proposal_ids = improvements.iter().filter_map(|suggestion| {
+                        if suggestion.patch.is_none() {
+                            return None;
+                        }
+                        let serialized = serde_json::to_vec(suggestion).ok()?;
+                        let proposal_key = format!(
+                            "{}:evolution:{}",
+                            task_iri,
+                            hex::encode(Sha256::digest(serialized)),
+                        );
+                        match proposal_store.create_or_get(&proposal_key, suggestion.clone(), self.skill_graph.as_ref()) {
+                            Ok(proposal) => Some(proposal.proposal_id),
+                            Err(error) => {
+                                warn!(task_iri = %task_iri, error = %error, "Failed to persist typed evolution proposal");
+                                None
+                            }
+                        }
+                    }).collect::<Vec<_>>();
                     let snapshot_json = serde_json::json!({
                         "@id": format!("{}#health-snapshot", task_iri),
                         "@type": "SkillHealthSnapshot",
@@ -790,7 +1155,9 @@ impl CodeCliEngine {
                             "skill_iri": s.skill_iri,
                             "description": s.description,
                             "confidence": s.confidence,
+                            "approval": s.approval.status(),
                         })).collect::<Vec<_>>(),
+                        "proposal_ids": proposal_ids,
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                     });
                     let snapshot_iri = format!("{}#health-snapshot", task_iri);
@@ -830,7 +1197,9 @@ impl CodeCliEngine {
             );
             match self.l2_bb.sparql_update(&sparql) {
                 Ok(_) => info!(task_iri = %task_iri, "Task metadata written to KG store"),
-                Err(e) => warn!(task_iri = %task_iri, error = %e, "Failed to write task metadata to KG"),
+                Err(e) => {
+                    warn!(task_iri = %task_iri, error = %e, "Failed to write task metadata to KG")
+                }
             }
         }
 
@@ -899,7 +1268,14 @@ impl CodeCliEngine {
 
     /// Token counter Arcs (lock-free reads from TUI).
     /// Returns (total_prompt, total_completion, last_prompt, last_completion).
-    pub fn token_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    pub fn token_arcs(
+        &self,
+    ) -> (
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
         (
             self.prompt_tokens.clone(),
             self.completion_tokens.clone(),
@@ -953,7 +1329,9 @@ impl CodeCliEngine {
         (l1, l2, l3)
     }
 
-    pub async fn list_checkpoints(&self) -> anyhow::Result<Vec<glidinghorse::core::checkpoint::CheckpointData>> {
+    pub async fn list_checkpoints(
+        &self,
+    ) -> anyhow::Result<Vec<glidinghorse::core::checkpoint::CheckpointData>> {
         let prefix = "iri://checkpoint/";
         let entries = self.l0.scan_iri_prefix(prefix, 100)?;
         let mut results: Vec<glidinghorse::core::checkpoint::CheckpointData> = entries
@@ -965,9 +1343,47 @@ impl CodeCliEngine {
         Ok(results)
     }
 
+    /// List durable, human-reviewable evolution proposals for this workspace.
+    pub fn list_evolution_proposals(
+        &self,
+    ) -> anyhow::Result<Vec<glidinghorse::skill_graph::EvolutionProposal>> {
+        Ok(EvolutionProposalStore::new(self.l0.clone()).list()?)
+    }
+
+    /// Record an explicit local-operator review. `approver` is an audit label,
+    /// not an authentication mechanism.
+    pub fn approve_evolution_proposal(
+        &self,
+        proposal_id: &str,
+        approver: &str,
+        comment: Option<String>,
+    ) -> anyhow::Result<glidinghorse::skill_graph::EvolutionProposal> {
+        Ok(EvolutionProposalStore::new(self.l0.clone()).approve(proposal_id, approver, comment)?)
+    }
+
+    pub fn validate_evolution_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> anyhow::Result<glidinghorse::skill_graph::EvolutionProposal> {
+        Ok(EvolutionProposalStore::new(self.l0.clone())
+            .validate_for_commit(proposal_id, self.skill_graph.as_ref())?)
+    }
+
+    /// Commit a governed link patch after durable approval and validation. No
+    /// automatic call path invokes this method.
+    pub fn commit_evolution_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> anyhow::Result<glidinghorse::skill_graph::EvolutionProposal> {
+        Ok(EvolutionProposalStore::new(self.l0.clone())
+            .commit_validated_link_patch(proposal_id, self.skill_graph.as_ref())?)
+    }
+
     pub async fn resume_task(&mut self, task_iri: &str) -> anyhow::Result<TaskResult> {
-        let cm = glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone());
-        let cp = cm.restore_latest(task_iri)?
+        let cm =
+            glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone());
+        let cp = cm
+            .restore_latest(task_iri)?
             .ok_or_else(|| anyhow::anyhow!("没有找到 task_iri={} 的 checkpoint", task_iri))?;
 
         let _agent_state: serde_json::Value = serde_json::from_str(&cp.agent_state_json)?;
@@ -980,15 +1396,25 @@ impl CodeCliEngine {
     }
 
     /// 从 checkpoint 恢复任务，包含完整的历史上下文消息
-    pub async fn resume_task_with_messages(&mut self, task_iri: &str, resumed_messages: Vec<glidinghorse::gateway::unified_gateway::ChatMessage>) -> anyhow::Result<TaskResult> {
+    pub async fn resume_task_with_messages(
+        &mut self,
+        task_iri: &str,
+        resumed_messages: Vec<glidinghorse::gateway::unified_gateway::ChatMessage>,
+    ) -> anyhow::Result<TaskResult> {
         let resume_input = "继续执行之前中断的任务。请从上次中断处继续。".to_string();
-        self.process_task_with_iri_and_messages(&resume_input, task_iri, Some(resumed_messages)).await
+        self.process_task_with_iri_and_messages(&resume_input, task_iri, Some(resumed_messages))
+            .await
     }
 
     /// Process a task with an externally-generated task IRI so the caller
     /// can emit supplementary input events during execution.
-    pub async fn process_task_with_iri(&mut self, user_input: &str, task_iri: &str) -> anyhow::Result<TaskResult> {
-        self.process_task_with_iri_and_messages(user_input, task_iri, None).await
+    pub async fn process_task_with_iri(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+    ) -> anyhow::Result<TaskResult> {
+        self.process_task_with_iri_and_messages(user_input, task_iri, None)
+            .await
     }
 
     /// Process a task with optional resumed messages (for checkpoint resume)
@@ -998,9 +1424,16 @@ impl CodeCliEngine {
         task_iri: &str,
         resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
     ) -> anyhow::Result<TaskResult> {
+        self.ensure_skill_vectors_indexed().await;
+        // Keep the code-KG precondition equivalent to the CLI task path.
+        // Scan failure is surfaced rather than silently claiming an updated
+        // code graph for a TUI/resume task.
+        self.scan_workspace_code()?;
         // Lazy MCP connect — connect to registered servers on first task
         if let Some(ref mut client) = self.mcp_client {
-            let needs_connect: Vec<String> = client.list_servers().iter()
+            let needs_connect: Vec<String> = client
+                .list_servers()
+                .iter()
                 .filter(|s| s.status == "registered")
                 .map(|s| s.name.clone())
                 .collect();
@@ -1019,7 +1452,9 @@ impl CodeCliEngine {
 
         use glidinghorse::core::agent_runner::TaskContext;
 
-        let ws_summary = self.workspace_monitor.as_ref()
+        let ws_summary = self
+            .workspace_monitor
+            .as_ref()
             .and_then(|wm| wm.get_file_inventory_summary());
 
         let ctx = TaskContext::new(task_iri, user_input, self.config.max_iterations)
@@ -1038,13 +1473,19 @@ impl CodeCliEngine {
         };
         let ctx = if let Some(msgs) = resumed_messages {
             let turn_count = msgs.iter().filter(|m| m.role == "assistant").count() as u32;
-            let tool_count = msgs.iter().filter(|m| m.role == "tool" || m.tool_call_id.is_some()).count() as u32;
+            let tool_count = msgs
+                .iter()
+                .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
+                .count() as u32;
             ctx.with_resumed_messages(msgs, turn_count, tool_count)
         } else {
             ctx
         };
 
-        let result = self.sa.process_task_with_context(user_input, task_iri, ctx).await?;
+        let result = self
+            .sa
+            .process_task_with_context(user_input, task_iri, ctx)
+            .await?;
 
         info!(
             task_iri = %task_iri,
@@ -1054,12 +1495,233 @@ impl CodeCliEngine {
             "任务处理完成"
         );
 
+        // TUI/resume uses this entry rather than `process_task`. Keep the
+        // transport-neutral terminal event and task-KG record consistent with
+        // the CLI path; CLI-specific AST/evolution follow-ups remain owned by
+        // `process_task` until they are separately made context-independent.
+        glidinghorse::core::TaskFinalizer::new(self.event_bus.clone())
+            .finalize(task_iri, &result)
+            .await;
+        self.record_tui_task_evolution(task_iri, &result).await;
+        self.write_task_metadata(task_iri, user_input, &result);
+
         // Snapshot the skill graph to the TimelineStore after each task,
         // enabling temporal rollback and traceability of graph evolution.
         let backend = SkillGraphSnapshotBackend::new(self.skill_graph.clone());
-        self.timeline.create_snapshot(&backend, &format!("task:{}", result.status.as_str()));
+        self.timeline
+            .create_snapshot(&backend, &format!("task:{}", result.status.as_str()));
 
         Ok(result)
     }
+
+    fn write_task_metadata(&self, task_iri: &str, user_input: &str, result: &TaskResult) {
+        use std::fmt::Write as FmtWrite;
+        let mut sparql = String::from(
+            "PREFIX task: <https://agent-harness.os/task#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n"
+        );
+        let escape_sparql = |s: &str| -> String {
+            s.replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', " ")
+                .replace('\r', " ")
+        };
+        let status_safe = escape_sparql(&result.status);
+        let input_safe = escape_sparql(&user_input.chars().take(200).collect::<String>());
+        let _ = write!(
+            sparql,
+            "INSERT DATA {{ GRAPH <graph:tasks> {{ <{task_iri}> a task:Task ; task:status '{status_safe}' ; task:input '{input_safe}' ; task:turnCount \"{}\"^^xsd:integer . }} }}\n",
+            result.turn_count,
+        );
+        match self.l2_bb.sparql_update(&sparql) {
+            Ok(_) => info!(task_iri = %task_iri, "Task metadata written to KG store"),
+            Err(error) => {
+                warn!(task_iri = %task_iri, %error, "Failed to write task metadata to KG")
+            }
+        }
+    }
+
+    /// The TUI/resume path has no CLI-only workspace scan, but it must still
+    /// contribute real tool outcomes to the shared skill graph and preserve
+    /// typed suggestions for review. This deliberately has no approval or
+    /// commit side effect.
+    async fn record_tui_task_evolution(&self, task_iri: &str, result: &TaskResult) {
+        let Ok(mut evolution) = self.evolution_engine.try_lock() else {
+            return;
+        };
+        let mut affected_skill_iris = Vec::new();
+        for action in &result.tracked_actions {
+            let Some(skill_iri) = self.skills.skill_iri_for_tool_name(&action.tool_name) else {
+                warn!(task_iri = %task_iri, tool = %action.tool_name, "No skill IRI for TUI tracked action");
+                continue;
+            };
+            let succeeded = matches!(
+                action.status,
+                glidinghorse::core::tracked_action::ActionStatus::Success
+            );
+            let mut usage = glidinghorse::skill_graph::evolution::UsageRecord::new(
+                &skill_iri,
+                task_iri,
+                &action.agent_role,
+                succeeded,
+            )
+            .with_context_tag(&result.status)
+            .with_context_tag(&format!("tool:{}", action.tool_name))
+            .with_duration(action.duration_secs.ceil().min(u32::MAX as f64) as u32);
+            if let Some(error) = action.error.as_deref() {
+                usage = usage.with_error(error);
+            }
+            if let Err(error) = evolution.record_usage(usage) {
+                warn!(task_iri = %task_iri, skill_iri = %skill_iri, %error, "Failed to record TUI skill usage");
+            } else if !affected_skill_iris.contains(&skill_iri) {
+                affected_skill_iris.push(skill_iri);
+            }
+        }
+
+        let causal_suggestions = evolution.get_pending_suggestions().to_vec();
+        if !causal_suggestions.is_empty() {
+            let serialized = causal_suggestions
+                .iter()
+                .map(|suggestion| {
+                    serde_json::json!({
+                        "type": format!("{:?}", suggestion.suggestion_type),
+                        "skill_iri": suggestion.skill_iri,
+                        "description": suggestion.description,
+                        "confidence": suggestion.confidence,
+                        "approval": suggestion.approval.status(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let payload = serde_json::json!({
+                "task_iri": task_iri,
+                "status": result.status,
+                "errors": result.errors,
+                "suggestions": serialized,
+                "entrypoint": "tui_or_resume",
+            });
+            let event_id = self
+                .event_bus
+                .emit(
+                    task_iri,
+                    "causal_analysis",
+                    "system:evolution_engine",
+                    &payload.to_string(),
+                )
+                .await;
+            info!(task_iri = %task_iri, %event_id, "Published TUI causal analysis");
+            let causal_iri = format!("{}#causal", task_iri);
+            if let Err(error) =
+                self.l2_bb
+                    .write_node(&causal_iri, &payload.to_string(), &self.core_config)
+            {
+                warn!(task_iri = %task_iri, %error, "Failed to write TUI causal analysis");
+            }
+        }
+
+        let preventive_actions = affected_skill_iris
+            .iter()
+            .flat_map(|skill_iri| {
+                evolution.suggest_preventive_action(skill_iri).into_iter().map(move |action| {
+                serde_json::json!({ "skill_iri": skill_iri, "action": action })
+            })
+            })
+            .collect::<Vec<_>>();
+        if !preventive_actions.is_empty() {
+            let preventive_iri = format!("{}#preventive-actions", task_iri);
+            let preventive = serde_json::json!({
+                "@id": preventive_iri,
+                "@type": "CausalPreventiveActions",
+                "task_iri": task_iri,
+                "actions": preventive_actions,
+                "entrypoint": "tui_or_resume",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+            let event_id = self
+                .event_bus
+                .emit(
+                    task_iri,
+                    "causal_preventive_actions",
+                    "system:evolution_engine",
+                    &preventive.to_string(),
+                )
+                .await;
+            info!(task_iri = %task_iri, %event_id, "Published TUI causal preventive actions");
+            if let Err(error) =
+                self.l2_bb
+                    .write_node(&preventive_iri, &preventive.to_string(), &self.core_config)
+            {
+                warn!(task_iri = %task_iri, %error, "Failed to write TUI causal preventive actions");
+            }
+        }
+
+        let improvements = evolution.suggest_improvements().await;
+        if improvements.is_empty() {
+            return;
+        }
+        let proposal_store = EvolutionProposalStore::new(self.l0.clone());
+        let proposal_ids = improvements.iter().filter_map(|suggestion| {
+            let patch = suggestion.patch.as_ref()?;
+            let serialized = serde_json::to_vec(suggestion).ok()?;
+            let key = format!("{}:tui-evolution:{}", task_iri, hex::encode(Sha256::digest(serialized)));
+            match proposal_store.create_or_get(&key, suggestion.clone(), self.skill_graph.as_ref()) {
+                Ok(proposal) => Some(proposal.proposal_id),
+                Err(error) => {
+                    warn!(task_iri = %task_iri, patch = ?patch, %error, "Failed to persist TUI evolution proposal");
+                    None
+                }
+            }
+        }).collect::<Vec<_>>();
+        let snapshot_iri = format!("{}#health-snapshot", task_iri);
+        let snapshot = serde_json::json!({
+            "@id": snapshot_iri,
+            "@type": "SkillHealthSnapshot",
+            "task_iri": task_iri,
+            "proposal_ids": proposal_ids,
+            "entrypoint": "tui_or_resume",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Err(error) =
+            self.l2_bb
+                .write_node(&snapshot_iri, &snapshot.to_string(), &self.core_config)
+        {
+            warn!(task_iri = %task_iri, %error, "Failed to write TUI skill health snapshot");
+        }
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{collect_workspace_code_files, load_code_scan_exclusions};
+
+    #[test]
+    fn code_scan_honors_configured_and_gitignore_exclusions_recursively() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(workspace.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("generated")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("configured_skip")).unwrap();
+        std::fs::write(workspace.path().join("src/nested/kept.rs"), "fn kept() {}").unwrap();
+        std::fs::write(workspace.path().join("generated/ignored.ts"), "export {};").unwrap();
+        std::fs::write(workspace.path().join("configured_skip/ignored.py"), "pass").unwrap();
+        std::fs::write(workspace.path().join("ignored.log"), "not source").unwrap();
+        std::fs::write(
+            workspace.path().join(".gitignore"),
+            "generated/\n*.log\n!kept.rs\n",
+        )
+        .unwrap();
+
+        let exclusions =
+            load_code_scan_exclusions(workspace.path(), &["configured_skip/".to_string()]);
+        let files = collect_workspace_code_files(workspace.path(), &exclusions)
+            .expect("workspace scan should succeed");
+        let relative = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(workspace.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(relative, vec!["src/nested/kept.rs"]);
+    }
+}

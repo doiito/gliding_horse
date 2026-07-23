@@ -6,10 +6,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
-use crate::memory::{l0_store, l2_blackboard, l3_projection, EvictionConfig};
 use crate::core::event_bus::EventBus;
 use crate::core::validation::ValidationEngine;
 use crate::core::CheckpointManager;
+use crate::memory::{l0_store, l2_blackboard, l3_projection, EvictionConfig};
 use crate::tools::skill_registry::SkillRegistry;
 
 #[derive(Error, Debug)]
@@ -51,18 +51,26 @@ pub enum CoreError {
     Internal { message: String },
 
     #[error("Permission denied: agent '{agent}' cannot {action} on '{resource}'")]
-    PermissionDenied { agent: String, resource: String, action: String },
+    PermissionDenied {
+        agent: String,
+        resource: String,
+        action: String,
+    },
 }
 
 impl From<oxigraph::store::StorageError> for CoreError {
     fn from(e: oxigraph::store::StorageError) -> Self {
-        CoreError::StorageError { message: e.to_string() }
+        CoreError::StorageError {
+            message: e.to_string(),
+        }
     }
 }
 
 impl From<oxigraph::sparql::QueryEvaluationError> for CoreError {
     fn from(e: oxigraph::sparql::QueryEvaluationError) -> Self {
-        CoreError::SparqlError { message: e.to_string() }
+        CoreError::SparqlError {
+            message: e.to_string(),
+        }
     }
 }
 
@@ -174,10 +182,14 @@ impl SemanticCore {
             "created_at": chrono::Utc::now().to_rfc3339(),
             "parent_task": parent_task_iri,
         });
-        let json_ld = serde_json::to_string(&task_node)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
-        self.blackboard.write_node(&task_iri, &json_ld, &self.config)?;
-        self.events.emit(&task_iri, "TASK_CREATED", "system", &json_ld).await;
+        let json_ld = serde_json::to_string(&task_node).map_err(|e| CoreError::Internal {
+            message: e.to_string(),
+        })?;
+        self.blackboard
+            .write_node(&task_iri, &json_ld, &self.config)?;
+        self.events
+            .emit(&task_iri, "TASK_CREATED", "system", &json_ld)
+            .await;
         Ok(task_iri)
     }
 
@@ -194,18 +206,28 @@ impl SemanticCore {
             task_iri.strip_prefix("iri://").unwrap_or(task_iri),
             uuid::Uuid::new_v4().hyphenated()
         );
-        self.blackboard.write_node(&node_iri, json_ld, &self.config)?;
+        self.blackboard
+            .write_node(&node_iri, json_ld, &self.config)?;
         self.projection.invalidate_cache_for_task(task_iri);
         self.events
-            .emit(task_iri, "NODE_CREATED", created_by.unwrap_or("unknown"), &serde_json::json!({
-                "node_iri": &node_iri,
-                "node_type": node_type,
-            }).to_string())
+            .emit(
+                task_iri,
+                "NODE_CREATED",
+                created_by.unwrap_or("unknown"),
+                &serde_json::json!({
+                    "node_iri": &node_iri,
+                    "node_type": node_type,
+                })
+                .to_string(),
+            )
             .await;
         Ok(node_iri)
     }
 
-    pub async fn read_node(&self, node_iri: &str) -> Result<Option<std::sync::Arc<l2_blackboard::Node>>, CoreError> {
+    pub async fn read_node(
+        &self,
+        node_iri: &str,
+    ) -> Result<Option<std::sync::Arc<l2_blackboard::Node>>, CoreError> {
         self.blackboard.read_node(node_iri)
     }
 
@@ -216,7 +238,9 @@ impl SemanticCore {
         source_agent_iri: &str,
         payload: &str,
     ) -> String {
-        self.events.emit(task_iri, event_type, source_agent_iri, payload).await
+        self.events
+            .emit(task_iri, event_type, source_agent_iri, payload)
+            .await
     }
 
     pub fn list_skills(&self, agent_role: &str) -> Vec<crate::tools::skill_registry::SkillMeta> {

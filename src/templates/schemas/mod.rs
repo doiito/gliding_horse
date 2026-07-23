@@ -1,14 +1,14 @@
 mod agent_template;
 mod prompt_segment;
 
-pub use agent_template::{AgentTemplate, validate_template};
+pub use agent_template::{validate_template, AgentTemplate};
 pub use prompt_segment::{PromptSegment, SegmentType};
 
-use std::path::Path;
-use std::collections::HashMap;
-use parking_lot::RwLock;
-use tracing::{debug, info, warn};
 use crate::CoreError;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::path::Path;
+use tracing::{debug, info, warn};
 
 pub struct TemplateRegistry {
     templates: RwLock<HashMap<String, AgentTemplate>>,
@@ -60,11 +60,10 @@ impl TemplateRegistry {
             message: format!("Failed to read template file {}: {}", path.display(), e),
         })?;
 
-        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-            CoreError::InvalidJsonLd {
+        let json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("Invalid JSON in {}: {}", path.display(), e),
-            }
-        })?;
+            })?;
 
         AgentTemplate::from_json_ld(&json)
     }
@@ -110,7 +109,8 @@ impl TemplateRegistry {
     pub fn find_template_by_role(&self, role: &str) -> Option<AgentTemplate> {
         let by_role = self.by_role.read();
         by_role.get(role).and_then(|ids| {
-            ids.first().and_then(|id| self.templates.read().get(id).cloned())
+            ids.first()
+                .and_then(|id| self.templates.read().get(id).cloned())
         })
     }
 
@@ -289,8 +289,8 @@ mod tests {
     #[test]
     fn test_registry_find_by_type() {
         let registry = TemplateRegistry::new();
-        let template = AgentTemplate::new("iri://template/pa", "PA")
-            .with_type("agent:PlanTemplate");
+        let template =
+            AgentTemplate::new("iri://template/pa", "PA").with_type("agent:PlanTemplate");
         registry.register(template).unwrap();
 
         let found = registry.find_templates_by_type("agent:PlanTemplate");

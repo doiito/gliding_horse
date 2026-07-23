@@ -6,9 +6,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::batch::error::BatchError;
-use crate::batch::types::{
-    BatchAgentConfig, PromptContext, PromptSource, WindowEntry,
-};
+use crate::batch::types::{BatchAgentConfig, PromptContext, PromptSource, WindowEntry};
 use crate::batch::vocabulary::{EntityTypeConfig, IntentTypeConfig, RelationTypeConfig};
 use crate::core::system_prompt::{SystemPromptBuilder, SystemPromptRegion};
 use crate::memory::l0_store::L0Store;
@@ -33,10 +31,7 @@ pub struct DynamicPromptEngine {
 }
 
 impl DynamicPromptEngine {
-    pub fn new(
-        template_engine: Arc<TemplateEngine>,
-        l0_store: Option<Arc<L0Store>>,
-    ) -> Self {
+    pub fn new(template_engine: Arc<TemplateEngine>, l0_store: Option<Arc<L0Store>>) -> Self {
         Self {
             template_engine,
             prompt_builder: SystemPromptBuilder::new(),
@@ -92,7 +87,12 @@ impl DynamicPromptEngine {
                 window_content.len(),
                 window_content
                     .iter()
-                    .map(|e| format!("[{}] {}: {}", e.timestamp.format("%H:%M:%S"), e.role, e.content))
+                    .map(|e| format!(
+                        "[{}] {}: {}",
+                        e.timestamp.format("%H:%M:%S"),
+                        e.role,
+                        e.content
+                    ))
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
@@ -144,7 +144,12 @@ impl DynamicPromptEngine {
                 window_content.len(),
                 window_content
                     .iter()
-                    .map(|e| format!("[{}] {}: {}", e.timestamp.format("%H:%M:%S"), e.role, e.content))
+                    .map(|e| format!(
+                        "[{}] {}: {}",
+                        e.timestamp.format("%H:%M:%S"),
+                        e.role,
+                        e.content
+                    ))
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
@@ -178,10 +183,7 @@ impl DynamicPromptEngine {
         config: &BatchAgentConfig,
         context: &PromptContext,
     ) -> Result<String, BatchError> {
-        let template_name = config
-            .prompt_template_name
-            .as_deref()
-            .unwrap_or("default");
+        let template_name = config.prompt_template_name.as_deref().unwrap_or("default");
 
         // Look up template using direct key matching template discovery
         let template_key = format!("prompts/batch/{}", template_name);
@@ -254,7 +256,9 @@ impl DynamicPromptEngine {
                     .prompt_template_name
                     .as_ref()
                     .map(|n| {
-                        self.template_engine.get_template(&format!("batch/{}", n)).is_some()
+                        self.template_engine
+                            .get_template(&format!("batch/{}", n))
+                            .is_some()
                     })
                     .unwrap_or(false);
 
@@ -267,7 +271,8 @@ impl DynamicPromptEngine {
                 let context_complexity = context.total_tokens();
                 let history_success_rate = 0.9; // Default optimistic value
 
-                if domain_maturity > 0.7 && history_success_rate > 0.85 && context_complexity < 2000 {
+                if domain_maturity > 0.7 && history_success_rate > 0.85 && context_complexity < 2000
+                {
                     PromptSource::TemplateFile
                 } else {
                     PromptSource::LlmGenerated

@@ -6,10 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(false)
-        .compile(
-            &["proto/pdca_core.proto"],
-            &["proto"],
-        )?;
+        .compile(&["proto/pdca_core.proto"], &["proto"])?;
 
     let se_app_proto = manifest_dir.join("apps/software_engineering_single/proto/se_app.proto");
     let se_app_proto_dir = manifest_dir.join("apps/software_engineering_single/proto");

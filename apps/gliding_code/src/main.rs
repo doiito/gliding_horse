@@ -6,22 +6,46 @@ struct Cli {
     #[arg(help = "Single prompt (omit for interactive mode)")]
     prompt: Option<String>,
 
-    #[arg(short = 'm', long = "model", default_value = "deepseek-v4-flash", help = "Model to use")]
+    #[arg(
+        short = 'm',
+        long = "model",
+        default_value = "deepseek-v4-flash",
+        help = "Model to use"
+    )]
     model: String,
 
-    #[arg(short = 'w', long = "workspace", default_value = ".", help = "Working directory")]
+    #[arg(
+        short = 'w',
+        long = "workspace",
+        default_value = ".",
+        help = "Working directory"
+    )]
     workspace: String,
 
-    #[arg(long = "max-iterations", default_value = "50", help = "Maximum iterations")]
+    #[arg(
+        long = "max-iterations",
+        default_value = "50",
+        help = "Maximum iterations"
+    )]
     max_iterations: u32,
 
-    #[arg(long = "max-pdca-cycles", default_value = "7", help = "Maximum PDCA cycle re-entry count for recursive tasks")]
+    #[arg(
+        long = "max-pdca-cycles",
+        default_value = "7",
+        help = "Maximum PDCA cycle re-entry count for recursive tasks"
+    )]
     max_pdca_cycles: u32,
 
-    #[arg(long = "api-key", help = "API key (takes precedence over DEEPSEEK_API_KEY env var)")]
+    #[arg(
+        long = "api-key",
+        help = "API key (takes precedence over DEEPSEEK_API_KEY env var)"
+    )]
     api_key: Option<String>,
 
-    #[arg(long = "api-url", help = "API URL (takes precedence over DEEPSEEK_API_URL env var)")]
+    #[arg(
+        long = "api-url",
+        help = "API URL (takes precedence over DEEPSEEK_API_URL env var)"
+    )]
     api_url: Option<String>,
 
     #[arg(short = 'v', long = "verbose", help = "Show verbose logs")]
@@ -30,22 +54,80 @@ struct Cli {
     #[arg(long = "debug", help = "Show debug logs (more detailed)")]
     debug: bool,
 
-    #[arg(long = "resume", help = "Resume task from checkpoint (provide task_iri)")]
+    #[arg(
+        long = "resume",
+        help = "Resume task from checkpoint (provide task_iri)"
+    )]
     resume: Option<String>,
 
     #[arg(long = "list-checkpoints", help = "List all checkpoints")]
     list_checkpoints: bool,
 
-    #[arg(long = "workflow", help = "Path to JSON-LD workflow definition file (optional, replaces LLM-generated plan)")]
+    #[arg(
+        long = "list-evolution-proposals",
+        help = "List durable skill-evolution proposals for this workspace"
+    )]
+    list_evolution_proposals: bool,
+
+    #[arg(
+        long = "approve-evolution-proposal",
+        value_name = "ID",
+        help = "Record an explicit approval for a proposal (requires --proposal-approver)"
+    )]
+    approve_evolution_proposal: Option<String>,
+
+    #[arg(
+        long = "validate-evolution-proposal",
+        value_name = "ID",
+        help = "Run no-side-effect gates for an approved proposal"
+    )]
+    validate_evolution_proposal: Option<String>,
+
+    #[arg(
+        long = "commit-evolution-proposal",
+        value_name = "ID",
+        help = "Commit a validated AddLink proposal"
+    )]
+    commit_evolution_proposal: Option<String>,
+
+    #[arg(
+        long = "proposal-approver",
+        value_name = "IDENTITY",
+        help = "Audit identity recorded with --approve-evolution-proposal; not authentication"
+    )]
+    proposal_approver: Option<String>,
+
+    #[arg(
+        long = "proposal-comment",
+        value_name = "TEXT",
+        help = "Optional audit comment for --approve-evolution-proposal"
+    )]
+    proposal_comment: Option<String>,
+
+    #[arg(
+        long = "workflow",
+        help = "Path to JSON-LD workflow definition file (optional, replaces LLM-generated plan)"
+    )]
     workflow: Option<String>,
 
-    #[arg(long = "daemon", help = "Run in daemon mode (Agent OS Worker — processes tasks from a Unix socket queue)")]
+    #[arg(
+        long = "daemon",
+        help = "Run in daemon mode (Agent OS Worker — processes tasks from a Unix socket queue)"
+    )]
     daemon: bool,
 
-    #[arg(long = "mcp-server", value_name = "NAME=URL", help = "MCP server config (repeatable, format name=url, e.g. --mcp-server chrome=http://localhost:3000/sse)")]
+    #[arg(
+        long = "mcp-server",
+        value_name = "NAME=URL",
+        help = "MCP server config (repeatable, format name=url, e.g. --mcp-server chrome=http://localhost:3000/sse)"
+    )]
     mcp_server: Vec<String>,
 
-    #[arg(long = "mcp-server-stdio", value_name = "NAME=JSON", help = "MCP Stdio server config (repeatable, format name=json, e.g. --mcp-server-stdio my-server='{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\"]}')")]
+    #[arg(
+        long = "mcp-server-stdio",
+        value_name = "NAME=JSON",
+        help = "MCP Stdio server config (repeatable, format name=json, e.g. --mcp-server-stdio my-server='{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\"]}')"
+    )]
     mcp_server_stdio: Vec<String>,
 }
 
@@ -81,15 +163,14 @@ fn main() -> anyhow::Result<()> {
     // tui-markdown 0.3 spams "Could not find syntax for code block: ''" on
     // every render when encountering fenced ``` or indented (4-space) code blocks.
     // Suppress its warnings to keep the log panel clean.
-    let filter_with_suppressions = |level: &str| {
-        format!("{},tui_markdown=error", level)
-    };
+    let filter_with_suppressions = |level: &str| format!("{},tui_markdown=error", level);
 
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter_with_suppressions(&log_level))),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(filter_with_suppressions(&log_level))
+            }),
         )
         .with_writer(shared_log)
         .with_target(false)
@@ -135,6 +216,29 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if cli.list_evolution_proposals {
+        list_evolution_proposals(&config)?;
+        return Ok(());
+    }
+
+    if let Some(ref proposal_id) = cli.approve_evolution_proposal {
+        let approver = cli.proposal_approver.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--approve-evolution-proposal requires --proposal-approver")
+        })?;
+        approve_evolution_proposal(&config, proposal_id, approver, cli.proposal_comment.clone())?;
+        return Ok(());
+    }
+
+    if let Some(ref proposal_id) = cli.validate_evolution_proposal {
+        validate_evolution_proposal(&config, proposal_id)?;
+        return Ok(());
+    }
+
+    if let Some(ref proposal_id) = cli.commit_evolution_proposal {
+        commit_evolution_proposal(&config, proposal_id)?;
+        return Ok(());
+    }
+
     if let Some(ref task_iri) = cli.resume {
         resume_task(config, task_iri, log_buffer)?;
         return Ok(());
@@ -152,34 +256,49 @@ fn main() -> anyhow::Result<()> {
 
     return Ok(());
 
-// Run in daemon mode: spawn an Agent OS Worker that processes tasks
-// from a Unix socket queue.
-fn run_daemon() -> anyhow::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let config = glidinghorse::worker::WorkerConfig::from_env();
-    eprintln!("Agent OS Worker starting (queue={}, concurrency={})...",
-        config.queue_base_path, config.concurrency);
-    if let Err(e) = rt.block_on(glidinghorse::worker::run_worker(config)) {
-        eprintln!("Agent OS Worker terminated with error: {}", e);
+    // Run in daemon mode: spawn an Agent OS Worker that processes tasks
+    // from a Unix socket queue.
+    fn run_daemon() -> anyhow::Result<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        let config = glidinghorse::worker::WorkerConfig::from_env();
+        eprintln!(
+            "Agent OS Worker starting (queue={}, concurrency={})...",
+            config.queue_base_path, config.concurrency
+        );
+        if let Err(e) = rt.block_on(glidinghorse::worker::run_worker(config)) {
+            eprintln!("Agent OS Worker terminated with error: {}", e);
+        }
+        Ok(())
     }
-    Ok(())
-}
 }
 
 fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    
+
     let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
     println!("Code CLI - Agent OS");
-    println!("Model: {} | Workspace: {}", engine.model(), engine.workspace());
+    println!(
+        "Model: {} | Workspace: {}",
+        engine.model(),
+        engine.workspace()
+    );
     println!();
 
     let result = rt.block_on(engine.process_task(prompt));
 
     match result {
         Ok((_, tr)) => {
-            let icon = match tr.status.as_str() { "success" => "✅", _ => "❌" };
-            println!("{} {} | Turns: {} | Tools: {}", icon, tr.status.to_uppercase(), tr.turn_count, tr.tool_call_count);
+            let icon = match tr.status.as_str() {
+                "success" => "✅",
+                _ => "❌",
+            };
+            println!(
+                "{} {} | Turns: {} | Tools: {}",
+                icon,
+                tr.status.to_uppercase(),
+                tr.turn_count,
+                tr.tool_call_count
+            );
             println!("📁 Output: {}", engine.workspace());
             println!();
             println!("{}", tr.summary);
@@ -201,10 +320,14 @@ fn run_single_with_logs(
     log_buffer: std::sync::Arc<code_cli::log_buffer::LogBuffer>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    
+
     let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
     println!("Code CLI - Agent OS");
-    println!("Model: {} | Workspace: {}", engine.model(), engine.workspace());
+    println!(
+        "Model: {} | Workspace: {}",
+        engine.model(),
+        engine.workspace()
+    );
     println!();
 
     let result = rt.block_on(engine.process_task(prompt));
@@ -221,8 +344,17 @@ fn run_single_with_logs(
 
     match result {
         Ok((_, tr)) => {
-            let icon = match tr.status.as_str() { "success" => "✅", _ => "❌" };
-            println!("{} {} | Turns: {} | Tools: {}", icon, tr.status.to_uppercase(), tr.turn_count, tr.tool_call_count);
+            let icon = match tr.status.as_str() {
+                "success" => "✅",
+                _ => "❌",
+            };
+            println!(
+                "{} {} | Turns: {} | Tools: {}",
+                icon,
+                tr.status.to_uppercase(),
+                tr.turn_count,
+                tr.tool_call_count
+            );
             println!("📁 Output: {}", engine.workspace());
             println!();
             println!("{}", tr.summary);
@@ -245,11 +377,117 @@ fn list_checkpoints(config: &code_cli::config::CliConfig) -> anyhow::Result<()> 
     } else {
         println!("Checkpoints:");
         for cp in &checkpoints {
-            println!("  {}  {}  turns={}  {}", cp.created_at, cp.name, cp.node_count, cp.task_iri);
+            println!(
+                "  {}  {}  turns={}  {}",
+                cp.created_at, cp.name, cp.node_count, cp.task_iri
+            );
         }
         println!("\nUse glidingcode --resume <task_iri> to resume");
     }
     Ok(())
+}
+
+fn list_evolution_proposals(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let engine = code_cli::engine::CodeCliEngine::new(config.clone())?;
+    let proposals = engine.list_evolution_proposals()?;
+    if proposals.is_empty() {
+        println!("No evolution proposals found.");
+    } else {
+        for proposal in proposals {
+            println!(
+                "{}  {:?}  {}  {}",
+                proposal.proposal_id,
+                proposal.status,
+                proposal.suggestion.skill_iri,
+                proposal.suggestion.description,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn approve_evolution_proposal(
+    config: &code_cli::config::CliConfig,
+    proposal_id: &str,
+    approver: &str,
+    comment: Option<String>,
+) -> anyhow::Result<()> {
+    let engine = code_cli::engine::CodeCliEngine::new(config.clone())?;
+    let proposal = engine.approve_evolution_proposal(proposal_id, approver, comment)?;
+    println!(
+        "Approved proposal {} ({:?})",
+        proposal.proposal_id, proposal.status
+    );
+    Ok(())
+}
+
+fn validate_evolution_proposal(
+    config: &code_cli::config::CliConfig,
+    proposal_id: &str,
+) -> anyhow::Result<()> {
+    let engine = code_cli::engine::CodeCliEngine::new(config.clone())?;
+    let proposal = engine.validate_evolution_proposal(proposal_id)?;
+    println!(
+        "Validated proposal {} ({:?})",
+        proposal.proposal_id, proposal.status
+    );
+    Ok(())
+}
+
+fn commit_evolution_proposal(
+    config: &code_cli::config::CliConfig,
+    proposal_id: &str,
+) -> anyhow::Result<()> {
+    let engine = code_cli::engine::CodeCliEngine::new(config.clone())?;
+    let proposal = engine.commit_evolution_proposal(proposal_id)?;
+    println!(
+        "Committed proposal {} ({:?})",
+        proposal.proposal_id, proposal.status
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn parses_durable_evolution_governance_commands() {
+        let cli = Cli::try_parse_from([
+            "glidingcode",
+            "--workspace",
+            "/tmp/gliding-code-test",
+            "--approve-evolution-proposal",
+            "proposal-42",
+            "--proposal-approver",
+            "reviewer@example.test",
+            "--proposal-comment",
+            "reviewed locally",
+        ])
+        .expect("governance command should be registered");
+
+        assert_eq!(cli.workspace, "/tmp/gliding-code-test");
+        assert_eq!(
+            cli.approve_evolution_proposal.as_deref(),
+            Some("proposal-42")
+        );
+        assert_eq!(
+            cli.proposal_approver.as_deref(),
+            Some("reviewer@example.test")
+        );
+        assert_eq!(cli.proposal_comment.as_deref(), Some("reviewed locally"));
+    }
+
+    #[test]
+    fn parses_non_mutating_proposal_list_command() {
+        let cli = Cli::try_parse_from(["glidingcode", "--list-evolution-proposals"])
+            .expect("list command should be registered");
+
+        assert!(cli.list_evolution_proposals);
+        assert!(cli.approve_evolution_proposal.is_none());
+        assert!(cli.commit_evolution_proposal.is_none());
+    }
 }
 
 fn resume_task(

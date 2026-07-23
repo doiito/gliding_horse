@@ -4,18 +4,17 @@ use std::os::unix::process::CommandExt;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::knowledge_graph::bridge::KnowledgeBridge;
 use crate::knowledge_graph::code_ast::CodeAstExtractor;
 use crate::knowledge_graph::extractor::KnowledgeExtractor;
 use crate::knowledge_graph::ontology::OntologyManager;
 use crate::knowledge_graph::rdf_mapper::RdfMapper;
-use crate::knowledge_graph::bridge::KnowledgeBridge;
 use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::knowledge_graph::types::{BridgeRelationType, EdgeDef, NodeDef, RdfQuad, RdfValue};
 use crate::skill_graph::graph_store::SkillGraphStore;
-use crate::knowledge_graph::types::{BridgeRelationType, NodeDef, EdgeDef, RdfQuad, RdfValue};
 use crate::utils::text::safe_truncate;
 
 use super::{GlobSearchInput, GrepSearchInput, ToolSearchInput, WebFetchInput, WebSearchInput};
@@ -63,9 +62,15 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let root = params.path.as_deref().unwrap_or(".");
-    let mode = params.output_mode.as_deref().unwrap_or("files_with_matches");
+    let mode = params
+        .output_mode
+        .as_deref()
+        .unwrap_or("files_with_matches");
     if mode != "files_with_matches" && mode != "content" && mode != "count" {
-        return Err(format!("Invalid output_mode: {}. Must be files_with_matches, content, or count", mode));
+        return Err(format!(
+            "Invalid output_mode: {}. Must be files_with_matches, content, or count",
+            mode
+        ));
     }
 
     let ci = params.case_insensitive.unwrap_or(false);
@@ -91,7 +96,10 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
     let mut all_matches: Vec<(String, usize, String)> = Vec::new();
     let mut file_contents: HashMap<String, String> = HashMap::new();
 
-    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -133,7 +141,12 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
 
     match mode {
         "files_with_matches" => {
-            let limited_files: Vec<String> = filenames.iter().skip(skipped).take(limit).cloned().collect();
+            let limited_files: Vec<String> = filenames
+                .iter()
+                .skip(skipped)
+                .take(limit)
+                .cloned()
+                .collect();
             Ok(json!({
                 "mode": "files_with_matches",
                 "num_files": files_with_matches,
@@ -181,7 +194,8 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
                 let cnt = content.lines().filter(|l| re.is_match(l)).count();
                 file_counts.push(json!({"file": fname, "count": cnt}));
             }
-            let limited_counts: Vec<Value> = file_counts.into_iter().skip(skipped).take(limit).collect();
+            let limited_counts: Vec<Value> =
+                file_counts.into_iter().skip(skipped).take(limit).collect();
             Ok(json!({
                 "mode": "count",
                 "num_files": files_with_matches,
@@ -285,7 +299,8 @@ pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
         ));
     }
 
-    let ct = resp.headers()
+    let ct = resp
+        .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
@@ -312,7 +327,11 @@ pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
         Err(e) => return Err(format!("Failed to read response body: {}", e)),
     };
 
-    let content = if ct.contains("html") { html_to_text(&body) } else { safe_truncate(&body, 8000).to_string() };
+    let content = if ct.contains("html") {
+        html_to_text(&body)
+    } else {
+        safe_truncate(&body, 8000).to_string()
+    };
 
     Ok(json!({
         "url": params.url, "status_code": code,
@@ -324,15 +343,15 @@ pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
 /// Execute search using Exa API (preferred, requires EXA_API_KEY env var).
 /// Return format compatible with execute_web_search.
 pub(super) async fn execute_exa_search(query: &str, started: Instant) -> Result<Value, String> {
-    let api_key = std::env::var("EXA_API_KEY")
-        .map_err(|_| "EXA_API_KEY not set".to_string())?;
+    let api_key = std::env::var("EXA_API_KEY").map_err(|_| "EXA_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("HTTP client: {}", e))?;
 
-    let resp = client.post("https://api.exa.ai/search")
+    let resp = client
+        .post("https://api.exa.ai/search")
         .header("x-api-key", &api_key)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
@@ -346,11 +365,14 @@ pub(super) async fn execute_exa_search(query: &str, started: Instant) -> Result<
         .map_err(|e| format!("Exa search request failed: {}", e))?;
 
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Exa response parse failed: {}", e))?;
 
     if !status.is_success() {
-        let error_msg = body.get("error")
+        let error_msg = body
+            .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown error");
         return Ok(json!({
@@ -362,22 +384,25 @@ pub(super) async fn execute_exa_search(query: &str, started: Instant) -> Result<
         }));
     }
 
-    let results: Vec<Value> = body.get("results")
+    let results: Vec<Value> = body
+        .get("results")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter().map(|r| {
-                json!({
-                    "title": r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                    "url": r.get("url").and_then(|v| v.as_str()).unwrap_or(""),
-                    "snippet": r.get("highlights")
-                        .and_then(|v| v.as_array())
-                        .and_then(|h| h.first())
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_else(|| {
-                            r.get("text").and_then(|v| v.as_str()).unwrap_or("")
-                        }),
+            arr.iter()
+                .map(|r| {
+                    json!({
+                        "title": r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                        "url": r.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                        "snippet": r.get("highlights")
+                            .and_then(|v| v.as_array())
+                            .and_then(|h| h.first())
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_else(|| {
+                                r.get("text").and_then(|v| v.as_str()).unwrap_or("")
+                            }),
+                    })
                 })
-            }).collect()
+                .collect()
         })
         .unwrap_or_default();
 
@@ -402,7 +427,9 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
                 }
                 tracing::warn!(
                     "Exa search failed ({}), falling back to DuckDuckGo",
-                    v.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error")
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("Unknown error")
                 );
             }
             Err(e) => {
@@ -422,10 +449,19 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
     // preventing Plan from exiting on network failure.
     let html_result: Result<(reqwest::StatusCode, String, String), String> = (async {
         // prefer DuckDuckGo Lite
-        let lite_url = format!("https://lite.duckduckgo.com/lite/?q={}", urlencode(&params.query));
-        let resp = client.get(&lite_url)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .send().await.map_err(|e| format!("Search: {}", e))?;
+        let lite_url = format!(
+            "https://lite.duckduckgo.com/lite/?q={}",
+            urlencode(&params.query)
+        );
+        let resp = client
+            .get(&lite_url)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Search: {}", e))?;
         let status = resp.status();
         let body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
 
@@ -434,10 +470,19 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
         }
 
         // fallback: DuckDuckGo HTML
-        let html_url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(&params.query));
-        let resp = client.get(&html_url)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .send().await.map_err(|e| format!("Search: {}", e))?;
+        let html_url = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            urlencode(&params.query)
+        );
+        let resp = client
+            .get(&html_url)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Search: {}", e))?;
         let status2 = resp.status();
         let body2 = resp.text().await.map_err(|e| format!("Read: {}", e))?;
 
@@ -446,11 +491,19 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
         }
 
         // fallback: DuckDuckGo Instant Answer API
-        let api_url = format!("https://api.duckduckgo.com/?q={}&format=json&no_html=1", urlencode(&params.query));
-        let resp = client.get(&api_url).send().await.map_err(|e| format!("API: {}", e))?;
+        let api_url = format!(
+            "https://api.duckduckgo.com/?q={}&format=json&no_html=1",
+            urlencode(&params.query)
+        );
+        let resp = client
+            .get(&api_url)
+            .send()
+            .await
+            .map_err(|e| format!("API: {}", e))?;
         let api_body = resp.text().await.map_err(|e| format!("Read: {}", e))?;
         Ok((status, api_body, "api".to_string()))
-    }).await;
+    })
+    .await;
 
     match html_result {
         Ok((status, body, source)) => {
@@ -498,15 +551,13 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
                 "results": results,
             }))
         }
-        Err(e) => {
-            Ok(json!({
-                "query": params.query,
-                "duration_seconds": started.elapsed().as_secs_f64(),
-                "results": [],
-                "error": format!("Search request failed: {}", e),
-                "suggestion": "Web search unavailable, please answer based on your own knowledge"
-            }))
-        }
+        Err(e) => Ok(json!({
+            "query": params.query,
+            "duration_seconds": started.elapsed().as_secs_f64(),
+            "results": [],
+            "error": format!("Search request failed: {}", e),
+            "suggestion": "Web search unavailable, please answer based on your own knowledge"
+        })),
     }
 }
 
@@ -522,7 +573,8 @@ pub(super) async fn execute_tool_search(input: Value) -> Result<Value, String> {
         ("web_search", "Search the web for current information. Network tool."),
         ("tool_search", "Search available tools by name or keyword. System tool."),
     ];
-    let matches: Vec<Value> = all.iter()
+    let matches: Vec<Value> = all
+        .iter()
         .filter(|(n, d)| n.to_lowercase().contains(&q) || d.to_lowercase().contains(&q))
         .take(max)
         .map(|(n, d)| json!({"name": n, "description": d, "source": "system:skills"}))
@@ -575,7 +627,8 @@ struct PowerShellInput {
 }
 
 pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
-    let params: FileReadInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    let params: FileReadInput =
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let path = &params.path;
     let path_obj = std::path::Path::new(path);
 
@@ -597,21 +650,32 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
         Err(e) => {
             let hint = if !path_obj.exists() {
                 // file not found → auto-list parent directory contents to help LLM find correct filename
-                let parent = path_obj.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                let parent = path_obj
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
                 let parent_display = parent.display().to_string();
                 let listing;
                 if let Ok(entries) = std::fs::read_dir(&parent) {
                     let files: Vec<String> = entries
                         .filter_map(|e| e.ok())
                         .map(|e| {
-                            let kind = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { "[dir]" } else { "[file]" };
+                            let kind = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                "[dir]"
+                            } else {
+                                "[file]"
+                            };
                             format!("  {} {}", kind, e.file_name().to_string_lossy())
                         })
                         .collect();
                     if files.is_empty() {
                         listing = format!("\nDirectory {} is empty.", parent_display);
                     } else {
-                        listing = format!("\nFiles in directory {}:\n{}", parent_display, files.join("\n"));
+                        listing = format!(
+                            "\nFiles in directory {}:\n{}",
+                            parent_display,
+                            files.join("\n")
+                        );
                     }
                 } else {
                     listing = format!("\nDirectory {} does not exist either. Use file_list(\".\") to see workspace root structure.", parent_display);
@@ -639,7 +703,12 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
     let lines: Vec<&str> = content.lines().collect();
     let start = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(usize::MAX);
-    let selected: Vec<String> = lines.iter().skip(start).take(limit).map(|l| l.to_string()).collect();
+    let selected: Vec<String> = lines
+        .iter()
+        .skip(start)
+        .take(limit)
+        .map(|l| l.to_string())
+        .collect();
     let total = lines.len();
     Ok(json!({
         "path": params.path, "total_lines": total,
@@ -648,7 +717,8 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
 }
 
 pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
-    let params: FileWriteInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    let params: FileWriteInput =
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     check_path_in_workspace(&params.path)?;
     if let Some(parent) = std::path::Path::new(&params.path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
@@ -658,7 +728,8 @@ pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
 }
 
 pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
-    let params: FileListInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    let params: FileListInput =
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let dir = params.path.as_deref().unwrap_or(".");
 
     // check if within workspace
@@ -676,7 +747,11 @@ pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("List error: {}", e))?;
     for entry in read_dir.flatten() {
         let ft = entry.file_type().ok();
-        let kind = if ft.map_or(false, |t| t.is_dir()) { "dir" } else { "file" };
+        let kind = if ft.map_or(false, |t| t.is_dir()) {
+            "dir"
+        } else {
+            "file"
+        };
         if let Ok(name) = entry.file_name().into_string() {
             entries.push(json!({"name": name, "type": kind}));
         }
@@ -688,20 +763,23 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
     // Windows: delegate to execute_powershell, LLM doesn't need to know
     #[cfg(windows)]
     {
-        let params: BashInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+        let params: BashInput =
+            serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
         let ps_input = serde_json::to_value(PowerShellInput {
             command: params.command,
             timeout: params.timeout,
             description: params.description,
             run_in_background: None,
-        }).map_err(|e| format!("Serialize error: {}", e))?;
+        })
+        .map_err(|e| format!("Serialize error: {}", e))?;
         return execute_powershell(ps_input).await;
     }
 
     // Unix: execute via sh -c
     #[cfg(not(windows))]
     {
-        let params: BashInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+        let params: BashInput =
+            serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
         use std::process::Command;
         use std::sync::{Arc, Mutex};
         use std::thread;
@@ -720,29 +798,28 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
             c.spawn().map_err(|e| format!("Spawn error: {}", e))
         };
 
-        let spawn_readers = |child: &mut std::process::Child|
-            -> (Arc<Mutex<String>>, Arc<Mutex<String>>)
-        {
-            let out_buf = Arc::new(Mutex::new(String::new()));
-            let err_buf = Arc::new(Mutex::new(String::new()));
-            if let Some(stdout) = child.stdout.take() {
-                let buf = out_buf.clone();
-                thread::spawn(move || {
-                    if let Ok(output) = std::io::read_to_string(stdout) {
-                        *buf.lock().expect("out_buf Mutex poisoned") = output;
-                    }
-                });
-            }
-            if let Some(stderr) = child.stderr.take() {
-                let buf = err_buf.clone();
-                thread::spawn(move || {
-                    if let Ok(output) = std::io::read_to_string(stderr) {
-                        *buf.lock().expect("err_buf Mutex poisoned") = output;
-                    }
-                });
-            }
-            (out_buf, err_buf)
-        };
+        let spawn_readers =
+            |child: &mut std::process::Child| -> (Arc<Mutex<String>>, Arc<Mutex<String>>) {
+                let out_buf = Arc::new(Mutex::new(String::new()));
+                let err_buf = Arc::new(Mutex::new(String::new()));
+                if let Some(stdout) = child.stdout.take() {
+                    let buf = out_buf.clone();
+                    thread::spawn(move || {
+                        if let Ok(output) = std::io::read_to_string(stdout) {
+                            *buf.lock().expect("out_buf Mutex poisoned") = output;
+                        }
+                    });
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    let buf = err_buf.clone();
+                    thread::spawn(move || {
+                        if let Ok(output) = std::io::read_to_string(stderr) {
+                            *buf.lock().expect("err_buf Mutex poisoned") = output;
+                        }
+                    });
+                }
+                (out_buf, err_buf)
+            };
 
         let mut child = spawn_child(&params.command)?;
         let (mut stdout_buf, mut stderr_buf) = spawn_readers(&mut child);
@@ -755,8 +832,14 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                 Ok(Some(status)) => {
                     // brief pause for reader threads to finish
                     thread::sleep(std::time::Duration::from_millis(50));
-                    let stdout = stdout_buf.lock().expect("stdout_buf Mutex poisoned").clone();
-                    let stderr = stderr_buf.lock().expect("stderr_buf Mutex poisoned").clone();
+                    let stdout = stdout_buf
+                        .lock()
+                        .expect("stdout_buf Mutex poisoned")
+                        .clone();
+                    let stderr = stderr_buf
+                        .lock()
+                        .expect("stderr_buf Mutex poisoned")
+                        .clone();
                     let code = status.code().unwrap_or(-1);
                     break json!({
                         "command": params.command, "exit_code": code,
@@ -784,8 +867,14 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                         }
                         let _ = child.kill();
                         kill_process_group(&child);
-                        let stdout = stdout_buf.lock().expect("stdout_buf Mutex poisoned").clone();
-                        let stderr = stderr_buf.lock().expect("stderr_buf Mutex poisoned").clone();
+                        let stdout = stdout_buf
+                            .lock()
+                            .expect("stdout_buf Mutex poisoned")
+                            .clone();
+                        let stderr = stderr_buf
+                            .lock()
+                            .expect("stderr_buf Mutex poisoned")
+                            .clone();
                         break json!({
                             "command": params.command, "timed_out": true,
                             "stdout": stdout, "stderr": stderr,
@@ -857,11 +946,13 @@ fn check_path_in_workspace(path: &str) -> Result<(), String> {
 }
 
 pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
-    let params: FileEditInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    let params: FileEditInput =
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     check_path_in_workspace(&params.path)?;
 
-    let content = std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
+    let content =
+        std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
 
     let count = content.matches(&params.old_string).count();
     if count == 0 {
@@ -885,7 +976,11 @@ pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
         content.replacen(&params.old_string, &params.new_string, 1)
     };
 
-    let replacements = if params.replace_all.unwrap_or(false) { count } else { 1 };
+    let replacements = if params.replace_all.unwrap_or(false) {
+        count
+    } else {
+        1
+    };
 
     std::fs::write(&params.path, &new_content).map_err(|e| format!("Write error: {}", e))?;
 
@@ -921,9 +1016,14 @@ fn generate_diff(path: &str, old_lines: &[&str], new_lines: &[&str]) -> String {
 }
 
 pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
-    let params: PowerShellInput = serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    let params: PowerShellInput =
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
-    let exe = if cfg!(target_os = "windows") { "powershell" } else { "pwsh" };
+    let exe = if cfg!(target_os = "windows") {
+        "powershell"
+    } else {
+        "pwsh"
+    };
 
     let exe_path = match which_powershell(exe) {
         Some(p) => p,
@@ -945,10 +1045,14 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
     let result = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = child.stdout.take()
+                let stdout = child
+                    .stdout
+                    .take()
                     .map(|out| std::io::read_to_string(out).unwrap_or_default())
                     .unwrap_or_default();
-                let stderr = child.stderr.take()
+                let stderr = child
+                    .stderr
+                    .take()
                     .map(|err| std::io::read_to_string(err).unwrap_or_default())
                     .unwrap_or_default();
                 let code = status.code().unwrap_or(-1);
@@ -970,7 +1074,9 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(e) => break json!({"command": params.command, "error": e.to_string(), "shell": exe}),
+            Err(e) => {
+                break json!({"command": params.command, "error": e.to_string(), "shell": exe})
+            }
         }
     };
     Ok(result)
@@ -997,19 +1103,44 @@ fn html_to_text(html: &str) -> String {
     for ch in html.chars() {
         match ch {
             '<' => in_tag = true,
-            '>' => { in_tag = false; if !text.is_empty() && !text.ends_with(' ') { text.push(' '); prev_space = true; } }
+            '>' => {
+                in_tag = false;
+                if !text.is_empty() && !text.ends_with(' ') {
+                    text.push(' ');
+                    prev_space = true;
+                }
+            }
             _ if in_tag => {}
-            ch if ch.is_whitespace() => { if !prev_space { text.push(' '); prev_space = true; } }
-            _ => { text.push(ch); prev_space = false; }
+            ch if ch.is_whitespace() => {
+                if !prev_space {
+                    text.push(' ');
+                    prev_space = true;
+                }
+            }
+            _ => {
+                text.push(ch);
+                prev_space = false;
+            }
         }
     }
-    let decoded = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        .replace("&quot;", "\"").replace("&nbsp;", " ");
+    let decoded = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ");
     let mut result = String::with_capacity(decoded.len());
     let mut ps = false;
     for ch in decoded.chars() {
-        if ch.is_whitespace() { if !ps { result.push(' '); ps = true; } }
-        else { result.push(ch); ps = false; }
+        if ch.is_whitespace() {
+            if !ps {
+                result.push(' ');
+                ps = true;
+            }
+        } else {
+            result.push(ch);
+            ps = false;
+        }
     }
     let len = safe_truncate(&result, 8000).len();
     result.truncate(len);
@@ -1021,21 +1152,41 @@ fn extract_ddg_results(html: &str) -> Vec<Value> {
     let mut rem = html;
     while let Some(s) = rem.find("result__a") {
         let after = &rem[s..];
-        let Some(hp) = after.find("href=") else { rem = &after[1..]; continue; };
+        let Some(hp) = after.find("href=") else {
+            rem = &after[1..];
+            continue;
+        };
         let hs = &after[hp + 5..];
-        let Some((url, rest)) = extract_quoted_str(hs) else { rem = &after[1..]; continue; };
-        let Some(ct) = rest.find('>') else { rem = &after[1..]; continue; };
+        let Some((url, rest)) = extract_quoted_str(hs) else {
+            rem = &after[1..];
+            continue;
+        };
+        let Some(ct) = rest.find('>') else {
+            rem = &after[1..];
+            continue;
+        };
         let at = &rest[ct + 1..];
-        let Some(ea) = at.find("</a>") else { rem = &after[1..]; continue; };
+        let Some(ea) = at.find("</a>") else {
+            rem = &after[1..];
+            continue;
+        };
         let title = html_to_text(&at[..ea]);
         rem = &at[ea + 4..];
         let snippet = if let Some(sp) = rem.find("result__snippet") {
             let sa = &rem[sp..];
             if let Some(tc) = sa.find('>') {
                 let sc = &sa[tc + 1..];
-                if let Some(es) = sc.find("</") { html_to_text(&sc[..es]) } else { String::new() }
-            } else { String::new() }
-        } else { String::new() };
+                if let Some(es) = sc.find("</") {
+                    html_to_text(&sc[..es])
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
         if !title.trim().is_empty() && (url.starts_with("http://") || url.starts_with("https://")) {
             results.push(json!({"title": title.trim(), "url": url, "snippet": snippet.trim()}));
         }
@@ -1045,7 +1196,9 @@ fn extract_ddg_results(html: &str) -> Vec<Value> {
 
 fn extract_ddg_api_results(body: &str) -> Vec<Value> {
     let mut results = Vec::new();
-    let Ok(data) = serde_json::from_str::<Value>(body) else { return results; };
+    let Ok(data) = serde_json::from_str::<Value>(body) else {
+        return results;
+    };
 
     // Abstract result
     if let Some(abstract_text) = data["AbstractText"].as_str() {
@@ -1078,10 +1231,10 @@ fn extract_ddg_api_results(body: &str) -> Vec<Value> {
                                 "url": sub["FirstURL"].as_str().unwrap_or(""),
                                 "snippet": text,
                             }));
-    }
-}
+                        }
+                    }
 
-// ---- L0 store read functions removed: agents should not access L0 directly, use L3 projection instead ----
+                    // ---- L0 store read functions removed: agents should not access L0 directly, use L3 projection instead ----
                 }
             }
         }
@@ -1094,16 +1247,30 @@ fn extract_ddg_lite_results(html: &str) -> Vec<Value> {
     let mut results = Vec::new();
     let mut rem = html;
     loop {
-        let Some(link_start) = rem.find("class=\"result-link\"") else { break; };
+        let Some(link_start) = rem.find("class=\"result-link\"") else {
+            break;
+        };
         let link_section = &rem[link_start..];
 
-        let Some(href_pos) = link_section.find("href=") else { rem = &link_section[1..]; continue; };
+        let Some(href_pos) = link_section.find("href=") else {
+            rem = &link_section[1..];
+            continue;
+        };
         let href_str = &link_section[href_pos + 5..];
-        let Some((url, after_url)) = extract_quoted_str(href_str) else { rem = &link_section[1..]; continue; };
+        let Some((url, after_url)) = extract_quoted_str(href_str) else {
+            rem = &link_section[1..];
+            continue;
+        };
 
-        let Some(gt_pos) = after_url.find('>') else { rem = &link_section[1..]; continue; };
+        let Some(gt_pos) = after_url.find('>') else {
+            rem = &link_section[1..];
+            continue;
+        };
         let title_start = &after_url[gt_pos + 1..];
-        let Some(title_end) = title_start.find("</a>") else { rem = &link_section[1..]; continue; };
+        let Some(title_end) = title_start.find("</a>") else {
+            rem = &link_section[1..];
+            continue;
+        };
         let title = html_to_text(&title_start[..title_end]);
 
         let snippet = if let Some(snip_pos) = after_url.find("class=\"result-snippet\"") {
@@ -1135,28 +1302,31 @@ fn extract_ddg_lite_results(html: &str) -> Vec<Value> {
 
 fn extract_quoted_str(input: &str) -> Option<(String, &str)> {
     let q = input.chars().next()?;
-    if q != '"' && q != '\'' { return None; }
+    if q != '"' && q != '\'' {
+        return None;
+    }
     let rest = &input[q.len_utf8()..];
     let end = rest.find(q)?;
     Some((rest[..end].to_string(), &rest[end + q.len_utf8()..]))
 }
 
 fn urlencode(s: &str) -> String {
-    s.chars().map(|c| match c {
-        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-        ' ' => "+".to_string(),
-        c => format!("%{:02X}", c as u8),
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "+".to_string(),
+            c => format!("%{:02X}", c as u8),
+        })
+        .collect()
 }
 
-static SKILL_CREATOR_GATEWAY: OnceCell<std::sync::Arc<crate::gateway::unified_gateway::UnifiedGateway>> = OnceCell::new();
-
-#[allow(dead_code)]
-pub(crate) fn init_skill_creator_gateway(gateway: std::sync::Arc<crate::gateway::unified_gateway::UnifiedGateway>) {
-    let _ = SKILL_CREATOR_GATEWAY.set(gateway);
-}
-
-pub(super) async fn execute_create_skill(input: Value, shared_graph: Option<Arc<SkillGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_create_skill(
+    input: Value,
+    gateway: Option<Arc<crate::gateway::unified_gateway::UnifiedGateway>>,
+    shared_graph: Option<Arc<SkillGraphStore>>,
+    shared_registry: Option<Arc<crate::tools::SkillRegistry>>,
+    vector_store: Option<Arc<crate::memory::hyperspace_store::HyperspaceStore>>,
+) -> Result<Value, String> {
     let description = input["description"].as_str().unwrap_or("").to_string();
     if description.is_empty() {
         return Err("description is required".to_string());
@@ -1166,13 +1336,17 @@ pub(super) async fn execute_create_skill(input: Value, shared_graph: Option<Arc<
     let category_hint = input["category_hint"].as_str().map(String::from);
     let security_level_override = input["security_level_override"].as_str().map(String::from);
 
-    if let Some(gateway) = SKILL_CREATOR_GATEWAY.get() {
-        let graph_store = shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
-        let registry = std::sync::Arc::new(crate::tools::SkillRegistry::new());
+    if let Some(gateway) = gateway {
+        let graph_store =
+            shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
+        let registry = shared_registry
+            .unwrap_or_else(|| std::sync::Arc::new(crate::tools::SkillRegistry::new()));
         let config = crate::skill_graph::SkillCreatorConfig::default();
-        let creator = crate::skill_graph::SkillCreator::new(
-            gateway.clone(), graph_store, registry, config,
-        );
+        let creator = crate::skill_graph::SkillCreator::new(gateway, graph_store, registry, config);
+        let creator = match vector_store {
+            Some(store) => creator.with_vector_store(store),
+            None => creator,
+        };
 
         let request = crate::skill_graph::CreateSkillRequest {
             description,
@@ -1181,18 +1355,28 @@ pub(super) async fn execute_create_skill(input: Value, shared_graph: Option<Arc<
             security_level_override,
         };
 
-        let result = creator.create_from_description(request).await
+        let result = creator
+            .create_from_description(request)
+            .await
             .map_err(|e| format!("Create Skill failed: {:?}", e))?;
 
         Ok(json!({
             "skill_iri": result.skill_iri,
             "name": result.name,
             "registered": true,
+            "executable": false,
+            "activation_status": "definition_only",
+            "note": "The definition is registered for review and discovery. No ToolExecutor handler is generated automatically.",
             "json_ld": result.json_ld,
         }))
     } else {
         let name = skill_name_hint.unwrap_or_else(|| {
-            description.split_whitespace().take(2).collect::<Vec<_>>().join("_").to_lowercase()
+            description
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("_")
+                .to_lowercase()
         });
         let category = category_hint.unwrap_or_else(|| "system".to_string());
 
@@ -1202,38 +1386,55 @@ pub(super) async fn execute_create_skill(input: Value, shared_graph: Option<Arc<
             "description": description,
             "category": category,
             "registered": false,
+            "executable": false,
+            "activation_status": "template_only",
             "note": "Gateway not initialized, returning template only. Use SkillCreator API to create the full Skill."
         }))
     }
 }
 
-pub(super) async fn execute_convert_skill(input: Value, shared_graph: Option<Arc<SkillGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_convert_skill(
+    input: Value,
+    gateway: Option<Arc<crate::gateway::unified_gateway::UnifiedGateway>>,
+    shared_graph: Option<Arc<SkillGraphStore>>,
+    shared_registry: Option<Arc<crate::tools::SkillRegistry>>,
+    vector_store: Option<Arc<crate::memory::hyperspace_store::HyperspaceStore>>,
+) -> Result<Value, String> {
     let markdown_content = input["markdown_content"].as_str().unwrap_or("").to_string();
     if markdown_content.is_empty() {
         return Err("markdown_content is required".to_string());
     }
     let source_path = input["source_path"].as_str().map(String::from);
 
-    if let Some(gateway) = SKILL_CREATOR_GATEWAY.get() {
-        let graph_store = shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
-        let registry = std::sync::Arc::new(crate::tools::SkillRegistry::new());
+    if let Some(gateway) = gateway {
+        let graph_store =
+            shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
+        let registry = shared_registry
+            .unwrap_or_else(|| std::sync::Arc::new(crate::tools::SkillRegistry::new()));
         let config = crate::skill_graph::SkillCreatorConfig::default();
-        let creator = crate::skill_graph::SkillCreator::new(
-            gateway.clone(), graph_store, registry, config,
-        );
+        let creator = crate::skill_graph::SkillCreator::new(gateway, graph_store, registry, config);
+        let creator = match vector_store {
+            Some(store) => creator.with_vector_store(store),
+            None => creator,
+        };
 
         let request = crate::skill_graph::ConvertMarkdownRequest {
             markdown_content,
             source_path,
         };
 
-        let result = creator.convert_from_markdown(request).await
+        let result = creator
+            .convert_from_markdown(request)
+            .await
             .map_err(|e| format!("Convert Skill failed: {:?}", e))?;
 
         Ok(json!({
             "skill_iri": result.skill_iri,
             "name": result.name,
             "registered": true,
+            "executable": false,
+            "activation_status": "definition_only",
+            "note": "The definition is registered for review and discovery. No ToolExecutor handler is generated automatically.",
             "json_ld": result.json_ld,
         }))
     } else {
@@ -1247,6 +1448,8 @@ pub(super) async fn execute_convert_skill(input: Value, shared_graph: Option<Arc
             "steps": def.steps.len(),
             "tags": def.tags,
             "registered": false,
+            "executable": false,
+            "activation_status": "template_only",
             "note": "Gateway not initialized, using static parse. Full conversion requires SkillCreator API."
         }))
     }
@@ -1254,7 +1457,10 @@ pub(super) async fn execute_convert_skill(input: Value, shared_graph: Option<Arc
 
 // ========== Knowledge graph tool implementation ==========
 
-pub(super) async fn execute_knowledge_extract(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_extract(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let text = input["text"].as_str().unwrap_or("").to_string();
     if text.is_empty() {
         return Err("text parameter cannot be empty".to_string());
@@ -1266,24 +1472,23 @@ pub(super) async fn execute_knowledge_extract(input: Value, kg_store: Arc<RwLock
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let api_key = std::env::var("ONE_API_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .map_err(|_| "API key not configured: set ONE_API_KEY or OPENAI_API_KEY environment variable".to_string())?;
-    let model = std::env::var("KG_EXTRACT_MODEL")
-        .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+        .map_err(|_| {
+            "API key not configured: set ONE_API_KEY or OPENAI_API_KEY environment variable"
+                .to_string()
+        })?;
+    let model =
+        std::env::var("KG_EXTRACT_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
 
     let ontology = OntologyManager::new();
-    let temp_store = KnowledgeGraphStore::new()
-        .map_err(|e| format!("Create temporary store failed: {}", e))?;
-    let extractor = KnowledgeExtractor::new(
-        ontology,
-        temp_store,
-        api_url,
-        api_key,
-        model,
-    );
+    let temp_store =
+        KnowledgeGraphStore::new().map_err(|e| format!("Create temporary store failed: {}", e))?;
+    let extractor = KnowledgeExtractor::new(ontology, temp_store, api_url, api_key, model);
 
-    let result = extractor.extract(&text, domain.as_deref())?;
+    let result = extractor.extract(&text, domain.as_deref()).await?;
 
-    let store = kg_store.write().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+    let store = kg_store
+        .write()
+        .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
     let graph = store.default_graph();
     store.write_quads(&result.quads, graph)?;
 
@@ -1296,14 +1501,19 @@ pub(super) async fn execute_knowledge_extract(input: Value, kg_store: Arc<RwLock
     }))
 }
 
-pub(super) async fn execute_knowledge_query(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_query(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let sparql = input["sparql"].as_str().unwrap_or("").to_string();
     if sparql.is_empty() {
         return Err("sparql parameter cannot be empty".to_string());
     }
     let named_graph = input["named_graph"].as_str().map(String::from);
 
-    let store = kg_store.read().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+    let store = kg_store
+        .read()
+        .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
     match store.query_sparql(&sparql, named_graph.as_deref()) {
         Ok(results) => Ok(json!({
             "success": true,
@@ -1319,7 +1529,9 @@ pub(super) async fn execute_knowledge_query(input: Value, kg_store: Arc<RwLock<K
 fn diagnose_sparql_error(sparql: &str, raw_error: &str) -> String {
     let mut msg = String::from("SPARQL query syntax error. Fix the query and retry.\n\n");
 
-    let error_body = raw_error.strip_prefix("SPARQL query failed: ").unwrap_or(raw_error);
+    let error_body = raw_error
+        .strip_prefix("SPARQL query failed: ")
+        .unwrap_or(raw_error);
     let pos = parse_error_position(error_body);
 
     if let Some((line, col)) = pos {
@@ -1334,8 +1546,8 @@ fn diagnose_sparql_error(sparql: &str, raw_error: &str) -> String {
             msg.push_str("│\n");
 
             if let Some(detail_start) = error_body.find(": ").and_then(|p| {
-                let rest = &error_body[p+2..];
-                rest.find(": ").map(|p2| &rest[p2+2..])
+                let rest = &error_body[p + 2..];
+                rest.find(": ").map(|p2| &rest[p2 + 2..])
             }) {
                 let detail = detail_start.trim();
                 if !detail.is_empty() && detail.len() < 200 {
@@ -1372,14 +1584,19 @@ fn parse_error_position(body: &str) -> Option<(usize, usize)> {
     Some((line, col))
 }
 
-pub(super) async fn execute_knowledge_search(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_search(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let keyword = input["keyword"].as_str().unwrap_or("").to_string();
     if keyword.is_empty() {
         return Err("keyword parameter cannot be empty".to_string());
     }
     let entity_type = input["entity_type"].as_str().map(String::from);
 
-    let store = kg_store.read().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+    let store = kg_store
+        .read()
+        .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
     let results = store.search_entities(&keyword, entity_type.as_deref())?;
 
     Ok(json!({
@@ -1390,14 +1607,19 @@ pub(super) async fn execute_knowledge_search(input: Value, kg_store: Arc<RwLock<
     }))
 }
 
-pub(super) async fn execute_knowledge_neighbors(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_neighbors(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let entity_id = input["entity_id"].as_str().unwrap_or("").to_string();
     if entity_id.is_empty() {
         return Err("entity_id parameter cannot be empty".to_string());
     }
     let depth = input["depth"].as_u64().unwrap_or(1).min(3) as usize;
 
-    let store = kg_store.read().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+    let store = kg_store
+        .read()
+        .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
     let result = store.get_neighbors(&entity_id, depth)?;
 
     Ok(json!({
@@ -1406,7 +1628,10 @@ pub(super) async fn execute_knowledge_neighbors(input: Value, kg_store: Arc<RwLo
     }))
 }
 
-pub(super) async fn execute_knowledge_import_json(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_import_json(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let json_data_str = input["json_data"].as_str().unwrap_or("");
     if json_data_str.is_empty() {
         return Err("json_data parameter cannot be empty".to_string());
@@ -1448,7 +1673,9 @@ pub(super) async fn execute_knowledge_import_json(input: Value, kg_store: Arc<Rw
         if let Some(obj) = item.as_object() {
             for (key, value) in obj {
                 if key != id_field && key != type_field && key != label_field {
-                    if desc_field == Some(key.as_str()) { continue; }
+                    if desc_field == Some(key.as_str()) {
+                        continue;
+                    }
                     properties.insert(key.clone(), value.clone());
                 }
             }
@@ -1472,7 +1699,11 @@ pub(super) async fn execute_knowledge_import_json(input: Value, kg_store: Arc<Rw
                     let target_id = if target_prefix.is_empty() {
                         target_val.to_string()
                     } else {
-                        format!("{}{}", target_prefix.trim_end_matches('/'), target_val.trim_start_matches('/'))
+                        format!(
+                            "{}{}",
+                            target_prefix.trim_end_matches('/'),
+                            target_val.trim_start_matches('/')
+                        )
                     };
                     if !target_id.is_empty() {
                         edges.push(EdgeDef {
@@ -1497,7 +1728,9 @@ pub(super) async fn execute_knowledge_import_json(input: Value, kg_store: Arc<Rw
     }
 
     let graph = {
-        let store = kg_store.read().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+        let store = kg_store
+            .read()
+            .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
         store.default_graph().to_string()
     };
 
@@ -1508,7 +1741,9 @@ pub(super) async fn execute_knowledge_import_json(input: Value, kg_store: Arc<Rw
     let result = RdfMapper::map_extraction(&extraction, &graph);
 
     {
-        let store = kg_store.write().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+        let store = kg_store
+            .write()
+            .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
         store.write_quads(&result.quads, &graph)?;
     }
 
@@ -1521,8 +1756,13 @@ pub(super) async fn execute_knowledge_import_json(input: Value, kg_store: Arc<Rw
     }))
 }
 
-pub(super) async fn execute_ontology_register(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
-    let terms = input["terms"].as_array().ok_or("terms parameter must be an array")?;
+pub(super) async fn execute_ontology_register(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
+    let terms = input["terms"]
+        .as_array()
+        .ok_or("terms parameter must be an array")?;
     if terms.is_empty() {
         return Err("terms array cannot be empty".to_string());
     }
@@ -1577,7 +1817,9 @@ pub(super) async fn execute_ontology_register(input: Value, kg_store: Arc<RwLock
 
     let registered = quads.len() / 3;
     {
-        let store = kg_store.write().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+        let store = kg_store
+            .write()
+            .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
         store.write_quads(&quads, graph)?;
     }
 
@@ -1588,7 +1830,10 @@ pub(super) async fn execute_ontology_register(input: Value, kg_store: Arc<RwLock
     }))
 }
 
-pub(super) async fn execute_knowledge_bridge_with_store(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_bridge_with_store(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let entity_id = input["entity_id"].as_str().unwrap_or("").to_string();
     if entity_id.is_empty() {
         return Err("entity_id parameter cannot be empty".to_string());
@@ -1603,12 +1848,19 @@ pub(super) async fn execute_knowledge_bridge_with_store(input: Value, kg_store: 
         "HasSkill" => BridgeRelationType::HasSkill,
         "ApplicableIn" => BridgeRelationType::ApplicableIn,
         "RelatedTo" => BridgeRelationType::RelatedTo,
-        _ => return Err(format!("Unsupported relation type: {}, options: HasSkill, ApplicableIn, RelatedTo", relation_type_str)),
+        _ => {
+            return Err(format!(
+                "Unsupported relation type: {}, options: HasSkill, ApplicableIn, RelatedTo",
+                relation_type_str
+            ))
+        }
     };
 
     // Create a bridge that shares the same underlying Oxigraph store.
     // Both `kg_store` and the bridge operate on the same triples.
-    let guard = kg_store.read().map_err(|e| format!("Failed to acquire kg_store lock: {}", e))?;
+    let guard = kg_store
+        .read()
+        .map_err(|e| format!("Failed to acquire kg_store lock: {}", e))?;
     let bridge = KnowledgeBridge::from_kg_store(&guard)
         .map_err(|e| format!("Failed to create KnowledgeBridge: {}", e))?;
     drop(guard); // release the read lock before write operations
@@ -1623,19 +1875,28 @@ pub(super) async fn execute_knowledge_bridge_with_store(input: Value, kg_store: 
     }))
 }
 
-pub(super) async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<RwLock<KnowledgeGraphStore>>) -> Result<Value, String> {
+pub(super) async fn execute_knowledge_extract_code(
+    input: Value,
+    kg_store: Arc<RwLock<KnowledgeGraphStore>>,
+) -> Result<Value, String> {
     let file_path = input["file_path"].as_str().unwrap_or("").to_string();
     if file_path.is_empty() {
         return Err("file_path parameter cannot be empty".to_string());
     }
-    let graph = input["named_graph"].as_str().unwrap_or("graph:code").to_string();
+    let graph = input["named_graph"]
+        .as_str()
+        .unwrap_or("graph:code")
+        .to_string();
     let force = input["force"].as_bool().unwrap_or(false);
 
-    let store = kg_store.write().map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
+    let store = kg_store
+        .write()
+        .map_err(|e| format!("Failed to acquire storage lock: {}", e))?;
 
     if force {
         let result = CodeAstExtractor::extract_from_file(&file_path, &graph)?;
-        store.delete_quads_by_subject_prefix(&format!("iri://entity/file:{}", file_path), &graph)?;
+        store
+            .delete_quads_by_subject_prefix(&format!("iri://entity/file:{}", file_path), &graph)?;
         store.write_quads(&result.quads, &graph)?;
         Ok(json!({
             "success": true,
@@ -1657,7 +1918,11 @@ pub(super) async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<R
                 "status": "unchanged",
                 "message": "File content unchanged, skipping AST extraction",
             })),
-            IncrementalResult::Created { entity_count, relation_count, quad_count } => Ok(json!({
+            IncrementalResult::Created {
+                entity_count,
+                relation_count,
+                quad_count,
+            } => Ok(json!({
                 "success": true,
                 "file_path": file_path,
                 "mode": "incremental",
@@ -1667,7 +1932,12 @@ pub(super) async fn execute_knowledge_extract_code(input: Value, kg_store: Arc<R
                 "quad_count": quad_count,
                 "graph": graph,
             })),
-            IncrementalResult::Updated { entity_count, relation_count, quad_count, deleted_quads } => Ok(json!({
+            IncrementalResult::Updated {
+                entity_count,
+                relation_count,
+                quad_count,
+                deleted_quads,
+            } => Ok(json!({
                 "success": true,
                 "file_path": file_path,
                 "mode": "incremental",
@@ -1712,7 +1982,10 @@ mod tests {
         assert!(msg.contains("line 1"), "should mention the line number");
         assert!(msg.contains("column 53"), "should mention the column");
         assert!(msg.contains("↑"), "should have a caret marker");
-        assert!(msg.contains("Common fixes"), "should include fix suggestions");
+        assert!(
+            msg.contains("Common fixes"),
+            "should include fix suggestions"
+        );
         assert!(msg.contains("parentheses"), "should mention parentheses");
     }
 

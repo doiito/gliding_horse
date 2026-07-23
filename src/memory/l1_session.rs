@@ -50,27 +50,62 @@ pub struct EvictionConfig {
 impl EvictionConfig {
     /// Default config — for Supervisor (SA), broad perspective
     pub const fn default_sa() -> Self {
-        Self { recency_weight: 0.30, relevance_weight: 0.40, cost_weight: 0.30, relevance_threshold: 0.3, safe_window_seconds: 300, beta: 0.7 }
+        Self {
+            recency_weight: 0.30,
+            relevance_weight: 0.40,
+            cost_weight: 0.30,
+            relevance_threshold: 0.3,
+            safe_window_seconds: 300,
+            beta: 0.7,
+        }
     }
 
     /// Plan (PA) — prioritize plan-structure-related history
     pub const fn plan() -> Self {
-        Self { recency_weight: 0.20, relevance_weight: 0.60, cost_weight: 0.20, relevance_threshold: 0.3, safe_window_seconds: 300, beta: 0.7 }
+        Self {
+            recency_weight: 0.20,
+            relevance_weight: 0.60,
+            cost_weight: 0.20,
+            relevance_threshold: 0.3,
+            safe_window_seconds: 300,
+            beta: 0.7,
+        }
     }
 
     /// Do (DA) — prioritize recent technical details, balance token cost
     pub const fn do_agent() -> Self {
-        Self { recency_weight: 0.35, relevance_weight: 0.30, cost_weight: 0.35, relevance_threshold: 0.3, safe_window_seconds: 300, beta: 0.7 }
+        Self {
+            recency_weight: 0.35,
+            relevance_weight: 0.30,
+            cost_weight: 0.35,
+            relevance_threshold: 0.3,
+            safe_window_seconds: 300,
+            beta: 0.7,
+        }
     }
 
     /// Check (CA) — prioritize audit standards and verification relevance
     pub const fn check() -> Self {
-        Self { recency_weight: 0.15, relevance_weight: 0.65, cost_weight: 0.20, relevance_threshold: 0.3, safe_window_seconds: 300, beta: 0.7 }
+        Self {
+            recency_weight: 0.15,
+            relevance_weight: 0.65,
+            cost_weight: 0.20,
+            relevance_threshold: 0.3,
+            safe_window_seconds: 300,
+            beta: 0.7,
+        }
     }
 
     /// Act (AA) — balanced config, slightly biased toward decision context
     pub const fn act() -> Self {
-        Self { recency_weight: 0.25, relevance_weight: 0.45, cost_weight: 0.30, relevance_threshold: 0.3, safe_window_seconds: 300, beta: 0.7 }
+        Self {
+            recency_weight: 0.25,
+            relevance_weight: 0.45,
+            cost_weight: 0.30,
+            relevance_threshold: 0.3,
+            safe_window_seconds: 300,
+            beta: 0.7,
+        }
     }
 
     pub fn for_role(role: &str) -> Self {
@@ -155,7 +190,12 @@ impl L1Session {
         Self::with_budget(agent_id, agent_role, task_iri, 4000)
     }
 
-    pub fn with_budget(agent_id: &str, agent_role: &str, task_iri: &str, token_budget: usize) -> Self {
+    pub fn with_budget(
+        agent_id: &str,
+        agent_role: &str,
+        task_iri: &str,
+        token_budget: usize,
+    ) -> Self {
         let eviction_config = EvictionConfig::for_role(agent_role);
         Self {
             session_id: format!("l1_{}", uuid::Uuid::new_v4().hyphenated()),
@@ -173,7 +213,13 @@ impl L1Session {
         }
     }
 
-    pub fn with_config(agent_id: &str, agent_role: &str, task_iri: &str, token_budget: usize, eviction_config: EvictionConfig) -> Self {
+    pub fn with_config(
+        agent_id: &str,
+        agent_role: &str,
+        task_iri: &str,
+        token_budget: usize,
+        eviction_config: EvictionConfig,
+    ) -> Self {
         Self {
             session_id: format!("l1_{}", uuid::Uuid::new_v4().hyphenated()),
             agent_id: agent_id.to_string(),
@@ -190,14 +236,30 @@ impl L1Session {
         }
     }
 
-    pub fn session_id(&self) -> &str { &self.session_id }
-    pub fn agent_id(&self) -> &str { &self.agent_id }
-    pub fn agent_role(&self) -> &str { &self.agent_role }
-    pub fn task_iri(&self) -> &str { &self.task_iri }
-    pub fn turn_count(&self) -> usize { self.turns.len() }
-    pub fn created_at(&self) -> &DateTime<Utc> { &self.created_at }
-    pub fn duration(&self) -> chrono::Duration { Utc::now() - self.created_at }
-    pub fn token_budget(&self) -> usize { self.token_budget }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    pub fn agent_role(&self) -> &str {
+        &self.agent_role
+    }
+    pub fn task_iri(&self) -> &str {
+        &self.task_iri
+    }
+    pub fn turn_count(&self) -> usize {
+        self.turns.len()
+    }
+    pub fn created_at(&self) -> &DateTime<Utc> {
+        &self.created_at
+    }
+    pub fn duration(&self) -> chrono::Duration {
+        Utc::now() - self.created_at
+    }
+    pub fn token_budget(&self) -> usize {
+        self.token_budget
+    }
 
     pub fn set_token_budget(&mut self, budget: usize) {
         self.token_budget = budget;
@@ -247,7 +309,10 @@ impl L1Session {
         // is_supplement entries skip this phase, only participate in scoring phase
         if cfg.relevance_threshold > 0.0 {
             let mut i = 1;
-            while i < self.turns.len() && self.current_tokens > self.token_budget && self.turns.len() > 1 {
+            while i < self.turns.len()
+                && self.current_tokens > self.token_budget
+                && self.turns.len() > 1
+            {
                 let t = &self.turns[i];
                 if !t.is_supplement {
                     let time_since = (now - t.timestamp).num_seconds();
@@ -282,7 +347,8 @@ impl L1Session {
                 };
                 // β fusion: query relevance × β + task relevance × (1-β)
                 let task_relevance = t.relevance_score.unwrap_or(query_sim);
-                let semantic_relevance = (cfg.beta * query_sim + (1.0 - cfg.beta) * task_relevance).max(0.001);
+                let semantic_relevance =
+                    (cfg.beta * query_sim + (1.0 - cfg.beta) * task_relevance).max(0.001);
 
                 let score = (1.0 / time_since) * cfg.recency_weight
                     + (1.0 / semantic_relevance) * cfg.relevance_weight
@@ -318,7 +384,11 @@ impl L1Session {
             } else {
                 entry.content.clone()
             };
-            self.add_summary("system", &format!("[Reloaded] {}", summary), Some(iri.to_string()));
+            self.add_summary(
+                "system",
+                &format!("[Reloaded] {}", summary),
+                Some(iri.to_string()),
+            );
             true
         } else {
             false
@@ -361,7 +431,12 @@ impl L1Session {
     /// Store LLM `summary` field to L1.
     /// thought+content should be separately archived to L0 via archive_full().
     /// Automatically checks token budget after adding, triggers eviction if exceeded.
-    pub fn add_summary(&mut self, role: &str, summary: &str, l0_archive_iri: Option<String>) -> &mut L1Turn {
+    pub fn add_summary(
+        &mut self,
+        role: &str,
+        summary: &str,
+        l0_archive_iri: Option<String>,
+    ) -> &mut L1Turn {
         let turn = L1Turn {
             role: role.to_string(),
             summary: summary.to_string(),
@@ -394,7 +469,9 @@ impl L1Session {
     ) -> Result<String, CoreError> {
         let iri = format!(
             "iri://archive/{}/{}/{}",
-            self.task_iri.strip_prefix("iri://").unwrap_or(&self.task_iri),
+            self.task_iri
+                .strip_prefix("iri://")
+                .unwrap_or(&self.task_iri),
             role,
             uuid::Uuid::new_v4().hyphenated()
         );
@@ -466,7 +543,11 @@ impl L1Session {
 
     /// Get summary chain with IRIs, for building structured reference summaries on message truncation.
     /// Each turn's summary is truncated to summary_length characters, with L0 archive IRI attached.
-    pub fn get_summary_chain_with_iris(&self, max_turns: usize, summary_length: usize) -> Vec<String> {
+    pub fn get_summary_chain_with_iris(
+        &self,
+        max_turns: usize,
+        summary_length: usize,
+    ) -> Vec<String> {
         self.turns
             .iter()
             .rev()
@@ -486,7 +567,9 @@ impl L1Session {
         if self.turns.is_empty() {
             return format!(
                 "Agent {} ({}) ran with {} turns.",
-                self.agent_id, self.agent_role, self.turns.len()
+                self.agent_id,
+                self.agent_role,
+                self.turns.len()
             );
         }
         let summaries: Vec<String> = self
@@ -669,7 +752,11 @@ mod tests {
     fn test_cosine_similarity_identical_vectors() {
         let v = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&v, &v);
-        assert!((sim - 1.0).abs() < 1e-6, "identical vectors should have similarity 1.0, got {}", sim);
+        assert!(
+            (sim - 1.0).abs() < 1e-6,
+            "identical vectors should have similarity 1.0, got {}",
+            sim
+        );
     }
 
     #[test]
@@ -677,7 +764,11 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - 0.0).abs() < 1e-6, "orthogonal vectors should have similarity 0.0, got {}", sim);
+        assert!(
+            (sim - 0.0).abs() < 1e-6,
+            "orthogonal vectors should have similarity 0.0, got {}",
+            sim
+        );
     }
 
     #[test]
@@ -685,7 +776,11 @@ mod tests {
         let a = vec![1.0, 2.0];
         let b = vec![-1.0, -2.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - (-1.0)).abs() < 1e-6, "opposite vectors should have similarity -1.0, got {}", sim);
+        assert!(
+            (sim - (-1.0)).abs() < 1e-6,
+            "opposite vectors should have similarity -1.0, got {}",
+            sim
+        );
     }
 
     #[test]
@@ -699,7 +794,11 @@ mod tests {
         let a = vec![0.0, 0.0];
         let b = vec![1.0, 2.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - 0.0).abs() < 1e-6, "zero vector should give 0.0, got {}", sim);
+        assert!(
+            (sim - 0.0).abs() < 1e-6,
+            "zero vector should give 0.0, got {}",
+            sim
+        );
     }
 
     // ========== Eviction Config Tests ==========
@@ -718,19 +817,33 @@ mod tests {
         assert!((sa.recency_weight - 0.30).abs() < 1e-6);
 
         let pa = EvictionConfig::for_role("PA");
-        assert!(pa.relevance_weight > pa.recency_weight, "PA should prioritize relevance over recency");
+        assert!(
+            pa.relevance_weight > pa.recency_weight,
+            "PA should prioritize relevance over recency"
+        );
         assert!((pa.relevance_weight - 0.60).abs() < 1e-6);
 
         let da = EvictionConfig::for_role("DA");
-        assert!(da.recency_weight >= da.cost_weight.min(da.relevance_weight), "DA should balance recency and cost");
+        assert!(
+            da.recency_weight >= da.cost_weight.min(da.relevance_weight),
+            "DA should balance recency and cost"
+        );
 
         let ca = EvictionConfig::for_role("CA");
-        assert!(ca.relevance_weight > 0.5, "CA should heavily prioritize relevance");
+        assert!(
+            ca.relevance_weight > 0.5,
+            "CA should heavily prioritize relevance"
+        );
     }
 
     #[test]
     fn test_eviction_config_with_config() {
-        let custom = EvictionConfig { recency_weight: 0.5, relevance_weight: 0.3, cost_weight: 0.2, ..Default::default() };
+        let custom = EvictionConfig {
+            recency_weight: 0.5,
+            relevance_weight: 0.3,
+            cost_weight: 0.2,
+            ..Default::default()
+        };
         let session = L1Session::with_config("agent_1", "DA", "iri://task/abc", 1000, custom);
         assert!((session.eviction_config().recency_weight - 0.5).abs() < 1e-6);
     }
@@ -744,12 +857,20 @@ mod tests {
         let match_emb = vec![0.99, 0.01, 0.01];
         let diff_emb = vec![0.0, 1.0, 0.0];
 
-        session.add_summary("assistant", "matching content", Some("iri://match".to_string()));
+        session.add_summary(
+            "assistant",
+            "matching content",
+            Some("iri://match".to_string()),
+        );
         if let Some(t) = session.turns.last_mut() {
             t.embedding = Some(match_emb.clone());
         }
 
-        session.add_summary("assistant", "different content", Some("iri://diff".to_string()));
+        session.add_summary(
+            "assistant",
+            "different content",
+            Some("iri://diff".to_string()),
+        );
         if let Some(t) = session.turns.last_mut() {
             t.embedding = Some(diff_emb.clone());
         }
@@ -771,7 +892,10 @@ mod tests {
 
         assert_eq!(session.turns.len(), 1);
         let t = &session.turns[0];
-        assert!(t.is_supplement, "add_supplement should set is_supplement = true");
+        assert!(
+            t.is_supplement,
+            "add_supplement should set is_supplement = true"
+        );
         assert_eq!(t.role, "user");
         assert_eq!(t.summary, "supplement note");
         assert_eq!(t.embedding, emb);
@@ -799,18 +923,39 @@ mod tests {
         let _evicted = session.evict_with_query(None);
         // Supplements should not be evicted by hard threshold
         let has_supplement = session.turns.iter().any(|t| t.is_supplement);
-        assert!(has_supplement, "supplement should be protected from hard threshold eviction");
+        assert!(
+            has_supplement,
+            "supplement should be protected from hard threshold eviction"
+        );
     }
 
     #[test]
     fn test_beta_fusion_influences_eviction() {
         let mut session = L1Session::with_config(
-            "agent_1", "DA", "iri://task/abc", 10000,
-            EvictionConfig { recency_weight: 0.0, relevance_weight: 1.0, cost_weight: 0.0, relevance_threshold: 0.0, safe_window_seconds: 0, beta: 0.5 }
+            "agent_1",
+            "DA",
+            "iri://task/abc",
+            10000,
+            EvictionConfig {
+                recency_weight: 0.0,
+                relevance_weight: 1.0,
+                cost_weight: 0.0,
+                relevance_threshold: 0.0,
+                safe_window_seconds: 0,
+                beta: 0.5,
+            },
         );
         // Keep first turn (always kept), add padding turns to create budget pressure
-        session.add_summary("assistant", "first long padding text to generate token cost xxxxxx", None);
-        session.add_summary("assistant", "second long padding text to generate more cost yyyyyy", None);
+        session.add_summary(
+            "assistant",
+            "first long padding text to generate token cost xxxxxx",
+            None,
+        );
+        session.add_summary(
+            "assistant",
+            "second long padding text to generate more cost yyyyyy",
+            None,
+        );
 
         // Two turns: same query_sim but different task_relevance
         let emb = Some(vec![1.0, 0.0]);
@@ -829,14 +974,23 @@ mod tests {
         session.token_budget = session.current_tokens - 1;
         let q_emb = vec![1.0, 0.0];
         let evicted = session.evict_with_query(Some(&q_emb));
-        assert!(evicted > 0, "eviction should occur when tokens exceed budget");
+        assert!(
+            evicted > 0,
+            "eviction should occur when tokens exceed budget"
+        );
 
         // β=0.5: high_rel semantic = 0.5*1.0+0.5*0.9=0.95, low_rel = 0.5*1.0+0.5*0.1=0.55
         // score = (1/semantic)*1.0, so high_rel ≈ 1.05, low_rel ≈ 1.82
         // min score wins eviction → high_rel evicted
         let has_low = session.turns.iter().any(|t| t.summary == "low_rel_turn");
-        assert!(has_low, "low relevance turn (higher score) should survive eviction");
+        assert!(
+            has_low,
+            "low relevance turn (higher score) should survive eviction"
+        );
         let has_high = session.turns.iter().any(|t| t.summary == "high_rel_turn");
-        assert!(!has_high, "high relevance turn (lower score) should be evicted first");
+        assert!(
+            !has_high,
+            "high relevance turn (lower score) should be evicted first"
+        );
     }
 }

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use glidinghorse::config::GatewaySettings;
 use glidinghorse::config::settings::LoggingSettings;
+use glidinghorse::config::AgentSettings;
+use glidinghorse::config::GatewaySettings;
 use glidinghorse::core::agent_instance::AgentRole;
 use glidinghorse::core::event_bus::EventBus;
 use glidinghorse::core::sa::{SupervisorAgent, TaskComplexity};
@@ -12,11 +13,10 @@ use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::skill_registry::SkillRegistry;
-use glidinghorse::config::AgentSettings;
 use glidinghorse::utils::init_logging;
 use glidinghorse::CoreConfig;
-use tempfile::TempDir;
 use serde_json::Value;
+use tempfile::TempDir;
 
 static LOGGING_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -63,8 +63,8 @@ fn init_e2e_logging() {
 }
 
 fn validate_jsonld_basic(json_str: &str) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_str(json_str)
-        .map_err(|e| format!("JSON解析失败: {}", e))?;
+    let parsed: Value =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON解析失败: {}", e))?;
     if parsed.get("@id").is_none() {
         return Err("缺少 @id 字段".to_string());
     }
@@ -75,8 +75,7 @@ fn validate_jsonld_basic(json_str: &str) -> Result<Value, String> {
 }
 
 fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .expect("DEEPSEEK_API_KEY must be set");
+    let api_key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set");
     let base_url = std::env::var("DEEPSEEK_API_URL")
         .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
 
@@ -97,7 +96,10 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let core_config = CoreConfig::default();
     let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
-        l0.clone(), l2.clone(), proj.clone(), core_config,
+        l0.clone(),
+        l2.clone(),
+        proj.clone(),
+        core_config,
     )));
     let templates_dir = dir.path().join("templates");
     std::fs::create_dir_all(&templates_dir).unwrap();
@@ -105,10 +107,20 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
     let skills = Arc::new(SkillRegistry::new());
     let agent_settings = AgentSettings::default();
     let runner = Arc::new(glidinghorse::core::agent_runner::AgentRunner::new(
-        gateway, skills.clone(), l2.clone(), l0, mm, tmpl.clone(), agent_settings,
+        gateway,
+        skills.clone(),
+        l2.clone(),
+        l0,
+        mm,
+        tmpl.clone(),
+        agent_settings,
     ));
     let sa = SupervisorAgent::new(
-        runner, tmpl, skills, Arc::new(EventBus::new(100)), max_iterations,
+        runner,
+        tmpl,
+        skills,
+        Arc::new(EventBus::new(100)),
+        max_iterations,
     )
     .with_memory(Some(l2), None, None);
     (sa, dir)
@@ -156,13 +168,21 @@ Save the complete research report to /tmp/agent_os_e2e/ai_agent_research.md
 
     tracing::info!("执行时间: {:?}", elapsed);
 
-    assert!(result.is_ok(), "任务应该完成，不应该报错: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "任务应该完成，不应该报错: {:?}",
+        result.err()
+    );
     let task_result = result.unwrap();
 
     tracing::info!("========== 调研任务完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
-    tracing::info!("轮次: {}, 工具调用: {}", task_result.turn_count, task_result.tool_call_count);
+    tracing::info!(
+        "轮次: {}, 工具调用: {}",
+        task_result.turn_count,
+        task_result.tool_call_count
+    );
     tracing::info!("错误: {:?}", task_result.errors);
 
     assert_ne!(task_result.status, "failed", "调研任务不应该完全失败");
@@ -185,8 +205,11 @@ Save the complete research report to /tmp/agent_os_e2e/ai_agent_research.md
         for node in &nodes {
             if let Ok(parsed) = validate_jsonld_basic(&node.json_ld) {
                 valid_count += 1;
-                tracing::debug!("节点 {} JSON-LD 有效, @type: {:?}",
-                    node.iri, parsed.get("@type"));
+                tracing::debug!(
+                    "节点 {} JSON-LD 有效, @type: {:?}",
+                    node.iri,
+                    parsed.get("@type")
+                );
             }
         }
         tracing::info!("JSON-LD 验证: {}/{} 节点有效", valid_count, nodes.len());
@@ -245,7 +268,11 @@ async fn test_e2e_research_security_agents() {
     tracing::info!("========== 安防调研完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
-    tracing::info!("轮次: {}, 工具调用: {}", task_result.turn_count, task_result.tool_call_count);
+    tracing::info!(
+        "轮次: {}, 工具调用: {}",
+        task_result.turn_count,
+        task_result.tool_call_count
+    );
     tracing::info!("错误: {:?}", task_result.errors);
 
     assert_ne!(task_result.status, "failed", "调研任务不应该完全失败");
@@ -326,7 +353,11 @@ HTTP 服务要求：
     tracing::info!("========== 混合任务完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
-    tracing::info!("轮次: {}, 工具调用: {}", task_result.turn_count, task_result.tool_call_count);
+    tracing::info!(
+        "轮次: {}, 工具调用: {}",
+        task_result.turn_count,
+        task_result.tool_call_count
+    );
     tracing::info!("错误: {:?}", task_result.errors);
 
     assert_ne!(task_result.status, "failed", "混合任务不应该完全失败");
@@ -345,7 +376,10 @@ HTTP 服务要求：
     if server_path.exists() {
         let content = std::fs::read_to_string(server_path).unwrap();
         tracing::info!("✅ HTTP 服务已创建 ({} 字节)", content.len());
-        assert!(content.contains("http") || content.contains("HTTP"), "应该包含 HTTP 相关代码");
+        assert!(
+            content.contains("http") || content.contains("HTTP"),
+            "应该包含 HTTP 相关代码"
+        );
     } else {
         tracing::warn!("❌ HTTP 服务未创建");
     }
@@ -379,8 +413,11 @@ fn test_sa_research_task_classification() {
     ] {
         let plan = sa.analyze_task(task);
         assert_eq!(
-            plan.task_complexity, TaskComplexity::Exploratory,
-            "任务 '{}' 应为 Exploratory, 实际 {:?}", task, plan.task_complexity
+            plan.task_complexity,
+            TaskComplexity::Exploratory,
+            "任务 '{}' 应为 Exploratory, 实际 {:?}",
+            task,
+            plan.task_complexity
         );
     }
 
@@ -394,8 +431,13 @@ fn test_sa_research_task_classification() {
     ] {
         let plan = sa.analyze_task(task);
         assert!(
-            matches!(plan.task_complexity, TaskComplexity::Standard | TaskComplexity::Exploratory),
-            "任务 '{}' 返回无效分类: {:?}", task, plan.task_complexity
+            matches!(
+                plan.task_complexity,
+                TaskComplexity::Standard | TaskComplexity::Exploratory
+            ),
+            "任务 '{}' 返回无效分类: {:?}",
+            task,
+            plan.task_complexity
         );
         tracing::info!("任务: {} → 复杂度: {:?}", task, plan.task_complexity);
     }
@@ -409,12 +451,26 @@ fn test_sa_research_plan_structure() {
     let plan = sa.analyze_task("Research and compare different AI Agent frameworks");
     assert_eq!(plan.task_complexity, TaskComplexity::Exploratory);
     assert!(plan.parallel_groups.len() > 0, "探索性任务应该有并行组");
-    assert!(plan.agent_sequence.contains(&AgentRole::Plan), "应该包含 PA");
-    assert!(plan.agent_sequence.contains(&AgentRole::Check), "应该包含 CA");
+    assert!(
+        plan.agent_sequence.contains(&AgentRole::Plan),
+        "应该包含 PA"
+    );
+    assert!(
+        plan.agent_sequence.contains(&AgentRole::Check),
+        "应该包含 CA"
+    );
     assert!(plan.agent_sequence.contains(&AgentRole::Act), "应该包含 AA");
 
-    let da_count = plan.agent_sequence.iter().filter(|r| **r == AgentRole::Do).count();
-    assert!(da_count >= 2, "探索性任务应该有多个 DA，实际有 {}", da_count);
+    let da_count = plan
+        .agent_sequence
+        .iter()
+        .filter(|r| **r == AgentRole::Do)
+        .count();
+    assert!(
+        da_count >= 2,
+        "探索性任务应该有多个 DA，实际有 {}",
+        da_count
+    );
 
     tracing::info!("探索性任务计划: {:?}", plan.description);
     tracing::info!("Agent 序列: {:?}", plan.agent_sequence);

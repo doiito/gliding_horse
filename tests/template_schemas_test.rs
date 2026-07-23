@@ -1,6 +1,6 @@
 use glidinghorse::templates::schemas::{
-    AgentTemplate, PromptSegment, SegmentType, TemplateRegistry,
-    validate_template, create_pa_template, create_da_template, create_ca_template, create_aa_template,
+    create_aa_template, create_ca_template, create_da_template, create_pa_template,
+    validate_template, AgentTemplate, PromptSegment, SegmentType, TemplateRegistry,
 };
 use serde_json::json;
 
@@ -9,7 +9,7 @@ fn test_prompt_segment_fixed() {
     let segment = PromptSegment::fixed("Hello, World!");
     assert_eq!(segment.segment_type, SegmentType::Fixed);
     assert_eq!(segment.content, Some("Hello, World!".to_string()));
-    
+
     let ctx = serde_json::Map::new();
     assert_eq!(segment.render(&ctx), "Hello, World!");
 }
@@ -19,7 +19,7 @@ fn test_prompt_segment_variable() {
     let segment = PromptSegment::variable("name");
     assert_eq!(segment.segment_type, SegmentType::Variable);
     assert_eq!(segment.source, Some("name".to_string()));
-    
+
     let mut ctx = serde_json::Map::new();
     ctx.insert("name".to_string(), json!("Alice"));
     assert_eq!(segment.render(&ctx), "Alice");
@@ -28,7 +28,7 @@ fn test_prompt_segment_variable() {
 #[test]
 fn test_prompt_segment_dynamic_transform() {
     let segment = PromptSegment::dynamic("items", Some("join_comma".to_string()));
-    
+
     let mut ctx = serde_json::Map::new();
     ctx.insert("items".to_string(), json!(["a", "b", "c"]));
     assert_eq!(segment.render(&ctx), "a, b, c");
@@ -58,7 +58,7 @@ fn test_agent_template_json_ld() {
     let json = template.to_json_ld().unwrap();
     assert_eq!(json["@id"], "iri://template/da");
     assert_eq!(json["role"], "DA");
-    
+
     let parsed = AgentTemplate::from_json_ld(&json).unwrap();
     assert_eq!(parsed.id, template.id);
     assert_eq!(parsed.role, template.role);
@@ -100,7 +100,7 @@ fn test_validate_template_invalid_id() {
 fn test_template_registry_register() {
     let registry = TemplateRegistry::new();
     let template = AgentTemplate::new("iri://template/test", "PA");
-    
+
     assert!(registry.register(template).is_ok());
     assert_eq!(registry.count(), 1);
 }
@@ -119,8 +119,7 @@ fn test_template_registry_find_by_role() {
 #[test]
 fn test_template_registry_find_by_type() {
     let registry = TemplateRegistry::new();
-    let template = AgentTemplate::new("iri://template/pa", "PA")
-        .with_type("agent:PlanTemplate");
+    let template = AgentTemplate::new("iri://template/pa", "PA").with_type("agent:PlanTemplate");
     registry.register(template).unwrap();
 
     let found = registry.find_templates_by_type("agent:PlanTemplate");
@@ -176,24 +175,27 @@ fn test_template_serialization_roundtrip() {
     let original = create_da_template();
     let json = original.to_json_ld().unwrap();
     let restored = AgentTemplate::from_json_ld(&json).unwrap();
-    
+
     assert_eq!(original.id, restored.id);
     assert_eq!(original.role, restored.role);
     assert_eq!(original.type_, restored.type_);
-    assert_eq!(original.skill_whitelist.len(), restored.skill_whitelist.len());
+    assert_eq!(
+        original.skill_whitelist.len(),
+        restored.skill_whitelist.len()
+    );
 }
 
 #[test]
 fn test_multiple_templates_in_registry() {
     let registry = TemplateRegistry::new();
-    
+
     registry.register(create_pa_template()).unwrap();
     registry.register(create_da_template()).unwrap();
     registry.register(create_ca_template()).unwrap();
     registry.register(create_aa_template()).unwrap();
-    
+
     assert_eq!(registry.count(), 4);
-    
+
     assert!(registry.find_template_by_role("PA").is_some());
     assert!(registry.find_template_by_role("DA").is_some());
     assert!(registry.find_template_by_role("CA").is_some());

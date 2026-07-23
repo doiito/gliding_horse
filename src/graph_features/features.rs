@@ -41,11 +41,12 @@ impl NodeFeatures {
     pub fn to_dense(&self) -> Vec<f32> {
         let mut v = Vec::with_capacity(16);
         v.push(self.poincare_radius as f32);
-        for &a in &self.poincare_angles {
+        for &a in self.poincare_angles.iter().take(3) {
             v.push(a as f32);
         }
-        // Pad to ensure 4 angle dims
-        while self.poincare_angles.len() < 3 {
+        // Pad to exactly three angular dimensions.  Use the output length,
+        // rather than the immutable source length, so short inputs terminate.
+        while v.len() < 4 {
             v.push(0.0);
         }
         v.push(self.in_degree);
@@ -290,7 +291,11 @@ mod tests {
     fn test_extract_features() {
         let (graph, store) = test_fixture();
         store
-            .register_skill(SkillGraphNode::new("iri://skills/test", "Test", "A test skill"))
+            .register_skill(SkillGraphNode::new(
+                "iri://skills/test",
+                "Test",
+                "A test skill",
+            ))
             .unwrap();
 
         let extractor = FeatureExtractor::new(graph);
@@ -320,6 +325,29 @@ mod tests {
             let dense = f.to_dense();
             assert!(dense.len() >= 12);
         }
+    }
+
+    #[test]
+    fn test_dense_vector_pads_short_angle_vectors_without_looping() {
+        let features = NodeFeatures {
+            skill_iri: "iri://skills/short".to_string(),
+            poincare_radius: 0.5,
+            poincare_angles: vec![0.25],
+            in_degree: 0.0,
+            out_degree: 0.0,
+            page_rank: 0.0,
+            betweenness: 0.0,
+            community_id: 0,
+            node_type: 0.0,
+            maturity: 0.0,
+            success_rate: 0.0,
+            security_level: 0.0,
+            tag_count: 0.0,
+            avg_neighbor_success_rate: 0.0,
+        };
+
+        let dense = features.to_dense();
+        assert_eq!(&dense[..4], &[0.5, 0.25, 0.0, 0.0]);
     }
 
     #[test]

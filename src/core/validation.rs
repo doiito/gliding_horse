@@ -3,8 +3,8 @@
 //! This module provides validation for JSON-LD documents and schemas.
 //! Includes MetaValidator for LLM output "one roundtrip, double harvest" mechanism.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::jsonld::JsonLdContext;
 use crate::CoreError;
@@ -152,11 +152,7 @@ impl JsonLdValidator {
         }
     }
 
-    pub fn validate_schema(
-        &self,
-        json_ld: &str,
-        schema: &serde_json::Value,
-    ) -> ValidationResult {
+    pub fn validate_schema(&self, json_ld: &str, schema: &serde_json::Value) -> ValidationResult {
         let base_result = self.validate(json_ld);
         if !base_result.valid {
             return base_result;
@@ -229,7 +225,9 @@ impl SignatureVerifier {
     }
 
     pub fn verify(&self, data: &str, signature: &str) -> Result<bool, CoreError> {
-        let public_key = self.public_key.as_ref()
+        let public_key = self
+            .public_key
+            .as_ref()
             .ok_or_else(|| CoreError::Internal {
                 message: "No public key configured".to_string(),
             })?;
@@ -241,10 +239,8 @@ impl SignatureVerifier {
                 message: format!("Invalid signature encoding: {}", e),
             })?;
 
-        let peer_public_key = ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            public_key,
-        );
+        let peer_public_key =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key);
 
         match peer_public_key.verify(data.as_bytes(), &signature_bytes) {
             Ok(()) => Ok(true),
@@ -267,7 +263,7 @@ impl Default for SignatureVerifier {
 /// Meta Validator for LLM output "one roundtrip, double harvest" mechanism.
 ///
 /// Validates metadata from LLM output and converts to JSON-LD format.
-/// 
+///
 /// Provides generic schemas applicable to any task type, not just coding tasks.
 pub struct MetaValidator {
     schemas: HashMap<String, serde_json::Value>,
@@ -276,7 +272,7 @@ pub struct MetaValidator {
 impl MetaValidator {
     pub fn new() -> Self {
         let mut schemas = HashMap::new();
-        
+
         // Plan - task plan, applicable to any task type
         schemas.insert("plan".to_string(), serde_json::json!({
             "type": "object",
@@ -296,7 +292,7 @@ impl MetaValidator {
                 "tags": {"type": "array", "items": {"type": "string"}},
             }
         }));
-        
+
         // Execution - execution result, applicable to any task type
         schemas.insert("execution".to_string(), serde_json::json!({
             "type": "object",
@@ -315,7 +311,7 @@ impl MetaValidator {
                 "tags": {"type": "array", "items": {"type": "string"}},
             }
         }));
-        
+
         // Check - check/validation result, applicable to any type of quality check
         schemas.insert("check".to_string(), serde_json::json!({
             "type": "object",
@@ -333,7 +329,7 @@ impl MetaValidator {
                 "tags": {"type": "array", "items": {"type": "string"}},
             }
         }));
-        
+
         // Analysis - analysis/research result, applicable to any type of information gathering and analysis
         schemas.insert("analysis".to_string(), serde_json::json!({
             "type": "object",
@@ -352,7 +348,7 @@ impl MetaValidator {
                 "tags": {"type": "array", "items": {"type": "string"}},
             }
         }));
-        
+
         // Decision - decision result, applicable to any type of decision making
         schemas.insert("decision".to_string(), serde_json::json!({
             "type": "object",
@@ -370,32 +366,39 @@ impl MetaValidator {
                 "tags": {"type": "array", "items": {"type": "string"}},
             }
         }));
-        
+
         // Compatibility aliases for old names
-        schemas.insert("code".to_string(), schemas.get("execution").cloned().unwrap());
+        schemas.insert(
+            "code".to_string(),
+            schemas.get("execution").cloned().unwrap(),
+        );
         schemas.insert("review".to_string(), schemas.get("check").cloned().unwrap());
-        schemas.insert("research".to_string(), schemas.get("analysis").cloned().unwrap());
-        
+        schemas.insert(
+            "research".to_string(),
+            schemas.get("analysis").cloned().unwrap(),
+        );
+
         Self { schemas }
     }
-    
+
     pub fn validate_and_convert(
         &self,
         content_type: &str,
         meta: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
-        let schema = self.schemas.get(content_type).ok_or_else(|| {
-            CoreError::ValidationFailed {
+        let schema = self
+            .schemas
+            .get(content_type)
+            .ok_or_else(|| CoreError::ValidationFailed {
                 message: format!("Unknown content type: {}", content_type),
-            }
-        })?;
-        
+            })?;
+
         let compiled = jsonschema::JSONSchema::options()
             .compile(schema)
             .map_err(|e| CoreError::ValidationFailed {
                 message: format!("Schema compilation error: {}", e),
             })?;
-        
+
         if let Err(validation_errors) = compiled.validate(meta) {
             let errors: Vec<String> = validation_errors
                 .map(|e| format!("{}: {}", e.instance_path, e))
@@ -404,19 +407,19 @@ impl MetaValidator {
                 message: errors.join("; "),
             });
         }
-        
+
         let json_ld = self.convert_to_json_ld(content_type, meta)?;
-        
+
         Ok(json_ld)
     }
-    
+
     fn convert_to_json_ld(
         &self,
         content_type: &str,
         meta: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         let node_iri = format!("iri://node_{}", uuid::Uuid::new_v4().hyphenated());
-        
+
         // Generic type name mapping
         let type_name = match content_type {
             "plan" => "PlanNode",
@@ -426,17 +429,19 @@ impl MetaValidator {
             "decision" => "DecisionNode",
             _ => "Node",
         };
-        
+
         let mut json_ld = serde_json::json!({
             "@id": node_iri,
             "@type": type_name,
         });
         JsonLdContext::inject(&mut json_ld);
-        
+
         if let Some(obj) = json_ld.as_object_mut() {
             if let Some(meta_obj) = meta.as_object() {
                 for (key, value) in meta_obj {
-                    let prefixed_key = if ["summary", "confidence", "@id", "@type", "@context"].contains(&key.as_str()) {
+                    let prefixed_key = if ["summary", "confidence", "@id", "@type", "@context"]
+                        .contains(&key.as_str())
+                    {
                         key.clone()
                     } else {
                         format!("ex:{}", key)
@@ -444,26 +449,28 @@ impl MetaValidator {
                     obj.insert(prefixed_key, value.clone());
                 }
             }
-            
+
             obj.insert(
                 "validated_at".to_string(),
                 serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
             );
         }
-        
+
         Ok(json_ld)
     }
-    
+
     pub fn register_schema(&mut self, content_type: String, schema: serde_json::Value) {
         self.schemas.insert(content_type, schema);
     }
-    
+
     pub fn get_schema(&self, content_type: &str) -> Option<&serde_json::Value> {
         self.schemas.get(content_type)
     }
-    
+
     pub fn list_content_types(&self) -> Vec<String> {
-        let mut types: Vec<String> = self.schemas.keys()
+        let mut types: Vec<String> = self
+            .schemas
+            .keys()
             .filter(|k| !["code", "review", "research"].contains(&k.as_str()))
             .cloned()
             .collect();
@@ -507,7 +514,7 @@ mod tests {
     #[test]
     fn test_meta_validator_plan() {
         let validator = MetaValidator::new();
-        
+
         let plan = serde_json::json!({
             "summary": "Create a marketing strategy",
             "goal": "Increase brand awareness",
@@ -516,18 +523,21 @@ mod tests {
             "priority": "high",
             "confidence": 0.85
         });
-        
+
         let result = validator.validate_and_convert("plan", &plan);
         assert!(result.is_ok());
-        
+
         let json_ld = result.unwrap();
-        assert_eq!(json_ld.get("@type").and_then(|t| t.as_str()), Some("PlanNode"));
+        assert_eq!(
+            json_ld.get("@type").and_then(|t| t.as_str()),
+            Some("PlanNode")
+        );
     }
 
     #[test]
     fn test_meta_validator_execution() {
         let validator = MetaValidator::new();
-        
+
         let execution = serde_json::json!({
             "summary": "Marketing campaign launched",
             "result_type": "campaign",
@@ -535,18 +545,21 @@ mod tests {
             "steps_completed": ["Research", "Design", "Launch"],
             "confidence": 0.9
         });
-        
+
         let result = validator.validate_and_convert("execution", &execution);
         assert!(result.is_ok());
-        
+
         let json_ld = result.unwrap();
-        assert_eq!(json_ld.get("@type").and_then(|t| t.as_str()), Some("ExecutionResult"));
+        assert_eq!(
+            json_ld.get("@type").and_then(|t| t.as_str()),
+            Some("ExecutionResult")
+        );
     }
 
     #[test]
     fn test_meta_validator_check() {
         let validator = MetaValidator::new();
-        
+
         let check = serde_json::json!({
             "summary": "Campaign quality check passed",
             "verdict": "pass",
@@ -555,18 +568,21 @@ mod tests {
             "recommendations": ["Add more CTAs"],
             "confidence": 0.88
         });
-        
+
         let result = validator.validate_and_convert("check", &check);
         assert!(result.is_ok());
-        
+
         let json_ld = result.unwrap();
-        assert_eq!(json_ld.get("@type").and_then(|t| t.as_str()), Some("CheckResult"));
+        assert_eq!(
+            json_ld.get("@type").and_then(|t| t.as_str()),
+            Some("CheckResult")
+        );
     }
 
     #[test]
     fn test_meta_validator_analysis() {
         let validator = MetaValidator::new();
-        
+
         let analysis = serde_json::json!({
             "summary": "Market analysis completed",
             "findings": ["Growing demand", "Competitor weakness"],
@@ -574,18 +590,21 @@ mod tests {
             "reliability": "high",
             "confidence": 0.82
         });
-        
+
         let result = validator.validate_and_convert("analysis", &analysis);
         assert!(result.is_ok());
-        
+
         let json_ld = result.unwrap();
-        assert_eq!(json_ld.get("@type").and_then(|t| t.as_str()), Some("AnalysisReport"));
+        assert_eq!(
+            json_ld.get("@type").and_then(|t| t.as_str()),
+            Some("AnalysisReport")
+        );
     }
 
     #[test]
     fn test_meta_validator_decision() {
         let validator = MetaValidator::new();
-        
+
         let decision = serde_json::json!({
             "summary": "Proceed with campaign",
             "action": "continue",
@@ -593,18 +612,21 @@ mod tests {
             "next_steps": ["Monitor metrics", "Optimize"],
             "confidence": 0.9
         });
-        
+
         let result = validator.validate_and_convert("decision", &decision);
         assert!(result.is_ok());
-        
+
         let json_ld = result.unwrap();
-        assert_eq!(json_ld.get("@type").and_then(|t| t.as_str()), Some("DecisionNode"));
+        assert_eq!(
+            json_ld.get("@type").and_then(|t| t.as_str()),
+            Some("DecisionNode")
+        );
     }
 
     #[test]
     fn test_backward_compatibility() {
         let validator = MetaValidator::new();
-        
+
         // Old name "code" should map to "execution" schema
         let code = serde_json::json!({
             "summary": "Task completed",
@@ -612,8 +634,11 @@ mod tests {
         });
         let result = validator.validate_and_convert("code", &code);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().get("@type").and_then(|t| t.as_str()), Some("ExecutionResult"));
-        
+        assert_eq!(
+            result.unwrap().get("@type").and_then(|t| t.as_str()),
+            Some("ExecutionResult")
+        );
+
         // Old name "review" should map to "check" schema
         let review = serde_json::json!({
             "summary": "Review completed",
@@ -622,8 +647,11 @@ mod tests {
         });
         let result = validator.validate_and_convert("review", &review);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().get("@type").and_then(|t| t.as_str()), Some("CheckResult"));
-        
+        assert_eq!(
+            result.unwrap().get("@type").and_then(|t| t.as_str()),
+            Some("CheckResult")
+        );
+
         // Old name "research" should map to "analysis" schema
         let research = serde_json::json!({
             "summary": "Research completed",
@@ -631,20 +659,23 @@ mod tests {
         });
         let result = validator.validate_and_convert("research", &research);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().get("@type").and_then(|t| t.as_str()), Some("AnalysisReport"));
+        assert_eq!(
+            result.unwrap().get("@type").and_then(|t| t.as_str()),
+            Some("AnalysisReport")
+        );
     }
 
     #[test]
     fn test_list_content_types() {
         let validator = MetaValidator::new();
         let types = validator.list_content_types();
-        
+
         assert!(types.contains(&"plan".to_string()));
         assert!(types.contains(&"execution".to_string()));
         assert!(types.contains(&"check".to_string()));
         assert!(types.contains(&"analysis".to_string()));
         assert!(types.contains(&"decision".to_string()));
-        
+
         // Aliases should not appear in the list
         assert!(!types.contains(&"code".to_string()));
         assert!(!types.contains(&"review".to_string()));

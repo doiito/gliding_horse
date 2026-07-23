@@ -16,11 +16,30 @@ impl RdfMapper {
         let mut out = String::with_capacity(id.len() + 8);
         for b in id.bytes() {
             match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-                | b'-' | b'.' | b'_' | b'~'
-                | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
-                | b'*' | b'+' | b',' | b';' | b'='
-                | b':' | b'/' | b'@' | b'#' | b'?' | b'%' => out.push(b as char),
+                b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'/'
+                | b'@'
+                | b'#'
+                | b'?'
+                | b'%' => out.push(b as char),
                 b' ' | b'\n' | b'\r' | b'\t' => out.push('_'),
                 _ => out.push_str(&format!("%{:02X}", b)),
             }
@@ -45,10 +64,7 @@ impl RdfMapper {
                 } else {
                     "http://www.w3.org/2001/XMLSchema#decimal"
                 };
-                Some(RdfValue::TypedLiteral(
-                    n.to_string(),
-                    xsd_type.to_string(),
-                ))
+                Some(RdfValue::TypedLiteral(n.to_string(), xsd_type.to_string()))
             }
             serde_json::Value::String(s) => Some(RdfValue::Literal(s.clone())),
             serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
@@ -208,10 +224,7 @@ impl RdfMapper {
             triples.push(format!("{} {} {} .", s, p, o));
         }
         let body = triples.join("\n  ");
-        format!(
-            "INSERT DATA {{ GRAPH <{}> {{\n  {}\n}} }}",
-            graph, body
-        )
+        format!("INSERT DATA {{ GRAPH <{}> {{\n  {}\n}} }}", graph, body)
     }
 }
 
@@ -271,7 +284,10 @@ mod tests {
         );
         assert_eq!(quads[1].object, RdfValue::Literal("Alice".to_string()));
 
-        let age_quad = quads.iter().find(|q| q.predicate == "https://agentos.ontology/meta/age").unwrap();
+        let age_quad = quads
+            .iter()
+            .find(|q| q.predicate == "https://agentos.ontology/meta/age")
+            .unwrap();
         assert_eq!(
             age_quad.object,
             RdfValue::TypedLiteral(
@@ -280,7 +296,10 @@ mod tests {
             )
         );
 
-        let active_quad = quads.iter().find(|q| q.predicate == "https://agentos.ontology/meta/active").unwrap();
+        let active_quad = quads
+            .iter()
+            .find(|q| q.predicate == "https://agentos.ontology/meta/active")
+            .unwrap();
         assert_eq!(
             active_quad.object,
             RdfValue::TypedLiteral(
@@ -342,7 +361,10 @@ mod tests {
             .iter()
             .find(|q| q.predicate == "http://www.w3.org/1999/02/22-rdf-syntax-ns#subject")
             .unwrap();
-        assert_eq!(subj_quad.object, RdfValue::Iri("iri://entity/a".to_string()));
+        assert_eq!(
+            subj_quad.object,
+            RdfValue::Iri("iri://entity/a".to_string())
+        );
 
         let pred_quad = quads
             .iter()
@@ -391,12 +413,9 @@ mod tests {
         assert_eq!(result.entity_count, 1);
         assert_eq!(result.relation_count, 1);
 
-        assert!(result
-            .quads
-            .iter()
-            .any(|q| q.subject == "iri://entity/x"
-                && q.predicate == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                && q.object == RdfValue::Iri("Item".to_string())));
+        assert!(result.quads.iter().any(|q| q.subject == "iri://entity/x"
+            && q.predicate == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            && q.object == RdfValue::Iri("Item".to_string())));
         assert!(result
             .quads
             .iter()
@@ -423,8 +442,12 @@ mod tests {
         let sparql = RdfMapper::quads_to_sparql_insert(&quads, "my_graph");
 
         assert!(sparql.starts_with("INSERT DATA { GRAPH <my_graph> {"));
-        assert!(sparql.contains("<iri://entity/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <Person> ."));
-        assert!(sparql.contains(r#"<iri://entity/a> <http://www.w3.org/2000/01/rdf-schema#label> "Alice" ."#));
+        assert!(sparql.contains(
+            "<iri://entity/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <Person> ."
+        ));
+        assert!(sparql.contains(
+            r#"<iri://entity/a> <http://www.w3.org/2000/01/rdf-schema#label> "Alice" ."#
+        ));
         assert!(sparql.ends_with("} }"));
     }
 
@@ -447,7 +470,10 @@ mod tests {
     #[test]
     fn test_escape_sparql_literal() {
         assert_eq!(RdfMapper::escape_sparql_literal("hello"), "hello");
-        assert_eq!(RdfMapper::escape_sparql_literal(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(
+            RdfMapper::escape_sparql_literal(r#"say "hi""#),
+            r#"say \"hi\""#
+        );
         assert_eq!(RdfMapper::escape_sparql_literal("a\nb"), "a\\nb");
         assert_eq!(RdfMapper::escape_sparql_literal("a\\b"), "a\\\\b");
     }

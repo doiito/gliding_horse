@@ -8,6 +8,8 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -16,6 +18,7 @@ use std::time::Instant;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::EngineError;
 
@@ -34,6 +37,19 @@ pub enum WalOp {
     Upsert { id: u32, iri: String },
     Delete { id: u32, iri: String },
     MetadataUpdate { id: u32, iri: String },
+}
+
+/// A fully decoded WAL record. Versioned records retain all state required to
+/// rebuild the vector, IRI registry, and metadata index after a crash.
+#[derive(Debug, Clone)]
+pub struct WalRecord {
+    pub op: WalOp,
+    pub clock: u64,
+    pub data: Vec<u8>,
+    pub metadata: Option<Value>,
+    /// Legacy records predate IRI/metadata persistence and cannot safely
+    /// restore business-visible state unless already covered by a snapshot.
+    pub legacy: bool,
 }
 
 impl WalOp {
@@ -79,6 +95,7 @@ struct WalInner {
 
 impl EngineWal {
     const MAGIC: u8 = 0xFE;
+    const VERSIONED_OPCODE_FLAG: u8 = 0x80;
     const MAX_SIZE: u64 = 512 * 1024 * 1024;
     const MAX_IO_ERRORS: u64 = 3;
 
@@ -95,6 +112,9 @@ impl EngineWal {
                 .create(true)
                 .read(true)
                 .write(true)
+                // The lock file is a coordination inode, not a log. Keep any
+                // existing bytes intact while acquiring its advisory lock.
+                .truncate(false)
                 .open(&lock_path)?;
             let fd = lf.as_raw_fd();
             let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
@@ -109,14 +129,10 @@ impl EngineWal {
         #[cfg(not(unix))]
         let lock_file = None;
 
-        // Recover any frozen WAL files from prior crash
-        Self::recover_frozen_wals(dir)?;
-
         // Open active WAL
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .write(true)
             .read(true)
             .open(&active_path)?;
 
@@ -145,8 +161,17 @@ impl EngineWal {
 
     // ── Append ────────────────────────────────────────────────────────────
 
-    /// Append a WAL entry. The id is serialized into the packet for crash recovery.
-    pub fn append(&self, op: &WalOp, clock: u64, data: &[u8]) -> Result<(), EngineError> {
+    /// Append a versioned WAL entry.
+    ///
+    /// The packet includes IRI and JSON metadata as well as vector bytes, so a
+    /// WAL-only restart can restore the same observable state as a snapshot.
+    pub fn append(
+        &self,
+        op: &WalOp,
+        clock: u64,
+        data: &[u8],
+        metadata: Option<&Value>,
+    ) -> Result<(), EngineError> {
         // Surge protection
         if self.io_error_count.load(Ordering::Acquire) >= Self::MAX_IO_ERRORS {
             return Err(EngineError::StorageCritical(
@@ -154,40 +179,76 @@ impl EngineWal {
             ));
         }
 
-        let id = match op {
-            WalOp::Insert { id, .. } | WalOp::Upsert { id, .. } | WalOp::Delete { id, .. } | WalOp::MetadataUpdate { id, .. } => *id,
+        let (id, iri) = match op {
+            WalOp::Insert { id, iri }
+            | WalOp::Upsert { id, iri }
+            | WalOp::Delete { id, iri }
+            | WalOp::MetadataUpdate { id, iri } => (*id, iri.as_str()),
         };
+        let iri_bytes = iri.as_bytes();
+        let metadata_bytes = metadata
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| EngineError::StorageError {
+                message: format!("WAL metadata serialization: {e}"),
+            })?
+            .unwrap_or_default();
+        let iri_len = u32::try_from(iri_bytes.len()).map_err(|_| EngineError::StorageError {
+            message: "WAL IRI exceeds u32 length".into(),
+        })?;
+        let metadata_len =
+            u32::try_from(metadata_bytes.len()).map_err(|_| EngineError::StorageError {
+                message: "WAL metadata exceeds u32 length".into(),
+            })?;
 
         // Build packet: [Magic(1) PayloadLen(4) CRC32(4) Payload...]
-        // Payload = [Opcode(1) ID(4) Clock(8) Data...]
-        let payload_len = data.len() + 13; // opcode(1) + id(4) + clock(8)
+        // Payload v2 = [Opcode|0x80(1) ID(4) Clock(8) IriLen(4) MetaLen(4)
+        //               Iri... Metadata... VectorData...]
+        let payload_len = data.len() + iri_bytes.len() + metadata_bytes.len() + 21;
         let mut packet = Vec::with_capacity(payload_len + 9);
 
         let mut hasher = Hasher::new();
-        hasher.update(&[op.variant_byte()]);
+        let opcode = Self::VERSIONED_OPCODE_FLAG | op.variant_byte();
+        hasher.update(&[opcode]);
         hasher.update(&id.to_le_bytes());
         hasher.update(&clock.to_le_bytes());
+        hasher.update(&iri_len.to_le_bytes());
+        hasher.update(&metadata_len.to_le_bytes());
+        hasher.update(iri_bytes);
+        hasher.update(&metadata_bytes);
         hasher.update(data);
         let crc = hasher.finalize();
 
         packet.push(Self::MAGIC);
-        packet.write_u32::<LittleEndian>(payload_len as u32).unwrap();
+        packet
+            .write_u32::<LittleEndian>(payload_len as u32)
+            .unwrap();
         packet.write_u32::<LittleEndian>(crc).unwrap();
-        packet.push(op.variant_byte());
+        packet.push(opcode);
         packet.write_u32::<LittleEndian>(id).unwrap();
         packet.write_u64::<LittleEndian>(clock).unwrap();
+        packet.write_u32::<LittleEndian>(iri_len).unwrap();
+        packet.write_u32::<LittleEndian>(metadata_len).unwrap();
+        packet.write_all(iri_bytes).unwrap();
+        packet.write_all(&metadata_bytes).unwrap();
         packet.write_all(data).unwrap();
 
         let packet_len = packet.len() as u64;
 
-        let mut inner = self.inner.lock().map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
 
         // Check rotation (inside lock to avoid races)
         let current = self.current_size.load(Ordering::Relaxed);
         if current + packet_len > Self::MAX_SIZE {
             drop(inner);
             self.rotate()?;
-            inner = self.inner.lock().map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
+            inner = self
+                .inner
+                .lock()
+                .map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
         }
 
         // Write
@@ -216,15 +277,21 @@ impl EngineWal {
     fn sync_internal(&self, inner: &mut WalInner) -> Result<(), EngineError> {
         match self.sync_mode {
             WalSyncMode::Strict => {
-                inner.file.sync_all().map_err(|e| EngineError::StorageError {
-                    message: format!("WAL fsync: {e}"),
-                })?;
+                inner
+                    .file
+                    .sync_all()
+                    .map_err(|e| EngineError::StorageError {
+                        message: format!("WAL fsync: {e}"),
+                    })?;
             }
             WalSyncMode::Batch { interval_ms } => {
                 if inner.last_fsync.elapsed().as_millis() as u64 >= interval_ms {
-                    inner.file.sync_all().map_err(|e| EngineError::StorageError {
-                        message: format!("WAL batch fsync: {e}"),
-                    })?;
+                    inner
+                        .file
+                        .sync_all()
+                        .map_err(|e| EngineError::StorageError {
+                            message: format!("WAL batch fsync: {e}"),
+                        })?;
                     inner.last_fsync = Instant::now();
                 }
             }
@@ -244,7 +311,10 @@ impl EngineWal {
         let frozen_path = self.dir.join(&frozen_name);
 
         // Sync current file before rename
-        let mut inner = self.inner.lock().map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
         inner.file.flush()?;
         inner.file.sync_all()?;
         inner.file.seek(std::io::SeekFrom::Start(0))?;
@@ -257,11 +327,13 @@ impl EngineWal {
         let new_file = OpenOptions::new()
             .create(true)
             .append(true)
-            .write(true)
             .read(true)
             .open(&self.active_path)?;
 
-        let mut inner = self.inner.lock().map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
         inner.file = new_file;
         inner.last_fsync = Instant::now();
         drop(inner);
@@ -273,7 +345,10 @@ impl EngineWal {
     // ── Sync (explicit, for checkpoint coordination) ───────────────────────
 
     pub fn sync(&self) -> Result<(), EngineError> {
-        let mut inner = self.inner.lock().map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| EngineError::internal("WAL mutex poisoned"))?;
         inner.file.flush()?;
         inner.file.sync_all()?;
         inner.last_fsync = Instant::now();
@@ -284,7 +359,7 @@ impl EngineWal {
 
     pub fn replay<F>(path: &Path, mut callback: F) -> Result<u64, EngineError>
     where
-        F: FnMut(WalOp, u64, &[u8]),
+        F: FnMut(WalRecord) -> Result<(), EngineError>,
     {
         if !path.exists() {
             return Ok(0);
@@ -330,14 +405,11 @@ impl EngineWal {
             let mut hasher = Hasher::new();
             hasher.update(&payload);
             if hasher.finalize() != stored_crc {
-                tracing::warn!(
-                    "WAL CRC mismatch at offset {}, truncating",
-                    valid_pos
-                );
+                tracing::warn!("WAL CRC mismatch at offset {}, truncating", valid_pos);
                 break;
             }
 
-            // Parse: [Opcode(1) ID(4) Clock(8) Data...]
+            // Parse legacy [Opcode(1) ID(4) Clock(8) Data...] or v2.
             let mut cursor = std::io::Cursor::new(&payload[..]);
             let opcode = match cursor.read_u8() {
                 Ok(o) => o,
@@ -351,19 +423,73 @@ impl EngineWal {
                 Ok(c) => c,
                 Err(_) => break,
             };
-            let data = &payload[13..]; // after opcode(1) + id(4) + clock(8)
+            let versioned = opcode & Self::VERSIONED_OPCODE_FLAG != 0;
+            let variant = if versioned {
+                opcode & !Self::VERSIONED_OPCODE_FLAG
+            } else {
+                opcode
+            };
 
-            let op = match opcode {
-                1 => WalOp::Insert { id: entry_id, iri: String::new() },
-                2 => WalOp::Upsert { id: entry_id, iri: String::new() },
-                3 => WalOp::Delete { id: entry_id, iri: String::new() },
-                4 => WalOp::MetadataUpdate { id: entry_id, iri: String::new() },
+            let (iri, metadata, data, legacy) = if versioned {
+                let iri_len = cursor.read_u32::<LittleEndian>().map_err(|_| EngineError::StorageError {
+                    message: format!("Malformed versioned WAL record at offset {valid_pos}: missing IRI length"),
+                })? as usize;
+                let metadata_len = cursor.read_u32::<LittleEndian>().map_err(|_| EngineError::StorageError {
+                    message: format!("Malformed versioned WAL record at offset {valid_pos}: missing metadata length"),
+                })? as usize;
+                let body_start = cursor.position() as usize;
+                let required = body_start
+                    .saturating_add(iri_len)
+                    .saturating_add(metadata_len);
+                if required > payload.len() {
+                    return Err(EngineError::StorageError {
+                        message: format!("Malformed versioned WAL record at offset {valid_pos}: lengths exceed payload"),
+                    });
+                }
+                let iri = String::from_utf8(payload[body_start..body_start + iri_len].to_vec())
+                    .map_err(|e| EngineError::StorageError {
+                        message: format!("Malformed versioned WAL IRI at offset {valid_pos}: {e}"),
+                    })?;
+                let meta_start = body_start + iri_len;
+                let metadata = if metadata_len == 0 {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_slice(&payload[meta_start..meta_start + metadata_len])
+                            .map_err(|e| EngineError::StorageError {
+                                message: format!(
+                                    "Malformed versioned WAL metadata at offset {valid_pos}: {e}"
+                                ),
+                            })?,
+                    )
+                };
+                (
+                    iri,
+                    metadata,
+                    payload[meta_start + metadata_len..].to_vec(),
+                    false,
+                )
+            } else {
+                (String::new(), None, payload[13..].to_vec(), true)
+            };
+
+            let op = match variant {
+                1 => WalOp::Insert { id: entry_id, iri },
+                2 => WalOp::Upsert { id: entry_id, iri },
+                3 => WalOp::Delete { id: entry_id, iri },
+                4 => WalOp::MetadataUpdate { id: entry_id, iri },
                 _ => {
                     tracing::warn!("Unknown WAL opcode {opcode} at offset {valid_pos}");
                     break;
                 }
             };
-            callback(op, clock, data);
+            callback(WalRecord {
+                op,
+                clock,
+                data,
+                metadata,
+                legacy,
+            })?;
             count += 1;
 
             valid_pos += 1 + 4 + 4 + payload_len;
@@ -379,10 +505,13 @@ impl EngineWal {
         Ok(count)
     }
 
-    // ── Frozen WAL recovery ───────────────────────────────────────────────
+    // ── Frozen WAL discovery ──────────────────────────────────────────────
 
-    fn recover_frozen_wals(dir: &Path) -> Result<(), EngineError> {
-        let mut entries: Vec<_> = fs::read_dir(dir)?
+    /// Return frozen WAL segments in creation order. Recovery is performed by
+    /// the engine after it has restored a snapshot; opening a WAL must never
+    /// delete records before the engine has applied them.
+    pub fn frozen_paths(&self) -> Result<Vec<PathBuf>, EngineError> {
+        let mut entries: Vec<_> = fs::read_dir(&self.dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let n = e.file_name();
@@ -392,20 +521,17 @@ impl EngineWal {
             .collect();
         entries.sort_by_key(|e| e.file_name());
 
-        for entry in &entries {
-            let name = entry.file_name();
-            tracing::info!("Recovering frozen WAL: {}", name.to_string_lossy());
-            // Replay into current active (done externally)
-            Self::replay(&entry.path(), |_op, _clock, _data| {})?;
-            fs::remove_file(entry.path())?;
-        }
-        Ok(())
+        Ok(entries.into_iter().map(|entry| entry.path()).collect())
     }
 
     // ── Len (total bytes written) ─────────────────────────────────────────
 
     pub fn len(&self) -> u64 {
         self.current_size.load(Ordering::Relaxed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn active_path(&self) -> &Path {
@@ -439,14 +565,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = EngineWal::open(dir.path(), sync).unwrap();
 
-        wal.append(&WalOp::Insert { id: 1, iri: "test:1".into() }, 1, b"data1")
-            .unwrap();
-        wal.append(&WalOp::Upsert { id: 2, iri: "test:2".into() }, 2, b"data2")
-            .unwrap();
-        wal.append(&WalOp::Delete { id: 3, iri: "test:3".into() }, 3, b"")
-            .unwrap();
+        wal.append(
+            &WalOp::Insert {
+                id: 1,
+                iri: "test:1".into(),
+            },
+            1,
+            b"data1",
+            None,
+        )
+        .unwrap();
+        wal.append(
+            &WalOp::Upsert {
+                id: 2,
+                iri: "test:2".into(),
+            },
+            2,
+            b"data2",
+            None,
+        )
+        .unwrap();
+        wal.append(
+            &WalOp::Delete {
+                id: 3,
+                iri: "test:3".into(),
+            },
+            3,
+            b"",
+            None,
+        )
+        .unwrap();
 
-        assert!(wal.len() > 0, "WAL should contain written bytes");
+        assert!(!wal.is_empty(), "WAL should contain written bytes");
     }
 
     #[test]
@@ -469,16 +619,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let wal = EngineWal::open(dir.path(), WalSyncMode::Strict).unwrap();
-            wal.append(&WalOp::Insert { id: 1, iri: "iri:1".into() }, 10, b"payload")
-                .unwrap();
-            wal.append(&WalOp::Upsert { id: 2, iri: "iri:2".into() }, 20, b"more")
-                .unwrap();
+            wal.append(
+                &WalOp::Insert {
+                    id: 1,
+                    iri: "iri:1".into(),
+                },
+                10,
+                b"payload",
+                Some(&serde_json::json!({"label":"one"})),
+            )
+            .unwrap();
+            wal.append(
+                &WalOp::Upsert {
+                    id: 2,
+                    iri: "iri:2".into(),
+                },
+                20,
+                b"more",
+                None,
+            )
+            .unwrap();
             wal.sync().unwrap();
         }
 
         let mut entries = Vec::new();
-        let count = EngineWal::replay(&dir.path().join("active.wal"), |op, clock, _data| {
-            entries.push((op, clock));
+        let count = EngineWal::replay(&dir.path().join("active.wal"), |record| {
+            entries.push((record.op, record.clock, record.metadata));
+            Ok(())
         })
         .unwrap();
 
@@ -486,12 +653,20 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, 10);
         assert_eq!(entries[1].1, 20);
+        assert_eq!(
+            entries[0].0,
+            WalOp::Insert {
+                id: 1,
+                iri: "iri:1".into()
+            }
+        );
+        assert_eq!(entries[0].2.as_ref().unwrap()["label"], "one");
     }
 
     #[test]
     fn test_wal_replay_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let count = EngineWal::replay(&dir.path().join("active.wal"), |_, _, _| {}).unwrap();
+        let count = EngineWal::replay(&dir.path().join("active.wal"), |_| Ok(())).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -503,16 +678,24 @@ mod tests {
         // Write enough to verify WAL works
         for i in 0..10u32 {
             wal.append(
-                &WalOp::Insert { id: i, iri: format!("iri:{i}") },
+                &WalOp::Insert {
+                    id: i,
+                    iri: format!("iri:{i}"),
+                },
                 i as u64,
                 b"test",
+                None,
             )
             .unwrap();
         }
 
         // Replay back
         let mut count = 0u64;
-        EngineWal::replay(&dir.path().join("active.wal"), |_, _, _| count += 1).unwrap();
+        EngineWal::replay(&dir.path().join("active.wal"), |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(count, 10);
     }
 
@@ -530,6 +713,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;

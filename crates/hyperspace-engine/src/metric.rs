@@ -1,4 +1,6 @@
-use crate::hyper_vector::{dot_product, fast_acosh, l2_squared, norm_squared, EmbeddingVector, MetricKind};
+use crate::hyper_vector::{
+    dot_product, fast_acosh, l2_squared, norm_squared, EmbeddingVector, MetricKind,
+};
 
 /// The core Metric trait - allows runtime switching between distance functions.
 pub trait Metric: Send + Sync {
@@ -110,8 +112,8 @@ pub fn lorentz_validate(coords: &[f64]) -> Result<(), String> {
         return Err("Empty coordinates".into());
     }
     let mut minkowski_norm = -coords[0] * coords[0];
-    for i in 1..coords.len() {
-        minkowski_norm += coords[i] * coords[i];
+    for value in coords.iter().skip(1) {
+        minkowski_norm += value * value;
     }
     let err = (minkowski_norm + 1.0).abs();
     if err > 1e-6 {
@@ -265,7 +267,10 @@ mod tests {
         let a = LorentzVec::new(2.0_f64.cosh(), 2.0_f64.sinh(), 0.0);
         let b = LorentzVec::new(1.0, 0.0, 0.0);
         // Use new_unchecked because Lorentz vectors have spatial norm > 1
-        let d = LorentzMetric.distance(&v_unchecked(a.to_vec(), MetricKind::Lorentz), &v_unchecked(b.to_vec(), MetricKind::Lorentz));
+        let d = LorentzMetric.distance(
+            &v_unchecked(a.to_vec(), MetricKind::Lorentz),
+            &v_unchecked(b.to_vec(), MetricKind::Lorentz),
+        );
         assert!(d > 0.0);
     }
 
@@ -322,7 +327,12 @@ mod tests {
         let q2 = exp_map(&p, &v, 1.0);
         // Poincaré log/exp roundtrip is approximate with floating point
         for i in 0..p.len() {
-            assert!((q[i] - q2[i]).abs() < 1e-2, "log/exp roundtrip mismatch at {i}: {} vs {}", q[i], q2[i]);
+            assert!(
+                (q[i] - q2[i]).abs() < 1e-2,
+                "log/exp roundtrip mismatch at {i}: {} vs {}",
+                q[i],
+                q2[i]
+            );
         }
     }
 

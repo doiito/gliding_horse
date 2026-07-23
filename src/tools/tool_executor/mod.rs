@@ -3,27 +3,28 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::knowledge_graph::store::KnowledgeGraphStore;
+use crate::memory::hyperspace_store::HyperspaceStore;
+use crate::skill_graph::graph_store::SkillGraphStore;
+use crate::skill_graph::security::{SecurityContext, SecurityDecision, SecurityEngine};
 use crate::tools::builtin::hooks::HookRunner;
-use crate::tools::builtin::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
-use crate::tools::builtin::rag;
 use crate::tools::builtin::knowledge;
 #[cfg(feature = "ontology")]
 use crate::tools::builtin::ontology_tools;
-use crate::knowledge_graph::store::KnowledgeGraphStore;
-use crate::skill_graph::graph_store::SkillGraphStore;
+use crate::tools::builtin::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use crate::tools::builtin::rag;
+use crate::tools::skill_registry::SkillRegistry;
 use crate::tools::tool_groups::ToolGroupManager;
-use crate::tools::workspace_monitor::{WorkspaceMonitor, FileState};
+use crate::tools::workspace_monitor::{FileState, WorkspaceMonitor};
 
 mod builtins;
 
 #[cfg(test)]
 mod tests;
-
 
 /// Tool input structs
 #[derive(Debug, Deserialize)]
@@ -68,7 +69,8 @@ pub struct ToolSearchInput {
     pub query: String,
     pub max_results: Option<usize>,
 }
-type ToolFn = Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
+type ToolFn =
+    Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
 
 /// Wrap a synchronous tool function (takes &Value) as an async ToolFn
 fn sync_tool_ref<F>(f: F) -> ToolFn
@@ -99,7 +101,8 @@ pub struct ToolExecutor {
     tools: HashMap<String, ToolFn>,
     tool_descriptions: Vec<ToolDescription>,
     kg_store: Arc<std::sync::RwLock<KnowledgeGraphStore>>,
-    projection_engine: Arc<parking_lot::RwLock<Option<Arc<crate::memory::l3_projection::ProjectionEngine>>>>,
+    projection_engine:
+        Arc<parking_lot::RwLock<Option<Arc<crate::memory::l3_projection::ProjectionEngine>>>>,
     micro_tool_contexts: Arc<parking_lot::RwLock<HashMap<String, MicroToolContext>>>,
     micro_tool_data: Arc<parking_lot::RwLock<HashMap<String, serde_json::Value>>>,
     syscall_gate: Option<crate::core::syscall_gate::SyscallGate>,
@@ -108,6 +111,11 @@ pub struct ToolExecutor {
     tool_group_manager: Option<ToolGroupManager>,
     workspace_monitor: Arc<parking_lot::RwLock<Option<Arc<WorkspaceMonitor>>>>,
     shared_skill_graph: Arc<parking_lot::RwLock<Option<Arc<SkillGraphStore>>>>,
+    shared_skill_registry: Arc<parking_lot::RwLock<Option<Arc<SkillRegistry>>>>,
+    shared_skill_vector_store: Arc<parking_lot::RwLock<Option<Arc<HyperspaceStore>>>>,
+    shared_skill_creator_gateway:
+        Arc<parking_lot::RwLock<Option<Arc<crate::gateway::unified_gateway::UnifiedGateway>>>>,
+    security_engine: Arc<parking_lot::RwLock<Option<Arc<SecurityEngine>>>>,
 }
 
 // Max micro-tool descriptions cap — removes oldest entries when exceeded.
@@ -120,19 +128,35 @@ const MICRO_TOOL_PREFIXES: &[&str] = &[
     "expand_relation",
 ];
 
+/// Built-ins that are executor capabilities rather than independently
+/// registered skills inherit a reviewed least-privilege SkillGraph policy.
+/// Keep this table explicit: an unknown tool must still fail closed.
+fn builtin_security_skill_iri(name: &str) -> Option<&'static str> {
+    match name {
+        "tool_search" | "glob_search" | "grep_search" | "file_read" | "read_agent_output"
+        | "read_full_result" | "get_entity_details" | "expand_relation" => {
+            Some("iri://skills/file_read")
+        }
+        "bash" | "file_write" | "file_edit" => Some("iri://skills/file_write"),
+        "web_search" | "web_fetch" | "http_request" => Some("iri://skills/http_request"),
+        "llm_chat" => Some("iri://skills/llm_chat"),
+        _ => None,
+    }
+}
+
 /// Tool role filter: empty = all roles, "PA"/"DA"/"CA"/"AA" = role-specific only
 #[derive(Clone)]
 pub struct ToolDescription {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-    pub allowed_roles: Vec<String>,  // empty = all roles allowed
+    pub allowed_roles: Vec<String>, // empty = all roles allowed
 }
 
 impl ToolExecutor {
     pub fn new() -> Self {
         let kg_store = Arc::new(std::sync::RwLock::new(
-            KnowledgeGraphStore::new().expect("Failed to create knowledge graph store")
+            KnowledgeGraphStore::new().expect("Failed to create knowledge graph store"),
         ));
         let mut exe = Self {
             tools: HashMap::new(),
@@ -147,24 +171,39 @@ impl ToolExecutor {
             tool_group_manager: None,
             workspace_monitor: Arc::new(parking_lot::RwLock::new(None)),
             shared_skill_graph: Arc::new(parking_lot::RwLock::new(None)),
+            shared_skill_registry: Arc::new(parking_lot::RwLock::new(None)),
+            shared_skill_vector_store: Arc::new(parking_lot::RwLock::new(None)),
+            shared_skill_creator_gateway: Arc::new(parking_lot::RwLock::new(None)),
+            security_engine: Arc::new(parking_lot::RwLock::new(None)),
         };
         exe.register_builtins();
         exe
     }
-    
-    pub fn set_projection_engine(&mut self, engine: Arc<crate::memory::l3_projection::ProjectionEngine>) {
+
+    pub fn set_projection_engine(
+        &mut self,
+        engine: Arc<crate::memory::l3_projection::ProjectionEngine>,
+    ) {
         *self.projection_engine.write() = Some(engine);
     }
-    
+
     pub fn set_tool_group_manager(&mut self, manager: ToolGroupManager) {
         self.tool_group_manager = Some(manager);
     }
 
-    /// Replace internal KnowledgeGraphStore with a unified Oxigraph Store
+    /// Point the existing shared KG holder at a unified Oxigraph Store.
+    ///
+    /// Built-in KG tool handlers capture `self.kg_store` during registration.
+    /// Replacing the Arc here would leave those handlers on the old isolated
+    /// store, so preserve the Arc identity and replace only its inner value.
     pub fn set_unified_kg_store(&mut self, store: Arc<oxigraph::store::Store>) {
-        self.kg_store = Arc::new(std::sync::RwLock::new(
-            KnowledgeGraphStore::with_shared_store(store).expect("Failed to create shared KG Store")
-        ));
+        let shared_store = KnowledgeGraphStore::with_shared_store(store)
+            .expect("Failed to create shared KG Store");
+        let mut guard = self
+            .kg_store
+            .write()
+            .expect("Knowledge graph store lock poisoned");
+        *guard = shared_store;
     }
 
     pub fn set_syscall_gate(&mut self, gate: crate::core::syscall_gate::SyscallGate) {
@@ -173,6 +212,13 @@ impl ToolExecutor {
 
     pub fn set_permission_policy(&mut self, policy: PermissionPolicy) {
         self.permission_policy = Some(policy);
+    }
+
+    /// Enable enforced SkillGraph security decisions for contextual calls.
+    /// Callers must supply the real agent/task context via
+    /// `execute_with_security_context`.
+    pub fn set_security_engine(&self, engine: Arc<SecurityEngine>) {
+        *self.security_engine.write() = Some(engine);
     }
 
     pub fn set_hook_runner(&mut self, runner: HookRunner) {
@@ -197,6 +243,28 @@ impl ToolExecutor {
     /// write into the live graph instead of an isolated temporary store.
     pub fn set_shared_skill_graph(&self, store: Arc<SkillGraphStore>) {
         *self.shared_skill_graph.write() = Some(store);
+    }
+
+    /// Inject the live registry used by planning and execution so dynamically
+    /// created skills do not disappear into a short-lived private registry.
+    pub fn set_shared_skill_registry(&self, registry: Arc<SkillRegistry>) {
+        *self.shared_skill_registry.write() = Some(registry);
+    }
+
+    /// Inject the application-owned vector store used to index skills created
+    /// through built-in tools.
+    pub fn set_shared_skill_vector_store(&self, store: Arc<HyperspaceStore>) {
+        *self.shared_skill_vector_store.write() = Some(store);
+    }
+
+    /// Inject the application gateway used by dynamic skill creation. This is
+    /// executor-local so independent workspaces do not share a process-global
+    /// creator gateway.
+    pub fn set_shared_skill_creator_gateway(
+        &self,
+        gateway: Arc<crate::gateway::unified_gateway::UnifiedGateway>,
+    ) {
+        *self.shared_skill_creator_gateway.write() = Some(gateway);
     }
 
     /// Notify workspace_monitor that a file was read externally (e.g., via read_full_result).
@@ -227,10 +295,18 @@ impl ToolExecutor {
     fn register_builtins(&mut self) {
         // All tools open to all roles; LLM selects based on role description in agent.md
         let all: &[&str] = &[];
-        self.register("glob_search", "Find files by glob pattern.", json!({
-            "properties": {"pattern": {"type":"string"},"path": {"type":"string"}},
-            "required": ["pattern"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_glob_search(input).await })), all);
+        self.register(
+            "glob_search",
+            "Find files by glob pattern.",
+            json!({
+                "properties": {"pattern": {"type":"string"},"path": {"type":"string"}},
+                "required": ["pattern"]
+            }),
+            Arc::new(|input: Value| {
+                Box::pin(async move { builtins::execute_glob_search(input).await })
+            }),
+            all,
+        );
         self.register("grep_search", "Search file contents with regex.", json!({
             "properties": {
                 "pattern": {"type":"string","description":"Regex pattern to search for"},
@@ -249,18 +325,42 @@ impl ToolExecutor {
             },
             "required": ["pattern"]
         }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_grep_search(input).await })), all);
-        self.register("web_fetch", "Fetch a URL into readable text.", json!({
-            "properties": {"url": {"type":"string"},"prompt": {"type":"string"}},
-            "required": ["url"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_web_fetch(input).await })), all);
-        self.register("web_search", "Search the web for information.", json!({
-            "properties": {"query": {"type":"string","minLength":2}},
-            "required": ["query"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_web_search(input).await })), all);
-        self.register("tool_search", "Search available tools by name.", json!({
-            "properties": {"query": {"type":"string"},"max_results": {"type":"integer"}},
-            "required": ["query"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_tool_search(input).await })), all);
+        self.register(
+            "web_fetch",
+            "Fetch a URL into readable text.",
+            json!({
+                "properties": {"url": {"type":"string"},"prompt": {"type":"string"}},
+                "required": ["url"]
+            }),
+            Arc::new(|input: Value| {
+                Box::pin(async move { builtins::execute_web_fetch(input).await })
+            }),
+            all,
+        );
+        self.register(
+            "web_search",
+            "Search the web for information.",
+            json!({
+                "properties": {"query": {"type":"string","minLength":2}},
+                "required": ["query"]
+            }),
+            Arc::new(|input: Value| {
+                Box::pin(async move { builtins::execute_web_search(input).await })
+            }),
+            all,
+        );
+        self.register(
+            "tool_search",
+            "Search available tools by name.",
+            json!({
+                "properties": {"query": {"type":"string"},"max_results": {"type":"integer"}},
+                "required": ["query"]
+            }),
+            Arc::new(|input: Value| {
+                Box::pin(async move { builtins::execute_tool_search(input).await })
+            }),
+            all,
+        );
         let ws_read = self.workspace_monitor.clone();
         self.register("file_read", "Read a text file. Reads the entire file by default. On re-read of a changed file, returns a unified diff showing what changed. On re-read of an unchanged file, returns from_cache=true — content already in your context, skip re-reading. Use mode:full to force full content, mode:changed_only to get only the new/changed lines.", json!({
             "properties": {
@@ -374,24 +474,30 @@ impl ToolExecutor {
             })
         }), all);
         let ws_write = self.workspace_monitor.clone();
-        self.register("file_write", "Write content to a file.", json!({
-            "properties": {"path": {"type":"string"},"content": {"type":"string"}},
-            "required": ["path","content"]
-        }), Arc::new(move |input: Value| {
-            let ws = ws_write.clone();
-            Box::pin(async move {
-                let result = builtins::execute_file_write(input).await?;
-                if result.get("success") == Some(&Value::Bool(true)) {
-                    let guard = ws.read();
-                    if let Some(ref wm) = *guard {
-                        if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
-                            wm.mark_file_written(path);
+        self.register(
+            "file_write",
+            "Write content to a file.",
+            json!({
+                "properties": {"path": {"type":"string"},"content": {"type":"string"}},
+                "required": ["path","content"]
+            }),
+            Arc::new(move |input: Value| {
+                let ws = ws_write.clone();
+                Box::pin(async move {
+                    let result = builtins::execute_file_write(input).await?;
+                    if result.get("success") == Some(&Value::Bool(true)) {
+                        let guard = ws.read();
+                        if let Some(ref wm) = *guard {
+                            if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
+                                wm.mark_file_written(path);
+                            }
                         }
                     }
-                }
-                Ok(result)
-            })
-        }), all);
+                    Ok(result)
+                })
+            }),
+            all,
+        );
         let ws_status = self.workspace_monitor.clone();
         self.register("workspace_status", "View workspace file status summary: stale files, written-unread files, counts by state and language.", json!({
             "properties": {},
@@ -438,31 +544,45 @@ impl ToolExecutor {
             })
         }), all);
         let ws_list = self.workspace_monitor.clone();
-        self.register("file_list", "List files in a directory.", json!({
-            "properties": {"path": {"type":"string"}},
-            "required": []
-        }), Arc::new(move |input: Value| {
-            let ws = ws_list.clone();
-            Box::pin(async move {
-                let mut result = builtins::execute_file_list(input).await?;
-                let guard = ws.read();
-                if let Some(ref wm) = *guard {
-                    if let Some(entries) = result.get_mut("entries").and_then(|e| e.as_array_mut()) {
-                        for entry in entries.iter_mut() {
-                            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let inv = wm.inventory.read();
+        self.register(
+            "file_list",
+            "List files in a directory.",
+            json!({
+                "properties": {"path": {"type":"string"}},
+                "required": []
+            }),
+            Arc::new(move |input: Value| {
+                let ws = ws_list.clone();
+                Box::pin(async move {
+                    let mut result = builtins::execute_file_list(input).await?;
+                    let guard = ws.read();
+                    if let Some(ref wm) = *guard {
+                        if let Some(entries) =
+                            result.get_mut("entries").and_then(|e| e.as_array_mut())
+                        {
+                            for entry in entries.iter_mut() {
+                                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                let inv = wm.inventory.read();
                                 if let Some(file_entry) = inv.get_entry(name) {
                                     entry.as_object_mut().map(|obj| {
-                                        obj.insert("state".to_string(), Value::String(file_entry.state.as_str().to_string()));
-                                        obj.insert("language".to_string(), Value::String(file_entry.language.clone()));
+                                        obj.insert(
+                                            "state".to_string(),
+                                            Value::String(file_entry.state.as_str().to_string()),
+                                        );
+                                        obj.insert(
+                                            "language".to_string(),
+                                            Value::String(file_entry.language.clone()),
+                                        );
                                     });
                                 }
                             }
                         }
                     }
-                Ok(result)
-            })
-        }), all);
+                    Ok(result)
+                })
+            }),
+            all,
+        );
         let bash_desc = if cfg!(target_os = "windows") {
             "Execute a shell command via PowerShell. Use for running python, pytest, etc. Supports most common shell commands.\n\nOUTPUT MANAGEMENT (mandatory):\n- If the command may produce >100 lines of output, pipe through | head -N or | grep <keyword> to limit results\n- Use | tail -N for recent entries, | wc -l to count first, | grep -c to match-count\n- For file searches, constrain the path (e.g. grep ... path/) instead of searching the entire workspace\n- The output will be truncated at 16KB if too large; always filter proactively to avoid losing data"
         } else {
@@ -496,14 +616,22 @@ impl ToolExecutor {
                 Ok(result)
             })
         }), all);
-        self.register("powershell", "Execute a PowerShell command.", json!({
-            "properties": {
-                "command": {"type":"string","description":"PowerShell command to run"},
-                "description": {"type":"string","description":"What this command does"},
-                "timeout": {"type":"integer","description":"Timeout in milliseconds"}
-            },
-            "required": ["command"]
-        }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_powershell(input).await })), all);
+        self.register(
+            "powershell",
+            "Execute a PowerShell command.",
+            json!({
+                "properties": {
+                    "command": {"type":"string","description":"PowerShell command to run"},
+                    "description": {"type":"string","description":"What this command does"},
+                    "timeout": {"type":"integer","description":"Timeout in milliseconds"}
+                },
+                "required": ["command"]
+            }),
+            Arc::new(|input: Value| {
+                Box::pin(async move { builtins::execute_powershell(input).await })
+            }),
+            all,
+        );
         self.register("rag_search", "Semantic search for relevant documents using RAG (Retrieval-Augmented Generation).", json!({
             "properties": {"query": {"type":"string","description":"Search query"},"limit": {"type":"integer","description":"Max results"}},
             "required": ["query"]
@@ -591,7 +719,10 @@ impl ToolExecutor {
 
         // ========== Skill Creation Tools (with shared SkillGraphStore) ==========
         let sg_for_create = self.shared_skill_graph.clone();
-        self.register("create_skill", "Create a new Skill definition from natural language description using LLM. The skill will be auto-registered and available for use.", json!({
+        let registry_for_create = self.shared_skill_registry.clone();
+        let vector_store_for_create = self.shared_skill_vector_store.clone();
+        let gateway_for_create = self.shared_skill_creator_gateway.clone();
+        self.register("create_skill", "Create a new Skill definition from natural language using LLM. The definition is registered for review and discovery; it does not create an executable ToolExecutor handler.", json!({
             "properties": {
                 "description": {"type":"string","description":"Natural language description of the skill to create"},
                 "skill_name_hint": {"type":"string","description":"Suggested skill name (optional, lowercase with underscores)"},
@@ -601,10 +732,16 @@ impl ToolExecutor {
             "required": ["description"]
         }), Arc::new(move |input: Value| {
             let sg = sg_for_create.read().clone();
-            Box::pin(async move { builtins::execute_create_skill(input, sg).await })
+            let registry = registry_for_create.read().clone();
+            let vector_store = vector_store_for_create.read().clone();
+            let gateway = gateway_for_create.read().clone();
+            Box::pin(async move { builtins::execute_create_skill(input, gateway, sg, registry, vector_store).await })
         }), &["DA"]);
 
         let sg_for_convert = self.shared_skill_graph.clone();
+        let registry_for_convert = self.shared_skill_registry.clone();
+        let vector_store_for_convert = self.shared_skill_vector_store.clone();
+        let gateway_for_convert = self.shared_skill_creator_gateway.clone();
         self.register("convert_skill", "Convert a Markdown-formatted skill description into a JSON-LD Skill definition. Parses the markdown structure and generates proper skill schema.", json!({
             "properties": {
                 "markdown_content": {"type":"string","description":"Markdown content describing the skill"},
@@ -613,7 +750,10 @@ impl ToolExecutor {
             "required": ["markdown_content"]
         }), Arc::new(move |input: Value| {
             let sg = sg_for_convert.read().clone();
-            Box::pin(async move { builtins::execute_convert_skill(input, sg).await })
+            let registry = registry_for_convert.read().clone();
+            let vector_store = vector_store_for_convert.read().clone();
+            let gateway = gateway_for_convert.read().clone();
+            Box::pin(async move { builtins::execute_convert_skill(input, gateway, sg, registry, vector_store).await })
         }), &["DA","CA"]);
 
         // ========== Knowledge Graph Tools ==========
@@ -630,16 +770,22 @@ impl ToolExecutor {
         }), all);
 
         let kg_store_for_query = self.kg_store.clone();
-        self.register("knowledge_query", "Execute a SPARQL SELECT query against the knowledge graph.", json!({
-            "properties": {
-                "sparql": {"type":"string","description":"SPARQL SELECT query statement."},
-                "named_graph": {"type":"string","description":"Named graph IRI (optional)."}
-            },
-            "required": ["sparql"]
-        }), Arc::new(move |input: Value| {
-            let kg_store = kg_store_for_query.clone();
-            Box::pin(async move { builtins::execute_knowledge_query(input, kg_store).await })
-        }), all);
+        self.register(
+            "knowledge_query",
+            "Execute a SPARQL SELECT query against the knowledge graph.",
+            json!({
+                "properties": {
+                    "sparql": {"type":"string","description":"SPARQL SELECT query statement."},
+                    "named_graph": {"type":"string","description":"Named graph IRI (optional)."}
+                },
+                "required": ["sparql"]
+            }),
+            Arc::new(move |input: Value| {
+                let kg_store = kg_store_for_query.clone();
+                Box::pin(async move { builtins::execute_knowledge_query(input, kg_store).await })
+            }),
+            all,
+        );
 
         let kg_store_for_search = self.kg_store.clone();
         self.register("kg_search", "Fuzzy search entities in the knowledge graph.", json!({
@@ -654,16 +800,24 @@ impl ToolExecutor {
         }), all);
 
         let kg_store_for_neighbors = self.kg_store.clone();
-        self.register("knowledge_neighbors", "Get neighbor nodes and relations of a specified entity in the knowledge graph.", json!({
-            "properties": {
-                "entity_id": {"type":"string","description":"Entity ID or IRI."},
-                "depth": {"type":"integer","description":"Traversal depth (1-3, default 1)."}
-            },
-            "required": ["entity_id"]
-        }), Arc::new(move |input: Value| {
-            let kg_store = kg_store_for_neighbors.clone();
-            Box::pin(async move { builtins::execute_knowledge_neighbors(input, kg_store).await })
-        }), all);
+        self.register(
+            "knowledge_neighbors",
+            "Get neighbor nodes and relations of a specified entity in the knowledge graph.",
+            json!({
+                "properties": {
+                    "entity_id": {"type":"string","description":"Entity ID or IRI."},
+                    "depth": {"type":"integer","description":"Traversal depth (1-3, default 1)."}
+                },
+                "required": ["entity_id"]
+            }),
+            Arc::new(move |input: Value| {
+                let kg_store = kg_store_for_neighbors.clone();
+                Box::pin(
+                    async move { builtins::execute_knowledge_neighbors(input, kg_store).await },
+                )
+            }),
+            all,
+        );
 
         let kg_store_for_import = self.kg_store.clone();
         self.register("knowledge_import_json", "Map structured JSON data into knowledge graph nodes.", json!({
@@ -756,27 +910,57 @@ impl ToolExecutor {
         // ========== Ontology Tools ==========
         #[cfg(feature = "ontology")]
         {
-            self.register("ontology_validate_turtle", "Validate Turtle RDF syntax. Returns number of valid triples.", json!({
-                "properties": {
-                    "ttl": {"type":"string","description":"Turtle content to validate"}
-                },
-                "required": ["ttl"]
-            }), Arc::new(|input: Value| Box::pin(async move { ontology_tools::execute_ontology_validate_turtle(input).await })), all);
+            self.register(
+                "ontology_validate_turtle",
+                "Validate Turtle RDF syntax. Returns number of valid triples.",
+                json!({
+                    "properties": {
+                        "ttl": {"type":"string","description":"Turtle content to validate"}
+                    },
+                    "required": ["ttl"]
+                }),
+                Arc::new(|input: Value| {
+                    Box::pin(async move {
+                        ontology_tools::execute_ontology_validate_turtle(input).await
+                    })
+                }),
+                all,
+            );
 
-            self.register("ontology_lint_turtle", "Lint Turtle content for best practices (labels, comments, domain/range).", json!({
-                "properties": {
-                    "ttl": {"type":"string","description":"Turtle content to lint"}
-                },
-                "required": ["ttl"]
-            }), Arc::new(|input: Value| Box::pin(async move { ontology_tools::execute_ontology_lint_turtle(input).await })), all);
+            self.register(
+                "ontology_lint_turtle",
+                "Lint Turtle content for best practices (labels, comments, domain/range).",
+                json!({
+                    "properties": {
+                        "ttl": {"type":"string","description":"Turtle content to lint"}
+                    },
+                    "required": ["ttl"]
+                }),
+                Arc::new(|input: Value| {
+                    Box::pin(
+                        async move { ontology_tools::execute_ontology_lint_turtle(input).await },
+                    )
+                }),
+                all,
+            );
 
-            self.register("ontology_diff_turtle", "Diff two Turtle documents and report added/removed triples.", json!({
-                "properties": {
-                    "old_ttl": {"type":"string","description":"Original Turtle content"},
-                    "new_ttl": {"type":"string","description":"New Turtle content"}
-                },
-                "required": ["old_ttl","new_ttl"]
-            }), Arc::new(|input: Value| Box::pin(async move { ontology_tools::execute_ontology_diff_turtle(input).await })), all);
+            self.register(
+                "ontology_diff_turtle",
+                "Diff two Turtle documents and report added/removed triples.",
+                json!({
+                    "properties": {
+                        "old_ttl": {"type":"string","description":"Original Turtle content"},
+                        "new_ttl": {"type":"string","description":"New Turtle content"}
+                    },
+                    "required": ["old_ttl","new_ttl"]
+                }),
+                Arc::new(|input: Value| {
+                    Box::pin(
+                        async move { ontology_tools::execute_ontology_diff_turtle(input).await },
+                    )
+                }),
+                all,
+            );
 
             self.register("ontology_validate_shacl", "Validate RDF data against SHACL shapes.", json!({
                 "properties": {
@@ -798,10 +982,17 @@ impl ToolExecutor {
     }
 
     /// Register a tool with role whitelist. Empty = all roles allowed.
-    pub fn register(&mut self, name: &str, description: &str, parameters: Value, handler: ToolFn, allowed_roles: &[&str]) {
+    pub fn register(
+        &mut self,
+        name: &str,
+        description: &str,
+        parameters: Value,
+        handler: ToolFn,
+        allowed_roles: &[&str],
+    ) {
         let roles: Vec<String> = allowed_roles.iter().map(|s| s.to_string()).collect();
         self.tools.insert(name.to_string(), handler);
-        
+
         if let Some(existing) = self.tool_descriptions.iter_mut().find(|td| td.name == name) {
             existing.description = description.to_string();
             existing.parameters = parameters.clone();
@@ -815,12 +1006,17 @@ impl ToolExecutor {
             });
             // Micro-tool description cap: removes oldest when exceeded
             if Self::is_micro_tool_name(name) {
-                while self.tool_descriptions.iter()
+                while self
+                    .tool_descriptions
+                    .iter()
                     .filter(|td| Self::is_micro_tool_name(&td.name))
-                    .count() > MAX_MICRO_TOOL_DESCRIPTIONS
+                    .count()
+                    > MAX_MICRO_TOOL_DESCRIPTIONS
                 {
                     // position() returns the first match (oldest registered)
-                    if let Some(pos) = self.tool_descriptions.iter()
+                    if let Some(pos) = self
+                        .tool_descriptions
+                        .iter()
                         .position(|td| Self::is_micro_tool_name(&td.name))
                     {
                         self.tool_descriptions.remove(pos);
@@ -841,13 +1037,18 @@ impl ToolExecutor {
         let contexts = Arc::clone(&self.micro_tool_contexts);
         let data = Arc::clone(&self.micro_tool_data);
         let tool_name_owned = tool_name.to_string();
-        
-        contexts.write().insert(tool_name.to_string(), context.clone());
-        
+
+        contexts
+            .write()
+            .insert(tool_name.to_string(), context.clone());
+
         let description = if tool_name.starts_with("read_full_result_") {
             format!("Read full tool result. call_id: {}", context.call_id)
         } else if tool_name.starts_with("query_") {
-            format!("Query entity types: {:?}. call_id: {}", context.entity_types, context.call_id)
+            format!(
+                "Query entity types: {:?}. call_id: {}",
+                context.entity_types, context.call_id
+            )
         } else if tool_name.starts_with("get_entity_details_") {
             format!("Get entity details. call_id: {}", context.call_id)
         } else {
@@ -862,97 +1063,117 @@ impl ToolExecutor {
             }
         });
 
-        self.register(tool_name, &description, params, Arc::new(move |input: Value| {
-            let contexts = contexts.clone();
-            let tool_name_owned = tool_name_owned.clone();
-            let data = data.clone();
-            Box::pin(async move {
-            let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-            let limit = input["limit"].as_u64().unwrap_or(100) as usize;
+        self.register(
+            tool_name,
+            &description,
+            params,
+            Arc::new(move |input: Value| {
+                let contexts = contexts.clone();
+                let tool_name_owned = tool_name_owned.clone();
+                let data = data.clone();
+                Box::pin(async move {
+                    let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+                    let limit = input["limit"].as_u64().unwrap_or(100) as usize;
 
-            let ctx_guard = contexts.read();
-            let ctx = ctx_guard.get(&tool_name_owned)
-                .ok_or_else(|| format!("Micro-tool context not found: {}", tool_name_owned))?;
+                    let ctx_guard = contexts.read();
+                    let ctx = ctx_guard.get(&tool_name_owned).ok_or_else(|| {
+                        format!("Micro-tool context not found: {}", tool_name_owned)
+                    })?;
 
-            let data_guard = data.read();
-            let stored_data = data_guard.get(&ctx.storage_key)
-                .ok_or_else(|| format!("Micro-tool data not found: {}", ctx.storage_key))?;
+                    let data_guard = data.read();
+                    let stored_data = data_guard
+                        .get(&ctx.storage_key)
+                        .ok_or_else(|| format!("Micro-tool data not found: {}", ctx.storage_key))?;
 
-            if tool_name_owned.starts_with("read_full_result_") {
-                if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let selected: Vec<String> = lines.iter()
-                        .skip(offset)
-                        .take(limit)
-                        .map(|l| l.to_string())
-                        .collect();
-                    return Ok(json!({
-                        "content": selected.join("\n"),
-                        "total_lines": lines.len(),
-                        "offset": offset,
-                        "returned": selected.len(),
-                        "call_id": ctx.call_id,
-                    }));
-                }
-            } else if tool_name_owned.starts_with("query_") {
-                if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                    let query_type = input["entity_type"].as_str().unwrap_or("");
-                    let keyword = input["keyword"].as_str().unwrap_or("");
-                    
-                    let mut results = Vec::new();
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-                        if let Some(arr) = parsed.as_array() {
-                            for item in arr.iter().skip(offset).take(limit) {
-                                let type_match = query_type.is_empty() || 
-                                    item.get("type").and_then(|v| v.as_str()).map(|t| t.contains(query_type)).unwrap_or(false);
-                                let keyword_match = keyword.is_empty() ||
-                                    item.to_string().to_lowercase().contains(&keyword.to_lowercase());
-                                if type_match && keyword_match {
-                                    results.push(item.clone());
+                    if tool_name_owned.starts_with("read_full_result_") {
+                        if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
+                            let lines: Vec<&str> = content.lines().collect();
+                            let selected: Vec<String> = lines
+                                .iter()
+                                .skip(offset)
+                                .take(limit)
+                                .map(|l| l.to_string())
+                                .collect();
+                            return Ok(json!({
+                                "content": selected.join("\n"),
+                                "total_lines": lines.len(),
+                                "offset": offset,
+                                "returned": selected.len(),
+                                "call_id": ctx.call_id,
+                            }));
+                        }
+                    } else if tool_name_owned.starts_with("query_") {
+                        if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
+                            let query_type = input["entity_type"].as_str().unwrap_or("");
+                            let keyword = input["keyword"].as_str().unwrap_or("");
+
+                            let mut results = Vec::new();
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                                if let Some(arr) = parsed.as_array() {
+                                    for item in arr.iter().skip(offset).take(limit) {
+                                        let type_match = query_type.is_empty()
+                                            || item
+                                                .get("type")
+                                                .and_then(|v| v.as_str())
+                                                .map(|t| t.contains(query_type))
+                                                .unwrap_or(false);
+                                        let keyword_match = keyword.is_empty()
+                                            || item
+                                                .to_string()
+                                                .to_lowercase()
+                                                .contains(&keyword.to_lowercase());
+                                        if type_match && keyword_match {
+                                            results.push(item.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(json!({
+                                "results": results,
+                                "count": results.len(),
+                                "call_id": ctx.call_id,
+                            }));
+                        }
+                    } else if tool_name_owned.starts_with("get_entity_details_") {
+                        let entity_id = input["entity_id"].as_str().unwrap_or("");
+                        if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                                if let Some(arr) = parsed.as_array() {
+                                    for item in arr {
+                                        if item.get("id").and_then(|v| v.as_str())
+                                            == Some(entity_id)
+                                        {
+                                            return Ok(json!({
+                                                "entity": item,
+                                                "call_id": ctx.call_id,
+                                            }));
+                                        }
+                                    }
                                 }
                             }
                         }
+                        return Ok(json!({
+                            "error": "Entity not found",
+                            "entity_id": entity_id,
+                            "call_id": ctx.call_id,
+                        }));
                     }
-                    return Ok(json!({
-                        "results": results,
-                        "count": results.len(),
-                        "call_id": ctx.call_id,
-                    }));
-                }
-            } else if tool_name_owned.starts_with("get_entity_details_") {
-                let entity_id = input["entity_id"].as_str().unwrap_or("");
-                if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
-                        if let Some(arr) = parsed.as_array() {
-                            for item in arr {
-                                if item.get("id").and_then(|v| v.as_str()) == Some(entity_id) {
-                                    return Ok(json!({
-                                        "entity": item,
-                                        "call_id": ctx.call_id,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-                return Ok(json!({
-                    "error": "Entity not found",
-                    "entity_id": entity_id,
-                    "call_id": ctx.call_id,
-                }));
-            }
 
-            Ok(json!({
-                "data": stored_data,
-                "call_id": ctx.call_id,
-            }))
-        })
-    }), &[]);
+                    Ok(json!({
+                        "data": stored_data,
+                        "call_id": ctx.call_id,
+                    }))
+                })
+            }),
+            &[],
+        );
     }
 
     /// Store micro-tool data
     pub fn store_micro_tool_data(&self, storage_key: &str, data: serde_json::Value) {
-        self.micro_tool_data.write().insert(storage_key.to_string(), data);
+        self.micro_tool_data
+            .write()
+            .insert(storage_key.to_string(), data);
     }
 
     /// Get list of registered micro-tools
@@ -975,10 +1196,14 @@ impl ToolExecutor {
         if let Some(ref runner) = self.hook_runner {
             let hook_result = runner.run_pre_tool_use(name, &input_str);
             if hook_result.is_denied() {
-                return Ok(json!({"error": format!("Pre-tool hook denied: {}", hook_result.messages().join("; "))}));
+                return Ok(
+                    json!({"error": format!("Pre-tool hook denied: {}", hook_result.messages().join("; "))}),
+                );
             }
             if hook_result.is_failed() {
-                return Ok(json!({"error": format!("Pre-tool hook failed: {}", hook_result.messages().join("; "))}));
+                return Ok(
+                    json!({"error": format!("Pre-tool hook failed: {}", hook_result.messages().join("; "))}),
+                );
             }
             if hook_result.is_cancelled() {
                 return Ok(json!({"error": "Pre-tool hook was cancelled"}));
@@ -991,8 +1216,11 @@ impl ToolExecutor {
             }
         }
 
-        let handler = match self.tools.get(name) {
-            Some(h) => h.clone(),
+        // Use the same lookup path as the agent loops so dynamically derived
+        // micro-tools retain their fallback semantics when execution goes
+        // through policy/gate enforcement.
+        let handler = match self.try_get_handler(name) {
+            Some(h) => h,
             None => return Err(format!("Tool not found: {}", name)),
         };
         debug!(tool = %name, "Executing tool");
@@ -1005,9 +1233,12 @@ impl ToolExecutor {
             match &result {
                 Ok(output) => {
                     let output_str = output.to_string();
-                    let post_result = runner.run_post_tool_use(name, &input_str, &output_str, false);
+                    let post_result =
+                        runner.run_post_tool_use(name, &input_str, &output_str, false);
                     if post_result.is_denied() {
-                        return Ok(json!({"error": format!("Post-tool hook denied: {}", post_result.messages().join("; ")), "original_output": output}));
+                        return Ok(
+                            json!({"error": format!("Post-tool hook denied: {}", post_result.messages().join("; ")), "original_output": output}),
+                        );
                     }
                 }
                 Err(e) => {
@@ -1017,6 +1248,57 @@ impl ToolExecutor {
         }
 
         result
+    }
+
+    pub async fn execute_with_security_context(
+        &self,
+        name: &str,
+        input: Value,
+        context: SecurityContext,
+    ) -> Result<Value, String> {
+        let security_engine = { self.security_engine.read().clone() };
+        if let Some(engine) = security_engine {
+            let skill_iri = {
+                let registry = self.shared_skill_registry.read();
+                registry
+                    .as_ref()
+                    .and_then(|registry| registry.skill_iri_for_tool_name(name))
+            }
+            .or_else(|| builtin_security_skill_iri(name).map(str::to_string))
+            // Generated result readers expose no independent side effect. They
+            // inherit the least-privilege built-in read capability instead of
+            // becoming an unregistered security bypass.
+            .or_else(|| {
+                MICRO_TOOL_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| "iri://skills/file_read".to_string())
+            });
+            let Some(skill_iri) = skill_iri else {
+                return Ok(
+                    json!({"error": "Security denied: tool has no registered executable skill", "tool": name}),
+                );
+            };
+            match engine.check_execution(&skill_iri, &context).await {
+                Ok(SecurityDecision::Allowed) => {}
+                Ok(SecurityDecision::Denied { reasons }) => {
+                    return Ok(
+                        json!({"error": "Security denied", "tool": name, "skill_iri": skill_iri, "reasons": reasons}),
+                    );
+                }
+                Ok(SecurityDecision::RequiresApproval { approver, reason }) => {
+                    return Ok(
+                        json!({"error": "Security approval required", "tool": name, "skill_iri": skill_iri, "approver": approver, "reason": reason}),
+                    );
+                }
+                Err(error) => {
+                    return Ok(
+                        json!({"error": format!("Security denied: {error}"), "tool": name, "skill_iri": skill_iri}),
+                    )
+                }
+            }
+        }
+        self.execute(name, input).await
     }
 
     /// Get tool handler (avoid holding lock across await)
@@ -1070,7 +1352,7 @@ impl ToolExecutor {
                         .collect();
                     return Ok(serde_json::json!({
                         "content": selected.join("
-"),
+                    "),
                         "total_lines": lines.len(),
                         "offset": offset,
                         "returned": selected.len(),
@@ -1100,31 +1382,51 @@ impl ToolExecutor {
             "AA" | "Act" => "Act",
             _ => role,
         };
-        
+
         let (default_tools, on_demand_tools) = if let Some(ref manager) = self.tool_group_manager {
             manager.get_tool_names_for_role(role_name)
         } else {
             let is_pa = role == "Plan" || role == "PA";
             let is_aa = role == "Act" || role == "AA";
             if is_pa {
-                let default: HashSet<String> = Self::pa_readonly_tools().iter().map(|s| s.to_string()).collect();
+                let default: HashSet<String> = Self::pa_readonly_tools()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
                 (default.clone(), default)
             } else if is_aa {
                 // Design: AA = Core(file_read,file_list) + System(tool_search) by default, Search+Knowledge on demand
                 let aa_tools: HashSet<String> = [
-                    "file_read", "file_list", "tool_search",
-                    "grep_search", "glob_search", "rag_search", "kg_search", "codebase_search",
-                    "knowledge_list", "knowledge_search", "knowledge_extract_code",
-                ].iter().map(|s| s.to_string()).collect();
+                    "file_read",
+                    "file_list",
+                    "tool_search",
+                    "grep_search",
+                    "glob_search",
+                    "rag_search",
+                    "kg_search",
+                    "codebase_search",
+                    "knowledge_list",
+                    "knowledge_search",
+                    "knowledge_extract_code",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
                 let all = aa_tools.clone();
                 (all, aa_tools)
             } else {
-                let all: HashSet<String> = self.tool_descriptions.iter().map(|td| td.name.clone()).collect();
+                let all: HashSet<String> = self
+                    .tool_descriptions
+                    .iter()
+                    .map(|td| td.name.clone())
+                    .collect();
                 (all.clone(), all)
             }
         };
-        
-        let result: Vec<Value> = self.tool_descriptions.iter()
+
+        let result: Vec<Value> = self
+            .tool_descriptions
+            .iter()
             .filter(|td| {
                 if !td.allowed_roles.is_empty() {
                     return td.allowed_roles.iter().any(|r| r == role);
@@ -1147,21 +1449,36 @@ impl ToolExecutor {
             })
             .collect();
 
-        let tool_names: Vec<&str> = result.iter()
+        let tool_names: Vec<&str> = result
+            .iter()
             .filter_map(|v| v["function"]["name"].as_str())
             .collect();
-        tracing::debug!("[tool_definitions_for_role] role={}, filtered={}/{}, tools={:?}",
-            role, result.len(), self.tool_descriptions.len(), tool_names);
+        tracing::debug!(
+            "[tool_definitions_for_role] role={}, filtered={}/{}, tools={:?}",
+            role,
+            result.len(),
+            self.tool_descriptions.len(),
+            tool_names
+        );
 
         result
     }
 
     pub fn pa_readonly_tools() -> &'static [&'static str] {
         &[
-            "file_read", "file_list", "glob_search", "grep_search",
-            "web_search", "web_fetch", "tool_search",
-            "rag_search", "knowledge_list", "knowledge_search", "kg_search",
-            "knowledge_extract_code", "bash",
+            "file_read",
+            "file_list",
+            "glob_search",
+            "grep_search",
+            "web_search",
+            "web_fetch",
+            "tool_search",
+            "rag_search",
+            "knowledge_list",
+            "knowledge_search",
+            "kg_search",
+            "knowledge_extract_code",
+            "bash",
         ]
     }
 
@@ -1195,4 +1512,3 @@ impl ToolExecutor {
         })
     }
 }
-

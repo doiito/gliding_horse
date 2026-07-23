@@ -13,12 +13,22 @@ impl ToolController {
     pub fn new() -> Self {
         Self {
             readonly_tools: vec![
-                "file_read", "file_list", "grep_search", "glob_search",
-                "tool_search", "web_search", "web_fetch", "rag_search",
+                "file_read",
+                "file_list",
+                "grep_search",
+                "glob_search",
+                "tool_search",
+                "web_search",
+                "web_fetch",
+                "rag_search",
             ],
             write_tools: vec![
-                "file_write", "bash", "code_execute", "http_request",
-                "rag_index", "rag_chunk",
+                "file_write",
+                "bash",
+                "code_execute",
+                "http_request",
+                "rag_index",
+                "rag_chunk",
             ],
         }
     }
@@ -31,34 +41,38 @@ impl ToolController {
         self.write_tools.contains(&tool_name)
     }
 
-    pub fn filter_tools_for_role(&self, tool_calls: &[(String, Value)], role: &AgentRole) -> Vec<(String, Value)> {
+    pub fn filter_tools_for_role(
+        &self,
+        tool_calls: &[(String, Value)],
+        role: &AgentRole,
+    ) -> Vec<(String, Value)> {
         match role {
             AgentRole::Plan => {
-                let write_calls: Vec<String> = tool_calls.iter()
+                let write_calls: Vec<String> = tool_calls
+                    .iter()
                     .filter(|(name, _)| self.is_write_tool(name))
                     .map(|(name, _)| name.clone())
                     .collect();
                 if !write_calls.is_empty() {
-                    warn!("[PA] Detected write tool calls: {:?}, filtered", write_calls);
+                    warn!(
+                        "[PA] Detected write tool calls: {:?}, filtered",
+                        write_calls
+                    );
                 }
-                tool_calls.iter()
+                tool_calls
+                    .iter()
                     .filter(|(name, _)| self.is_readonly_tool(name))
                     .cloned()
                     .collect()
             }
-            AgentRole::Do | AgentRole::Check | AgentRole::Act => {
-                tool_calls.to_vec()
-            }
+            AgentRole::Do | AgentRole::Check | AgentRole::Act => tool_calls.to_vec(),
         }
     }
 
     pub fn should_force_finish(&self, tool_calls: &[(String, Value)], role: &AgentRole) -> bool {
         match role {
-            AgentRole::Plan => {
-                tool_calls.iter().any(|(name, _)| self.is_write_tool(name))
-            }
-            AgentRole::Act => false
-,
+            AgentRole::Plan => tool_calls.iter().any(|(name, _)| self.is_write_tool(name)),
+            AgentRole::Act => false,
             AgentRole::Do => false,
             AgentRole::Check => false,
         }
@@ -68,7 +82,9 @@ impl ToolController {
         match role {
             AgentRole::Plan => self.readonly_tools.iter().map(|s| s.to_string()).collect(),
             AgentRole::Do | AgentRole::Check | AgentRole::Act => {
-                let mut tools: Vec<String> = self.readonly_tools.iter()
+                let mut tools: Vec<String> = self
+                    .readonly_tools
+                    .iter()
                     .chain(self.write_tools.iter())
                     .map(|s| s.to_string())
                     .collect();

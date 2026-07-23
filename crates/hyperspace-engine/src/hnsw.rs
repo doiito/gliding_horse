@@ -135,7 +135,9 @@ impl IncrementalHNSW {
         }
         if id_u >= self.visited_gen.len() {
             self.visited_gen
-                .resize_with(self.visited_gen.len().max(id_u + 1).max(1024), || AtomicUsize::new(0));
+                .resize_with(self.visited_gen.len().max(id_u + 1).max(1024), || {
+                    AtomicUsize::new(0)
+                });
         }
 
         let ep = self.entry_point.load(Ordering::Relaxed);
@@ -143,7 +145,9 @@ impl IncrementalHNSW {
         self.nodes[id_u] = Some(Node {
             vector,
             neighbors0: Vec::with_capacity(self.config.m0),
-            neighbors_upper: (0..level).map(|_| Vec::with_capacity(self.config.m)).collect(),
+            neighbors_upper: (0..level)
+                .map(|_| Vec::with_capacity(self.config.m))
+                .collect(),
             level,
         });
 
@@ -229,7 +233,10 @@ impl IncrementalHNSW {
         };
         let mut best = entry;
         let mut best_dist = if self.contains(best) {
-            self.metric.distance(query_node, &self.nodes[best as usize].as_ref().unwrap().vector)
+            self.metric.distance(
+                query_node,
+                &self.nodes[best as usize].as_ref().unwrap().vector,
+            )
         } else {
             return entry;
         };
@@ -238,7 +245,10 @@ impl IncrementalHNSW {
             let neighbors = self.get_neighbors(best, layer);
             let mut improved = false;
             for &nid in &neighbors {
-                let d = self.metric.distance(query_node, &self.nodes[nid as usize].as_ref().unwrap().vector);
+                let d = self.metric.distance(
+                    query_node,
+                    &self.nodes[nid as usize].as_ref().unwrap().vector,
+                );
                 if d < best_dist {
                     best_dist = d;
                     best = nid;
@@ -271,7 +281,10 @@ impl IncrementalHNSW {
             return Vec::new();
         }
 
-        let entry_dist = self.metric.distance(query_node, &self.nodes[entry as usize].as_ref().unwrap().vector);
+        let entry_dist = self.metric.distance(
+            query_node,
+            &self.nodes[entry as usize].as_ref().unwrap().vector,
+        );
         let mut c = vec![(entry, entry_dist)];
         let mut i = 0;
 
@@ -290,7 +303,7 @@ impl IncrementalHNSW {
                     &self.nodes[nid as usize].as_ref().unwrap().vector,
                 );
                 let pos = c
-                    .binary_search_by(|&(_, ref dist)| {
+                    .binary_search_by(|(_, dist)| {
                         dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap_or_else(|e| e);
@@ -361,17 +374,26 @@ impl IncrementalHNSW {
     }
 
     /// Single-layer greedy search for an external query (not a node ID).
-    fn search_layer_single_external(&self, layer: usize, entry: u32, query: &EmbeddingVector) -> u32 {
+    fn search_layer_single_external(
+        &self,
+        layer: usize,
+        entry: u32,
+        query: &EmbeddingVector,
+    ) -> u32 {
         if !self.contains(entry) {
             return entry;
         }
         let mut best = entry;
-        let mut best_dist = self.metric.distance(query, &self.nodes[best as usize].as_ref().unwrap().vector);
+        let mut best_dist = self
+            .metric
+            .distance(query, &self.nodes[best as usize].as_ref().unwrap().vector);
         loop {
             let neighbors = self.get_neighbors(best, layer);
             let mut improved = false;
             for &nid in &neighbors {
-                let d = self.metric.distance(query, &self.nodes[nid as usize].as_ref().unwrap().vector);
+                let d = self
+                    .metric
+                    .distance(query, &self.nodes[nid as usize].as_ref().unwrap().vector);
                 if d < best_dist {
                     best_dist = d;
                     best = nid;
@@ -398,7 +420,9 @@ impl IncrementalHNSW {
             return Vec::new();
         }
 
-        let entry_dist = self.metric.distance(query, &self.nodes[entry as usize].as_ref().unwrap().vector);
+        let entry_dist = self
+            .metric
+            .distance(query, &self.nodes[entry as usize].as_ref().unwrap().vector);
         let mut c = vec![(entry, entry_dist)];
         let mut i = 0;
 
@@ -413,9 +437,11 @@ impl IncrementalHNSW {
                     }
                     self.visited_gen[nu].store(gen, Ordering::Relaxed);
                 }
-                let d = self.metric.distance(query, &self.nodes[nid as usize].as_ref().unwrap().vector);
+                let d = self
+                    .metric
+                    .distance(query, &self.nodes[nid as usize].as_ref().unwrap().vector);
                 let pos = c
-                    .binary_search_by(|&(_, ref dist)| {
+                    .binary_search_by(|(_, dist)| {
                         dist.partial_cmp(&d).unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap_or_else(|e| e);
@@ -444,25 +470,31 @@ impl IncrementalHNSW {
 
     fn get_neighbors(&self, node_id: u32, layer: usize) -> Vec<u32> {
         match self.nodes.get(node_id as usize).and_then(|n| n.as_ref()) {
-            Some(n) if layer == 0 => {
-                n.neighbors0
-                    .iter()
-                    .filter(|&&id| self.contains(id))
-                    .copied()
-                    .collect()
-            }
-            Some(n) if layer >= 1 && layer - 1 < n.neighbors_upper.len() => {
-                n.neighbors_upper[layer - 1]
-                    .iter()
-                    .filter(|&&id| self.contains(id))
-                    .copied()
-                    .collect()
-            }
+            Some(n) if layer == 0 => n
+                .neighbors0
+                .iter()
+                .filter(|&&id| self.contains(id))
+                .copied()
+                .collect(),
+            Some(n) if layer >= 1 && layer - 1 < n.neighbors_upper.len() => n.neighbors_upper
+                [layer - 1]
+                .iter()
+                .filter(|&&id| self.contains(id))
+                .copied()
+                .collect(),
             _ => Vec::new(),
         }
     }
 
     pub fn remove(&mut self, id: u32) {
+        // Remove reverse edges first. Leaving them behind means an upsert of
+        // the same ID inherits stale topology from its previous vector.
+        for node in self.nodes.iter_mut().filter_map(Option::as_mut) {
+            node.neighbors0.retain(|&neighbor| neighbor != id);
+            for neighbors in &mut node.neighbors_upper {
+                neighbors.retain(|&neighbor| neighbor != id);
+            }
+        }
         if let Some(n) = self.nodes.get_mut(id as usize) {
             *n = None;
         }
@@ -553,8 +585,10 @@ impl IncrementalHNSW {
         self.fix_entry_point();
         self.fix_max_layer();
         // Resize visited_gen
-        self.visited_gen
-            .resize_with(self.visited_gen.len().max(self.nodes.len()).max(1024), || AtomicUsize::new(0));
+        self.visited_gen.resize_with(
+            self.visited_gen.len().max(self.nodes.len()).max(1024),
+            || AtomicUsize::new(0),
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     extract::State,
@@ -74,7 +74,9 @@ pub struct KgImportRequest {
     pub clear_before: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Deserialize)]
 pub struct KgQueryRequest {
@@ -97,8 +99,14 @@ pub fn build_router(core: Arc<SemanticCore>, kg_store: Arc<oxigraph::store::Stor
         .route("/api/v1/tasks", post(create_task_handler))
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
         .route("/api/v1/tasks/stream", post(stream_task_handler))
-        .route("/api/v1/tasks/:task_iri/status", get(get_realtime_status_handler))
-        .route("/api/v1/tasks/:task_iri/details", get(get_execution_details_handler))
+        .route(
+            "/api/v1/tasks/:task_iri/status",
+            get(get_realtime_status_handler),
+        )
+        .route(
+            "/api/v1/tasks/:task_iri/details",
+            get(get_execution_details_handler),
+        )
         .route("/api/v1/nodes", post(write_node_handler))
         .route("/api/v1/nodes/:node_iri", get(read_node_handler))
         .route("/api/v1/projections", post(get_projection_handler))
@@ -200,9 +208,9 @@ async fn stream_task_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StreamTaskRequest>,
 ) -> impl IntoResponse {
-    let task_iri = req.task_iri.unwrap_or_else(|| {
-        format!("iri://stream/{}", uuid::Uuid::new_v4().hyphenated())
-    });
+    let task_iri = req
+        .task_iri
+        .unwrap_or_else(|| format!("iri://stream/{}", uuid::Uuid::new_v4().hyphenated()));
 
     let event_bus = state.core.events.clone();
     let task_iri_clone = task_iri.clone();
@@ -313,9 +321,16 @@ async fn get_projection_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ProjectionRequest>,
 ) -> impl IntoResponse {
-    let frame = req.frame_name.unwrap_or_else(|| "reference_only".to_string());
+    let frame = req
+        .frame_name
+        .unwrap_or_else(|| "reference_only".to_string());
     let params = req.params.unwrap_or_default();
-    match state.core.projection.project(&req.task_iri, &frame, params).await {
+    match state
+        .core
+        .projection
+        .project(&req.task_iri, &frame, params)
+        .await
+    {
         Ok(projection) => Json(json!({
             "projection": serde_json::from_str::<Value>(&projection).ok(),
             "frame": frame,
@@ -343,16 +358,26 @@ async fn emit_event_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let task_iri = payload.get("task_iri").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let event_type = payload.get("event_type").and_then(|v| v.as_str()).unwrap_or("CUSTOM");
-    let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("http_api");
-    let event_id = state.core.emit_event(task_iri, event_type, source, &payload.to_string()).await;
+    let task_iri = payload
+        .get("task_iri")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let event_type = payload
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("CUSTOM");
+    let source = payload
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("http_api");
+    let event_id = state
+        .core
+        .emit_event(task_iri, event_type, source, &payload.to_string())
+        .await;
     Json(json!({"event_id": event_id, "status": "emitted"}))
 }
 
-async fn list_skills_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn list_skills_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let skills = state.core.skills.list_all_skills();
     Json(json!({
         "count": skills.len(),
@@ -360,9 +385,7 @@ async fn list_skills_handler(
     }))
 }
 
-async fn stream_batch_events_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn stream_batch_events_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let event_bus = state.core.events.clone();
     let mut rx = event_bus.subscribe();
 
@@ -453,12 +476,7 @@ async fn kg_import_handler(
 
     let kg = match KnowledgeGraphStore::with_shared_store(store) {
         Ok(kg) => kg,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e})),
-            )
-        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     };
 
     match kg.write_quads(&result.quads, &graph_iri) {
@@ -472,10 +490,7 @@ async fn kg_import_handler(
                 "graph": req.graph,
             })),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }
 
@@ -486,12 +501,7 @@ async fn kg_query_handler(
     let store = state.kg_store.clone();
     let kg = match KnowledgeGraphStore::with_shared_store(store) {
         Ok(kg) => kg,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e})),
-            )
-        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     };
 
     let named_graph = req.named_graph.as_deref().map(|g| expand_iri(g));
@@ -504,10 +514,7 @@ async fn kg_query_handler(
                 "count": results.len(),
             })),
         ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e})),
-        ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     }
 }
 
@@ -618,9 +625,5 @@ fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> 
         _ => return None,
     };
 
-    Some(
-        Event::default()
-            .event(event_name)
-            .data(data.to_string())
-    )
+    Some(Event::default().event(event_name).data(data.to_string()))
 }

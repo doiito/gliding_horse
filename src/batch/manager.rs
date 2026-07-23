@@ -6,14 +6,14 @@ use tracing::{debug, info, warn};
 
 use crate::batch::emitter::BatchEventEmitter;
 use crate::batch::error::BatchError;
+use crate::batch::extractor::ExtractorPipeline;
 use crate::batch::handlers;
 use crate::batch::trigger::TriggerSystem;
-use crate::batch::types::{
-    BatchAgentConfig, BatchAgentStatus, BatchMetrics, ExtractionResult,
-};
-use crate::batch::window::WindowConfig;
+use crate::batch::types::{BatchAgentConfig, BatchAgentStatus, BatchMetrics, ExtractionResult};
 use crate::batch::window::SlidingWindow;
+use crate::batch::window::WindowConfig;
 use crate::config::settings::BatchAgentSettings;
+use crate::core::event_bus::Event;
 use crate::core::event_bus::EventBus;
 use crate::skill_graph::graph_store::SkillGraphStore;
 
@@ -78,7 +78,10 @@ impl BatchAgentManager {
                 time_window_secs: *secs,
                 intent_shift_threshold: 0.6,
             },
-            crate::batch::types::WindowType::Hybrid { max_messages, max_seconds } => WindowConfig {
+            crate::batch::types::WindowType::Hybrid {
+                max_messages,
+                max_seconds,
+            } => WindowConfig {
                 max_entries: *max_messages,
                 min_entries: 1,
                 time_window_secs: *max_seconds,
@@ -128,9 +131,10 @@ impl BatchAgentManager {
 
     pub async fn start(&mut self, name: Option<&str>) -> Result<(), BatchError> {
         if let Some(n) = name {
-            let instance = self.agents.get_mut(n).ok_or_else(|| {
-                BatchError::AgentNotFound { name: n.into() }
-            })?;
+            let instance = self
+                .agents
+                .get_mut(n)
+                .ok_or_else(|| BatchError::AgentNotFound { name: n.into() })?;
             if instance.status == BatchAgentStatus::Running {
                 return Err(BatchError::AgentAlreadyRunning { name: n.into() });
             }
@@ -159,9 +163,10 @@ impl BatchAgentManager {
 
     pub async fn stop(&mut self, name: Option<&str>) -> Result<(), BatchError> {
         if let Some(n) = name {
-            let instance = self.agents.get_mut(n).ok_or_else(|| {
-                BatchError::AgentNotFound { name: n.into() }
-            })?;
+            let instance = self
+                .agents
+                .get_mut(n)
+                .ok_or_else(|| BatchError::AgentNotFound { name: n.into() })?;
             instance.status = BatchAgentStatus::Stopped;
             if let Some(ref emitter) = self.emitter {
                 emitter.emit_agent_stopped(n, "manual_stop").await;
@@ -186,38 +191,167 @@ impl BatchAgentManager {
     }
 
     pub fn get_window_status(&self, name: &str) -> Option<crate::batch::types::WindowStatus> {
-        self.agents
-            .get(name)
-            .map(|a| a.window.read().status())
+        self.agents.get(name).map(|a| a.window.read().status())
     }
 
     pub fn get_metrics(&self, name: &str) -> Option<BatchMetrics> {
         self.agents.get(name).map(|a| a.metrics.clone())
     }
 
-    pub fn push_message(&mut self, agent_name: &str, entry: crate::batch::types::WindowEntry) -> Result<(), BatchError> {
-        let instance = self.agents.get_mut(agent_name).ok_or_else(|| {
-            BatchError::AgentNotFound { name: agent_name.into() }
-        })?;
+    pub fn push_message(
+        &mut self,
+        agent_name: &str,
+        entry: crate::batch::types::WindowEntry,
+    ) -> Result<(), BatchError> {
+        let instance =
+            self.agents
+                .get_mut(agent_name)
+                .ok_or_else(|| BatchError::AgentNotFound {
+                    name: agent_name.into(),
+                })?;
         instance.window.write().push(entry)
     }
 
-    pub fn evaluate_triggers(&self, agent_name: &str) -> Vec<crate::batch::types::TriggerReason> {
-        self.agents
-            .get(agent_name)
-            .map(|a| {
-                let rt = tokio::runtime::Handle::try_current();
-                match rt {
-                    Ok(handle) => {
-                        handle.block_on(async { a.trigger_system.evaluate().await })
-                    }
-                    Err(_) => vec![],
-                }
+    /// Convert one bus event into window entries for the agents that explicitly
+    /// declare it as a `CustomEvent` trigger.  This is deliberately opt-in:
+    /// lifecycle and batch-output events must not be broadcast to every agent.
+    /// Returns the affected agent names so a runtime adapter can evaluate and
+    /// execute only those windows.
+    pub fn enqueue_custom_event(&mut self, event: &Event) -> Vec<String> {
+        let names: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|(_, instance)| {
+                instance.status == BatchAgentStatus::Running
+                    && instance.config.triggers.iter().any(|trigger| {
+                        matches!(&trigger.trigger_type,
+                            crate::batch::types::TriggerType::CustomEvent(event_type)
+                            if event_type == &event.event_type)
+                    })
             })
-            .unwrap_or_default()
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        for name in &names {
+            let entry = crate::batch::types::WindowEntry {
+                message_id: event.event_id.clone(),
+                role: "event".to_string(),
+                content: event.payload.clone(),
+                timestamp: event.timestamp,
+                estimated_intent: None,
+                metadata: std::collections::HashMap::from([
+                    ("event_type".to_string(), event.event_type.clone()),
+                    ("task_iri".to_string(), event.task_iri.clone()),
+                    (
+                        "source_agent_iri".to_string(),
+                        event.source_agent_iri.clone(),
+                    ),
+                ]),
+            };
+            if let Err(error) = self.push_message(name, entry) {
+                warn!(%error, agent = %name, "Failed to enqueue batch event");
+            }
+        }
+        names
     }
 
-    pub fn drain_window(&mut self, agent_name: &str) -> Option<Vec<crate::batch::types::WindowEntry>> {
+    pub async fn evaluate_triggers(
+        &self,
+        agent_name: &str,
+    ) -> Vec<crate::batch::types::TriggerReason> {
+        match self.agents.get(agent_name) {
+            Some(agent) => agent.trigger_system.evaluate().await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Execute one ready batch using the configured extraction pipeline. This
+    /// is the concrete consumption boundary used by event/cron adapters: it
+    /// refuses stopped agents, drains exactly one window through the existing
+    /// pipeline, runs the maintenance handler, and publishes outcomes.
+    pub async fn execute_ready(
+        &mut self,
+        agent_name: &str,
+        pipeline: &ExtractorPipeline,
+        context: &crate::batch::types::PromptContext,
+    ) -> Result<ExtractionResult, BatchError> {
+        let (config, window_size) = {
+            let instance =
+                self.agents
+                    .get(agent_name)
+                    .ok_or_else(|| BatchError::AgentNotFound {
+                        name: agent_name.into(),
+                    })?;
+            if instance.status != BatchAgentStatus::Running {
+                return Err(BatchError::Internal {
+                    message: format!("Batch agent '{}' is not running", agent_name),
+                });
+            }
+            (
+                instance.config.clone(),
+                instance.window.read().status().entry_count,
+            )
+        };
+        if window_size == 0 {
+            return Err(BatchError::Internal {
+                message: "Cannot execute an empty batch window".to_string(),
+            });
+        }
+        if let Some(emitter) = &self.emitter {
+            emitter
+                .emit_extraction_started(agent_name, "pending", window_size)
+                .await;
+        }
+        let result = {
+            let instance = self
+                .agents
+                .get_mut(agent_name)
+                .expect("agent validated above");
+            // Drain under the lock, then release it before an async gateway
+            // call. Holding a parking_lot guard across `.await` would block
+            // producers and make the background consumer non-Send.
+            instance.window.write().drain()
+        };
+        let result = pipeline.extract(&config, result, context).await?;
+        if let Some(emitter) = &self.emitter {
+            emitter.emit_extraction_complete(agent_name, &result).await;
+        }
+        let outcome = if config.apply_graph_mutations {
+            self.run_maintenance_handler(agent_name, &result)
+        } else {
+            handlers::HandlerOutcome {
+                handler_name: agent_name.to_string(),
+                actions_taken: vec![
+                    "Graph mutations skipped: apply_graph_mutations is disabled".to_string()
+                ],
+                ..Default::default()
+            }
+        };
+        if let Some(emitter) = &self.emitter {
+            for event in outcome.pending_events {
+                let _ = emitter
+                    .event_bus()
+                    .emit(
+                        &format!("batch://{}", agent_name),
+                        &event.event_type,
+                        &format!("batch:{}", agent_name),
+                        &event.payload.to_string(),
+                    )
+                    .await;
+            }
+        }
+        if let Some(instance) = self.agents.get_mut(agent_name) {
+            instance
+                .trigger_system
+                .update_last_execution(chrono::Utc::now());
+        }
+        Ok(result)
+    }
+
+    pub fn drain_window(
+        &mut self,
+        agent_name: &str,
+    ) -> Option<Vec<crate::batch::types::WindowEntry>> {
         self.agents
             .get_mut(agent_name)
             .map(|a| a.window.write().drain())
@@ -264,28 +398,45 @@ impl BatchAgentManager {
                         s.window_max_messages.unwrap_or(5),
                     ),
                 },
-                triggers: s.triggers.iter().map(|t| {
-                    let trigger_type = match t.trigger_type.to_lowercase().as_str() {
-                        s if s.starts_with("cron") => crate::batch::types::TriggerType::CronSchedule(
-                            t.params.get("schedule").cloned().unwrap_or_default(),
-                        ),
-                        "intent_shift" | "intent" => crate::batch::types::TriggerType::IntentShift,
-                        s if s.starts_with("message") => crate::batch::types::TriggerType::MessageThreshold(
-                            t.params.get("threshold").and_then(|v| v.parse().ok()).unwrap_or(5),
-                        ),
-                        s if s.starts_with("custom") => crate::batch::types::TriggerType::CustomEvent(
-                            t.params.get("event").cloned().unwrap_or_default(),
-                        ),
-                        _ => crate::batch::types::TriggerType::WindowFull,
-                    };
-                    crate::batch::types::TriggerConfig {
-                        trigger_type,
-                        params: t.params.clone(),
-                    }
-                }).collect(),
+                triggers: s
+                    .triggers
+                    .iter()
+                    .map(|t| {
+                        let trigger_type = match t.trigger_type.to_lowercase().as_str() {
+                            s if s.starts_with("cron") => {
+                                crate::batch::types::TriggerType::CronSchedule(
+                                    t.params.get("schedule").cloned().unwrap_or_default(),
+                                )
+                            }
+                            "intent_shift" | "intent" => {
+                                crate::batch::types::TriggerType::IntentShift
+                            }
+                            s if s.starts_with("message") => {
+                                crate::batch::types::TriggerType::MessageThreshold(
+                                    t.params
+                                        .get("threshold")
+                                        .and_then(|v| v.parse().ok())
+                                        .unwrap_or(5),
+                                )
+                            }
+                            s if s.starts_with("custom") => {
+                                crate::batch::types::TriggerType::CustomEvent(
+                                    t.params.get("event").cloned().unwrap_or_default(),
+                                )
+                            }
+                            _ => crate::batch::types::TriggerType::WindowFull,
+                        };
+                        crate::batch::types::TriggerConfig {
+                            trigger_type,
+                            params: t.params.clone(),
+                        }
+                    })
+                    .collect(),
                 prompt_source: crate::batch::types::PromptSource::HybridWithTemplate,
                 prompt_template_path: s.prompt_template_path.clone(),
-                prompt_template_name: s.prompt_template_name.clone()
+                prompt_template_name: s
+                    .prompt_template_name
+                    .clone()
                     .or_else(|| Some(s.name.clone())),
                 prompt_params: std::collections::HashMap::new(),
                 business_domain: s.business_domain.clone(),
@@ -305,15 +456,24 @@ impl BatchAgentManager {
                 temperature: s.temperature,
                 max_retries: s.max_retries.unwrap_or(3),
                 timeout_seconds: s.timeout_seconds.unwrap_or(120),
-                emit_on: s.emit_on.iter().map(|e| match e.to_lowercase().as_str() {
-                    "new_relation" => crate::batch::types::EmitCondition::NewRelation,
-                    "intent_detected" => crate::batch::types::EmitCondition::IntentDetected(vec![]),
-                    "confidence_above" => crate::batch::types::EmitCondition::ConfidenceAbove(0.8),
-                    _ => crate::batch::types::EmitCondition::Always,
-                }).collect(),
+                emit_on: s
+                    .emit_on
+                    .iter()
+                    .map(|e| match e.to_lowercase().as_str() {
+                        "new_relation" => crate::batch::types::EmitCondition::NewRelation,
+                        "intent_detected" => {
+                            crate::batch::types::EmitCondition::IntentDetected(vec![])
+                        }
+                        "confidence_above" => {
+                            crate::batch::types::EmitCondition::ConfidenceAbove(0.8)
+                        }
+                        _ => crate::batch::types::EmitCondition::Always,
+                    })
+                    .collect(),
                 inject_user_reminders: s.inject_user_reminders,
                 inject_context_summary: s.inject_context_summary,
                 inject_related_entities: true,
+                apply_graph_mutations: s.apply_graph_mutations,
             };
             results.push(self.register(config));
         }
@@ -330,7 +490,10 @@ impl BatchAgentManager {
         match self.graph_store {
             Some(ref graph) => handlers::run_handler(agent_name, result, graph.as_ref()),
             None => {
-                warn!("No SkillGraphStore available — maintenance handler skipped for {}", agent_name);
+                warn!(
+                    "No SkillGraphStore available — maintenance handler skipped for {}",
+                    agent_name
+                );
                 handlers::HandlerOutcome {
                     handler_name: agent_name.to_string(),
                     actions_taken: vec!["No graph store available".to_string()],
@@ -344,5 +507,57 @@ impl BatchAgentManager {
 impl Default for BatchAgentManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::batch::types::{TriggerConfig, TriggerType, WindowType};
+    use crate::core::event_bus::EventPriority;
+
+    #[tokio::test]
+    async fn custom_event_is_enqueued_only_for_matching_running_agents() {
+        let mut manager = BatchAgentManager::new();
+        let mut matching = BatchAgentConfig::default();
+        matching.name = "matching".to_string();
+        matching.window_type = WindowType::MessageCount(2);
+        matching.triggers = vec![TriggerConfig {
+            trigger_type: TriggerType::CustomEvent("WORKSPACE_FILE_MODIFIED".to_string()),
+            params: HashMap::new(),
+        }];
+        manager.register(matching).unwrap();
+
+        let mut other = BatchAgentConfig::default();
+        other.name = "other".to_string();
+        other.triggers = vec![TriggerConfig {
+            trigger_type: TriggerType::CustomEvent("TASK_COMPLETED".to_string()),
+            params: HashMap::new(),
+        }];
+        manager.register(other).unwrap();
+        manager.start(None).await.unwrap();
+
+        let event = Event {
+            event_id: "evt-1".to_string(),
+            task_iri: "task:1".to_string(),
+            event_type: "WORKSPACE_FILE_MODIFIED".to_string(),
+            source_agent_iri: "monitor".to_string(),
+            payload: "src/lib.rs changed".to_string(),
+            payload_json_ld: "src/lib.rs changed".to_string(),
+            timestamp: chrono::Utc::now(),
+            sequence: 1,
+            type_mask: 1,
+            priority: EventPriority::Normal,
+        };
+
+        assert_eq!(
+            manager.enqueue_custom_event(&event),
+            vec!["matching".to_string()]
+        );
+        assert_eq!(
+            manager.get_window_status("matching").unwrap().entry_count,
+            1
+        );
+        assert_eq!(manager.get_window_status("other").unwrap().entry_count, 0);
     }
 }

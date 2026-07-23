@@ -57,7 +57,11 @@ fn parse_cron_next(expression: &str, from: DateTime<Utc>) -> Option<DateTime<Utc
     };
 
     // If the calculated time is in the past or too close (< 1s), add one interval
-    let next = if next <= timestamp { next + interval_secs } else { next };
+    let next = if next <= timestamp {
+        next + interval_secs
+    } else {
+        next
+    };
 
     DateTime::from_timestamp(next, 0)
 }
@@ -74,13 +78,11 @@ impl TriggerSystem {
         let cron_schedules: Vec<CronSchedule> = triggers
             .iter()
             .filter_map(|t| match &t.trigger_type {
-                TriggerType::CronSchedule(expr) => {
-                    Some(CronSchedule {
-                        job_id: format!("cron_{}", uuid::Uuid::new_v4().hyphenated()),
-                        expression: expr.clone(),
-                        one_shot: false,
-                    })
-                }
+                TriggerType::CronSchedule(expr) => Some(CronSchedule {
+                    job_id: format!("cron_{}", uuid::Uuid::new_v4().hyphenated()),
+                    expression: expr.clone(),
+                    one_shot: false,
+                }),
                 _ => None,
             })
             .collect();
@@ -112,7 +114,8 @@ impl TriggerSystem {
                         if let Some(next) = cron.next_after(self.last_execution) {
                             if next <= Utc::now() {
                                 reasons.push(TriggerReason::TimeElapsed {
-                                    elapsed_secs: (Utc::now() - self.last_execution).num_seconds() as u64,
+                                    elapsed_secs: (Utc::now() - self.last_execution).num_seconds()
+                                        as u64,
                                     max_secs: 0,
                                 });
                             }
@@ -216,7 +219,11 @@ mod tests {
         // */5 seconds
         let next = parse_cron_next("*/5", base).unwrap();
         let diff = next.timestamp() - base.timestamp();
-        assert!(diff > 0 && diff <= 5, "Expected next within 5s, got diff={}", diff);
+        assert!(
+            diff > 0 && diff <= 5,
+            "Expected next within 5s, got diff={}",
+            diff
+        );
 
         // */10 seconds
         let base2 = DateTime::from_timestamp(1003, 0).unwrap();
@@ -228,7 +235,11 @@ mod tests {
     fn test_cron_at_exact_second() {
         let base = DateTime::from_timestamp(100, 0).unwrap();
         let next = parse_cron_next("*/30", base).unwrap();
-        assert_eq!(next.timestamp(), 120, "Next multiple of 30 after 100 is 120");
+        assert_eq!(
+            next.timestamp(),
+            120,
+            "Next multiple of 30 after 100 is 120"
+        );
     }
 
     #[test]

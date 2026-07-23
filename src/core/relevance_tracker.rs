@@ -1,4 +1,3 @@
-
 use chrono::{DateTime, Utc};
 
 use crate::core::sa::TaskComplexity;
@@ -133,9 +132,7 @@ impl RelevanceTracker {
     /// | Recursive      | 0.3  | hours–days       |
     pub fn adapt_to_complexity(&mut self, complexity: &TaskComplexity) {
         self.time_decay_lambda = match complexity {
-            TaskComplexity::Instant
-            | TaskComplexity::Simple
-            | TaskComplexity::Emergency => 0.0,
+            TaskComplexity::Instant | TaskComplexity::Simple | TaskComplexity::Emergency => 0.0,
             TaskComplexity::Standard => 0.1,
             TaskComplexity::Complex => 0.15,
             TaskComplexity::Exploratory | TaskComplexity::Recursive => 0.3,
@@ -163,7 +160,11 @@ mod tests {
         let mut tracker = RelevanceTracker::new(0.6);
         // No task context, no prev input → fallback
         let score = tracker.on_new_input(&make_emb(vec![1.0, 0.0, 0.0]));
-        assert!((score - 0.5).abs() < 0.001, "fallback should be 0.5, got {}", score);
+        assert!(
+            (score - 0.5).abs() < 0.001,
+            "fallback should be 0.5, got {}",
+            score
+        );
     }
 
     #[test]
@@ -173,7 +174,11 @@ mod tests {
 
         // input matches task → high global score
         let score = tracker.on_new_input(&make_emb(vec![0.99, 0.01, 0.01]));
-        assert!(score > 0.5, "matching input should score > 0.5, got {}", score);
+        assert!(
+            score > 0.5,
+            "matching input should score > 0.5, got {}",
+            score
+        );
     }
 
     #[test]
@@ -182,7 +187,11 @@ mod tests {
         tracker.set_task_context(make_emb(vec![1.0, 0.0]));
 
         let score = tracker.on_new_input(&make_emb(vec![1.0, 0.0]));
-        assert!((score - 1.0).abs() < 0.01, "exact match with α=1 should give 1.0, got {}", score);
+        assert!(
+            (score - 1.0).abs() < 0.01,
+            "exact match with α=1 should give 1.0, got {}",
+            score
+        );
     }
 
     #[test]
@@ -192,11 +201,19 @@ mod tests {
 
         // First input: has task context, no prev → local fallback 0.5
         let first = tracker.on_new_input(&make_emb(vec![0.5, 0.5]));
-        assert!((first - 0.5).abs() < 0.001, "first input with α=0 should be 0.5, got {}", first);
+        assert!(
+            (first - 0.5).abs() < 0.001,
+            "first input with α=0 should be 0.5, got {}",
+            first
+        );
 
         // Second input: same as first → high local score
         let second = tracker.on_new_input(&make_emb(vec![0.5, 0.5]));
-        assert!((second - 1.0).abs() < 0.01, "identical consecutive inputs with α=0 should give 1.0, got {}", second);
+        assert!(
+            (second - 1.0).abs() < 0.01,
+            "identical consecutive inputs with α=0 should give 1.0, got {}",
+            second
+        );
     }
 
     #[test]

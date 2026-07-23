@@ -62,7 +62,12 @@ impl Spinner {
         Self::default()
     }
 
-    pub fn tick(&mut self, label: &str, theme: &ColorTheme, out: &mut impl Write) -> io::Result<()> {
+    pub fn tick(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
         queue!(
@@ -78,7 +83,12 @@ impl Spinner {
         out.flush()
     }
 
-    pub fn finish(&mut self, label: &str, theme: &ColorTheme, out: &mut impl Write) -> io::Result<()> {
+    pub fn finish(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
         self.frame_index = 0;
         execute!(
             out,
@@ -90,7 +100,12 @@ impl Spinner {
         )
     }
 
-    pub fn fail(&mut self, label: &str, theme: &ColorTheme, out: &mut impl Write) -> io::Result<()> {
+    pub fn fail(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
         self.frame_index = 0;
         execute!(
             out,
@@ -311,7 +326,14 @@ impl StreamRenderer {
         );
     }
 
-    pub fn show_task_result(&mut self, status: &str, summary: &str, turn_count: u32, tool_call_count: u32, workspace: &str) {
+    pub fn show_task_result(
+        &mut self,
+        status: &str,
+        summary: &str,
+        turn_count: u32,
+        tool_call_count: u32,
+        workspace: &str,
+    ) {
         let stdout = &mut io::stdout();
         let status_color = match status {
             "success" => Color::Green,

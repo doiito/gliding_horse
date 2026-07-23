@@ -368,17 +368,17 @@ impl SkillRegistry {
         let path = path.as_ref();
         info!(path = %path.display(), "Loading skills from JSON-LD");
 
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| CoreError::Internal {
-                message: format!("Failed to read JSON-LD file: {}", e),
-            })?;
+        let content = std::fs::read_to_string(path).map_err(|e| CoreError::Internal {
+            message: format!("Failed to read JSON-LD file: {}", e),
+        })?;
 
-        let json: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| CoreError::InvalidJsonLd {
+        let json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("Invalid JSON: {}", e),
             })?;
 
-        let skills = json.get("skills")
+        let skills = json
+            .get("skills")
             .and_then(|s| s.as_array())
             .ok_or_else(|| CoreError::InvalidJsonLd {
                 message: "No skills array found".to_string(),
@@ -397,55 +397,68 @@ impl SkillRegistry {
     }
 
     fn parse_skill_from_jsonld(&self, json: &serde_json::Value) -> Result<SkillMeta, CoreError> {
-        let skill_iri = json.get("@id")
+        let skill_iri = json
+            .get("@id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| CoreError::InvalidJsonLd {
                 message: "Missing @id".to_string(),
             })?
             .to_string();
 
-        let name = json.get("skill:name")
+        let name = json
+            .get("skill:name")
             .or_else(|| json.get("name"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let description = json.get("skill:description")
+        let description = json
+            .get("skill:description")
             .or_else(|| json.get("description"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let version = json.get("skill:version")
+        let version = json
+            .get("skill:version")
             .or_else(|| json.get("version"))
             .and_then(|v| v.as_str())
             .unwrap_or("1.0.0")
             .to_string();
 
-        let category = json.get("skill:category")
+        let category = json
+            .get("skill:category")
             .or_else(|| json.get("category"))
             .and_then(|v| v.as_str())
             .unwrap_or("general")
             .to_string();
 
-        let security_level = json.get("skill:securityLevel")
+        let security_level = json
+            .get("skill:securityLevel")
             .or_else(|| json.get("security_level"))
             .and_then(|v| v.as_str())
             .unwrap_or("normal")
             .to_string();
 
-        let allowed_roles = json.get("skill:allowedRoles")
+        let allowed_roles = json
+            .get("skill:allowedRoles")
             .or_else(|| json.get("allowed_roles"))
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|r| r.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| r.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let input_schema_raw = json.get("skill:inputSchema")
+        let input_schema_raw = json
+            .get("skill:inputSchema")
             .or_else(|| json.get("input_schema"))
             .cloned()
             .unwrap_or(serde_json::json!({"type": "object"}));
 
-        let output_schema_raw = json.get("skill:outputSchema")
+        let output_schema_raw = json
+            .get("skill:outputSchema")
             .or_else(|| json.get("output_schema"))
             .cloned()
             .unwrap_or(serde_json::json!({"type": "object"}));
@@ -453,20 +466,24 @@ impl SkillRegistry {
         let input_schema = Self::convert_jsonld_schema_to_jsonschema(&input_schema_raw);
         let output_schema = Self::convert_jsonld_schema_to_jsonschema(&output_schema_raw);
 
-        let compiled_template = json.get("skill:compiledTemplate")
+        let compiled_template = json
+            .get("skill:compiledTemplate")
             .or_else(|| json.get("compiled_template"))
             .and_then(|v| serde_json::to_string(v).ok())
             .unwrap_or_else(|| "{}".to_string());
 
-        let signature = json.get("skill:signature")
+        let signature = json
+            .get("skill:signature")
             .or_else(|| json.get("signature"))
             .and_then(|v| v.as_str().map(String::from));
 
-        let signature_algorithm = json.get("skill:signatureAlgorithm")
+        let signature_algorithm = json
+            .get("skill:signatureAlgorithm")
             .or_else(|| json.get("signature_algorithm"))
             .and_then(|v| v.as_str().map(String::from));
 
-        let input_mapping = json.get("skill:inputMapping")
+        let input_mapping = json
+            .get("skill:inputMapping")
             .or_else(|| json.get("input_mapping"))
             .and_then(|v| v.as_object())
             .map(|obj| {
@@ -480,7 +497,8 @@ impl SkillRegistry {
             })
             .unwrap_or_default();
 
-        let output_mapping = json.get("skill:outputMapping")
+        let output_mapping = json
+            .get("skill:outputMapping")
             .or_else(|| json.get("output_mapping"))
             .and_then(|v| v.as_object())
             .map(|obj| {
@@ -494,7 +512,8 @@ impl SkillRegistry {
             })
             .unwrap_or_default();
 
-        let skill_types = json.get("@type")
+        let skill_types = json
+            .get("@type")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -538,7 +557,10 @@ impl SkillRegistry {
         let mut result = serde_json::Map::new();
         result.insert("type".to_string(), serde_json::json!("object"));
 
-        if let Some(props) = obj.get("skill:properties").or_else(|| obj.get("properties")) {
+        if let Some(props) = obj
+            .get("skill:properties")
+            .or_else(|| obj.get("properties"))
+        {
             let converted_props = Self::convert_properties(props);
             result.insert("properties".to_string(), converted_props);
         }
@@ -580,7 +602,10 @@ impl SkillRegistry {
             result.insert("type".to_string(), type_val.clone());
         }
 
-        if let Some(desc) = obj.get("skill:description").or_else(|| obj.get("description")) {
+        if let Some(desc) = obj
+            .get("skill:description")
+            .or_else(|| obj.get("description"))
+        {
             result.insert("description".to_string(), desc.clone());
         }
 
@@ -604,7 +629,10 @@ impl SkillRegistry {
             result.insert("maximum".to_string(), max_val.clone());
         }
 
-        if let Some(props) = obj.get("skill:properties").or_else(|| obj.get("properties")) {
+        if let Some(props) = obj
+            .get("skill:properties")
+            .or_else(|| obj.get("properties"))
+        {
             result.insert("properties".to_string(), Self::convert_properties(props));
         }
 
@@ -644,24 +672,56 @@ impl SkillRegistry {
             skill_types: skill.skill_types.clone(),
         };
 
+        let iri = skill.skill_iri.clone();
+        // Never hold the primary map while acquiring secondary-index locks:
+        // role readers acquire in the opposite order (index → primary map).
+        // A brief replacement window can omit this IRI from a concurrent read,
+        // but cannot deadlock the agent runtime.
+        if self.skills.write().remove(&iri).is_some() {
+            self.remove_from_secondary_indexes(&iri);
+        }
         {
-            let mut skills = self.skills.write();
-            let iri = skill.skill_iri.clone();
-
+            let mut by_role = self.skills_by_role.write();
             for role in &skill.allowed_roles {
-                let mut by_role = self.skills_by_role.write();
                 by_role.entry(role.clone()).or_default().push(iri.clone());
             }
-
-            {
-                let mut by_cat = self.skills_by_category.write();
-                by_cat.entry(skill.category.clone()).or_default().push(iri.clone());
-            }
-
-            skills.insert(iri, cached);
         }
+        {
+            let mut by_cat = self.skills_by_category.write();
+            by_cat
+                .entry(skill.category.clone())
+                .or_default()
+                .push(iri.clone());
+        }
+        self.skills.write().insert(iri, cached);
 
         debug!(skill_iri = %skill.skill_iri, "Skill registered");
+    }
+
+    /// Remove a skill and every role/category secondary-index reference.
+    /// This is used by compensating workflows such as dynamic-skill creation
+    /// when a later required store write fails.
+    pub fn unregister_skill(&self, skill_iri: &str) -> bool {
+        let removed = self.skills.write().remove(skill_iri).is_some();
+        if removed {
+            self.remove_from_secondary_indexes(skill_iri);
+            debug!(skill_iri, "Skill unregistered");
+        }
+        removed
+    }
+
+    fn remove_from_secondary_indexes(&self, skill_iri: &str) {
+        let mut by_role = self.skills_by_role.write();
+        by_role.retain(|_, iris| {
+            iris.retain(|iri| iri != skill_iri);
+            !iris.is_empty()
+        });
+        drop(by_role);
+        let mut by_category = self.skills_by_category.write();
+        by_category.retain(|_, iris| {
+            iris.retain(|iri| iri != skill_iri);
+            !iris.is_empty()
+        });
     }
 
     pub fn get_skill(&self, skill_iri: &str) -> Option<SkillMeta> {
@@ -676,13 +736,19 @@ impl SkillRegistry {
             category: cached.basic.category.clone(),
             security_level: cached.basic.security_level.clone(),
             allowed_roles: cached.basic.allowed_roles.clone(),
-            input_schema: cached.schema.as_ref()
+            input_schema: cached
+                .schema
+                .as_ref()
                 .map(|s| s.input_schema.clone())
                 .unwrap_or(serde_json::json!({"type": "object"})),
-            output_schema: cached.schema.as_ref()
+            output_schema: cached
+                .schema
+                .as_ref()
                 .map(|s| s.output_schema.clone())
                 .unwrap_or(serde_json::json!({"type": "object"})),
-            compiled_template: cached.full.as_ref()
+            compiled_template: cached
+                .full
+                .as_ref()
                 .map(|f| f.compiled_template.clone())
                 .unwrap_or_default(),
             signature: None,
@@ -691,6 +757,19 @@ impl SkillRegistry {
             output_mapping: cached.output_mapping.clone(),
             skill_types: cached.skill_types.clone(),
         })
+    }
+
+    /// Resolve a runtime tool name to the canonical skill IRI.
+    ///
+    /// Tool names are part of the execution protocol while IRIs are part of
+    /// the graph/evolution protocol. Keeping this lookup in the registry
+    /// prevents callers from manufacturing a second IRI namespace.
+    pub fn skill_iri_for_tool_name(&self, tool_name: &str) -> Option<String> {
+        self.skills
+            .read()
+            .values()
+            .find(|cached| cached.basic.name == tool_name)
+            .map(|cached| cached.basic.skill_iri.clone())
     }
 
     pub fn get_skill_basic(&self, skill_iri: &str) -> Option<SkillBasic> {
@@ -723,6 +802,12 @@ impl SkillRegistry {
             .map(|iris| {
                 iris.iter()
                     .filter_map(|iri| self.get_skill(iri))
+                    .filter(|skill| {
+                        !skill
+                            .skill_types
+                            .iter()
+                            .any(|kind| kind == "definition_only")
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -733,17 +818,14 @@ impl SkillRegistry {
 
         by_cat
             .get(category)
-            .map(|iris| {
-                iris.iter()
-                    .filter_map(|iri| self.get_skill(iri))
-                    .collect()
-            })
+            .map(|iris| iris.iter().filter_map(|iri| self.get_skill(iri)).collect())
             .unwrap_or_default()
     }
 
     pub fn list_all_skills(&self) -> Vec<SkillMeta> {
         let skills = self.skills.read();
-        skills.keys()
+        skills
+            .keys()
             .filter_map(|iri| self.get_skill(iri))
             .collect()
     }
@@ -758,19 +840,22 @@ impl SkillRegistry {
         skill_iri: &str,
         input: &str,
     ) -> Result<serde_json::Value, CoreError> {
-        let schema = self.get_skill_schema(skill_iri)
+        let schema = self
+            .get_skill_schema(skill_iri)
             .ok_or_else(|| CoreError::SkillNotFound {
                 iri: skill_iri.to_string(),
             })?;
 
-        let input_value: serde_json::Value = serde_json::from_str(input)
-            .map_err(|e| CoreError::InvalidJsonLd {
+        let input_value: serde_json::Value =
+            serde_json::from_str(input).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("Invalid JSON input: {}", e),
             })?;
 
         let compiled = jsonschema::JSONSchema::options()
             .compile(&schema.input_schema)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+            .map_err(|e| CoreError::Internal {
+                message: e.to_string(),
+            })?;
 
         if let Err(errors) = compiled.validate(&input_value) {
             let error_messages: Vec<String> = errors
@@ -790,19 +875,22 @@ impl SkillRegistry {
         skill_iri: &str,
         output: &str,
     ) -> Result<serde_json::Value, CoreError> {
-        let schema = self.get_skill_schema(skill_iri)
+        let schema = self
+            .get_skill_schema(skill_iri)
             .ok_or_else(|| CoreError::SkillNotFound {
                 iri: skill_iri.to_string(),
             })?;
 
-        let output_value: serde_json::Value = serde_json::from_str(output)
-            .map_err(|e| CoreError::InvalidJsonLd {
+        let output_value: serde_json::Value =
+            serde_json::from_str(output).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("Invalid JSON output: {}", e),
             })?;
 
         let compiled = jsonschema::JSONSchema::options()
             .compile(&schema.output_schema)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+            .map_err(|e| CoreError::Internal {
+                message: e.to_string(),
+            })?;
 
         if let Err(errors) = compiled.validate(&output_value) {
             let error_messages: Vec<String> = errors
@@ -819,14 +907,15 @@ impl SkillRegistry {
 
     pub fn get_compiled_template(&self, skill_iri: &str) -> Option<String> {
         let skills = self.skills.read();
-        skills.get(skill_iri).and_then(|c| {
-            c.full.as_ref().map(|f| f.compiled_template.clone())
-        })
+        skills
+            .get(skill_iri)
+            .and_then(|c| c.full.as_ref().map(|f| f.compiled_template.clone()))
     }
 
     pub fn check_signature(&self, skill_iri: &str) -> bool {
         let skills = self.skills.read();
-        skills.get(skill_iri)
+        skills
+            .get(skill_iri)
             .and_then(|c| c.full.as_ref())
             .map(|_| true)
             .unwrap_or(false)
@@ -972,22 +1061,31 @@ impl SkillRegistry {
             .as_object()
             .cloned()
             .unwrap_or_default();
-        context_map.insert("schema".to_string(), serde_json::json!("https://agent-harness.os/schema#"));
+        context_map.insert(
+            "schema".to_string(),
+            serde_json::json!("https://agent-harness.os/schema#"),
+        );
 
         let mut input_props = serde_json::Map::new();
         for (local_name, iri) in &skill.input_mapping {
-            input_props.insert(local_name.clone(), serde_json::json!({
-                "@id": iri,
-                "@type": "schema:Parameter"
-            }));
+            input_props.insert(
+                local_name.clone(),
+                serde_json::json!({
+                    "@id": iri,
+                    "@type": "schema:Parameter"
+                }),
+            );
         }
 
         let mut output_props = serde_json::Map::new();
         for (local_name, iri) in &skill.output_mapping {
-            output_props.insert(local_name.clone(), serde_json::json!({
-                "@id": iri,
-                "@type": "schema:OutputField"
-            }));
+            output_props.insert(
+                local_name.clone(),
+                serde_json::json!({
+                    "@id": iri,
+                    "@type": "schema:OutputField"
+                }),
+            );
         }
 
         let mut skill_types_json = vec![serde_json::json!("skill:Skill")];
@@ -996,19 +1094,52 @@ impl SkillRegistry {
         }
 
         let mut result = serde_json::Map::new();
-        result.insert("@context".to_string(), serde_json::Value::Object(context_map));
-        result.insert("@id".to_string(), serde_json::Value::String(skill.skill_iri.clone()));
-        result.insert("@type".to_string(), serde_json::Value::Array(skill_types_json));
-        result.insert("skill:name".to_string(), serde_json::Value::String(skill.name));
-        result.insert("skill:description".to_string(), serde_json::Value::String(skill.description));
-        result.insert("skill:version".to_string(), serde_json::Value::String(skill.version));
-        result.insert("skill:category".to_string(), serde_json::Value::String(skill.category));
-        result.insert("skill:securityLevel".to_string(), serde_json::Value::String(skill.security_level));
-        result.insert("skill:allowedRoles".to_string(), serde_json::json!(skill.allowed_roles));
+        result.insert(
+            "@context".to_string(),
+            serde_json::Value::Object(context_map),
+        );
+        result.insert(
+            "@id".to_string(),
+            serde_json::Value::String(skill.skill_iri.clone()),
+        );
+        result.insert(
+            "@type".to_string(),
+            serde_json::Value::Array(skill_types_json),
+        );
+        result.insert(
+            "skill:name".to_string(),
+            serde_json::Value::String(skill.name),
+        );
+        result.insert(
+            "skill:description".to_string(),
+            serde_json::Value::String(skill.description),
+        );
+        result.insert(
+            "skill:version".to_string(),
+            serde_json::Value::String(skill.version),
+        );
+        result.insert(
+            "skill:category".to_string(),
+            serde_json::Value::String(skill.category),
+        );
+        result.insert(
+            "skill:securityLevel".to_string(),
+            serde_json::Value::String(skill.security_level),
+        );
+        result.insert(
+            "skill:allowedRoles".to_string(),
+            serde_json::json!(skill.allowed_roles),
+        );
         result.insert("skill:inputSchema".to_string(), skill.input_schema);
         result.insert("skill:outputSchema".to_string(), skill.output_schema);
-        result.insert("skill:inputMapping".to_string(), serde_json::Value::Object(input_props));
-        result.insert("skill:outputMapping".to_string(), serde_json::Value::Object(output_props));
+        result.insert(
+            "skill:inputMapping".to_string(),
+            serde_json::Value::Object(input_props),
+        );
+        result.insert(
+            "skill:outputMapping".to_string(),
+            serde_json::Value::Object(output_props),
+        );
 
         Some(serde_json::Value::Object(result))
     }
@@ -1033,6 +1164,67 @@ mod tests {
 
         let da_skills = registry.list_skills_for_role("DA");
         assert!(!da_skills.is_empty());
+    }
+
+    #[test]
+    fn definition_only_skill_is_retained_but_not_offered_as_executable_role_skill() {
+        let registry = SkillRegistry::new();
+        let mut definition = registry.get_skill("iri://skills/file_read").unwrap();
+        definition.skill_iri = "iri://skills/generated_definition".to_string();
+        definition.name = "generated_definition".to_string();
+        definition.skill_types = vec!["definition_only".to_string()];
+        registry.register_skill(definition);
+
+        assert!(registry
+            .get_skill("iri://skills/generated_definition")
+            .is_some());
+        assert!(registry
+            .list_all_skills()
+            .iter()
+            .any(|skill| skill.skill_iri == "iri://skills/generated_definition"));
+        assert!(!registry
+            .list_skills_for_role("DA")
+            .iter()
+            .any(|skill| skill.skill_iri == "iri://skills/generated_definition"));
+    }
+
+    #[test]
+    fn replacing_or_unregistering_skill_cleans_secondary_indexes() {
+        let registry = SkillRegistry::new();
+        let mut replacement = registry.get_skill("iri://skills/file_read").unwrap();
+        replacement.allowed_roles = vec!["AA".to_string()];
+        replacement.category = "replacement-category".to_string();
+        registry.register_skill(replacement);
+
+        assert!(!registry
+            .list_skills_for_role("DA")
+            .iter()
+            .any(|skill| skill.skill_iri == "iri://skills/file_read"));
+        assert_eq!(
+            registry
+                .list_skills_for_role("AA")
+                .iter()
+                .filter(|skill| skill.skill_iri == "iri://skills/file_read")
+                .count(),
+            1
+        );
+        assert!(registry.unregister_skill("iri://skills/file_read"));
+        assert!(registry.get_skill("iri://skills/file_read").is_none());
+        assert!(!registry
+            .list_skills_for_role("AA")
+            .iter()
+            .any(|skill| skill.skill_iri == "iri://skills/file_read"));
+    }
+
+    #[test]
+    fn test_resolve_canonical_skill_iri_from_tool_name() {
+        let registry = SkillRegistry::new();
+
+        assert_eq!(
+            registry.skill_iri_for_tool_name("file_read").as_deref(),
+            Some("iri://skills/file_read")
+        );
+        assert_eq!(registry.skill_iri_for_tool_name("unknown_tool"), None);
     }
 
     #[test]
@@ -1100,7 +1292,10 @@ mod tests {
 
         let converted = SkillRegistry::convert_jsonld_schema_to_jsonschema(&jsonld_schema);
 
-        assert_eq!(converted.get("type").and_then(|t| t.as_str()), Some("object"));
+        assert_eq!(
+            converted.get("type").and_then(|t| t.as_str()),
+            Some("object")
+        );
         assert!(converted.get("properties").is_some());
         assert!(converted.get("required").is_some());
 
@@ -1109,18 +1304,28 @@ mod tests {
         assert!(props.contains_key("encoding"));
 
         let path_prop = props.get("path").unwrap().as_object().unwrap();
-        assert_eq!(path_prop.get("type").and_then(|t| t.as_str()), Some("string"));
-        assert_eq!(path_prop.get("description").and_then(|d| d.as_str()), Some("File path to read"));
+        assert_eq!(
+            path_prop.get("type").and_then(|t| t.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            path_prop.get("description").and_then(|d| d.as_str()),
+            Some("File path to read")
+        );
 
         let encoding_prop = props.get("encoding").unwrap().as_object().unwrap();
-        assert_eq!(encoding_prop.get("default").and_then(|d| d.as_str()), Some("utf-8"));
+        assert_eq!(
+            encoding_prop.get("default").and_then(|d| d.as_str()),
+            Some("utf-8")
+        );
     }
 
     #[test]
     fn test_semantic_capability_discovery() {
         let registry = SkillRegistry::new();
 
-        let file_ops = registry.find_skills_by_semantic_capability("iri://skill-types/FileOperation");
+        let file_ops =
+            registry.find_skills_by_semantic_capability("iri://skill-types/FileOperation");
         assert_eq!(file_ops.len(), 2);
         assert!(file_ops.iter().any(|s| s.name == "file_read"));
         assert!(file_ops.iter().any(|s| s.name == "file_write"));
@@ -1129,7 +1334,8 @@ mod tests {
         assert_eq!(ai_ops.len(), 1);
         assert_eq!(ai_ops[0].name, "llm_chat");
 
-        let non_existent = registry.find_skills_by_semantic_capability("iri://skill-types/NonExistent");
+        let non_existent =
+            registry.find_skills_by_semantic_capability("iri://skill-types/NonExistent");
         assert!(non_existent.is_empty());
     }
 
@@ -1163,8 +1369,14 @@ mod tests {
         let mapped = registry.map_input_params("iri://skills/file_read", &params);
 
         assert_eq!(mapped.len(), 2);
-        assert_eq!(mapped.get("iri://schema/file/path"), Some(&serde_json::json!("/tmp/test.txt")));
-        assert_eq!(mapped.get("iri://schema/file/encoding"), Some(&serde_json::json!("utf-8")));
+        assert_eq!(
+            mapped.get("iri://schema/file/path"),
+            Some(&serde_json::json!("/tmp/test.txt"))
+        );
+        assert_eq!(
+            mapped.get("iri://schema/file/encoding"),
+            Some(&serde_json::json!("utf-8"))
+        );
         assert!(!mapped.contains_key("unknown_param"));
 
         let empty_mapped = registry.map_input_params("iri://skills/non_existent", &params);
@@ -1179,20 +1391,35 @@ mod tests {
         assert!(jsonld.is_some());
 
         let jsonld = jsonld.unwrap();
-        assert_eq!(jsonld.get("@id").and_then(|v| v.as_str()), Some("iri://skills/file_read"));
-        assert_eq!(jsonld.get("skill:name").and_then(|v| v.as_str()), Some("file_read"));
+        assert_eq!(
+            jsonld.get("@id").and_then(|v| v.as_str()),
+            Some("iri://skills/file_read")
+        );
+        assert_eq!(
+            jsonld.get("skill:name").and_then(|v| v.as_str()),
+            Some("file_read")
+        );
 
         let types = jsonld.get("@type").and_then(|v| v.as_array()).unwrap();
         assert!(types.contains(&serde_json::json!("skill:Skill")));
         assert!(types.contains(&serde_json::json!("iri://skill-types/FileOperation")));
         assert!(types.contains(&serde_json::json!("iri://skill-types/ReadOperation")));
 
-        let input_mapping = jsonld.get("skill:inputMapping").and_then(|v| v.as_object()).unwrap();
+        let input_mapping = jsonld
+            .get("skill:inputMapping")
+            .and_then(|v| v.as_object())
+            .unwrap();
         assert!(input_mapping.contains_key("path"));
         assert!(input_mapping.contains_key("encoding"));
 
-        let path_mapping = input_mapping.get("path").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(path_mapping.get("@id").and_then(|v| v.as_str()), Some("iri://schema/file/path"));
+        let path_mapping = input_mapping
+            .get("path")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            path_mapping.get("@id").and_then(|v| v.as_str()),
+            Some("iri://schema/file/path")
+        );
 
         let none_jsonld = registry.to_json_ld("iri://skills/non_existent");
         assert!(none_jsonld.is_none());
@@ -1212,13 +1439,20 @@ mod tests {
 
         assert!(skill.input_mapping.contains_key("path"));
         assert!(skill.input_mapping.contains_key("encoding"));
-        assert_eq!(skill.input_mapping.get("path"), Some(&"iri://schema/file/path".to_string()));
+        assert_eq!(
+            skill.input_mapping.get("path"),
+            Some(&"iri://schema/file/path".to_string())
+        );
 
         assert!(skill.output_mapping.contains_key("content"));
         assert!(skill.output_mapping.contains_key("size"));
 
-        assert!(skill.skill_types.contains(&"iri://skill-types/FileOperation".to_string()));
-        assert!(skill.skill_types.contains(&"iri://skill-types/ReadOperation".to_string()));
+        assert!(skill
+            .skill_types
+            .contains(&"iri://skill-types/FileOperation".to_string()));
+        assert!(skill
+            .skill_types
+            .contains(&"iri://skill-types/ReadOperation".to_string()));
     }
 
     #[test]
@@ -1257,7 +1491,13 @@ mod tests {
         assert_eq!(skill.skill_iri, "iri://skills/test_skill");
         assert_eq!(skill.name, "test_skill");
         assert_eq!(skill.skill_types, vec!["iri://skill-types/TestOperation"]);
-        assert_eq!(skill.input_mapping.get("param1"), Some(&"iri://schema/test/param1".to_string()));
-        assert_eq!(skill.output_mapping.get("result"), Some(&"iri://schema/test/result".to_string()));
+        assert_eq!(
+            skill.input_mapping.get("param1"),
+            Some(&"iri://schema/test/param1".to_string())
+        );
+        assert_eq!(
+            skill.output_mapping.get("result"),
+            Some(&"iri://schema/test/result".to_string())
+        );
     }
 }

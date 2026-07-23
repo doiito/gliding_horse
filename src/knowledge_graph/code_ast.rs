@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Language, Node, Parser, Tree};
 use tracing::debug;
+use tree_sitter::{Language, Node, Parser, Tree};
 
 use super::rdf_mapper::RdfMapper;
 use super::store::KnowledgeGraphStore;
@@ -104,8 +104,17 @@ struct AstExtraction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncrementalResult {
     Unchanged,
-    Updated { entity_count: usize, relation_count: usize, quad_count: usize, deleted_quads: usize },
-    Created { entity_count: usize, relation_count: usize, quad_count: usize },
+    Updated {
+        entity_count: usize,
+        relation_count: usize,
+        quad_count: usize,
+        deleted_quads: usize,
+    },
+    Created {
+        entity_count: usize,
+        relation_count: usize,
+        quad_count: usize,
+    },
 }
 
 fn compute_sha256(content: &str) -> String {
@@ -125,9 +134,10 @@ fn get_cached_hash(store: &KnowledgeGraphStore, file_path: &str, graph: &str) ->
         graph, subject_iri
     );
     match store.query_sparql(&sparql, None) {
-        Ok(results) if !results.is_empty() => {
-            results[0].get("?hash").and_then(|v| v.as_str()).map(String::from)
-        }
+        Ok(results) if !results.is_empty() => results[0]
+            .get("?hash")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         _ => None,
     }
 }
@@ -146,7 +156,10 @@ impl CodeAstExtractor {
         if lang == CodeLanguage::Unknown {
             return Err(format!(
                 "unsupported file type: {}",
-                file_path.extension().and_then(|e| e.to_str()).unwrap_or("?")
+                file_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("?")
             ));
         }
 
@@ -164,12 +177,13 @@ impl CodeAstExtractor {
         let is_update = cached_hash.is_some();
 
         let deleted_quads = if is_update {
-            store.delete_quads_by_subject_prefix(&format!("iri://entity/file:{}", path), graph)?
+            store.delete_code_file_subgraph(&format!("iri://entity/file:{}", path), graph)?
         } else {
             0
         };
 
-        let result = Self::extract_from_source_with_hash(&source, &lang, path, graph, &current_hash)?;
+        let result =
+            Self::extract_from_source_with_hash(&source, &lang, path, graph, &current_hash)?;
 
         store.write_quads(&result.quads, graph)?;
 
@@ -206,7 +220,10 @@ impl CodeAstExtractor {
         if lang == CodeLanguage::Unknown {
             return Err(format!(
                 "unsupported file type: {}",
-                file_path.extension().and_then(|e| e.to_str()).unwrap_or("?")
+                file_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("?")
             ));
         }
 
@@ -234,14 +251,17 @@ impl CodeAstExtractor {
         graph: &str,
         content_hash: &str,
     ) -> Result<RdfMappingResult, String> {
-        let language = lang.to_language()
+        let language = lang
+            .to_language()
             .ok_or_else(|| format!("language {} does not support AST extraction", lang.name()))?;
 
         let mut parser = Parser::new();
-        parser.set_language(&language)
+        parser
+            .set_language(&language)
             .map_err(|e| format!("failed to set tree-sitter language: {}", e))?;
 
-        let tree = parser.parse(source, None)
+        let tree = parser
+            .parse(source, None)
             .ok_or_else(|| "failed to parse source code".to_string())?;
 
         let extraction = match lang {
@@ -253,7 +273,10 @@ impl CodeAstExtractor {
             CodeLanguage::Go => Self::extract_go(&tree, source, file_path),
             CodeLanguage::Java => Self::extract_java(&tree, source, file_path),
             CodeLanguage::C | CodeLanguage::Cpp => Self::extract_c_cpp(&tree, source, file_path),
-            CodeLanguage::Unknown => AstExtraction { entities: vec![], relations: vec![] },
+            CodeLanguage::Unknown => AstExtraction {
+                entities: vec![],
+                relations: vec![],
+            },
         };
 
         let file_entity_id = format!("file:{}", file_path);
@@ -267,10 +290,22 @@ impl CodeAstExtractor {
             description: Some(format!("{} source file", lang.name())),
             properties: {
                 let mut props = HashMap::new();
-                props.insert("language".to_string(), serde_json::Value::String(lang.name().to_string()));
-                props.insert("path".to_string(), serde_json::Value::String(file_path.to_string()));
-                props.insert("contentHash".to_string(), serde_json::Value::String(content_hash.to_string()));
-                props.insert("sourceFile".to_string(), serde_json::Value::String(file_path.to_string()));
+                props.insert(
+                    "language".to_string(),
+                    serde_json::Value::String(lang.name().to_string()),
+                );
+                props.insert(
+                    "path".to_string(),
+                    serde_json::Value::String(file_path.to_string()),
+                );
+                props.insert(
+                    "contentHash".to_string(),
+                    serde_json::Value::String(content_hash.to_string()),
+                );
+                props.insert(
+                    "sourceFile".to_string(),
+                    serde_json::Value::String(file_path.to_string()),
+                );
                 props
             },
             source_location: None,
@@ -287,19 +322,25 @@ impl CodeAstExtractor {
         }
 
         let output = LLMExtractionOutput {
-            nodes: entities.iter().map(|e| NodeDef {
-                id: e.id.clone(),
-                node_type: e.entity_type.clone(),
-                label: e.label.clone(),
-                description: e.description.clone(),
-                properties: e.properties.clone(),
-            }).collect(),
-            edges: relations.iter().map(|r| EdgeDef {
-                source: r.source.clone(),
-                target: r.target.clone(),
-                relation: r.relation.clone(),
-                properties: HashMap::new(),
-            }).collect(),
+            nodes: entities
+                .iter()
+                .map(|e| NodeDef {
+                    id: e.id.clone(),
+                    node_type: e.entity_type.clone(),
+                    label: e.label.clone(),
+                    description: e.description.clone(),
+                    properties: e.properties.clone(),
+                })
+                .collect(),
+            edges: relations
+                .iter()
+                .map(|r| EdgeDef {
+                    source: r.source.clone(),
+                    target: r.target.clone(),
+                    relation: r.relation.clone(),
+                    properties: HashMap::new(),
+                })
+                .collect(),
         };
 
         let result = RdfMapper::map_extraction(&output, graph);
@@ -330,9 +371,18 @@ impl CodeAstExtractor {
         let root = tree.root_node();
 
         let mut cursor = root.walk();
-        Self::walk_rust(&mut cursor, source, file_path, &mut entities, &mut relations);
+        Self::walk_rust(
+            &mut cursor,
+            source,
+            file_path,
+            &mut entities,
+            &mut relations,
+        );
 
-        AstExtraction { entities, relations }
+        AstExtraction {
+            entities,
+            relations,
+        }
     }
 
     fn walk_rust(
@@ -348,14 +398,19 @@ impl CodeAstExtractor {
                 "function_item" | "function_signature" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("fn", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("fn", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Function".to_string(),
                             description: Some(format!("fn {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                         Self::extract_rust_calls(&node, source, file_path, &id, relations);
                     }
@@ -363,53 +418,78 @@ impl CodeAstExtractor {
                 "struct_item" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("struct", file_path, &name, node.start_position().row + 1);
+                        let id = Self::make_id(
+                            "struct",
+                            file_path,
+                            &name,
+                            node.start_position().row + 1,
+                        );
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Struct".to_string(),
                             description: Some(format!("struct {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "enum_item" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("enum", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("enum", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Enum".to_string(),
                             description: Some(format!("enum {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "trait_item" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("trait", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("trait", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Trait".to_string(),
                             description: Some(format!("trait {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "impl_item" => {
                     if let Some(type_node) = node.child_by_field_name("type") {
                         let type_name = Self::node_text(&type_node, source).to_string();
-                        let trait_name = node.child_by_field_name("trait")
+                        let trait_name = node
+                            .child_by_field_name("trait")
                             .map(|n| Self::node_text(&n, source).to_string());
 
                         if let Some(trait_name) = trait_name {
-                            let impl_id = Self::make_id("impl", file_path, &format!("{}+{}", trait_name, type_name), node.start_position().row + 1);
+                            let impl_id = Self::make_id(
+                                "impl",
+                                file_path,
+                                &format!("{}+{}", trait_name, type_name),
+                                node.start_position().row + 1,
+                            );
                             let type_id = Self::make_id("struct", file_path, &type_name, 0);
                             let trait_id = Self::make_id("trait", file_path, &trait_name, 0);
                             relations.push(AstRelation {
@@ -423,7 +503,11 @@ impl CodeAstExtractor {
                                 entity_type: "https://agentos.ontology/code/Impl".to_string(),
                                 description: Some(format!("impl {} for {}", trait_name, type_name)),
                                 properties: HashMap::new(),
-                                source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                                source_location: Some(format!(
+                                    "{}:{}",
+                                    file_path,
+                                    node.start_position().row + 1
+                                )),
                             });
                         }
                     }
@@ -433,32 +517,52 @@ impl CodeAstExtractor {
                         if child.kind() == "function_item" || child.kind() == "function_signature" {
                             if let Some(name_node) = child.child_by_field_name("name") {
                                 let name = Self::node_text(&name_node, source).to_string();
-                                let id = Self::make_id("fn", file_path, &name, child.start_position().row + 1);
+                                let id = Self::make_id(
+                                    "fn",
+                                    file_path,
+                                    &name,
+                                    child.start_position().row + 1,
+                                );
                                 entities.push(AstEntity {
                                     id: id.clone(),
                                     label: name.clone(),
                                     entity_type: "https://agentos.ontology/code/Method".to_string(),
                                     description: Some(format!("method {}", name)),
                                     properties: HashMap::new(),
-                                    source_location: Some(format!("{}:{}", file_path, child.start_position().row + 1)),
+                                    source_location: Some(format!(
+                                        "{}:{}",
+                                        file_path,
+                                        child.start_position().row + 1
+                                    )),
                                 });
                                 Self::extract_rust_calls(&child, source, file_path, &id, relations);
                             }
                         }
                     }
-                    if !cursor.goto_next_sibling() { break; }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
                     continue;
                 }
                 "use_declaration" => {
                     let use_text = Self::node_text(&node, source).to_string();
-                    let id = Self::make_id("use", file_path, &use_text.replace(' ', ""), node.start_position().row + 1);
+                    let id = Self::make_id(
+                        "use",
+                        file_path,
+                        &use_text.replace(' ', ""),
+                        node.start_position().row + 1,
+                    );
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: use_text.clone(),
                         entity_type: "https://agentos.ontology/code/Import".to_string(),
                         description: Some(use_text),
                         properties: HashMap::new(),
-                        source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                        source_location: Some(format!(
+                            "{}:{}",
+                            file_path,
+                            node.start_position().row + 1
+                        )),
                     });
                 }
                 _ => {}
@@ -469,7 +573,9 @@ impl CodeAstExtractor {
                 cursor.goto_parent();
             }
 
-            if !cursor.goto_next_sibling() { break; }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -517,9 +623,18 @@ impl CodeAstExtractor {
         let root = tree.root_node();
 
         let mut cursor = root.walk();
-        Self::walk_python(&mut cursor, source, file_path, &mut entities, &mut relations);
+        Self::walk_python(
+            &mut cursor,
+            source,
+            file_path,
+            &mut entities,
+            &mut relations,
+        );
 
-        AstExtraction { entities, relations }
+        AstExtraction {
+            entities,
+            relations,
+        }
     }
 
     fn walk_python(
@@ -535,29 +650,41 @@ impl CodeAstExtractor {
                 "function_definition" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("fn", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("fn", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Function".to_string(),
                             description: Some(format!("def {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
-                        Self::extract_generic_calls(&node, source, file_path, &id, relations, "call");
+                        Self::extract_generic_calls(
+                            &node, source, file_path, &id, relations, "call",
+                        );
                     }
                 }
                 "class_definition" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("class", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("class", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Class".to_string(),
                             description: Some(format!("class {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
 
                         if let Some(arg_list) = node.child_by_field_name("superclasses") {
@@ -565,11 +692,13 @@ impl CodeAstExtractor {
                             for child in arg_list.children(&mut arg_cursor) {
                                 if child.kind() == "identifier" || child.kind() == "attribute" {
                                     let parent_name = Self::node_text(&child, source).to_string();
-                                    let parent_id = Self::make_id("class", file_path, &parent_name, 0);
+                                    let parent_id =
+                                        Self::make_id("class", file_path, &parent_name, 0);
                                     relations.push(AstRelation {
                                         source: id.clone(),
                                         target: parent_id,
-                                        relation: "https://agentos.ontology/code/inherits".to_string(),
+                                        relation: "https://agentos.ontology/code/inherits"
+                                            .to_string(),
                                     });
                                 }
                             }
@@ -578,14 +707,23 @@ impl CodeAstExtractor {
                 }
                 "import_statement" | "import_from_statement" => {
                     let import_text = Self::node_text(&node, source).to_string();
-                    let id = Self::make_id("import", file_path, &import_text.replace(' ', ""), node.start_position().row + 1);
+                    let id = Self::make_id(
+                        "import",
+                        file_path,
+                        &import_text.replace(' ', ""),
+                        node.start_position().row + 1,
+                    );
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
                         entity_type: "https://agentos.ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
-                        source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                        source_location: Some(format!(
+                            "{}:{}",
+                            file_path,
+                            node.start_position().row + 1
+                        )),
                     });
                 }
                 _ => {}
@@ -596,7 +734,9 @@ impl CodeAstExtractor {
                 cursor.goto_parent();
             }
 
-            if !cursor.goto_next_sibling() { break; }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -606,9 +746,18 @@ impl CodeAstExtractor {
         let root = tree.root_node();
 
         let mut cursor = root.walk();
-        Self::walk_js_ts(&mut cursor, source, file_path, &mut entities, &mut relations);
+        Self::walk_js_ts(
+            &mut cursor,
+            source,
+            file_path,
+            &mut entities,
+            &mut relations,
+        );
 
-        AstExtraction { entities, relations }
+        AstExtraction {
+            entities,
+            relations,
+        }
     }
 
     fn walk_js_ts(
@@ -624,29 +773,46 @@ impl CodeAstExtractor {
                 "function_declaration" | "generator_function_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("fn", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("fn", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Function".to_string(),
                             description: Some(format!("function {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
-                        Self::extract_generic_calls(&node, source, file_path, &id, relations, "call_expression");
+                        Self::extract_generic_calls(
+                            &node,
+                            source,
+                            file_path,
+                            &id,
+                            relations,
+                            "call_expression",
+                        );
                     }
                 }
                 "class_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("class", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("class", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Class".to_string(),
                             description: Some(format!("class {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
 
                         if let Some(heritage) = node.child_by_field_name("heritage") {
@@ -658,7 +824,8 @@ impl CodeAstExtractor {
                                     relations.push(AstRelation {
                                         source: id.clone(),
                                         target: parent_id,
-                                        relation: "https://agentos.ontology/code/inherits".to_string(),
+                                        relation: "https://agentos.ontology/code/inherits"
+                                            .to_string(),
                                     });
                                 }
                             }
@@ -668,43 +835,71 @@ impl CodeAstExtractor {
                 "method_definition" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("method", file_path, &name, node.start_position().row + 1);
+                        let id = Self::make_id(
+                            "method",
+                            file_path,
+                            &name,
+                            node.start_position().row + 1,
+                        );
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Method".to_string(),
                             description: Some(format!("method {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "import_statement" | "import_clause" => {
                     let import_text = Self::node_text(&node, source).to_string();
-                    let id = Self::make_id("import", file_path, &import_text.replace(' ', ""), node.start_position().row + 1);
+                    let id = Self::make_id(
+                        "import",
+                        file_path,
+                        &import_text.replace(' ', ""),
+                        node.start_position().row + 1,
+                    );
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
                         entity_type: "https://agentos.ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
-                        source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                        source_location: Some(format!(
+                            "{}:{}",
+                            file_path,
+                            node.start_position().row + 1
+                        )),
                     });
                 }
                 "variable_declarator" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
                         let value_node = node.child_by_field_name("value");
-                        let is_arrow_fn = value_node.map_or(false, |v| v.kind() == "arrow_function");
+                        let is_arrow_fn =
+                            value_node.map_or(false, |v| v.kind() == "arrow_function");
                         if is_arrow_fn {
-                            let id = Self::make_id("fn", file_path, &name, node.start_position().row + 1);
+                            let id = Self::make_id(
+                                "fn",
+                                file_path,
+                                &name,
+                                node.start_position().row + 1,
+                            );
                             entities.push(AstEntity {
                                 id: id.clone(),
                                 label: name.clone(),
                                 entity_type: "https://agentos.ontology/code/Function".to_string(),
                                 description: Some(format!("const {} = () => ...", name)),
                                 properties: HashMap::new(),
-                                source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                                source_location: Some(format!(
+                                    "{}:{}",
+                                    file_path,
+                                    node.start_position().row + 1
+                                )),
                             });
                         }
                     }
@@ -712,28 +907,42 @@ impl CodeAstExtractor {
                 "interface_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("interface", file_path, &name, node.start_position().row + 1);
+                        let id = Self::make_id(
+                            "interface",
+                            file_path,
+                            &name,
+                            node.start_position().row + 1,
+                        );
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Interface".to_string(),
                             description: Some(format!("interface {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "type_alias_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("type", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("type", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/TypeAlias".to_string(),
                             description: Some(format!("type {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
@@ -745,7 +954,9 @@ impl CodeAstExtractor {
                 cursor.goto_parent();
             }
 
-            if !cursor.goto_next_sibling() { break; }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -755,9 +966,18 @@ impl CodeAstExtractor {
         let root = tree.root_node();
 
         let mut cursor = root.walk();
-        Self::walk_go(&mut cursor, source, file_path, &mut entities, &mut relations);
+        Self::walk_go(
+            &mut cursor,
+            source,
+            file_path,
+            &mut entities,
+            &mut relations,
+        );
 
-        AstExtraction { entities, relations }
+        AstExtraction {
+            entities,
+            relations,
+        }
     }
 
     fn walk_go(
@@ -773,29 +993,50 @@ impl CodeAstExtractor {
                 "function_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("fn", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("fn", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Function".to_string(),
                             description: Some(format!("func {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
-                        Self::extract_generic_calls(&node, source, file_path, &id, relations, "call_expression");
+                        Self::extract_generic_calls(
+                            &node,
+                            source,
+                            file_path,
+                            &id,
+                            relations,
+                            "call_expression",
+                        );
                     }
                 }
                 "method_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("method", file_path, &name, node.start_position().row + 1);
+                        let id = Self::make_id(
+                            "method",
+                            file_path,
+                            &name,
+                            node.start_position().row + 1,
+                        );
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Method".to_string(),
                             description: Some(format!("method {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
@@ -805,7 +1046,8 @@ impl CodeAstExtractor {
                         if child.kind() == "type_spec" {
                             if let Some(name_node) = child.child_by_field_name("name") {
                                 let name = Self::node_text(&name_node, source).to_string();
-                                let type_kind = child.child_by_field_name("type")
+                                let type_kind = child
+                                    .child_by_field_name("type")
                                     .map(|t| t.kind().to_string())
                                     .unwrap_or_default();
                                 let entity_type = match type_kind.as_str() {
@@ -813,14 +1055,23 @@ impl CodeAstExtractor {
                                     "interface_type" => "https://agentos.ontology/code/Interface",
                                     _ => "https://agentos.ontology/code/Type",
                                 };
-                                let id = Self::make_id("type", file_path, &name, node.start_position().row + 1);
+                                let id = Self::make_id(
+                                    "type",
+                                    file_path,
+                                    &name,
+                                    node.start_position().row + 1,
+                                );
                                 entities.push(AstEntity {
                                     id: id.clone(),
                                     label: name.clone(),
                                     entity_type: entity_type.to_string(),
                                     description: Some(format!("type {}", name)),
                                     properties: HashMap::new(),
-                                    source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                                    source_location: Some(format!(
+                                        "{}:{}",
+                                        file_path,
+                                        node.start_position().row + 1
+                                    )),
                                 });
                             }
                         }
@@ -828,14 +1079,23 @@ impl CodeAstExtractor {
                 }
                 "import_declaration" => {
                     let import_text = Self::node_text(&node, source).to_string();
-                    let id = Self::make_id("import", file_path, &import_text.replace(' ', "").replace('"', ""), node.start_position().row + 1);
+                    let id = Self::make_id(
+                        "import",
+                        file_path,
+                        &import_text.replace(' ', "").replace('"', ""),
+                        node.start_position().row + 1,
+                    );
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
                         entity_type: "https://agentos.ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
-                        source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                        source_location: Some(format!(
+                            "{}:{}",
+                            file_path,
+                            node.start_position().row + 1
+                        )),
                     });
                 }
                 _ => {}
@@ -846,7 +1106,9 @@ impl CodeAstExtractor {
                 cursor.goto_parent();
             }
 
-            if !cursor.goto_next_sibling() { break; }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -856,9 +1118,18 @@ impl CodeAstExtractor {
         let root = tree.root_node();
 
         let mut cursor = root.walk();
-        Self::walk_java(&mut cursor, source, file_path, &mut entities, &mut relations);
+        Self::walk_java(
+            &mut cursor,
+            source,
+            file_path,
+            &mut entities,
+            &mut relations,
+        );
 
-        AstExtraction { entities, relations }
+        AstExtraction {
+            entities,
+            relations,
+        }
     }
 
     fn walk_java(
@@ -879,14 +1150,23 @@ impl CodeAstExtractor {
                             "record_declaration" => "https://agentos.ontology/code/Record",
                             _ => "https://agentos.ontology/code/Class",
                         };
-                        let id = Self::make_id("class", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("class", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: entity_type.to_string(),
-                            description: Some(format!("{} {}", node.kind().replace("_declaration", ""), name)),
+                            description: Some(format!(
+                                "{} {}",
+                                node.kind().replace("_declaration", ""),
+                                name
+                            )),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
 
                         if let Some(superclass) = node.child_by_field_name("superclass") {
@@ -904,11 +1184,13 @@ impl CodeAstExtractor {
                             for child in interfaces.children(&mut iface_cursor) {
                                 if child.kind() == "type_identifier" {
                                     let iface_name = Self::node_text(&child, source).to_string();
-                                    let iface_id = Self::make_id("interface", file_path, &iface_name, 0);
+                                    let iface_id =
+                                        Self::make_id("interface", file_path, &iface_name, 0);
                                     relations.push(AstRelation {
                                         source: id.clone(),
                                         target: iface_id,
-                                        relation: "https://agentos.ontology/code/implements".to_string(),
+                                        relation: "https://agentos.ontology/code/implements"
+                                            .to_string(),
                                     });
                                 }
                             }
@@ -918,42 +1200,76 @@ impl CodeAstExtractor {
                 "interface_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("interface", file_path, &name, node.start_position().row + 1);
+                        let id = Self::make_id(
+                            "interface",
+                            file_path,
+                            &name,
+                            node.start_position().row + 1,
+                        );
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Interface".to_string(),
                             description: Some(format!("interface {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "method_declaration" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
-                        let id = Self::make_id("method", file_path, &name, node.start_position().row + 1);
+                        let id = Self::make_id(
+                            "method",
+                            file_path,
+                            &name,
+                            node.start_position().row + 1,
+                        );
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Method".to_string(),
                             description: Some(format!("method {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
-                        Self::extract_generic_calls(&node, source, file_path, &id, relations, "method_invocation");
+                        Self::extract_generic_calls(
+                            &node,
+                            source,
+                            file_path,
+                            &id,
+                            relations,
+                            "method_invocation",
+                        );
                     }
                 }
                 "import_declaration" => {
                     let import_text = Self::node_text(&node, source).to_string();
-                    let id = Self::make_id("import", file_path, &import_text.replace(' ', ""), node.start_position().row + 1);
+                    let id = Self::make_id(
+                        "import",
+                        file_path,
+                        &import_text.replace(' ', ""),
+                        node.start_position().row + 1,
+                    );
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
                         entity_type: "https://agentos.ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
-                        source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                        source_location: Some(format!(
+                            "{}:{}",
+                            file_path,
+                            node.start_position().row + 1
+                        )),
                     });
                 }
                 _ => {}
@@ -964,7 +1280,9 @@ impl CodeAstExtractor {
                 cursor.goto_parent();
             }
 
-            if !cursor.goto_next_sibling() { break; }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -974,9 +1292,18 @@ impl CodeAstExtractor {
         let root = tree.root_node();
 
         let mut cursor = root.walk();
-        Self::walk_c_cpp(&mut cursor, source, file_path, &mut entities, &mut relations);
+        Self::walk_c_cpp(
+            &mut cursor,
+            source,
+            file_path,
+            &mut entities,
+            &mut relations,
+        );
 
-        AstExtraction { entities, relations }
+        AstExtraction {
+            entities,
+            relations,
+        }
     }
 
     fn walk_c_cpp(
@@ -1004,16 +1331,28 @@ impl CodeAstExtractor {
                         None
                     });
                     if let Some(name) = name {
-                        let id = Self::make_id("fn", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("fn", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: "https://agentos.ontology/code/Function".to_string(),
                             description: Some(format!("function {}", name)),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
-                        Self::extract_generic_calls(&node, source, file_path, &id, relations, "call_expression");
+                        Self::extract_generic_calls(
+                            &node,
+                            source,
+                            file_path,
+                            &id,
+                            relations,
+                            "call_expression",
+                        );
                     }
                 }
                 "class_specifier" | "struct_specifier" => {
@@ -1024,27 +1363,45 @@ impl CodeAstExtractor {
                         } else {
                             "https://agentos.ontology/code/Struct"
                         };
-                        let id = Self::make_id("class", file_path, &name, node.start_position().row + 1);
+                        let id =
+                            Self::make_id("class", file_path, &name, node.start_position().row + 1);
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
                             entity_type: entity_type.to_string(),
-                            description: Some(format!("{} {}", node.kind().replace("_specifier", ""), name)),
+                            description: Some(format!(
+                                "{} {}",
+                                node.kind().replace("_specifier", ""),
+                                name
+                            )),
                             properties: HashMap::new(),
-                            source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                            source_location: Some(format!(
+                                "{}:{}",
+                                file_path,
+                                node.start_position().row + 1
+                            )),
                         });
                     }
                 }
                 "preproc_include" => {
                     let include_text = Self::node_text(&node, source).to_string();
-                    let id = Self::make_id("include", file_path, &include_text.replace(' ', ""), node.start_position().row + 1);
+                    let id = Self::make_id(
+                        "include",
+                        file_path,
+                        &include_text.replace(' ', ""),
+                        node.start_position().row + 1,
+                    );
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: include_text.clone(),
                         entity_type: "https://agentos.ontology/code/Import".to_string(),
                         description: Some(include_text),
                         properties: HashMap::new(),
-                        source_location: Some(format!("{}:{}", file_path, node.start_position().row + 1)),
+                        source_location: Some(format!(
+                            "{}:{}",
+                            file_path,
+                            node.start_position().row + 1
+                        )),
                     });
                 }
                 _ => {}
@@ -1055,7 +1412,9 @@ impl CodeAstExtractor {
                 cursor.goto_parent();
             }
 
-            if !cursor.goto_next_sibling() { break; }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -1068,7 +1427,14 @@ impl CodeAstExtractor {
         call_kind: &str,
     ) {
         let mut call_cursor = node.walk();
-        Self::find_generic_calls_recursive(&mut call_cursor, source, file_path, caller_id, relations, call_kind);
+        Self::find_generic_calls_recursive(
+            &mut call_cursor,
+            source,
+            file_path,
+            caller_id,
+            relations,
+            call_kind,
+        );
     }
 
     fn find_generic_calls_recursive(
@@ -1094,8 +1460,12 @@ impl CodeAstExtractor {
 
         if cursor.goto_first_child() {
             loop {
-                Self::find_generic_calls_recursive(cursor, source, file_path, caller_id, relations, call_kind);
-                if !cursor.goto_next_sibling() { break; }
+                Self::find_generic_calls_recursive(
+                    cursor, source, file_path, caller_id, relations, call_kind,
+                );
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
             }
             cursor.goto_parent();
         }
@@ -1122,9 +1492,18 @@ mod tests {
 
     #[test]
     fn test_code_language_from_path() {
-        assert_eq!(CodeLanguage::from_path(Path::new("src/main.rs")), CodeLanguage::Rust);
-        assert_eq!(CodeLanguage::from_path(Path::new("app.py")), CodeLanguage::Python);
-        assert_eq!(CodeLanguage::from_path(Path::new("Makefile")), CodeLanguage::Unknown);
+        assert_eq!(
+            CodeLanguage::from_path(Path::new("src/main.rs")),
+            CodeLanguage::Rust
+        );
+        assert_eq!(
+            CodeLanguage::from_path(Path::new("app.py")),
+            CodeLanguage::Python
+        );
+        assert_eq!(
+            CodeLanguage::from_path(Path::new("Makefile")),
+            CodeLanguage::Unknown
+        );
     }
 
     #[test]
@@ -1148,10 +1527,18 @@ fn main() {
 }
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Rust, "test.rs", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Rust,
+            "test.rs",
+            "graph:test",
+        )
+        .unwrap();
 
-        assert!(result.entity_count >= 3, "should extract at least 3 entities (use/struct/fn), actual: {}", result.entity_count);
+        assert!(
+            result.entity_count >= 3,
+            "should extract at least 3 entities (use/struct/fn), actual: {}",
+            result.entity_count
+        );
         assert!(result.quads.len() > 0, "should generate RDF quads");
     }
 
@@ -1173,10 +1560,18 @@ def helper():
     print("help")
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Python, "test.py", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Python,
+            "test.py",
+            "graph:test",
+        )
+        .unwrap();
 
-        assert!(result.entity_count >= 3, "should extract at least 3 entities (import/class/def), actual: {}", result.entity_count);
+        assert!(
+            result.entity_count >= 3,
+            "should extract at least 3 entities (import/class/def), actual: {}",
+            result.entity_count
+        );
         assert!(result.quads.len() > 0, "should generate RDF quads");
     }
 
@@ -1200,10 +1595,18 @@ const App = () => {
 };
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::JavaScript, "test.js", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::JavaScript,
+            "test.js",
+            "graph:test",
+        )
+        .unwrap();
 
-        assert!(result.entity_count >= 2, "should extract at least 2 entities, actual: {}", result.entity_count);
+        assert!(
+            result.entity_count >= 2,
+            "should extract at least 2 entities, actual: {}",
+            result.entity_count
+        );
     }
 
     #[test]
@@ -1227,10 +1630,18 @@ func main() {
 }
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Go, "test.go", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Go,
+            "test.go",
+            "graph:test",
+        )
+        .unwrap();
 
-        assert!(result.entity_count >= 3, "should extract at least 3 entities (import/type/func), actual: {}", result.entity_count);
+        assert!(
+            result.entity_count >= 3,
+            "should extract at least 3 entities (import/type/func), actual: {}",
+            result.entity_count
+        );
     }
 
     #[test]
@@ -1250,10 +1661,18 @@ public class Main extends Base implements Runnable {
 }
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Java, "Main.java", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Java,
+            "Main.java",
+            "graph:test",
+        )
+        .unwrap();
 
-        assert!(result.entity_count >= 3, "should extract at least 3 entities (import/class/method), actual: {}", result.entity_count);
+        assert!(
+            result.entity_count >= 3,
+            "should extract at least 3 entities (import/class/method), actual: {}",
+            result.entity_count
+        );
     }
 
     #[test]
@@ -1270,17 +1689,24 @@ int main() {
     return 0;
 }
 "#;
-        let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::C, "test.c", "graph:test"
-        ).unwrap();
+        let result =
+            CodeAstExtractor::extract_from_source(source, &CodeLanguage::C, "test.c", "graph:test")
+                .unwrap();
 
-        assert!(result.entity_count >= 2, "should extract at least 2 entities (include/function), actual: {}", result.entity_count);
+        assert!(
+            result.entity_count >= 2,
+            "should extract at least 2 entities (include/function), actual: {}",
+            result.entity_count
+        );
     }
 
     #[test]
     fn test_unknown_language_returns_error() {
         let result = CodeAstExtractor::extract_from_source(
-            "hello", &CodeLanguage::Unknown, "test.xyz", "graph:test"
+            "hello",
+            &CodeLanguage::Unknown,
+            "test.xyz",
+            "graph:test",
         );
         assert!(result.is_err());
     }
@@ -1299,12 +1725,17 @@ impl Draw for Circle {
 }
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Rust, "test.rs", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Rust,
+            "test.rs",
+            "graph:test",
+        )
+        .unwrap();
 
-        let has_implements = result.quads.iter().any(|q| {
-            q.predicate.contains("implements")
-        });
+        let has_implements = result
+            .quads
+            .iter()
+            .any(|q| q.predicate.contains("implements"));
         assert!(has_implements, "should extract implements relation");
     }
 
@@ -1318,12 +1749,17 @@ class Child(Base):
     pass
 "#;
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Python, "test.py", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Python,
+            "test.py",
+            "graph:test",
+        )
+        .unwrap();
 
-        let has_inherits = result.quads.iter().any(|q| {
-            q.predicate.contains("inherits")
-        });
+        let has_inherits = result
+            .quads
+            .iter()
+            .any(|q| q.predicate.contains("inherits"));
         assert!(has_inherits, "should extract inherits relation");
     }
 
@@ -1347,18 +1783,30 @@ class Child(Base):
     fn test_extract_includes_content_hash() {
         let source = "fn hello() {}";
         let result = CodeAstExtractor::extract_from_source(
-            source, &CodeLanguage::Rust, "test.rs", "graph:test"
-        ).unwrap();
+            source,
+            &CodeLanguage::Rust,
+            "test.rs",
+            "graph:test",
+        )
+        .unwrap();
 
-        let has_hash = result.quads.iter().any(|q| {
-            q.predicate.contains("contentHash")
-        });
-        assert!(has_hash, "extraction result should include contentHash property");
+        let has_hash = result
+            .quads
+            .iter()
+            .any(|q| q.predicate.contains("contentHash"));
+        assert!(
+            has_hash,
+            "extraction result should include contentHash property"
+        );
 
-        let has_source_file = result.quads.iter().any(|q| {
-            q.predicate.contains("sourceFile")
-        });
-        assert!(has_source_file, "extraction result should include sourceFile property");
+        let has_source_file = result
+            .quads
+            .iter()
+            .any(|q| q.predicate.contains("sourceFile"));
+        assert!(
+            has_source_file,
+            "extraction result should include sourceFile property"
+        );
     }
 
     #[test]
@@ -1374,7 +1822,11 @@ class Child(Base):
 
         let result1 = CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
         match result1 {
-            IncrementalResult::Created { entity_count, quad_count, .. } => {
+            IncrementalResult::Created {
+                entity_count,
+                quad_count,
+                ..
+            } => {
                 assert!(entity_count > 0, "first extraction should have entities");
                 assert!(quad_count > 0, "first extraction should have quads");
             }
@@ -1382,7 +1834,11 @@ class Child(Base):
         }
 
         let result2 = CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
-        assert_eq!(result2, IncrementalResult::Unchanged, "unchanged file should be Unchanged");
+        assert_eq!(
+            result2,
+            IncrementalResult::Unchanged,
+            "unchanged file should be Unchanged"
+        );
     }
 
     #[test]
@@ -1407,7 +1863,11 @@ class Child(Base):
 
         let result2 = CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
         match result2 {
-            IncrementalResult::Updated { entity_count, deleted_quads, .. } => {
+            IncrementalResult::Updated {
+                entity_count,
+                deleted_quads,
+                ..
+            } => {
                 assert!(entity_count > 0, "updated result should have entities");
                 assert!(deleted_quads > 0, "update should delete old quads");
             }
@@ -1415,7 +1875,31 @@ class Child(Base):
         }
 
         let result3 = CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
-        assert_eq!(result3, IncrementalResult::Unchanged, "unchanged after update should be Unchanged");
+        assert_eq!(
+            result3,
+            IncrementalResult::Unchanged,
+            "unchanged after update should be Unchanged"
+        );
+    }
+
+    #[test]
+    fn test_incremental_update_removes_declarations_no_longer_in_file() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let graph = "graph:code";
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("stale.rs");
+        std::fs::write(&file_path, "fn removed_symbol() {}\n").unwrap();
+        let path_str = file_path.to_str().unwrap();
+        CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
+
+        std::fs::write(&file_path, "fn replacement_symbol() {}\n").unwrap();
+        CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
+
+        let sparql = format!(
+            "SELECT ?s WHERE {{ GRAPH <{}> {{ ?s <http://www.w3.org/2000/01/rdf-schema#label> \"removed_symbol\" . }} }}",
+            graph
+        );
+        assert!(store.query_sparql(&sparql, None).unwrap().is_empty());
     }
 
     #[test]
@@ -1438,12 +1922,17 @@ class Child(Base):
             graph
         );
         let results = store.query_sparql(&count_sparql, None).unwrap();
-        let count = results.first()
+        let count = results
+            .first()
             .and_then(|r| r.get("?count"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
 
-        assert_eq!(count, 1, "repeated incremental extraction should not produce duplicate entities, actual: {}", count);
+        assert_eq!(
+            count, 1,
+            "repeated incremental extraction should not produce duplicate entities, actual: {}",
+            count
+        );
     }
 }

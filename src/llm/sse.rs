@@ -112,7 +112,11 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, SseError> {
     let json: Value = match serde_json::from_str(&payload) {
         Ok(v) => v,
         Err(e) => {
-            tracing::debug!("Failed to parse SSE payload as JSON: {} - payload: {}", e, &payload[..payload.len().min(200)]);
+            tracing::debug!(
+                "Failed to parse SSE payload as JSON: {} - payload: {}",
+                e,
+                &payload[..payload.len().min(200)]
+            );
             return Ok(None);
         }
     };
@@ -138,23 +142,27 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
         if let Some(delta) = choice.get("delta") {
             if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                 if !content.is_empty() {
-                    return Ok(Some(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                        index,
-                        delta: ContentBlockDelta::TextDelta {
-                            text: content.to_string(),
+                    return Ok(Some(StreamEvent::ContentBlockDelta(
+                        ContentBlockDeltaEvent {
+                            index,
+                            delta: ContentBlockDelta::TextDelta {
+                                text: content.to_string(),
+                            },
                         },
-                    })));
+                    )));
                 }
             }
 
             if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                 if !reasoning.is_empty() {
-                    return Ok(Some(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                        index,
-                        delta: ContentBlockDelta::ThinkingDelta {
-                            thinking: reasoning.to_string(),
+                    return Ok(Some(StreamEvent::ContentBlockDelta(
+                        ContentBlockDeltaEvent {
+                            index,
+                            delta: ContentBlockDelta::ThinkingDelta {
+                                thinking: reasoning.to_string(),
+                            },
                         },
-                    })));
+                    )));
                 }
             }
 
@@ -163,13 +171,25 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
                     let tc_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     let id = tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let function = tc.get("function");
-                    let name = function.and_then(|f| f.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let arguments = function.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let name = function
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let arguments = function
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
-                    return Ok(Some(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                        index: tc_index,
-                        delta: ContentBlockDelta::ToolCallDelta { id, name, arguments },
-                    })));
+                    return Ok(Some(StreamEvent::ContentBlockDelta(
+                        ContentBlockDeltaEvent {
+                            index: tc_index,
+                            delta: ContentBlockDelta::ToolCallDelta {
+                                id,
+                                name,
+                                arguments,
+                            },
+                        },
+                    )));
                 }
             }
         }
@@ -185,9 +205,18 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
     }
 
     if let Some(usage) = json.get("usage") {
-        let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let completion_tokens = usage
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let total_tokens = usage
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
 
         return Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
             finish_reason: None,
@@ -200,7 +229,10 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
     }
 
     if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
-        let model = json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let model = json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         return Ok(Some(StreamEvent::MessageStart(MessageStartEvent {
             id: Some(id.to_string()),
             model,
@@ -233,10 +265,10 @@ impl IncrementalJsonParser {
 
     fn try_parse(&mut self) -> Option<Value> {
         let chars: Vec<char> = self.buffer.chars().collect();
-        
+
         for i in self.last_check_pos..chars.len() {
             let c = chars[i];
-            
+
             if self.escape_next {
                 self.escape_next = false;
                 self.last_check_pos = i + 1;
@@ -389,14 +421,18 @@ mod tests {
 
     #[test]
     fn test_sse_parser_single_frame() {
-        let frame = concat!(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n"
-        );
+        let frame =
+            concat!("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n");
 
         let event = parse_frame(frame).expect("frame should parse");
         assert!(event.is_some());
         if let Some(StreamEvent::ContentBlockDelta(e)) = event {
-            assert_eq!(e.delta, ContentBlockDelta::TextDelta { text: "Hello".to_string() });
+            assert_eq!(
+                e.delta,
+                ContentBlockDelta::TextDelta {
+                    text: "Hello".to_string()
+                }
+            );
         } else {
             panic!("Expected ContentBlockDelta");
         }
@@ -408,7 +444,10 @@ mod tests {
         let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel";
         let second = b"lo\"}}]}\n\n";
 
-        assert!(parser.push(first).expect("first chunk should buffer").is_empty());
+        assert!(parser
+            .push(first)
+            .expect("first chunk should buffer")
+            .is_empty());
         let events = parser.push(second).expect("second chunk should parse");
 
         assert_eq!(events.len(), 1);
@@ -416,7 +455,9 @@ mod tests {
             events[0],
             StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                 index: 0,
-                delta: ContentBlockDelta::TextDelta { text: "Hello".to_string() },
+                delta: ContentBlockDelta::TextDelta {
+                    text: "Hello".to_string()
+                },
             })
         );
     }
@@ -426,7 +467,9 @@ mod tests {
         let mut parser = SseParser::new();
         let payload = "data: [DONE]\n\n";
 
-        let events = parser.push(payload.as_bytes()).expect("parser should succeed");
+        let events = parser
+            .push(payload.as_bytes())
+            .expect("parser should succeed");
         assert!(events.is_empty());
     }
 
@@ -439,7 +482,12 @@ mod tests {
         let event = parse_frame(frame).expect("frame should parse");
         assert!(event.is_some());
         if let Some(StreamEvent::ContentBlockDelta(e)) = event {
-            assert_eq!(e.delta, ContentBlockDelta::ThinkingDelta { thinking: "Thinking...".to_string() });
+            assert_eq!(
+                e.delta,
+                ContentBlockDelta::ThinkingDelta {
+                    thinking: "Thinking...".to_string()
+                }
+            );
         } else {
             panic!("Expected ThinkingDelta");
         }
@@ -448,10 +496,10 @@ mod tests {
     #[test]
     fn test_incremental_json_parser() {
         let mut parser = IncrementalJsonParser::new();
-        
+
         assert!(parser.push(r#"{"key": "#).is_none());
         let result = parser.push(r#""value"}"#);
-        
+
         assert!(result.is_some());
         let json = result.unwrap();
         assert_eq!(json["key"], "value");

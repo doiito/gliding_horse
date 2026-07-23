@@ -156,7 +156,9 @@ impl FileInventory {
                         for result in iter {
                             if let Ok((key, value)) = result {
                                 let path = key.value().to_string();
-                                if let Ok(entry) = serde_json::from_slice::<FileEntry>(value.value()) {
+                                if let Ok(entry) =
+                                    serde_json::from_slice::<FileEntry>(value.value())
+                                {
                                     mem_cache.insert(path, entry);
                                 }
                             }
@@ -424,10 +426,7 @@ impl FileInventory {
     /// List all files matching a state filter.
     pub fn list_by_state(&self, state: FileState) -> Vec<FileEntry> {
         let mem = self.mem_cache.read();
-        mem.values()
-            .filter(|e| e.state == state)
-            .cloned()
-            .collect()
+        mem.values().filter(|e| e.state == state).cloned().collect()
     }
 
     /// List all tracked files.
@@ -627,7 +626,9 @@ impl FileInventory {
             ..crate::CoreConfig::default()
         };
 
-        if let Err(e) = blackboard.write_node_to_graph(&iri, &json_ld.to_string(), WORKSPACE_GRAPH, &config) {
+        if let Err(e) =
+            blackboard.write_node_to_graph(&iri, &json_ld.to_string(), WORKSPACE_GRAPH, &config)
+        {
             warn!(path = %entry.path, error = %e, "FileInventory: L2 sync failed");
         }
     }
@@ -678,8 +679,7 @@ pub fn match_glob_pattern(path: &str, pattern: &str) -> bool {
             }
             // Match file extension
             let ext_dot = format!(".{}", ext);
-            return path.ends_with(&ext_dot)
-                || path.contains(&format!("/{}", ext_dot));
+            return path.ends_with(&ext_dot) || path.contains(&format!("/{}", ext_dot));
         }
         return path.contains(pattern) || path.ends_with(pattern);
     };
@@ -717,11 +717,14 @@ mod tests {
     #[test]
     fn test_full_scan() {
         let dir = TempDir::new().unwrap();
-        create_workspace(&dir, &[
-            ("src/main.rs", "fn main() {}"),
-            ("src/lib.rs", "pub fn hello() {}"),
-            ("README.md", "# Hello"),
-        ]);
+        create_workspace(
+            &dir,
+            &[
+                ("src/main.rs", "fn main() {}"),
+                ("src/lib.rs", "pub fn hello() {}"),
+                ("README.md", "# Hello"),
+            ],
+        );
 
         let inventory = FileInventory::new(None, None, vec![]);
         let count = inventory.full_scan(&dir.path().to_string_lossy());
@@ -731,16 +734,17 @@ mod tests {
     #[test]
     fn test_exclude_pattern() {
         let dir = TempDir::new().unwrap();
-        create_workspace(&dir, &[
-            ("src/main.rs", "fn main() {}"),
-            ("node_modules/pkg/index.js", "module.exports = {};"),
-            ("target/debug/app", "binary"),
-        ]);
-
-        let inventory = FileInventory::new(
-            None, None,
-            vec!["node_modules/".into(), "target/".into()],
+        create_workspace(
+            &dir,
+            &[
+                ("src/main.rs", "fn main() {}"),
+                ("node_modules/pkg/index.js", "module.exports = {};"),
+                ("target/debug/app", "binary"),
+            ],
         );
+
+        let inventory =
+            FileInventory::new(None, None, vec!["node_modules/".into(), "target/".into()]);
         let count = inventory.full_scan(&dir.path().to_string_lossy());
         assert_eq!(count, 1);
     }
@@ -772,10 +776,16 @@ mod tests {
         inventory.add_or_update(&path.to_string_lossy());
 
         inventory.mark_read(&path.to_string_lossy(), 0);
-        assert_eq!(inventory.get_entry(&path.to_string_lossy()).unwrap().state, FileState::ReadFresh);
+        assert_eq!(
+            inventory.get_entry(&path.to_string_lossy()).unwrap().state,
+            FileState::ReadFresh
+        );
 
         inventory.mark_stale(&path.to_string_lossy());
-        assert_eq!(inventory.get_entry(&path.to_string_lossy()).unwrap().state, FileState::ReadStale);
+        assert_eq!(
+            inventory.get_entry(&path.to_string_lossy()).unwrap().state,
+            FileState::ReadStale
+        );
     }
 
     #[test]
@@ -813,7 +823,10 @@ mod tests {
 
     #[test]
     fn test_glob_exact_match() {
-        assert!(match_glob_pattern("node_modules/pkg/index.js", "node_modules/"));
+        assert!(match_glob_pattern(
+            "node_modules/pkg/index.js",
+            "node_modules/"
+        ));
         assert!(match_glob_pattern("target/debug/app", "target/"));
         assert!(match_glob_pattern("src/main.rs", "src/main.rs"));
     }
@@ -841,40 +854,59 @@ mod tests {
     #[test]
     fn test_glob_directory_prefix() {
         // Directory patterns - with trailing slash
-        assert!(match_glob_pattern("node_modules/pkg/index.js", "node_modules/"));
-        assert!(match_glob_pattern("project/node_modules/pkg.js", "node_modules/"));
+        assert!(match_glob_pattern(
+            "node_modules/pkg/index.js",
+            "node_modules/"
+        ));
+        assert!(match_glob_pattern(
+            "project/node_modules/pkg.js",
+            "node_modules/"
+        ));
 
         // Without trailing slash, no dot → treated as directory
-        assert!(match_glob_pattern("node_modules/pkg/index.js", "node_modules"));
+        assert!(match_glob_pattern(
+            "node_modules/pkg/index.js",
+            "node_modules"
+        ));
         assert!(match_glob_pattern("build/output.o", "build"));
 
         // Should NOT match partial directory names
-        assert!(!match_glob_pattern("src/node_modules_test/helper.js", "node_modules/"));
+        assert!(!match_glob_pattern(
+            "src/node_modules_test/helper.js",
+            "node_modules/"
+        ));
     }
 
     #[test]
     fn test_glob_path_specific() {
         // Exact path segments in the middle
-        assert!(match_glob_pattern("/home/user/project/data/rag/doc.json", "data/"));
-        assert!(!match_glob_pattern("/home/user/project/database/schema.sql", "data/"));
+        assert!(match_glob_pattern(
+            "/home/user/project/data/rag/doc.json",
+            "data/"
+        ));
+        assert!(!match_glob_pattern(
+            "/home/user/project/database/schema.sql",
+            "data/"
+        ));
     }
 
     #[test]
     fn test_glob_gitignore_patterns() {
         // Common .gitignore patterns
         let patterns = vec![
-            ".env",           // dotfile
-            "*.pyc",          // compiled python
-            "__pycache__/",   // cache dir
-            ".next/",         // build dir
-            "dist/",          // output dir
+            ".env",            // dotfile
+            "*.pyc",           // compiled python
+            "__pycache__/",    // cache dir
+            ".next/",          // build dir
+            "dist/",           // output dir
             ".gliding_horse/", // app data
         ];
 
         for pat in &patterns {
             assert!(
                 match_glob_pattern(&format!("/workspace/{}", pat.trim_end_matches('/')), pat),
-                "Pattern '{}' should match itself", pat
+                "Pattern '{}' should match itself",
+                pat
             );
         }
     }
@@ -882,7 +914,8 @@ mod tests {
     #[test]
     fn test_glob_exclude_all_variants() {
         let inventory = FileInventory::new(
-            None, None,
+            None,
+            None,
             vec!["node_modules/".into(), "*.pyc".into(), "build/".into()],
         );
 
@@ -938,7 +971,10 @@ mod tests {
         let overflow = dir.path().join("overflow.rs");
         std::fs::write(&overflow, "fn overflow() {}").unwrap();
         let result = inventory.add_or_update(&overflow.to_string_lossy());
-        assert!(result.is_none(), "Entry beyond MAX_INVENTORY_ENTRIES should be rejected");
+        assert!(
+            result.is_none(),
+            "Entry beyond MAX_INVENTORY_ENTRIES should be rejected"
+        );
 
         assert_eq!(inventory.total_count(), super::MAX_INVENTORY_ENTRIES);
     }
@@ -954,7 +990,11 @@ mod tests {
         let inventory = FileInventory::new(None, None, vec!["vendor/".into()]);
         let count = inventory.full_scan(&dir.path().to_string_lossy());
         assert_eq!(count, 1, "full_scan should exclude vendor/");
-        assert!(inventory.get_entry(&dir.path().join("src/main.rs").to_string_lossy()).is_some());
-        assert!(inventory.get_entry(&dir.path().join("vendor/lib.rs").to_string_lossy()).is_none());
+        assert!(inventory
+            .get_entry(&dir.path().join("src/main.rs").to_string_lossy())
+            .is_some());
+        assert!(inventory
+            .get_entry(&dir.path().join("vendor/lib.rs").to_string_lossy())
+            .is_none());
     }
 }

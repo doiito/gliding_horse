@@ -1,7 +1,4 @@
-
-use super::types::{
-    ChainValidationError, RootCauseConfig, TraceChain, TraceLevel,
-};
+use super::types::{ChainValidationError, RootCauseConfig, TraceChain, TraceLevel};
 
 /// EvidenceChainManager validates the continuity and integrity of trace evidence chains.
 pub struct EvidenceChainManager {
@@ -35,7 +32,10 @@ impl EvidenceChainManager {
 
         // 4. Minimum trace depth
         if chain.depth() < 2 {
-            errors.push(format!("Evidence chain depth insufficient: {} levels (minimum 2)", chain.depth()));
+            errors.push(format!(
+                "Evidence chain depth insufficient: {} levels (minimum 2)",
+                chain.depth()
+            ));
         }
 
         if errors.is_empty() {
@@ -51,7 +51,10 @@ impl EvidenceChainManager {
             errors.push(format!("Level {}: missing evidence source", level.level));
         }
         if level.evidence.confidence < 0.0 || level.evidence.confidence > 1.0 {
-            errors.push(format!("Level {}: confidence out of range ({})", level.level, level.evidence.confidence));
+            errors.push(format!(
+                "Level {}: confidence out of range ({})",
+                level.level, level.evidence.confidence
+            ));
         }
         if level.evidence.confidence < self.config.min_confidence {
             errors.push(format!(
@@ -65,9 +68,7 @@ impl EvidenceChainManager {
     }
 
     /// Validate that two adjacent levels have continuous evidence
-    fn validate_continuity(
-        &self, a: &TraceLevel, b: &TraceLevel, errors: &mut Vec<String>,
-    ) {
+    fn validate_continuity(&self, a: &TraceLevel, b: &TraceLevel, errors: &mut Vec<String>) {
         if b.level != a.level + 1 {
             errors.push(format!(
                 "Level {} → {}: level numbers are not sequential",
@@ -92,52 +93,69 @@ impl EvidenceChainManager {
             return 0.0;
         }
         // Geometric mean of all confidence values
-        let product: f64 = chain.levels.iter()
-            .map(|l| l.evidence.confidence)
-            .product();
+        let product: f64 = chain.levels.iter().map(|l| l.evidence.confidence).product();
         product.powf(1.0 / chain.levels.len() as f64)
     }
 
     /// Find the weakest link (lowest confidence level)
     pub fn weakest_evidence<'a>(&self, chain: &'a TraceChain) -> Option<&'a TraceLevel> {
-        chain.levels.iter()
-            .min_by(|a, b| a.evidence.confidence
+        chain.levels.iter().min_by(|a, b| {
+            a.evidence
+                .confidence
                 .partial_cmp(&b.evidence.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Generate a human-readable evidence report
     pub fn evidence_report(&self, chain: &TraceChain) -> String {
         let mut report = String::new();
-        report.push_str(&format!("===== Evidence Chain Report [{}] =====\n", chain.trace_id));
-        report.push_str(&format!("Agent: {} | Task: {}\n\n",
+        report.push_str(&format!(
+            "===== Evidence Chain Report [{}] =====\n",
+            chain.trace_id
+        ));
+        report.push_str(&format!(
+            "Agent: {} | Task: {}\n\n",
             chain.agent_id,
             chain.task_id.as_deref().unwrap_or("N/A"),
         ));
 
         for level in &chain.levels {
-            let flag = if level.is_root_cause { " [Root Cause]" } else { "" };
-            report.push_str(&format!(
-                "  L{} {}{}\n", level.level, level.label, flag
-            ));
+            let flag = if level.is_root_cause {
+                " [Root Cause]"
+            } else {
+                ""
+            };
+            report.push_str(&format!("  L{} {}{}\n", level.level, level.label, flag));
             report.push_str(&format!("    Description: {}\n", level.description));
             report.push_str(&format!("    Source: {}\n", level.evidence.source));
-            report.push_str(&format!("    Confidence: {:.2}\n", level.evidence.confidence));
+            report.push_str(&format!(
+                "    Confidence: {:.2}\n",
+                level.evidence.confidence
+            ));
             report.push('\n');
         }
 
         report.push_str(&format!(
-            "Overall Confidence: {:.2}\n", self.chain_confidence(chain)
+            "Overall Confidence: {:.2}\n",
+            self.chain_confidence(chain)
         ));
         report.push_str(&format!(
-            "Status: {}", if chain.resolved { "Root Cause Identified" } else { "Root Cause Not Identified" }
+            "Status: {}",
+            if chain.resolved {
+                "Root Cause Identified"
+            } else {
+                "Root Cause Not Identified"
+            }
         ));
         report
     }
 
     /// Check that each level has at least the minimum confidence
     pub fn all_levels_confident(&self, chain: &TraceChain) -> bool {
-        chain.levels.iter()
+        chain
+            .levels
+            .iter()
             .all(|l| l.evidence.confidence >= self.config.min_confidence)
     }
 }
@@ -155,21 +173,24 @@ mod tests {
     fn make_chain() -> TraceChain {
         let mut chain = TraceChain::new("test_chain", "agent_1");
         chain.add_level(TraceLevel {
-            level: 1, label: "symptom".into(),
+            level: 1,
+            label: "symptom".into(),
             description: "error occurred".into(),
             source_location: "file.rs:10".into(),
             is_root_cause: false,
             evidence: Evidence::new("file.rs:10", json!("error"), 0.9),
         });
         chain.add_level(TraceLevel {
-            level: 2, label: "intermediate".into(),
+            level: 2,
+            label: "intermediate".into(),
             description: "caller".into(),
             source_location: "caller.rs:20".into(),
             is_root_cause: false,
             evidence: Evidence::new("caller.rs:20", json!("caller"), 0.8),
         });
         chain.add_level(TraceLevel {
-            level: 3, label: "root_cause".into(),
+            level: 3,
+            label: "root_cause".into(),
             description: "root cause".into(),
             source_location: "root.rs:1".into(),
             is_root_cause: true,
@@ -222,7 +243,8 @@ mod tests {
         let manager = EvidenceChainManager::new(RootCauseConfig::default());
         let mut chain = TraceChain::new("shallow", "agent_1");
         chain.add_level(TraceLevel {
-            level: 1, label: "symptom".into(),
+            level: 1,
+            label: "symptom".into(),
             description: "only level".into(),
             source_location: "x.rs:1".into(),
             is_root_cause: true,
@@ -258,7 +280,10 @@ mod tests {
         let result = manager.validate_chain(&chain);
         assert!(result.is_err());
         let error_msg = format!("{:?}", result);
-        assert!(error_msg.contains("fully duplicated"), "Should detect fully duplicate level");
+        assert!(
+            error_msg.contains("fully duplicated"),
+            "Should detect fully duplicate level"
+        );
     }
 
     #[test]
@@ -266,8 +291,10 @@ mod tests {
         let manager = EvidenceChainManager::new(RootCauseConfig::default());
         let mut chain = make_chain();
         chain.levels[1].evidence.source = "file.rs:10".to_string(); // same as L1 but diff desc
-        // descriptions differ (L1="error occurred", L2="caller")
-        assert!(manager.validate_chain(&chain).is_ok(),
-            "Same source with different descriptions is valid");
+                                                                    // descriptions differ (L1="error occurred", L2="caller")
+        assert!(
+            manager.validate_chain(&chain).is_ok(),
+            "Same source with different descriptions is valid"
+        );
     }
 }

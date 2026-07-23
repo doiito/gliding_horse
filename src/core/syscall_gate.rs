@@ -83,7 +83,12 @@ impl WhitelistManager {
         false
     }
 
-    pub fn check_permission_for_agent(&self, agent_id: &str, role: &AgentRole, tool_name: &str) -> bool {
+    pub fn check_permission_for_agent(
+        &self,
+        agent_id: &str,
+        role: &AgentRole,
+        tool_name: &str,
+    ) -> bool {
         if let Some(custom) = self.custom_whitelist.get(agent_id) {
             if custom.contains(tool_name) {
                 return true;
@@ -160,11 +165,12 @@ impl SyscallGate {
         input_json: &str,
         role: &AgentRole,
     ) -> Result<Value, CoreError> {
-        let tool_name = skill_iri
-            .trim_start_matches("iri://skills/")
-            .to_string();
+        let tool_name = skill_iri.trim_start_matches("iri://skills/").to_string();
 
-        if !self.whitelist_manager.check_permission_for_agent(agent_id, role, &tool_name) {
+        if !self
+            .whitelist_manager
+            .check_permission_for_agent(agent_id, role, &tool_name)
+        {
             warn!(agent = %agent_id, role = %role, tool = %tool_name, "Role whitelist denied");
             return Err(CoreError::ValidationFailed {
                 message: format!(
@@ -188,7 +194,11 @@ impl SyscallGate {
         };
 
         if let Some(ref how) = snapshot.how {
-            if how.forbidden_tools.iter().any(|t| t.eq_ignore_ascii_case(tool_name)) {
+            if how
+                .forbidden_tools
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(tool_name))
+            {
                 return Err(crate::CoreError::Internal {
                     message: format!("Tool {} is in 5W2H forbiddenTools list, denied", tool_name),
                 });
@@ -199,10 +209,15 @@ impl SyscallGate {
             if let Some(ref access_level) = who.access_level {
                 let write_tools = ["file_write", "bash", "code_execute", "file_delete"];
                 if *access_level == crate::core::five_w2h::AccessLevel::Read
-                    && write_tools.iter().any(|t| t.eq_ignore_ascii_case(tool_name))
+                    && write_tools
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(tool_name))
                 {
                     return Err(crate::CoreError::Internal {
-                        message: format!("5W2H accessLevel is Read, write tool {} denied", tool_name),
+                        message: format!(
+                            "5W2H accessLevel is Read, write tool {} denied",
+                            tool_name
+                        ),
                     });
                 }
             }
@@ -222,7 +237,10 @@ impl SyscallGate {
             if !self.whitelist_manager.check_permission(&role, tool_name) {
                 warn!(role = %agent_role, tool = %tool_name, "Role-based whitelist denied");
                 return Err(crate::CoreError::Internal {
-                    message: format!("Role '{}' is not allowed to use tool '{}'", agent_role, tool_name),
+                    message: format!(
+                        "Role '{}' is not allowed to use tool '{}'",
+                        agent_role, tool_name
+                    ),
                 });
             }
         }
@@ -231,7 +249,8 @@ impl SyscallGate {
     }
 
     pub fn set_agent_whitelist(&mut self, agent_id: &str, allowed_iris: Vec<String>) {
-        self.agent_whitelist.insert(agent_id.to_string(), allowed_iris);
+        self.agent_whitelist
+            .insert(agent_id.to_string(), allowed_iris);
     }
 
     pub fn add_to_whitelist(&mut self, agent_id: &str, skill_iri: &str) {
@@ -274,7 +293,11 @@ impl SyscallGate {
             .unwrap_or(false)
     }
 
-    pub fn sync_whitelist_to_oxigraph(&self, blackboard: &Blackboard, agent_id: &str) -> Result<usize, CoreError> {
+    pub fn sync_whitelist_to_oxigraph(
+        &self,
+        blackboard: &Blackboard,
+        agent_id: &str,
+    ) -> Result<usize, CoreError> {
         let graph = format!("iri://whitelist/{}", agent_id);
         let mut count = 0;
         if let Some(iris) = self.agent_whitelist.get(agent_id) {
@@ -291,7 +314,11 @@ impl SyscallGate {
         Ok(count)
     }
 
-    pub fn query_agent_tools(&self, blackboard: &Blackboard, agent_id: &str) -> Result<Vec<String>, CoreError> {
+    pub fn query_agent_tools(
+        &self,
+        blackboard: &Blackboard,
+        agent_id: &str,
+    ) -> Result<Vec<String>, CoreError> {
         let graph = format!("iri://whitelist/{}", agent_id);
         let sparql = format!(
             "SELECT ?iri WHERE {{ GRAPH <{graph}> {{ ?iri a <https://agent-harness.os/skill#AccessibleTool> }} }}",
@@ -402,50 +429,55 @@ mod tests_5w2h {
     #[test]
     fn test_5w2h_forbidden_tools_constraint() {
         let gate = make_gate();
-        let w2h = Task5W2H::new("Restricted task", "Test constraints")
-            .with_how(HowDetail {
-                plan_iri: None,
-                preferred_skills: vec![],
-                forbidden_tools: vec!["bash".to_string(), "file_delete".to_string()],
-                required_steps: None,
-                dependencies: vec![],
-            });
+        let w2h = Task5W2H::new("Restricted task", "Test constraints").with_how(HowDetail {
+            plan_iri: None,
+            preferred_skills: vec![],
+            forbidden_tools: vec!["bash".to_string(), "file_delete".to_string()],
+            required_steps: None,
+            dependencies: vec![],
+        });
         assert!(gate.check_5w2h_constraints("file_read", Some(&w2h)).is_ok());
         assert!(gate.check_5w2h_constraints("bash", Some(&w2h)).is_err());
         assert!(gate.check_5w2h_constraints("bash", Some(&w2h)).is_err());
-        assert!(gate.check_5w2h_constraints("file_delete", Some(&w2h)).is_err());
+        assert!(gate
+            .check_5w2h_constraints("file_delete", Some(&w2h))
+            .is_err());
     }
 
     #[test]
     fn test_5w2h_access_level_read_constraint() {
         let gate = make_gate();
-        let w2h = Task5W2H::new("Read-only task", "Test access control")
-            .with_who(WhoDetail {
-                requestor: None,
-                assignees: vec![],
-                stakeholders: vec![],
-                required_role: None,
-                access_level: Some(AccessLevel::Read),
-            });
+        let w2h = Task5W2H::new("Read-only task", "Test access control").with_who(WhoDetail {
+            requestor: None,
+            assignees: vec![],
+            stakeholders: vec![],
+            required_role: None,
+            access_level: Some(AccessLevel::Read),
+        });
         assert!(gate.check_5w2h_constraints("file_read", Some(&w2h)).is_ok());
-        assert!(gate.check_5w2h_constraints("file_write", Some(&w2h)).is_err());
+        assert!(gate
+            .check_5w2h_constraints("file_write", Some(&w2h))
+            .is_err());
         assert!(gate.check_5w2h_constraints("bash", Some(&w2h)).is_err());
-        assert!(gate.check_5w2h_constraints("code_execute", Some(&w2h)).is_err());
+        assert!(gate
+            .check_5w2h_constraints("code_execute", Some(&w2h))
+            .is_err());
     }
 
     #[test]
     fn test_5w2h_access_level_write_allowed() {
         let gate = make_gate();
-        let w2h = Task5W2H::new("Write task", "Test write permission")
-            .with_who(WhoDetail {
-                requestor: None,
-                assignees: vec![],
-                stakeholders: vec![],
-                required_role: None,
-                access_level: Some(AccessLevel::Write),
-            });
+        let w2h = Task5W2H::new("Write task", "Test write permission").with_who(WhoDetail {
+            requestor: None,
+            assignees: vec![],
+            stakeholders: vec![],
+            required_role: None,
+            access_level: Some(AccessLevel::Write),
+        });
         assert!(gate.check_5w2h_constraints("file_read", Some(&w2h)).is_ok());
-        assert!(gate.check_5w2h_constraints("file_write", Some(&w2h)).is_ok());
+        assert!(gate
+            .check_5w2h_constraints("file_write", Some(&w2h))
+            .is_ok());
     }
 
     #[test]

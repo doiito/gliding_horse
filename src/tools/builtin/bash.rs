@@ -257,7 +257,9 @@ mod tests {
     use crate::tools::builtin::sandbox::FilesystemIsolationMode;
 
     fn run_bash(input: BashCommandInput) -> std::io::Result<BashCommandOutput> {
-        tokio::runtime::Runtime::new().unwrap().block_on(execute_bash(input))
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_bash(input))
     }
 
     #[test]

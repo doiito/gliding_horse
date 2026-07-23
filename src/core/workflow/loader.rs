@@ -44,12 +44,15 @@ pub fn load_workflow_jsonld(json: &str) -> Result<WorkflowDefinition, String> {
     }
 
     // try to parse as @graph container
-    let root: Value = serde_json::from_str(json)
-        .map_err(|e| format!("JSON parse failed: {}", e))?;
+    let root: Value =
+        serde_json::from_str(json).map_err(|e| format!("JSON parse failed: {}", e))?;
 
     let graph_array = match root.get("@graph") {
         Some(Value::Array(arr)) => arr,
-        _ => return Err("Cannot parse JSON-LD workflow definition: neither WorkflowDefinition nor @graph array".to_string()),
+        _ => return Err(
+            "Cannot parse JSON-LD workflow definition: neither WorkflowDefinition nor @graph array"
+                .to_string(),
+        ),
     };
 
     // Find Workflow definition and AgentNode definitions in @graph array
@@ -68,17 +71,13 @@ pub fn load_workflow_jsonld(json: &str) -> Result<WorkflowDefinition, String> {
         }
     }
 
-    let wf_entry = workflow_entry.ok_or_else(|| {
-        "No entry with @type Workflow found in @graph array".to_string()
-    })?;
+    let wf_entry = workflow_entry
+        .ok_or_else(|| "No entry with @type Workflow found in @graph array".to_string())?;
 
     // Extract fields from Workflow entry (handle wf: prefix)
-    let name = get_jsonld_str(wf_entry, "name")
-        .unwrap_or_default();
-    let description = get_jsonld_str(wf_entry, "description")
-        .unwrap_or_default();
-    let version = get_jsonld_str(wf_entry, "version")
-        .unwrap_or_default();
+    let name = get_jsonld_str(wf_entry, "name").unwrap_or_default();
+    let description = get_jsonld_str(wf_entry, "description").unwrap_or_default();
+    let version = get_jsonld_str(wf_entry, "version").unwrap_or_default();
     let entry_node = get_jsonld_str(wf_entry, "entryNode")
         .or_else(|| get_jsonld_str(wf_entry, "entry_node"))
         .ok_or_else(|| "Workflow missing entryNode or entry_node".to_string())?;
@@ -91,8 +90,10 @@ pub fn load_workflow_jsonld(json: &str) -> Result<WorkflowDefinition, String> {
         .iter()
         .filter_map(|v| {
             // Nodes can be string @id or objects
-            v.as_str().map(|s| s.to_string())
-                .or_else(|| v.get("@id").and_then(|id| id.as_str().map(|s| s.to_string())))
+            v.as_str().map(|s| s.to_string()).or_else(|| {
+                v.get("@id")
+                    .and_then(|id| id.as_str().map(|s| s.to_string()))
+            })
         })
         .collect();
 
@@ -109,11 +110,15 @@ pub fn load_workflow_jsonld(json: &str) -> Result<WorkflowDefinition, String> {
     let ordered_entries: Vec<&Value> = if wf_node_refs.is_empty() {
         agent_nodes
     } else {
-        wf_node_refs.iter()
+        wf_node_refs
+            .iter()
             .filter_map(|ref_id| {
                 let found = node_map.get(ref_id).copied();
                 if found.is_none() {
-                    warn!("Workflow references node '{}' but not found in @graph", ref_id);
+                    warn!(
+                        "Workflow references node '{}' but not found in @graph",
+                        ref_id
+                    );
                 }
                 found
             })
@@ -141,7 +146,7 @@ fn get_jsonld_str(val: &Value, field: &str) -> Option<String> {
     let variants = [
         field.to_string(),
         format!("wf:{}", field),
-        field.replace('_', ""),           // entry_node → entrynode
+        field.replace('_', ""), // entry_node → entrynode
     ];
     for v in &variants {
         if let Some(s) = val.get(v).and_then(|v| v.as_str()) {
@@ -208,8 +213,7 @@ fn parse_agent_node(entry: &Value) -> Result<WorkflowNodeDef, String> {
         .or_else(|| get_jsonld_str(entry, "successCriteria"))
         .unwrap_or_default();
 
-    let node_type = get_jsonld_str(entry, "@type")
-        .unwrap_or_else(|| "AgentNode".to_string());
+    let node_type = get_jsonld_str(entry, "@type").unwrap_or_else(|| "AgentNode".to_string());
 
     // Parse string array fields
     let tools = parse_string_array(entry, "tools");
@@ -278,7 +282,8 @@ fn parse_string_array(entry: &Value, field: &str) -> Option<Vec<String>> {
     let variants = [field.to_string(), format!("wf:{}", field)];
     for v in &variants {
         if let Some(Value::Array(arr)) = entry.get(v) {
-            let strs: Vec<String> = arr.iter()
+            let strs: Vec<String> = arr
+                .iter()
                 .filter_map(|item| item.as_str().map(|s| s.to_string()))
                 .collect();
             if !strs.is_empty() || !arr.is_empty() {
@@ -294,11 +299,13 @@ fn parse_branch_condition(entry: &Value) -> Option<BranchCondition> {
     let variants = ["branch_on_failure", "branchOnFailure", "wf:branchOnFailure"];
     for var in &variants {
         if let Some(bf) = entry.get(*var) {
-            let condition = bf.get("condition")
+            let condition = bf
+                .get("condition")
                 .or_else(|| bf.get("wf:condition"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let target = bf.get("target")
+            let target = bf
+                .get("target")
                 .or_else(|| bf.get("wf:target"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
@@ -318,7 +325,8 @@ fn parse_input_mapping(entry: &Value) -> Option<InputMapping> {
     let variants = ["input_mapping", "inputMapping", "wf:inputMapping"];
     for var in &variants {
         if let Some(im) = entry.get(*var) {
-            let mappings: HashMap<String, String> = im.get("mappings")
+            let mappings: HashMap<String, String> = im
+                .get("mappings")
                 .or_else(|| im.get("wf:mappings"))
                 .and_then(|m| m.as_object())
                 .map(|obj| {
@@ -327,7 +335,8 @@ fn parse_input_mapping(entry: &Value) -> Option<InputMapping> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let context_template = im.get("context_template")
+            let context_template = im
+                .get("context_template")
                 .or_else(|| im.get("contextTemplate"))
                 .or_else(|| im.get("wf:contextTemplate"))
                 .and_then(|v| v.as_str())
@@ -363,16 +372,20 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
 
     // Phase 2: Build edges
     for node_def in &def.nodes {
-        let src_idx = node_index.get(&node_def.id).ok_or_else(|| {
-            format!("Node {} not found in node_index", node_def.id)
-        })?;
+        let src_idx = node_index
+            .get(&node_def.id)
+            .ok_or_else(|| format!("Node {} not found in node_index", node_def.id))?;
 
         // 2a: next edges (main execution flow)
         if let Some(ref next_id) = node_def.next {
             if let Some(dst_idx) = node_index.get(next_id) {
-                graph.add_edge(*src_idx, *dst_idx, GraphEdge {
-                    relation: "next".to_string(),
-                });
+                graph.add_edge(
+                    *src_idx,
+                    *dst_idx,
+                    GraphEdge {
+                        relation: "next".to_string(),
+                    },
+                );
             } else {
                 warn!("Node {} next '{}' does not exist", node_def.id, next_id);
             }
@@ -381,20 +394,31 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
         // 2b: next_nodes edges (parallel forks)
         for next_id in &node_def.next_nodes {
             if let Some(dst_idx) = node_index.get(next_id) {
-                graph.add_edge(*src_idx, *dst_idx, GraphEdge {
-                    relation: "next".to_string(),
-                });
+                graph.add_edge(
+                    *src_idx,
+                    *dst_idx,
+                    GraphEdge {
+                        relation: "next".to_string(),
+                    },
+                );
             } else {
-                warn!("Node {} next_node '{}' does not exist", node_def.id, next_id);
+                warn!(
+                    "Node {} next_node '{}' does not exist",
+                    node_def.id, next_id
+                );
             }
         }
 
         // 2c: dependencies edges (additional prerequisites)
         for dep_id in &node_def.dependencies {
             if let Some(dep_idx) = node_index.get(dep_id) {
-                graph.add_edge(*dep_idx, *src_idx, GraphEdge {
-                    relation: "dependency".to_string(),
-                });
+                graph.add_edge(
+                    *dep_idx,
+                    *src_idx,
+                    GraphEdge {
+                        relation: "dependency".to_string(),
+                    },
+                );
             }
         }
 
@@ -402,17 +426,21 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
         if let Some(ref branch) = node_def.branch_on_failure {
             if branch.target != node_def.id {
                 if let Some(dst_idx) = node_index.get(&branch.target) {
-                    graph.add_edge(*src_idx, *dst_idx, GraphEdge {
-                        relation: "branch".to_string(),
-                    });
+                    graph.add_edge(
+                        *src_idx,
+                        *dst_idx,
+                        GraphEdge {
+                            relation: "branch".to_string(),
+                        },
+                    );
                 }
             }
         }
     }
 
-    let entry_idx = *node_index.get(&def.entry_node).ok_or_else(|| {
-        format!("Entry node '{}' not found in node list", def.entry_node)
-    })?;
+    let entry_idx = *node_index
+        .get(&def.entry_node)
+        .ok_or_else(|| format!("Entry node '{}' not found in node list", def.entry_node))?;
 
     info!(
         nodes = def.nodes.len(),
@@ -447,9 +475,7 @@ pub fn topological_order(dag: &WorkflowDag) -> Result<Vec<NodeIndex>, String> {
 
 /// Get all predecessors of a node (incoming edge neighbors)
 pub fn predecessors(dag: &WorkflowDag, node: NodeIndex) -> Vec<NodeIndex> {
-    dag.graph
-        .neighbors_directed(node, Incoming)
-        .collect()
+    dag.graph.neighbors_directed(node, Incoming).collect()
 }
 
 /// Check if all dependencies of a node are met
@@ -468,10 +494,7 @@ pub fn all_dependencies_met(
 }
 
 /// Check if the conditional branch should trigger
-pub fn should_branch(
-    node_def: &WorkflowNodeDef,
-    result: &NodeResult,
-) -> Option<String> {
+pub fn should_branch(node_def: &WorkflowNodeDef, result: &NodeResult) -> Option<String> {
     if let Some(ref branch) = node_def.branch_on_failure {
         let matches = match branch.condition.as_str() {
             "$.result.status == 'failed'" => result.status == "failed",

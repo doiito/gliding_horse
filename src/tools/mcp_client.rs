@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info, warn};
-use reqwest::Client;
 
 use crate::config::{McpServerConfig, McpStdioServerConfig};
 use crate::CoreError;
@@ -100,27 +100,39 @@ impl StdioProcess {
     }
 
     /// Send a JSON-RPC request and read the matching response.
-    async fn send_request(&mut self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, CoreError> {
+    async fn send_request(
+        &mut self,
+        request: &JsonRpcRequest,
+    ) -> Result<JsonRpcResponse, CoreError> {
         let json_str = serde_json::to_string(request).map_err(|e| CoreError::Internal {
             message: format!("JSON serialization failed: {}", e),
         })?;
 
         // Write request to stdin (newline-delimited JSON)
-        self.stdin.write_all(json_str.as_bytes()).await.map_err(|e| CoreError::Internal {
-            message: format!("Failed to write to MCP stdin: {}", e),
-        })?;
-        self.stdin.write_all(b"\n").await.map_err(|e| CoreError::Internal {
-            message: format!("Failed to write newline to MCP stdin: {}", e),
-        })?;
+        self.stdin
+            .write_all(json_str.as_bytes())
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Failed to write to MCP stdin: {}", e),
+            })?;
+        self.stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Failed to write newline to MCP stdin: {}", e),
+            })?;
         self.stdin.flush().await.map_err(|e| CoreError::Internal {
             message: format!("Failed to flush MCP stdin: {}", e),
         })?;
 
         // Read response line from stdout
         self.buffer.clear();
-        self.stdout.read_line(&mut self.buffer).await.map_err(|e| CoreError::Internal {
-            message: format!("Failed to read MCP stdout: {}", e),
-        })?;
+        self.stdout
+            .read_line(&mut self.buffer)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Failed to read MCP stdout: {}", e),
+            })?;
 
         if self.buffer.is_empty() {
             return Err(CoreError::Internal {
@@ -128,9 +140,14 @@ impl StdioProcess {
             });
         }
 
-        let response: JsonRpcResponse = serde_json::from_str(self.buffer.trim()).map_err(|e| CoreError::Internal {
-            message: format!("Failed to parse MCP response: {} (raw: {})", e, self.buffer.trim()),
-        })?;
+        let response: JsonRpcResponse =
+            serde_json::from_str(self.buffer.trim()).map_err(|e| CoreError::Internal {
+                message: format!(
+                    "Failed to parse MCP response: {} (raw: {})",
+                    e,
+                    self.buffer.trim()
+                ),
+            })?;
 
         Ok(response)
     }
@@ -171,7 +188,8 @@ impl McpClient {
     }
 
     fn next_request_id(&self) -> u64 {
-        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register an HTTP MCP server by URL.
@@ -243,9 +261,12 @@ impl McpClient {
 
     async fn connect_http(&mut self, name: &str) -> Result<Vec<McpTool>, CoreError> {
         let url = {
-            let state = self.servers.get_mut(name).ok_or_else(|| CoreError::Internal {
-                message: format!("MCP server not registered: {}", name),
-            })?;
+            let state = self
+                .servers
+                .get_mut(name)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("MCP server not registered: {}", name),
+                })?;
             state.status = "connecting".to_string();
             state.url.clone()
         };
@@ -267,9 +288,13 @@ impl McpClient {
 
     async fn connect_stdio(&mut self, name: &str) -> Result<Vec<McpTool>, CoreError> {
         // Get the stdio config
-        let config = self.stdio_configs.get(name).cloned().ok_or_else(|| CoreError::Internal {
+        let config = self
+            .stdio_configs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CoreError::Internal {
                 message: format!("MCP Stdio server config not found: {}", name),
-        })?;
+            })?;
 
         // Update status
         if let Some(state) = self.servers.get_mut(name) {
@@ -288,7 +313,9 @@ impl McpClient {
 
                 match process.send_request(&request).await {
                     Ok(response) => {
-                        let tools = self.parse_tools_from_response(name, &response).unwrap_or_default();
+                        let tools = self
+                            .parse_tools_from_response(name, &response)
+                            .unwrap_or_default();
                         self.processes.insert(name.to_string(), process);
 
                         if let Some(state) = self.servers.get_mut(name) {
@@ -304,30 +331,42 @@ impl McpClient {
                     }
                 }
             }
-            Err(e) => {
-                Ok(self.handle_connect_fallback(name, e).await)
-            }
+            Err(e) => Ok(self.handle_connect_fallback(name, e).await),
         }
     }
 
     /// Parse tools from a JSON-RPC tools/list response.
-    fn parse_tools_from_response(&self, name: &str, response: &JsonRpcResponse) -> Result<Vec<McpTool>, CoreError> {
+    fn parse_tools_from_response(
+        &self,
+        name: &str,
+        response: &JsonRpcResponse,
+    ) -> Result<Vec<McpTool>, CoreError> {
         if let Some(ref result) = response.result {
-            let tools: Vec<McpTool> = result.get("tools")
+            let tools: Vec<McpTool> = result
+                .get("tools")
                 .and_then(|t| serde_json::from_value(t.clone()).ok())
                 .unwrap_or_default();
             Ok(tools)
         } else if let Some(ref error) = response.error {
             Err(CoreError::Internal {
-                message: format!("MCP server '{}' returned error: {} ({})", name, error.message, error.code),
+                message: format!(
+                    "MCP server '{}' returned error: {} ({})",
+                    name, error.message, error.code
+                ),
             })
         } else {
             Ok(Vec::new())
         }
     }
 
-    async fn handle_connect_response(&mut self, name: &str, response: JsonRpcResponse) -> Vec<McpTool> {
-        let tools = self.parse_tools_from_response(name, &response).unwrap_or_default();
+    async fn handle_connect_response(
+        &mut self,
+        name: &str,
+        response: JsonRpcResponse,
+    ) -> Vec<McpTool> {
+        let tools = self
+            .parse_tools_from_response(name, &response)
+            .unwrap_or_default();
         if let Some(state) = self.servers.get_mut(name) {
             state.tools = tools.clone();
             state.status = "connected".to_string();
@@ -371,15 +410,20 @@ impl McpClient {
         arguments: &Value,
     ) -> Result<Value, CoreError> {
         let transport = {
-            let state = self.servers.get(server).ok_or_else(|| CoreError::Internal {
-                message: format!("MCP server not found: {}", server),
-            })?;
+            let state = self
+                .servers
+                .get(server)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("MCP server not found: {}", server),
+                })?;
             if state.status.starts_with("error") {
                 return Err(CoreError::Internal {
                     message: format!("MCP server {} status abnormal: {}", server, state.status),
                 });
             }
-            state.tools.iter()
+            state
+                .tools
+                .iter()
                 .find(|t| t.name == tool)
                 .ok_or_else(|| CoreError::Internal {
                     message: format!("Tool {} not found on server {}", tool, server),
@@ -401,19 +445,25 @@ impl McpClient {
 
         match transport.as_str() {
             "http" => {
-                let url = self.servers.get(server).map(|s| s.url.clone()).unwrap_or_default();
+                let url = self
+                    .servers
+                    .get(server)
+                    .map(|s| s.url.clone())
+                    .unwrap_or_default();
                 self.call_tool_http(&url, &request).await
             }
-            "stdio" => {
-                self.call_tool_stdio(server, &request).await
-            }
+            "stdio" => self.call_tool_stdio(server, &request).await,
             _ => Err(CoreError::Internal {
                 message: format!("Unknown MCP transport type: {}", transport),
             }),
         }
     }
 
-    async fn call_tool_http(&self, url: &str, request: &JsonRpcRequest) -> Result<Value, CoreError> {
+    async fn call_tool_http(
+        &self,
+        url: &str,
+        request: &JsonRpcRequest,
+    ) -> Result<Value, CoreError> {
         match self.send_rpc_http(url, request).await {
             Ok(response) => Self::handle_call_response(response),
             Err(_) => Ok(json!({
@@ -423,10 +473,17 @@ impl McpClient {
         }
     }
 
-    async fn call_tool_stdio(&mut self, server: &str, request: &JsonRpcRequest) -> Result<Value, CoreError> {
-        let process = self.processes.get_mut(server).ok_or_else(|| CoreError::Internal {
-            message: format!("MCP Stdio process not found: {}", server),
-        })?;
+    async fn call_tool_stdio(
+        &mut self,
+        server: &str,
+        request: &JsonRpcRequest,
+    ) -> Result<Value, CoreError> {
+        let process = self
+            .processes
+            .get_mut(server)
+            .ok_or_else(|| CoreError::Internal {
+                message: format!("MCP Stdio process not found: {}", server),
+            })?;
 
         if !process.is_alive() {
             return Ok(json!({
@@ -458,8 +515,13 @@ impl McpClient {
 
     // ── Transport layer ───────────────────────────────────────────
 
-    async fn send_rpc_http(&self, url: &str, request: &JsonRpcRequest) -> Result<JsonRpcResponse, CoreError> {
-        let response = self.http_client
+    async fn send_rpc_http(
+        &self,
+        url: &str,
+        request: &JsonRpcRequest,
+    ) -> Result<JsonRpcResponse, CoreError> {
+        let response = self
+            .http_client
             .post(url)
             .json(request)
             .send()
@@ -468,8 +530,8 @@ impl McpClient {
                 message: format!("MCP HTTP request failed: {}", e),
             })?;
 
-        let rpc_response: JsonRpcResponse = response.json().await
-            .map_err(|e| CoreError::Internal {
+        let rpc_response: JsonRpcResponse =
+            response.json().await.map_err(|e| CoreError::Internal {
                 message: format!("MCP response parse failed: {}", e),
             })?;
 
@@ -496,11 +558,17 @@ impl McpClient {
         result
     }
 
-    pub fn register_tools_to_skill_registry(&self, registry: &crate::tools::skill_registry::SkillRegistry) {
+    pub fn register_tools_to_skill_registry(
+        &self,
+        registry: &crate::tools::skill_registry::SkillRegistry,
+    ) {
         for (server_name, state) in &self.servers {
             for tool in &state.tools {
                 let iri = format!("iri://mcp/{}/{}", server_name, tool.name);
-                let input_schema = tool.input_schema.clone().unwrap_or(json!({"type":"object","properties":{}}));
+                let input_schema = tool
+                    .input_schema
+                    .clone()
+                    .unwrap_or(json!({"type":"object","properties":{}}));
                 let skill = crate::tools::skill_registry::SkillMeta {
                     skill_iri: iri.clone(),
                     name: tool.name.clone(),
@@ -508,7 +576,12 @@ impl McpClient {
                     version: "0.1.0".to_string(),
                     category: "mcp".to_string(),
                     security_level: "normal".to_string(),
-                    allowed_roles: vec!["Plan".to_string(), "Do".to_string(), "Check".to_string(), "Act".to_string()],
+                    allowed_roles: vec![
+                        "Plan".to_string(),
+                        "Do".to_string(),
+                        "Check".to_string(),
+                        "Act".to_string(),
+                    ],
                     input_schema,
                     output_schema: json!({"type":"object"}),
                     compiled_template: String::new(),
@@ -550,7 +623,7 @@ impl Default for McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{McpServerConfig, McpRemoteServerConfig};
+    use crate::config::{McpRemoteServerConfig, McpServerConfig};
 
     #[tokio::test]
     async fn test_mcp_client_register() {
@@ -576,13 +649,11 @@ mod tests {
     fn test_register_to_skill_registry() {
         let mut client = McpClient::new();
         client.register_server("test", "http://localhost:8080/mcp");
-        client.servers.get_mut("test").unwrap().tools = vec![
-            McpTool {
-                name: "test_tool".to_string(),
-                description: Some("Test tool".to_string()),
-                input_schema: Some(json!({"type":"object"})),
-            },
-        ];
+        client.servers.get_mut("test").unwrap().tools = vec![McpTool {
+            name: "test_tool".to_string(),
+            description: Some("Test tool".to_string()),
+            input_schema: Some(json!({"type":"object"})),
+        }];
         let registry = crate::tools::skill_registry::SkillRegistry::new();
         client.register_tools_to_skill_registry(&registry);
     }

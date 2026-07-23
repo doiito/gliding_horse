@@ -49,7 +49,10 @@ impl SupplementaryInputStore {
             timestamp: Utc::now(),
             consumed: false,
         };
-        let mut map = self.pending.lock().expect("SupplementaryInputStore lock poisoned");
+        let mut map = self
+            .pending
+            .lock()
+            .expect("SupplementaryInputStore lock poisoned");
         map.entry(task_iri.to_string()).or_default().push(entry);
         tracing::info!(
             task_iri = %task_iri,
@@ -64,9 +67,13 @@ impl SupplementaryInputStore {
     /// Atomic operation: fetched entries are marked consumed but kept in the list for auditing.
     /// Returns Vec instead of iterator to minimize lock hold time.
     pub fn take_pending(&self, task_iri: &str) -> Vec<SupplementEntry> {
-        let mut map = self.pending.lock().expect("SupplementaryInputStore lock poisoned");
+        let mut map = self
+            .pending
+            .lock()
+            .expect("SupplementaryInputStore lock poisoned");
         let entries = map.entry(task_iri.to_string()).or_default();
-        let pending: Vec<_> = entries.iter_mut()
+        let pending: Vec<_> = entries
+            .iter_mut()
             .filter(|e| !e.consumed)
             .map(|e| {
                 e.consumed = true;
@@ -78,7 +85,10 @@ impl SupplementaryInputStore {
 
     /// Check if there are unconsumed supplementary inputs
     pub fn has_pending(&self, task_iri: &str) -> bool {
-        let map = self.pending.lock().expect("SupplementaryInputStore lock poisoned");
+        let map = self
+            .pending
+            .lock()
+            .expect("SupplementaryInputStore lock poisoned");
         map.get(task_iri)
             .map(|entries| entries.iter().any(|e| !e.consumed))
             .unwrap_or(false)
@@ -86,7 +96,10 @@ impl SupplementaryInputStore {
 
     /// Get the count of unconsumed entries for the specified task
     pub fn pending_count(&self, task_iri: &str) -> usize {
-        let map = self.pending.lock().expect("SupplementaryInputStore lock poisoned");
+        let map = self
+            .pending
+            .lock()
+            .expect("SupplementaryInputStore lock poisoned");
         map.get(task_iri)
             .map(|entries| entries.iter().filter(|e| !e.consumed).count())
             .unwrap_or(0)
@@ -94,7 +107,10 @@ impl SupplementaryInputStore {
 
     /// Clean up data for completed tasks
     pub fn cleanup(&self, task_iri: &str) {
-        let mut map = self.pending.lock().expect("SupplementaryInputStore lock poisoned");
+        let mut map = self
+            .pending
+            .lock()
+            .expect("SupplementaryInputStore lock poisoned");
         map.remove(task_iri);
     }
 }
@@ -121,7 +137,12 @@ mod tests {
     fn test_store_and_take_pending() {
         let store = SupplementaryInputStore::new();
         store.store("iri://task/test1", "supplement info 1", None, 0.85);
-        store.store("iri://task/test1", "supplement info 2", Some(vec![1.0, 2.0]), 0.45);
+        store.store(
+            "iri://task/test1",
+            "supplement info 2",
+            Some(vec![1.0, 2.0]),
+            0.45,
+        );
 
         let pending = store.take_pending("iri://task/test1");
         assert_eq!(pending.len(), 2);
@@ -139,7 +160,11 @@ mod tests {
         assert_eq!(first.len(), 1);
 
         let second = store.take_pending("iri://task/test2");
-        assert_eq!(second.len(), 0, "consumed entries should not be returned again");
+        assert_eq!(
+            second.len(),
+            0,
+            "consumed entries should not be returned again"
+        );
     }
 
     #[test]

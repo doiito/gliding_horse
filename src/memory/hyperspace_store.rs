@@ -1,15 +1,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::Utc;
 use hyperspace_engine::engine::{HyperspaceEngine, HyperspaceEngineImpl, SearchHit};
 use hyperspace_engine::filter::JsonLdFilter;
 use hyperspace_engine::hnsw::HnswConfig;
 use hyperspace_engine::hyper_vector::{EmbeddingVector, MetricKind};
 use hyperspace_engine::metric::CosineMetric;
 use hyperspace_engine::wal::WalSyncMode;
-use chrono::Utc;
 use serde_json::Value;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::memory::embedding_service::EmbeddingService;
 use crate::CoreError;
@@ -120,10 +120,7 @@ impl HyperspaceStore {
     ///
     /// `data_dir` — persistent storage directory (WAL + snapshots + HNSW index).
     /// `embed` — embedding service that determines the vector dimension.
-    pub fn open(
-        data_dir: &Path,
-        embed: Arc<dyn EmbeddingService>,
-    ) -> Result<Self, CoreError> {
+    pub fn open(data_dir: &Path, embed: Arc<dyn EmbeddingService>) -> Result<Self, CoreError> {
         let dim = embed.dimension();
         let engine = HyperspaceEngineImpl::open(
             data_dir,
@@ -144,15 +141,15 @@ impl HyperspaceStore {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Embed text, falling back to a zero vector on failure.
-    async fn get_embedding(&self, text: &str) -> Vec<f32> {
-        match self.embed.embed(text).await {
-            Ok(vec) => vec,
-            Err(e) => {
-                warn!(error = %e, "Embedding service failed, using zero vector");
-                vec![0.0f32; self.embed.dimension()]
-            }
-        }
+    /// Embed text. A failed embedding must not be indexed as a zero vector,
+    /// because that fabricates a semantic point and contaminates retrieval.
+    async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        self.embed
+            .embed(text)
+            .await
+            .map_err(|error| CoreError::Internal {
+                message: format!("Embedding service failed: {}", error),
+            })
     }
 
     /// Convert a `HybridSearchFilter` to a `Vec<JsonLdFilter>` for the engine.
@@ -269,7 +266,10 @@ impl HyperspaceStore {
                 ScoredEntry {
                     iri: hit.iri,
                     text,
-                    score: hit.score,
+                    // The engine exposes negative distance for ranking. Public
+                    // store scores are positive relevance, so decay always
+                    // penalises older entries instead of reversing their rank.
+                    score: 1.0 / (1.0 + (-hit.score).max(0.0)),
                     tags,
                     importance,
                     jsonld_types,
@@ -297,7 +297,7 @@ impl HyperspaceStore {
         jsonld_types: Option<&[String]>,
         named_graph: Option<&str>,
     ) -> Result<u32, CoreError> {
-        let vector = self.get_embedding(text).await;
+        let vector = self.get_embedding(text).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -308,20 +308,19 @@ impl HyperspaceStore {
         payload.insert("iri".into(), Value::String(iri.into()));
         // Store current Unix timestamp for time-based filtering
         let now_ts = Utc::now().timestamp() as f64;
-        payload.insert("stored_at".into(), Value::Number(
-            serde_json::Number::from_f64(now_ts).unwrap_or_else(|| serde_json::Number::from(0))
-        ));
+        payload.insert(
+            "stored_at".into(),
+            Value::Number(
+                serde_json::Number::from_f64(now_ts).unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
+        );
         payload.insert(
             "text".into(),
             Value::String(text.chars().take(500).collect()),
         );
         payload.insert(
             "tags".into(),
-            Value::Array(
-                tags.iter()
-                    .map(|t| Value::String(t.clone()))
-                    .collect(),
-            ),
+            Value::Array(tags.iter().map(|t| Value::String(t.clone())).collect()),
         );
 
         if let Some(imp) = importance {
@@ -336,12 +335,7 @@ impl HyperspaceStore {
         if let Some(types) = jsonld_types {
             payload.insert(
                 "@type".into(),
-                Value::Array(
-                    types
-                        .iter()
-                        .map(|t| Value::String(t.clone()))
-                        .collect(),
-                ),
+                Value::Array(types.iter().map(|t| Value::String(t.clone())).collect()),
             );
         }
         if let Some(graph) = named_graph {
@@ -373,7 +367,7 @@ impl HyperspaceStore {
         filter: &HybridSearchFilter,
         limit: u64,
     ) -> Result<Vec<ScoredEntry>, CoreError> {
-        let vector = self.get_embedding(query).await;
+        let vector = self.get_embedding(query).await?;
         let vec = EmbeddingVector::from_f32_slice(&vector, MetricKind::Cosine).map_err(|e| {
             CoreError::Internal {
                 message: format!("EmbeddingVector: {e}"),
@@ -417,7 +411,11 @@ impl HyperspaceStore {
                 }
             }
         }
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(results)
     }
 
@@ -455,11 +453,12 @@ impl HyperspaceStore {
 
     /// Delete a vector entry by IRI.
     pub async fn delete(&self, iri: &str) -> Result<(), CoreError> {
-        self.engine.delete(iri).await.map_err(|e| {
-            CoreError::Internal {
+        self.engine
+            .delete(iri)
+            .await
+            .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace delete: {e}"),
-            }
-        })?;
+            })?;
         Ok(())
     }
 
@@ -472,16 +471,22 @@ impl HyperspaceStore {
 
     /// Resolve an IRI to its numeric point ID (if indexed).
     pub async fn resolve_iri(&self, iri: &str) -> Result<Option<u32>, CoreError> {
-        self.engine.resolve_iri(iri).await.map_err(|e| CoreError::Internal {
-            message: format!("Hyperspace resolve_iri: {e}"),
-        })
+        self.engine
+            .resolve_iri(iri)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace resolve_iri: {e}"),
+            })
     }
 
     /// Look up the IRI for a numeric point ID (reverse of resolve_iri).
     pub async fn lookup_id(&self, id: u32) -> Result<Option<String>, CoreError> {
-        self.engine.lookup_id(id).await.map_err(|e| CoreError::Internal {
-            message: format!("Hyperspace lookup_id: {e}"),
-        })
+        self.engine
+            .lookup_id(id)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace lookup_id: {e}"),
+            })
     }
 }
 
@@ -489,11 +494,31 @@ impl HyperspaceStore {
 mod tests {
     use super::*;
     use crate::memory::embedding_service::FallbackEmbeddingService;
+    use async_trait::async_trait;
 
     fn setup_store() -> HyperspaceStore {
         let dir = tempfile::tempdir().unwrap();
         let embed = Arc::new(FallbackEmbeddingService::new());
         HyperspaceStore::open(dir.path(), embed).unwrap()
+    }
+
+    struct FailingEmbedding;
+    #[async_trait]
+    impl EmbeddingService for FailingEmbedding {
+        async fn embed(&self, _: &str) -> Result<Vec<f32>, String> {
+            Err("offline".to_string())
+        }
+        fn dimension(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_does_not_insert_zero_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HyperspaceStore::open(dir.path(), Arc::new(FailingEmbedding)).unwrap();
+        assert!(store.upsert("failed", "text", &[]).await.is_err());
+        assert_eq!(store.count().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -507,8 +532,14 @@ mod tests {
     #[tokio::test]
     async fn test_search_returns_results() {
         let store = setup_store();
-        store.upsert("s:1", "rust async programming", &[]).await.unwrap();
-        store.upsert("s:2", "python web framework", &[]).await.unwrap();
+        store
+            .upsert("s:1", "rust async programming", &[])
+            .await
+            .unwrap();
+        store
+            .upsert("s:2", "python web framework", &[])
+            .await
+            .unwrap();
 
         let results = store.search("programming", 10).await.unwrap();
         assert_eq!(results.len(), 2);
@@ -540,10 +571,19 @@ mod tests {
     #[tokio::test]
     async fn test_search_by_tags() {
         let store = setup_store();
-        store.upsert("t:1", "rust code", &["lang:rust".into()]).await.unwrap();
-        store.upsert("t:2", "python code", &["lang:python".into()]).await.unwrap();
+        store
+            .upsert("t:1", "rust code", &["lang:rust".into()])
+            .await
+            .unwrap();
+        store
+            .upsert("t:2", "python code", &["lang:python".into()])
+            .await
+            .unwrap();
 
-        let results = store.search_by_tags(&["lang:rust".into()], 10).await.unwrap();
+        let results = store
+            .search_by_tags(&["lang:rust".into()], 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].iri, "t:1");
     }

@@ -82,7 +82,8 @@ impl ConsistencyEngine {
                     self.blackboard.delete_node(node_iri)?;
                     if let Some(entry) = self.l0_store.retrieve(node_iri)? {
                         let config = CoreConfig::default();
-                        self.blackboard.write_node(node_iri, &entry.content, &config)?;
+                        self.blackboard
+                            .write_node(node_iri, &entry.content, &config)?;
                         debug!(node_iri = %node_iri, "L2 read: node reloaded from L0");
                     } else {
                         warn!(node_iri = %node_iri, "L2 read: no corresponding entry in L0");
@@ -135,7 +136,12 @@ mod tests {
     use crate::CoreConfig;
     use tempfile::tempdir;
 
-    fn setup() -> (Arc<ConsistencyEngine>, Arc<Blackboard>, Arc<L0Store>, Arc<MemoryBus>) {
+    fn setup() -> (
+        Arc<ConsistencyEngine>,
+        Arc<Blackboard>,
+        Arc<L0Store>,
+        Arc<MemoryBus>,
+    ) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("l0_test");
         let l0_store = Arc::new(L0Store::new(path.to_str().unwrap()).unwrap());

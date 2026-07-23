@@ -107,19 +107,7 @@ Output strictly in the following JSON format, without any additional text, expla
             .build()
             .map_err(|e| format!("failed to create HTTP client: {}", e))?;
 
-        let url = format!(
-            "{}/chat/completions",
-            self.api_url.trim_end_matches('/').trim_end_matches("/v1")
-        );
-
-        let body = ChatRequestBody {
-            model: self.model.clone(),
-            messages: vec![ChatRequestMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-            temperature: 0.1,
-        };
+        let (url, body) = self.chat_request(prompt);
 
         debug!(model = %self.model, url = %url, "calling LLM API for knowledge extraction");
 
@@ -144,8 +132,13 @@ Output strictly in the following JSON format, without any additional text, expla
             .map_err(|e| format!("failed to read LLM response: {}", e))?;
 
         let chat_resp: ChatCompletionResponse =
-            serde_json::from_str(&response_text)
-                .map_err(|e| format!("failed to parse LLM response JSON: {} (raw response: {})", e, truncate_str(&response_text, 200)))?;
+            serde_json::from_str(&response_text).map_err(|e| {
+                format!(
+                    "failed to parse LLM response JSON: {} (raw response: {})",
+                    e,
+                    truncate_str(&response_text, 200)
+                )
+            })?;
 
         let choice = chat_resp
             .choices
@@ -157,6 +150,20 @@ Output strictly in the following JSON format, without any additional text, expla
             .message
             .content
             .ok_or_else(|| "LLM response content is empty".to_string())
+    }
+
+    fn chat_request(&self, prompt: &str) -> (String, ChatRequestBody) {
+        (
+            chat_completions_url(&self.api_url),
+            ChatRequestBody {
+                model: self.model.clone(),
+                messages: vec![ChatRequestMessage {
+                    role: "user".to_string(),
+                    content: prompt.to_string(),
+                }],
+                temperature: 0.1,
+            },
+        )
     }
 
     pub fn validate_extraction(json_str: &str) -> Result<LLMExtractionOutput, String> {
@@ -201,15 +208,16 @@ Output strictly in the following JSON format, without any additional text, expla
         Ok(output)
     }
 
-    pub fn extract(&self, text: &str, domain: Option<&str>) -> Result<RdfMappingResult, String> {
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| {
-                tokio::runtime::Runtime::new()
-                    .expect("failed to create tokio runtime")
-                    .handle()
-                    .clone()
-            });
-
+    /// Extract knowledge asynchronously.
+    ///
+    /// This method is called from async tool handlers. It must not create or
+    /// block a Tokio runtime internally, otherwise calls from an existing
+    /// runtime panic with "Cannot start a runtime from within a runtime".
+    pub async fn extract(
+        &self,
+        text: &str,
+        domain: Option<&str>,
+    ) -> Result<RdfMappingResult, String> {
         let vocab = self.ontology.get_vocabulary(domain);
         let vocabulary = self.ontology.format_vocabulary_for_prompt(&vocab);
         let base_prompt = Self::build_extraction_prompt(text, &vocabulary);
@@ -220,7 +228,7 @@ Output strictly in the following JSON format, without any additional text, expla
         for attempt in 1..=3 {
             debug!(attempt, "knowledge extraction attempt");
 
-            let llm_result = handle.block_on(self.call_llm(&current_prompt));
+            let llm_result = self.call_llm(&current_prompt).await;
 
             let raw_response = match llm_result {
                 Ok(resp) => resp,
@@ -281,6 +289,22 @@ Output strictly in the following JSON format, without any additional text, expla
 
     pub fn store(&self) -> &KnowledgeGraphStore {
         &self.store
+    }
+}
+
+/// Normalize an OpenAI-compatible base URL to its chat-completions endpoint.
+///
+/// Callers may provide a server root, a `/v1` base, or an already complete
+/// endpoint. The official default (`https://api.openai.com/v1`) must retain
+/// the `/v1` segment.
+fn chat_completions_url(api_url: &str) -> String {
+    let base = api_url.trim().trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
     }
 }
 
@@ -408,6 +432,38 @@ mod tests {
         assert!(prompt.contains("test text"));
         assert!(prompt.contains("nodes"));
         assert!(prompt.contains("edges"));
+    }
+
+    #[test]
+    fn test_chat_completions_url_normalization() {
+        assert_eq!(
+            chat_completions_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://proxy.example/"),
+            "https://proxy.example/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://proxy.example/v1/chat/completions"),
+            "https://proxy.example/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_extract_request_uses_v1_endpoint_without_network_fixture() {
+        let extractor = KnowledgeExtractor::new(
+            OntologyManager::new(),
+            KnowledgeGraphStore::new().unwrap(),
+            "https://proxy.example/v1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+        );
+        let (url, body) = extractor.chat_request("Alice is a person");
+        assert_eq!(url, "https://proxy.example/v1/chat/completions");
+        assert_eq!(body.model, "test-model");
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(body.messages[0].content, "Alice is a person");
     }
 
     #[test]

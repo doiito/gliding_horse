@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::core::agent_instance::AgentRole;
 use crate::CoreError;
@@ -12,27 +12,49 @@ pub enum InterventionAction {
     ContinueWithMonitor,
 
     // === 2. Parameter Tuning ===
-    IncreaseRetry { additional_retries: u32 },
-    IncreaseTimeout { additional_seconds: u64 },
+    IncreaseRetry {
+        additional_retries: u32,
+    },
+    IncreaseTimeout {
+        additional_seconds: u64,
+    },
     ReduceComplexity,
-    RestrictTools { allowed_tools: Vec<String> },
+    RestrictTools {
+        allowed_tools: Vec<String>,
+    },
 
     // === 3. Execution Flow Adjustment ===
-    SkipStep { step_id: String },
-    RetryStep { step_id: String },
+    SkipStep {
+        step_id: String,
+    },
+    RetryStep {
+        step_id: String,
+    },
     Parallelize,
-    SplitStep { step_id: String, sub_steps: Vec<String> },
-    InsertExtraStep { description: String },
+    SplitStep {
+        step_id: String,
+        sub_steps: Vec<String>,
+    },
+    InsertExtraStep {
+        description: String,
+    },
 
     // === 4. Resource & Mode Switch ===
     FallbackToShallow,
     EmergencyMode,
-    IncreaseBudget { additional_tokens: u64, additional_time_secs: u64 },
+    IncreaseBudget {
+        additional_tokens: u64,
+        additional_time_secs: u64,
+    },
     FreezeAndReport,
 
     // === 5. Termination & Escalation ===
-    AbortTask { reason: String },
-    NotifyHuman { message: String },
+    AbortTask {
+        reason: String,
+    },
+    NotifyHuman {
+        message: String,
+    },
 }
 
 impl InterventionAction {

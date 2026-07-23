@@ -41,7 +41,11 @@ impl EmbeddingVector {
             }
             _ => 0.0,
         };
-        Ok(Self { coords, metric, alpha })
+        Ok(Self {
+            coords,
+            metric,
+            alpha,
+        })
     }
 
     /// Create from f32 slice (e.g. from ONNX embedding output).
@@ -63,7 +67,11 @@ impl EmbeddingVector {
             }
             _ => 0.0,
         };
-        Self { coords, metric, alpha }
+        Self {
+            coords,
+            metric,
+            alpha,
+        }
     }
 
     /// Serialize to fixed-size bytes for storage (f64 per coord + alpha).
@@ -113,7 +121,11 @@ impl EmbeddingVector {
             cbuf.copy_from_slice(&bytes[offset..offset + 8]);
             coords.push(f64::from_le_bytes(cbuf));
         }
-        Ok(Self { coords, metric, alpha })
+        Ok(Self {
+            coords,
+            metric,
+            alpha,
+        })
     }
 
     /// Element size in bytes for storage (for fixed-size mmap).
@@ -133,10 +145,7 @@ impl EmbeddingVector {
 
 // Helper: L2 squared between two f64 slices
 pub fn l2_squared(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
 // Helper: dot product

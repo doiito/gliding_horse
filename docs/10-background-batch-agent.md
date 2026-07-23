@@ -11,7 +11,7 @@ Gliding Horse Agent OS 已有：
 - **技能图谱**：7,500+ LOC 动态语义网络，6 类链接类型，Learn/Reduce 自举学习，冲突检测
 - **五层记忆**：MESI 一致性协议的 L0→L3 层次化存储
 - **执行引擎**：PDCA 循环 + 10 类感知触发器
-- **Batch Agent 框架**：滑动窗口 + 模板引擎 + 抽取管道 + 知识持久化（Phase 1-5 已完成）
+- **Batch Agent 框架**：滑动窗口、模板引擎、抽取管道和持久化组件均已实现。根 gRPC 服务的 `init_batch_system` 已启动后台适配器：仅显式配置的 `CustomEvent` 会进入对应 Agent 窗口并触发执行，cron/window trigger 由周期检查执行；流式任务复用该服务的共享状态。L0 journal 已持久化输入、按 event ID 去重、成功确认并在启动时重放 pending 输入。`apply_graph_mutations` 默认为 false，因而维护 handler 不会默认改图；当前 `KnowledgePersister` 也没有接入 execute path。若显式打开改图开关，仍没有 event-id 幂等、审批或事务门禁，且缺端到端 LLM fixture，因此不能视为 exactly-once 或可恢复知识写回系统。
 
 ### 缺口
 

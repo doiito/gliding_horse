@@ -75,9 +75,7 @@ impl ShaclValidator {
 
                 // sh:minCount
                 if let Some(min_count_str) = prop.get("minCount") {
-                    let min_count = strip_quotes(min_count_str)
-                        .parse::<u64>()
-                        .unwrap_or(0);
+                    let min_count = strip_quotes(min_count_str).parse::<u64>().unwrap_or(0);
                     if min_count > 0 {
                         let query = format!(
                             r#"SELECT ?focus (COUNT(?val) AS ?cnt) WHERE {{
@@ -360,12 +358,13 @@ impl ShaclValidator {
 
 // ─── Helper functions ─────────────────────────────────────
 
-fn query_solutions(
-    store: &Store,
-    query: &str,
-) -> anyhow::Result<Vec<HashMap<String, String>>> {
+fn query_solutions(store: &Store, query: &str) -> anyhow::Result<Vec<HashMap<String, String>>> {
     use oxigraph::sparql::SparqlEvaluator;
-    match SparqlEvaluator::new().parse_query(query)?.on_store(store).execute()? {
+    match SparqlEvaluator::new()
+        .parse_query(query)?
+        .on_store(store)
+        .execute()?
+    {
         QueryResults::Solutions(solutions) => {
             let vars: Vec<String> = solutions
                 .variables()

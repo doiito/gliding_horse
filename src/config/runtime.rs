@@ -41,7 +41,10 @@ impl RuntimeHookConfig {
     pub fn extend(&mut self, other: &Self) {
         extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
         extend_unique(&mut self.post_tool_use, other.post_tool_use());
-        extend_unique(&mut self.post_tool_use_failure, other.post_tool_use_failure());
+        extend_unique(
+            &mut self.post_tool_use_failure,
+            other.post_tool_use_failure(),
+        );
     }
 }
 
@@ -147,4 +150,3 @@ pub struct McpOAuthConfig {
     pub client_id: Option<String>,
     pub callback_port: Option<u16>,
 }
-

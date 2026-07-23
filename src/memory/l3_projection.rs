@@ -10,8 +10,8 @@ use crate::jsonld::framing::{
     apply_frame, estimate_tokens, fit_to_budget, EmbedDirective, FrameTemplate,
 };
 use crate::jsonld::JsonLdContext;
-use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::hyperspace_store::HyperspaceStore;
+use crate::memory::l2_blackboard::Blackboard;
 use crate::CoreError;
 
 #[derive(Debug, Clone)]
@@ -62,7 +62,7 @@ impl ProjectionEngine {
     pub fn with_vector_store(
         blackboard: Arc<Blackboard>,
         max_size: usize,
-    vector_store: Option<Arc<HyperspaceStore>>,
+        vector_store: Option<Arc<HyperspaceStore>>,
     ) -> Self {
         let frames = Self::load_default_frames();
         Self {
@@ -117,17 +117,23 @@ impl ProjectionEngine {
     fn load_default_frames() -> HashMap<String, ProjectionFrame> {
         let mut frames = HashMap::new();
 
-        frames.insert("summary_only".to_string(), ProjectionFrame {
-            name: "summary_only".to_string(),
-            description: "SA global situation awareness".to_string(),
-            target_role: "SA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "summary".to_string(), "status".to_string(), "confidence".to_string(),
-            ],
-            max_size: 500,
-            max_nodes: 20,
-            sparql_template: Some(r#"
+        frames.insert(
+            "summary_only".to_string(),
+            ProjectionFrame {
+                name: "summary_only".to_string(),
+                description: "SA global situation awareness".to_string(),
+                target_role: "SA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "summary".to_string(),
+                    "status".to_string(),
+                    "confidence".to_string(),
+                ],
+                max_size: 500,
+                max_nodes: 20,
+                sparql_template: Some(
+                    r#"
                 PREFIX ex: <http://agent-os.org/ontology/>
                 CONSTRUCT {
                     ?node ex:summary ?summary .
@@ -141,31 +147,46 @@ impl ProjectionEngine {
                     OPTIONAL { ?node ex:status ?status }
                     OPTIONAL { ?node ex:confidence ?conf }
                 }
-            "#.to_string()),
-            params: vec![],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "agent": "https://agent-harness.os/agent#"
-            }))
-            .with_include_properties(vec!["summary".to_string(), "status".to_string()])
-            .with_max_depth(1)),
-        });
+            "#
+                    .to_string(),
+                ),
+                params: vec![],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "agent": "https://agent-harness.os/agent#"
+                    }))
+                    .with_include_properties(vec!["summary".to_string(), "status".to_string()])
+                    .with_max_depth(1),
+                ),
+            },
+        );
 
-        frames.insert("pa_init".to_string(), ProjectionFrame {
-            name: "pa_init".to_string(),
-            description: "PA startup input".to_string(),
-            target_role: "PA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "summary".to_string(), "goal".to_string(),
-                "constraints".to_string(), "resources".to_string(),
-                "task:what".to_string(), "task:why".to_string(),
-                "task:how".to_string(), "task:where".to_string(),
-                "five_w2h_what".to_string(), "five_w2h_why".to_string(),
-                "five_w2h_deadline".to_string(), "five_w2h_execution_env".to_string(),
-            ],
-            max_size: 512,
-            max_nodes: 10,
-            sparql_template: Some(r#"
+        frames.insert(
+            "pa_init".to_string(),
+            ProjectionFrame {
+                name: "pa_init".to_string(),
+                description: "PA startup input".to_string(),
+                target_role: "PA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "summary".to_string(),
+                    "goal".to_string(),
+                    "constraints".to_string(),
+                    "resources".to_string(),
+                    "task:what".to_string(),
+                    "task:why".to_string(),
+                    "task:how".to_string(),
+                    "task:where".to_string(),
+                    "five_w2h_what".to_string(),
+                    "five_w2h_why".to_string(),
+                    "five_w2h_deadline".to_string(),
+                    "five_w2h_execution_env".to_string(),
+                ],
+                max_size: 512,
+                max_nodes: 10,
+                sparql_template: Some(
+                    r#"
                 PREFIX ex: <http://agent-os.org/ontology/>
                 CONSTRUCT {
                     ?task ex:goal ?goal .
@@ -180,29 +201,40 @@ impl ProjectionEngine {
                     OPTIONAL { ?task ex:constraints ?constraints }
                     OPTIONAL { ?task ex:resources ?resources }
                 }
-            "#.to_string()),
-            params: vec!["task_iri".to_string()],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "exec": "https://agent-harness.os/exec#",
-                "task": "https://agent-harness.os/task#"
-            }))
-            .with_embed_rule("task:subTasks".to_string(), EmbedDirective::Always)
-            .with_embed_rule("exec:assignedTo".to_string(), EmbedDirective::Link)
-            .with_max_depth(3)),
-        });
+            "#
+                    .to_string(),
+                ),
+                params: vec!["task_iri".to_string()],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "exec": "https://agent-harness.os/exec#",
+                        "task": "https://agent-harness.os/task#"
+                    }))
+                    .with_embed_rule("task:subTasks".to_string(), EmbedDirective::Always)
+                    .with_embed_rule("exec:assignedTo".to_string(), EmbedDirective::Link)
+                    .with_max_depth(3),
+                ),
+            },
+        );
 
-        frames.insert("da_input".to_string(), ProjectionFrame {
-            name: "da_input".to_string(),
-            description: "DA execution input".to_string(),
-            target_role: "DA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "summary".to_string(), "instructions".to_string(),
-                "dependencies".to_string(), "language".to_string(),
-            ],
-            max_size: 512,
-            max_nodes: 10,
-            sparql_template: Some(r#"
+        frames.insert(
+            "da_input".to_string(),
+            ProjectionFrame {
+                name: "da_input".to_string(),
+                description: "DA execution input".to_string(),
+                target_role: "DA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "summary".to_string(),
+                    "instructions".to_string(),
+                    "dependencies".to_string(),
+                    "language".to_string(),
+                ],
+                max_size: 512,
+                max_nodes: 10,
+                sparql_template: Some(
+                    r#"
                 PREFIX ex: <http://agent-os.org/ontology/>
                 CONSTRUCT {
                     ?node ex:instructions ?instructions .
@@ -217,131 +249,188 @@ impl ProjectionEngine {
                     OPTIONAL { ?node ex:dependencies ?deps }
                     OPTIONAL { ?node ex:language ?lang }
                 }
-            "#.to_string()),
-            params: vec!["plan_iri".to_string()],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "exec": "https://agent-harness.os/exec#",
-                "task": "https://agent-harness.os/task#"
-            }))
-            .with_embed_rule("task:inputData".to_string(), EmbedDirective::Always)
-            .with_embed_rule("task:resources".to_string(), EmbedDirective::Link)
-            .with_max_depth(4)),
-        });
+            "#
+                    .to_string(),
+                ),
+                params: vec!["plan_iri".to_string()],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "exec": "https://agent-harness.os/exec#",
+                        "task": "https://agent-harness.os/task#"
+                    }))
+                    .with_embed_rule("task:inputData".to_string(), EmbedDirective::Always)
+                    .with_embed_rule("task:resources".to_string(), EmbedDirective::Link)
+                    .with_max_depth(4),
+                ),
+            },
+        );
 
-        frames.insert("ca_review".to_string(), ProjectionFrame {
-            name: "ca_review".to_string(),
-            description: "CA check input".to_string(),
-            target_role: "CA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "summary".to_string(), "storage_path".to_string(),
-                "language".to_string(), "dependencies".to_string(),
-                "task:what".to_string(), "task:why".to_string(), "task:who".to_string(),
-                "task:when".to_string(), "task:where".to_string(), "task:how".to_string(),
-                "task:howMuch".to_string(),
-                "five_w2h_what".to_string(), "five_w2h_why".to_string(),
-                "five_w2h_success_criteria".to_string(), "five_w2h_deadline".to_string(),
-                "five_w2h_execution_env".to_string(), "five_w2h_required_steps".to_string(),
-                "five_w2h_token_budget".to_string(), "five_w2h_forbidden_tools".to_string(),
-                "auditResult".to_string(), "verdict".to_string(),
-            ],
-            max_size: 256,
-            max_nodes: 10,
-            sparql_template: None,
-            params: vec!["artifact_iri".to_string()],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "exec": "https://agent-harness.os/exec#",
-                "task": "https://agent-harness.os/task#"
-            }))
-            .with_embed_rule("exec:results".to_string(), EmbedDirective::Always)
-            .with_embed_rule("exec:validationRules".to_string(), EmbedDirective::Always)
-            .with_max_depth(3)),
-        });
+        frames.insert(
+            "ca_review".to_string(),
+            ProjectionFrame {
+                name: "ca_review".to_string(),
+                description: "CA check input".to_string(),
+                target_role: "CA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "summary".to_string(),
+                    "storage_path".to_string(),
+                    "language".to_string(),
+                    "dependencies".to_string(),
+                    "task:what".to_string(),
+                    "task:why".to_string(),
+                    "task:who".to_string(),
+                    "task:when".to_string(),
+                    "task:where".to_string(),
+                    "task:how".to_string(),
+                    "task:howMuch".to_string(),
+                    "five_w2h_what".to_string(),
+                    "five_w2h_why".to_string(),
+                    "five_w2h_success_criteria".to_string(),
+                    "five_w2h_deadline".to_string(),
+                    "five_w2h_execution_env".to_string(),
+                    "five_w2h_required_steps".to_string(),
+                    "five_w2h_token_budget".to_string(),
+                    "five_w2h_forbidden_tools".to_string(),
+                    "auditResult".to_string(),
+                    "verdict".to_string(),
+                ],
+                max_size: 256,
+                max_nodes: 10,
+                sparql_template: None,
+                params: vec!["artifact_iri".to_string()],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "exec": "https://agent-harness.os/exec#",
+                        "task": "https://agent-harness.os/task#"
+                    }))
+                    .with_embed_rule("exec:results".to_string(), EmbedDirective::Always)
+                    .with_embed_rule("exec:validationRules".to_string(), EmbedDirective::Always)
+                    .with_max_depth(3),
+                ),
+            },
+        );
 
-        frames.insert("aa_decision".to_string(), ProjectionFrame {
-            name: "aa_decision".to_string(),
-            description: "AA decision input".to_string(),
-            target_role: "AA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "summary".to_string(), "verdict".to_string(),
-                "severity".to_string(), "suggestions".to_string(),
-                "task:what".to_string(), "task:why".to_string(), "task:howMuch".to_string(),
-                "five_w2h_what".to_string(), "five_w2h_why".to_string(),
-                "auditResult".to_string(), "overallVerdict".to_string(),
-                "verdict".to_string(), "suggestions".to_string(),
-                "decision".to_string(),
-            ],
-            max_size: 512,
-            max_nodes: 10,
-            sparql_template: None,
-            params: vec!["review_iri".to_string()],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "exec": "https://agent-harness.os/exec#",
-                "task": "https://agent-harness.os/task#"
-            }))
-            .with_embed_rule("exec:reviewResults".to_string(), EmbedDirective::Always)
-            .with_embed_rule("exec:alternatives".to_string(), EmbedDirective::Link)
-            .with_max_depth(2)),
-        });
+        frames.insert(
+            "aa_decision".to_string(),
+            ProjectionFrame {
+                name: "aa_decision".to_string(),
+                description: "AA decision input".to_string(),
+                target_role: "AA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "summary".to_string(),
+                    "verdict".to_string(),
+                    "severity".to_string(),
+                    "suggestions".to_string(),
+                    "task:what".to_string(),
+                    "task:why".to_string(),
+                    "task:howMuch".to_string(),
+                    "five_w2h_what".to_string(),
+                    "five_w2h_why".to_string(),
+                    "auditResult".to_string(),
+                    "overallVerdict".to_string(),
+                    "verdict".to_string(),
+                    "suggestions".to_string(),
+                    "decision".to_string(),
+                ],
+                max_size: 512,
+                max_nodes: 10,
+                sparql_template: None,
+                params: vec!["review_iri".to_string()],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "exec": "https://agent-harness.os/exec#",
+                        "task": "https://agent-harness.os/task#"
+                    }))
+                    .with_embed_rule("exec:reviewResults".to_string(), EmbedDirective::Always)
+                    .with_embed_rule("exec:alternatives".to_string(), EmbedDirective::Link)
+                    .with_max_depth(2),
+                ),
+            },
+        );
 
-        frames.insert("health_check".to_string(), ProjectionFrame {
-            name: "health_check".to_string(),
-            description: "Health status check for SA".to_string(),
-            target_role: "SA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "status".to_string(), "confidence".to_string(), "error_count".to_string(),
-            ],
-            max_size: 256,
-            max_nodes: 20,
-            sparql_template: None,
-            params: vec![],
-            jsonld_frame: None,
-        });
+        frames.insert(
+            "health_check".to_string(),
+            ProjectionFrame {
+                name: "health_check".to_string(),
+                description: "Health status check for SA".to_string(),
+                target_role: "SA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "status".to_string(),
+                    "confidence".to_string(),
+                    "error_count".to_string(),
+                ],
+                max_size: 256,
+                max_nodes: 20,
+                sparql_template: None,
+                params: vec![],
+                jsonld_frame: None,
+            },
+        );
 
-        frames.insert("error_analysis".to_string(), ProjectionFrame {
-            name: "error_analysis".to_string(),
-            description: "Error analysis view for SA".to_string(),
-            target_role: "SA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "error_type".to_string(), "error_message".to_string(), "timestamp".to_string(),
-            ],
-            max_size: 512,
-            max_nodes: 10,
-            sparql_template: None,
-            params: vec!["agent_id".to_string()],
-            jsonld_frame: None,
-        });
+        frames.insert(
+            "error_analysis".to_string(),
+            ProjectionFrame {
+                name: "error_analysis".to_string(),
+                description: "Error analysis view for SA".to_string(),
+                target_role: "SA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "error_type".to_string(),
+                    "error_message".to_string(),
+                    "timestamp".to_string(),
+                ],
+                max_size: 512,
+                max_nodes: 10,
+                sparql_template: None,
+                params: vec!["agent_id".to_string()],
+                jsonld_frame: None,
+            },
+        );
 
-        frames.insert("reference_only".to_string(), ProjectionFrame {
-            name: "reference_only".to_string(),
-            description: "Minimal IRI reference only".to_string(),
-            target_role: "any".to_string(),
-            include_properties: vec!["@id".to_string()],
-            max_size: 128,
-            max_nodes: 50,
-            sparql_template: None,
-            params: vec![],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({}))
-                .with_max_depth(1)),
-        });
+        frames.insert(
+            "reference_only".to_string(),
+            ProjectionFrame {
+                name: "reference_only".to_string(),
+                description: "Minimal IRI reference only".to_string(),
+                target_role: "any".to_string(),
+                include_properties: vec!["@id".to_string()],
+                max_size: 128,
+                max_nodes: 50,
+                sparql_template: None,
+                params: vec![],
+                jsonld_frame: Some(FrameTemplate::new(serde_json::json!({})).with_max_depth(1)),
+            },
+        );
 
-        frames.insert("5w2h_summary".to_string(), ProjectionFrame {
-            name: "5w2h_summary".to_string(),
-            description: "5W2H summary view for SA dashboard".to_string(),
-            target_role: "SA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "task:what".to_string(), "task:why".to_string(),
-                "status".to_string(), "summary".to_string(),
-                "five_w2h_what".to_string(), "five_w2h_why".to_string(),
-                "five_w2h_deadline".to_string(), "five_w2h_priority".to_string(),
-            ],
-            max_size: 300,
-            max_nodes: 20,
-            sparql_template: Some(r#"
+        frames.insert(
+            "5w2h_summary".to_string(),
+            ProjectionFrame {
+                name: "5w2h_summary".to_string(),
+                description: "5W2H summary view for SA dashboard".to_string(),
+                target_role: "SA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "task:what".to_string(),
+                    "task:why".to_string(),
+                    "status".to_string(),
+                    "summary".to_string(),
+                    "five_w2h_what".to_string(),
+                    "five_w2h_why".to_string(),
+                    "five_w2h_deadline".to_string(),
+                    "five_w2h_priority".to_string(),
+                ],
+                max_size: 300,
+                max_nodes: 20,
+                sparql_template: Some(
+                    r#"
         PREFIX task: <https://pdca-agent.org/ontology/task#>
         CONSTRUCT {
             ?node task:what ?what .
@@ -356,29 +445,46 @@ impl ProjectionEngine {
             OPTIONAL { ?node task:status ?status }
             OPTIONAL { ?node task:summary ?summary }
         }
-    "#.to_string()),
-            params: vec![],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "task": "https://pdca-agent.org/ontology/task#"
-            }))
-            .with_include_properties(vec!["task:what".to_string(), "task:why".to_string(), "status".to_string()])
-            .with_max_depth(2)),
-        });
+    "#
+                    .to_string(),
+                ),
+                params: vec![],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "task": "https://pdca-agent.org/ontology/task#"
+                    }))
+                    .with_include_properties(vec![
+                        "task:what".to_string(),
+                        "task:why".to_string(),
+                        "status".to_string(),
+                    ])
+                    .with_max_depth(2),
+                ),
+            },
+        );
 
         // ── Workspace Monitor L3 frames ──
-        frames.insert("workspace_stale_files".to_string(), ProjectionFrame {
-            name: "workspace_stale_files".to_string(),
-            description: "Lists all workspace files with ReadStale or WrittenUnread state".to_string(),
-            target_role: "DA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "ws:filePath".to_string(), "ws:state".to_string(),
-                "ws:currentVersion".to_string(), "ws:lastReadVersion".to_string(),
-                "ws:mtime".to_string(), "ws:fileExt".to_string(),
-            ],
-            max_size: 1024,
-            max_nodes: 100,
-            sparql_template: Some(r#"
+        frames.insert(
+            "workspace_stale_files".to_string(),
+            ProjectionFrame {
+                name: "workspace_stale_files".to_string(),
+                description: "Lists all workspace files with ReadStale or WrittenUnread state"
+                    .to_string(),
+                target_role: "DA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "ws:filePath".to_string(),
+                    "ws:state".to_string(),
+                    "ws:currentVersion".to_string(),
+                    "ws:lastReadVersion".to_string(),
+                    "ws:mtime".to_string(),
+                    "ws:fileExt".to_string(),
+                ],
+                max_size: 1024,
+                max_nodes: 100,
+                sparql_template: Some(
+                    r#"
         PREFIX ws: <iri://workspace/ontology/>
         CONSTRUCT {
             ?node a ws:File .
@@ -400,30 +506,45 @@ impl ProjectionEngine {
             OPTIONAL { ?node ws:fileExt ?ext }
         }
         ORDER BY DESC(?mtime)
-    "#.to_string()),
-            params: vec![],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "ws": "iri://workspace/ontology/"
-            }))
-            .with_max_depth(2)),
-        });
+    "#
+                    .to_string(),
+                ),
+                params: vec![],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "ws": "iri://workspace/ontology/"
+                    }))
+                    .with_max_depth(2),
+                ),
+            },
+        );
 
-        frames.insert("workspace_file_detail".to_string(), ProjectionFrame {
-            name: "workspace_file_detail".to_string(),
-            description: "Detailed view of a specific workspace file by path".to_string(),
-            target_role: "DA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "ws:filePath".to_string(), "ws:fileSize".to_string(),
-                "ws:fileExt".to_string(), "ws:language".to_string(),
-                "ws:mtime".to_string(), "ws:contentHash".to_string(),
-                "ws:state".to_string(), "ws:lastReadAt".to_string(),
-                "ws:lastReadVersion".to_string(), "ws:currentVersion".to_string(),
-                "ws:readCount".to_string(), "ws:parentDir".to_string(),
-            ],
-            max_size: 512,
-            max_nodes: 5,
-            sparql_template: Some(r#"
+        frames.insert(
+            "workspace_file_detail".to_string(),
+            ProjectionFrame {
+                name: "workspace_file_detail".to_string(),
+                description: "Detailed view of a specific workspace file by path".to_string(),
+                target_role: "DA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "ws:filePath".to_string(),
+                    "ws:fileSize".to_string(),
+                    "ws:fileExt".to_string(),
+                    "ws:language".to_string(),
+                    "ws:mtime".to_string(),
+                    "ws:contentHash".to_string(),
+                    "ws:state".to_string(),
+                    "ws:lastReadAt".to_string(),
+                    "ws:lastReadVersion".to_string(),
+                    "ws:currentVersion".to_string(),
+                    "ws:readCount".to_string(),
+                    "ws:parentDir".to_string(),
+                ],
+                max_size: 512,
+                max_nodes: 5,
+                sparql_template: Some(
+                    r#"
         PREFIX ws: <iri://workspace/ontology/>
         CONSTRUCT {
             ?node a ws:File .
@@ -457,27 +578,39 @@ impl ProjectionEngine {
             OPTIONAL { ?node ws:parentDir ?parent }
         }
         LIMIT 5
-    "#.to_string()),
-            params: vec!["target_path".to_string()],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "ws": "iri://workspace/ontology/"
-            }))
-            .with_max_depth(2)),
-        });
+    "#
+                    .to_string(),
+                ),
+                params: vec!["target_path".to_string()],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "ws": "iri://workspace/ontology/"
+                    }))
+                    .with_max_depth(2),
+                ),
+            },
+        );
 
-        frames.insert("workspace_overview".to_string(), ProjectionFrame {
-            name: "workspace_overview".to_string(),
-            description: "Aggregated workspace overview: file counts by state, by language".to_string(),
-            target_role: "SA".to_string(),
-            include_properties: vec![
-                "@id".to_string(), "@type".to_string(),
-                "ws:filePath".to_string(), "ws:state".to_string(),
-                "ws:language".to_string(), "ws:fileSize".to_string(),
-                "ws:fileExt".to_string(),
-            ],
-            max_size: 2048,
-            max_nodes: 500,
-            sparql_template: Some(r#"
+        frames.insert(
+            "workspace_overview".to_string(),
+            ProjectionFrame {
+                name: "workspace_overview".to_string(),
+                description: "Aggregated workspace overview: file counts by state, by language"
+                    .to_string(),
+                target_role: "SA".to_string(),
+                include_properties: vec![
+                    "@id".to_string(),
+                    "@type".to_string(),
+                    "ws:filePath".to_string(),
+                    "ws:state".to_string(),
+                    "ws:language".to_string(),
+                    "ws:fileSize".to_string(),
+                    "ws:fileExt".to_string(),
+                ],
+                max_size: 2048,
+                max_nodes: 500,
+                sparql_template: Some(
+                    r#"
         PREFIX ws: <iri://workspace/ontology/>
         CONSTRUCT {
             ?node a ws:File .
@@ -496,13 +629,18 @@ impl ProjectionEngine {
             OPTIONAL { ?node ws:fileExt ?ext }
         }
         ORDER BY ?path
-    "#.to_string()),
-            params: vec![],
-            jsonld_frame: Some(FrameTemplate::new(serde_json::json!({
-                "ws": "iri://workspace/ontology/"
-            }))
-            .with_max_depth(1)),
-        });
+    "#
+                    .to_string(),
+                ),
+                params: vec![],
+                jsonld_frame: Some(
+                    FrameTemplate::new(serde_json::json!({
+                        "ws": "iri://workspace/ontology/"
+                    }))
+                    .with_max_depth(1),
+                ),
+            },
+        );
 
         frames
     }
@@ -516,7 +654,9 @@ impl ProjectionEngine {
     ) -> Result<String, CoreError> {
         debug!(task_iri = %task_iri, frame = %frame_name, "Executing projection");
 
-        let frame = self.frames.get(frame_name)
+        let frame = self
+            .frames
+            .get(frame_name)
             .ok_or_else(|| CoreError::FrameNotFound {
                 name: frame_name.to_string(),
             })?;
@@ -530,15 +670,28 @@ impl ProjectionEngine {
         }
 
         let mut projection = serde_json::Map::new();
-        projection.insert("@context".to_string(), (*JsonLdContext::context_value()).clone());
-        projection.insert("task_iri".to_string(), serde_json::Value::String(task_iri.to_string()));
-        projection.insert("frame".to_string(), serde_json::Value::String(frame_name.to_string()));
+        projection.insert(
+            "@context".to_string(),
+            (*JsonLdContext::context_value()).clone(),
+        );
+        projection.insert(
+            "task_iri".to_string(),
+            serde_json::Value::String(task_iri.to_string()),
+        );
+        projection.insert(
+            "frame".to_string(),
+            serde_json::Value::String(frame_name.to_string()),
+        );
 
         let artifacts = if let Some(sparql_template) = &frame.sparql_template {
             // Flush pending Oxigraph syncs before SPARQL query to avoid write-lock contention
             // and ensure all recently written nodes are queryable.
             self.blackboard.flush_oxigraph();
-            self.execute_sparql_construct(sparql_template, &frame.include_properties, frame.max_nodes)?
+            self.execute_sparql_construct(
+                sparql_template,
+                &frame.include_properties,
+                frame.max_nodes,
+            )?
         } else {
             self.project_from_cache(task_iri, &frame.include_properties, frame.max_nodes)?
         };
@@ -554,16 +707,30 @@ impl ProjectionEngine {
         }
 
         let result = serde_json::to_string(&serde_json::Value::Object(projection.clone()))
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+            .map_err(|e| CoreError::Internal {
+                message: e.to_string(),
+            })?;
 
         let size = result.as_bytes().len();
         let result = if size > self.max_size {
             let truncated = self.truncate_projection(result, self.max_size)?;
-            debug!(original_size = size, truncated_size = truncated.len(), "Projection truncated");
+            debug!(
+                original_size = size,
+                truncated_size = truncated.len(),
+                "Projection truncated"
+            );
             truncated
         } else {
-            let artifacts_count = projection.get("artifacts").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0);
-            debug!(size = size, artifacts_count = artifacts_count, "Projection complete");
+            let artifacts_count = projection
+                .get("artifacts")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            debug!(
+                size = size,
+                artifacts_count = artifacts_count,
+                "Projection complete"
+            );
             result
         };
 
@@ -575,11 +742,16 @@ impl ProjectionEngine {
             created_at: chrono::Utc::now(),
             is_valid: true,
         };
-        self.materialized_cache.write().insert(cache_key.clone(), view);
+        self.materialized_cache
+            .write()
+            .insert(cache_key.clone(), view);
         {
             let mut index = self.reverse_index.write();
             for node in &dependent_nodes {
-                index.entry(node.clone()).or_default().push(cache_key.clone());
+                index
+                    .entry(node.clone())
+                    .or_default()
+                    .push(cache_key.clone());
             }
         }
 
@@ -596,7 +768,8 @@ impl ProjectionEngine {
 
         let results = self.blackboard.query(sparql)?;
 
-        let mut subject_data: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+        let mut subject_data: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+            HashMap::new();
 
         for result in results.iter() {
             let subject = result.get("subject").and_then(|s| s.as_str());
@@ -605,14 +778,17 @@ impl ProjectionEngine {
 
             if let (Some(subj), Some(pred), Some(obj)) = (subject, predicate, object) {
                 let prop_name = Self::predicate_to_property_name(pred);
-                
+
                 if include_properties.contains(&prop_name) || prop_name == "@type" {
                     let entry = subject_data.entry(subj.to_string()).or_insert_with(|| {
                         let mut m = serde_json::Map::new();
-                        m.insert("@id".to_string(), serde_json::Value::String(subj.to_string()));
+                        m.insert(
+                            "@id".to_string(),
+                            serde_json::Value::String(subj.to_string()),
+                        );
                         m
                     });
-                    
+
                     let value = Self::parse_object_value(obj);
                     if prop_name == "@type" {
                         if let Some(existing) = entry.get_mut("@type") {
@@ -638,39 +814,45 @@ impl ProjectionEngine {
             .take(max_nodes)
             .collect();
 
-        debug!(artifacts = artifacts.len(), "SPARQL CONSTRUCT completed (optimized, no N+1)");
+        debug!(
+            artifacts = artifacts.len(),
+            "SPARQL CONSTRUCT completed (optimized, no N+1)"
+        );
         Ok(artifacts)
     }
 
     fn predicate_to_property_name(predicate: &str) -> String {
         let predicate = predicate.trim_start_matches('<').trim_end_matches('>');
-        
+
         if predicate == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
             return "@type".to_string();
         }
-        
+
         if let Some(prop) = predicate.strip_prefix("http://agent-os.org/prop/") {
             return prop.replace('_', " ");
         }
-        
+
         if let Some(prop) = predicate.strip_prefix("http://agent-os.org/ontology/") {
             return prop.to_string();
         }
-        
-        for prefix in &["https://agent-harness.os/task#", "https://agent-harness.os/exec#"] {
+
+        for prefix in &[
+            "https://agent-harness.os/task#",
+            "https://agent-harness.os/exec#",
+        ] {
             if let Some(prop) = predicate.strip_prefix(prefix) {
                 return prop.to_string();
             }
         }
-        
+
         predicate.to_string()
     }
 
     fn parse_object_value(object: &str) -> serde_json::Value {
         let object = object.trim_start_matches('<').trim_end_matches('>');
-        
+
         if object.starts_with('"') && object.ends_with('"') {
-            let inner = &object[1..object.len()-1];
+            let inner = &object[1..object.len() - 1];
             let unescaped = inner
                 .replace("\\n", "\n")
                 .replace("\\r", "\r")
@@ -679,7 +861,7 @@ impl ProjectionEngine {
                 .replace("\\\\", "\\");
             return serde_json::Value::String(unescaped);
         }
-        
+
         if let Ok(n) = object.parse::<i64>() {
             return serde_json::Value::Number(n.into());
         }
@@ -694,7 +876,7 @@ impl ProjectionEngine {
         if object == "false" {
             return serde_json::Value::Bool(false);
         }
-        
+
         serde_json::Value::String(object.to_string())
     }
 
@@ -727,12 +909,15 @@ impl ProjectionEngine {
     }
 
     fn truncate_projection(&self, json: String, max_size: usize) -> Result<String, CoreError> {
-        let mut value: serde_json::Value = serde_json::from_str(&json)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| CoreError::Internal {
+                message: e.to_string(),
+            })?;
 
         loop {
-            let current = serde_json::to_string(&value)
-                .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+            let current = serde_json::to_string(&value).map_err(|e| CoreError::Internal {
+                message: e.to_string(),
+            })?;
 
             if current.len() <= max_size {
                 return Ok(current);
@@ -747,8 +932,9 @@ impl ProjectionEngine {
             }
         }
 
-        let current = serde_json::to_string(&value)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+        let current = serde_json::to_string(&value).map_err(|e| CoreError::Internal {
+            message: e.to_string(),
+        })?;
 
         if current.len() <= max_size {
             return Ok(current);
@@ -758,17 +944,22 @@ impl ProjectionEngine {
             obj.retain(|k, _| k == "@context" || k == "task_iri" || k == "frame");
         }
 
-        let current = serde_json::to_string(&value)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
+        let current = serde_json::to_string(&value).map_err(|e| CoreError::Internal {
+            message: e.to_string(),
+        })?;
 
         if current.len() > max_size {
             if let Some(obj) = value.as_object_mut() {
-                obj.insert("@context".to_string(), Value::String("https://agent-os.org/context".to_string()));
+                obj.insert(
+                    "@context".to_string(),
+                    Value::String("https://agent-os.org/context".to_string()),
+                );
             }
         }
 
-        serde_json::to_string(&value)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })
+        serde_json::to_string(&value).map_err(|e| CoreError::Internal {
+            message: e.to_string(),
+        })
     }
 
     pub fn register_frame(&mut self, frame: ProjectionFrame) {
@@ -788,7 +979,10 @@ impl ProjectionEngine {
         index.clear();
         for (cache_key, view) in cache {
             for node in &view.dependent_nodes {
-                index.entry(node.clone()).or_default().push(cache_key.clone());
+                index
+                    .entry(node.clone())
+                    .or_default()
+                    .push(cache_key.clone());
             }
         }
     }
@@ -833,7 +1027,7 @@ impl ProjectionEngine {
             .filter(|k| k.starts_with(&format!("{}:", task_iri)))
             .cloned()
             .collect();
-        
+
         for key in keys_to_invalidate {
             if let Some(view) = cache.get_mut(&key) {
                 view.is_valid = false;
@@ -866,14 +1060,20 @@ impl ProjectionEngine {
         }
     }
 
-    async fn vector_enhanced_search(&self, query: &str, limit: usize) -> Result<Vec<String>, CoreError> {
+    async fn vector_enhanced_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, CoreError> {
         if let Some(ref vs) = self.vector_store {
             match vs.search(query, limit as u64).await {
                 Ok(entries) => {
-                    let iris: Vec<String> = entries.iter()
-                        .map(|e| e.iri.clone())
-                        .collect();
-                    debug!(query_len = query.len(), results = iris.len(), "Vector search completed");
+                    let iris: Vec<String> = entries.iter().map(|e| e.iri.clone()).collect();
+                    debug!(
+                        query_len = query.len(),
+                        results = iris.len(),
+                        "Vector search completed"
+                    );
                     return Ok(iris);
                 }
                 Err(e) => {
@@ -917,8 +1117,12 @@ impl ProjectionEngine {
         frame_name: &str,
         limit: usize,
     ) -> Result<String, CoreError> {
-        let frame = self.frames.get(frame_name)
-            .ok_or_else(|| CoreError::FrameNotFound { name: frame_name.to_string() })?;
+        let frame = self
+            .frames
+            .get(frame_name)
+            .ok_or_else(|| CoreError::FrameNotFound {
+                name: frame_name.to_string(),
+            })?;
 
         let vector_iris = self.vector_enhanced_search(query, limit).await?;
 
@@ -929,13 +1133,25 @@ impl ProjectionEngine {
         };
 
         let mut projection = serde_json::Map::new();
-        projection.insert("@context".to_string(), (*JsonLdContext::context_value()).clone());
-        projection.insert("query".to_string(), serde_json::Value::String(query.to_string()));
-        projection.insert("frame".to_string(), serde_json::Value::String(frame_name.to_string()));
+        projection.insert(
+            "@context".to_string(),
+            (*JsonLdContext::context_value()).clone(),
+        );
+        projection.insert(
+            "query".to_string(),
+            serde_json::Value::String(query.to_string()),
+        );
+        projection.insert(
+            "frame".to_string(),
+            serde_json::Value::String(frame_name.to_string()),
+        );
         projection.insert("artifacts".to_string(), serde_json::Value::Array(artifacts));
 
-        serde_json::to_string(&serde_json::Value::Object(projection))
-            .map_err(|e| CoreError::Internal { message: e.to_string() })
+        serde_json::to_string(&serde_json::Value::Object(projection)).map_err(|e| {
+            CoreError::Internal {
+                message: e.to_string(),
+            }
+        })
     }
 
     #[instrument(skip(self, frame))]
@@ -988,7 +1204,7 @@ impl ProjectionEngine {
             if let Some(node) = self.blackboard.read_node(&node_iri)? {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&node.json_ld) {
                     let estimated = estimate_tokens(&parsed);
-                    
+
                     if current_tokens + estimated > budget {
                         let remaining_budget = budget.saturating_sub(current_tokens);
                         if remaining_budget > 10 {
@@ -1006,13 +1222,19 @@ impl ProjectionEngine {
         }
 
         let mut projection = serde_json::Map::new();
-        projection.insert("@context".to_string(), serde_json::json!({
-            "agent": "https://agent-harness.os/agent#"
-        }));
+        projection.insert(
+            "@context".to_string(),
+            serde_json::json!({
+                "agent": "https://agent-harness.os/agent#"
+            }),
+        );
         projection.insert("task_iri".to_string(), Value::String(task_iri.to_string()));
         projection.insert("artifacts".to_string(), Value::Array(artifacts));
         projection.insert("token_budget".to_string(), Value::Number(budget.into()));
-        projection.insert("estimated_tokens".to_string(), Value::Number(current_tokens.into()));
+        projection.insert(
+            "estimated_tokens".to_string(),
+            Value::Number(current_tokens.into()),
+        );
 
         Ok(Value::Object(projection))
     }
@@ -1031,8 +1253,8 @@ impl ProjectionEngine {
     pub fn read_node(&self, node_iri: &str) -> Result<Option<serde_json::Value>, CoreError> {
         match self.blackboard.read_node(node_iri)? {
             Some(node) => {
-                let parsed: serde_json::Value = serde_json::from_str(&node.json_ld)
-                    .map_err(|e| CoreError::Internal {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&node.json_ld).map_err(|e| CoreError::Internal {
                         message: format!("Failed to parse L2 node JSON: {}", e),
                     })?;
                 Ok(Some(parsed))
@@ -1053,9 +1275,13 @@ mod tests {
 
         let config = crate::CoreConfig::default();
         let json_ld = r#"{"@id":"iri://task_1/node_1","@type":"Artifact","status":"created"}"#;
-        blackboard.write_node("iri://task_1/node_1", json_ld, &config).unwrap();
+        blackboard
+            .write_node("iri://task_1/node_1", json_ld, &config)
+            .unwrap();
 
-        let result = engine.project("iri://task_1", "reference_only", HashMap::new()).await;
+        let result = engine
+            .project("iri://task_1", "reference_only", HashMap::new())
+            .await;
         assert!(result.is_ok());
     }
 
@@ -1082,7 +1308,7 @@ mod tests {
 
         let summary_frame = engine.get_frame("summary_only").unwrap();
         assert!(summary_frame.jsonld_frame.is_some());
-        
+
         let jsonld_frame = summary_frame.jsonld_frame.as_ref().unwrap();
         assert!(jsonld_frame.max_depth.is_some());
         assert!(!jsonld_frame.include_properties.is_empty());
@@ -1102,10 +1328,14 @@ mod tests {
                 {"@id": "a2", "data": "y".repeat(50)},
                 {"@id": "a3", "data": "z".repeat(50)},
             ]
-        }).to_string();
+        })
+        .to_string();
 
         let result = engine.truncate_projection(large_json, 100).unwrap();
-        assert!(result.len() <= 100, "Truncated result should fit within max_size");
+        assert!(
+            result.len() <= 100,
+            "Truncated result should fit within max_size"
+        );
     }
 
     #[tokio::test]
@@ -1125,12 +1355,19 @@ mod tests {
                 "value": "nested value"
             }
         }"#;
-        
+
         let write_result = blackboard.write_node("iri://task/1/node/1", json_ld, &config);
-        assert!(write_result.is_ok(), "Failed to write node: {:?}", write_result.err());
+        assert!(
+            write_result.is_ok(),
+            "Failed to write node: {:?}",
+            write_result.err()
+        );
 
         let task_nodes = blackboard.get_task_nodes("iri://task/1");
-        assert!(!task_nodes.is_empty(), "No task nodes found for iri://task/1");
+        assert!(
+            !task_nodes.is_empty(),
+            "No task nodes found for iri://task/1"
+        );
 
         let frame = FrameTemplate::new(serde_json::json!({
             "task": "https://agent-harness.os/task#"
@@ -1145,10 +1382,10 @@ mod tests {
         assert!(projection.is_object());
         let obj = projection.as_object().unwrap();
         assert!(obj.contains_key("artifacts"));
-        
+
         let artifacts = obj.get("artifacts").unwrap().as_array().unwrap();
         assert!(!artifacts.is_empty(), "Artifacts should not be empty");
-        
+
         let first_artifact = artifacts[0].as_object().unwrap();
         assert!(first_artifact.contains_key("summary"));
         assert!(first_artifact.contains_key("status"));
@@ -1161,13 +1398,18 @@ mod tests {
 
         let config = crate::CoreConfig::default();
         for i in 1..=5 {
-            let json_ld = format!(r#"{{
+            let json_ld = format!(
+                r#"{{
                 "@id": "iri://task_1/node_{}",
                 "@type": "TaskNode",
                 "summary": "Task node {}",
                 "description": "A longer description for node {}"
-            }}"#, i, i, i);
-            blackboard.write_node(&format!("iri://task_1/node_{}", i), &json_ld, &config).unwrap();
+            }}"#,
+                i, i, i
+            );
+            blackboard
+                .write_node(&format!("iri://task_1/node_{}", i), &json_ld, &config)
+                .unwrap();
         }
 
         let budget = 100;
@@ -1177,13 +1419,16 @@ mod tests {
         let projection = result.unwrap();
         assert!(projection.is_object());
         let obj = projection.as_object().unwrap();
-        
+
         assert!(obj.contains_key("token_budget"));
         assert!(obj.contains_key("estimated_tokens"));
         assert!(obj.contains_key("artifacts"));
 
         let estimated_tokens = obj.get("estimated_tokens").unwrap().as_u64().unwrap() as usize;
-        assert!(estimated_tokens <= budget, "Estimated tokens should be within budget");
+        assert!(
+            estimated_tokens <= budget,
+            "Estimated tokens should be within budget"
+        );
     }
 
     #[test]
@@ -1192,13 +1437,16 @@ mod tests {
         let engine = ProjectionEngine::new(blackboard, 1024);
 
         let mut templates = HashMap::new();
-        templates.insert("summary_only".to_string(), FrameTemplate::new(serde_json::json!({
-            "custom": "https://example.org/custom#"
-        }))
-        .with_max_depth(5));
+        templates.insert(
+            "summary_only".to_string(),
+            FrameTemplate::new(serde_json::json!({
+                "custom": "https://example.org/custom#"
+            }))
+            .with_max_depth(5),
+        );
 
         let updated_engine = engine.with_frame_templates(templates);
-        
+
         let frame = updated_engine.get_frame("summary_only").unwrap();
         assert!(frame.jsonld_frame.is_some());
         let jsonld_frame = frame.jsonld_frame.as_ref().unwrap();
@@ -1210,8 +1458,15 @@ mod tests {
         let blackboard = Arc::new(Blackboard::new().unwrap());
         let engine = ProjectionEngine::new(blackboard, 1024);
 
-        let frames_with_jsonld = vec!["summary_only", "pa_init", "da_input", "ca_review", "aa_decision", "reference_only"];
-        
+        let frames_with_jsonld = vec![
+            "summary_only",
+            "pa_init",
+            "da_input",
+            "ca_review",
+            "aa_decision",
+            "reference_only",
+        ];
+
         for frame_name in frames_with_jsonld {
             let frame = engine.get_frame(frame_name).unwrap();
             assert!(
@@ -1230,14 +1485,18 @@ mod tests {
         let frame = engine.get_frame("workspace_overview").unwrap();
         assert_eq!(frame.name, "workspace_overview");
         assert_eq!(frame.target_role, "SA");
-        assert!(frame.include_properties.contains(&"ws:filePath".to_string()));
+        assert!(frame
+            .include_properties
+            .contains(&"ws:filePath".to_string()));
         assert!(frame.include_properties.contains(&"ws:state".to_string()));
         assert!(frame.sparql_template.is_some());
 
         let frame = engine.get_frame("workspace_stale_files").unwrap();
         assert_eq!(frame.name, "workspace_stale_files");
         assert_eq!(frame.target_role, "DA");
-        assert!(frame.include_properties.contains(&"ws:filePath".to_string()));
+        assert!(frame
+            .include_properties
+            .contains(&"ws:filePath".to_string()));
         assert!(frame.sparql_template.is_some());
 
         let frame = engine.get_frame("workspace_file_detail").unwrap();
@@ -1251,12 +1510,21 @@ mod tests {
         let engine = ProjectionEngine::new(blackboard, 2048);
 
         let overview = engine.get_frame("workspace_overview").unwrap();
-        assert!(overview.max_nodes >= 100, "workspace_overview should handle at least 100 files");
+        assert!(
+            overview.max_nodes >= 100,
+            "workspace_overview should handle at least 100 files"
+        );
 
         let stale = engine.get_frame("workspace_stale_files").unwrap();
-        assert!(stale.max_nodes >= 50, "workspace_stale_files should handle at least 50 files");
+        assert!(
+            stale.max_nodes >= 50,
+            "workspace_stale_files should handle at least 50 files"
+        );
 
         let detail = engine.get_frame("workspace_file_detail").unwrap();
-        assert!(detail.max_nodes >= 1, "workspace_file_detail should handle at least 1 file");
+        assert!(
+            detail.max_nodes >= 1,
+            "workspace_file_detail should handle at least 1 file"
+        );
     }
 }

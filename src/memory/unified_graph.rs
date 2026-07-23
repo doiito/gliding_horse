@@ -5,8 +5,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use oxigraph::model::{Literal, NamedNode, Quad, Term};
 use oxigraph::sparql::QueryResults;
-use oxigraph::store::Store;
-use parking_lot::RwLock;
+use oxigraph::store::{Store, Transaction};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -24,7 +23,7 @@ pub struct Entity {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PropertyValue {
     String(String),
     Integer(i64),
@@ -70,53 +69,9 @@ pub struct GraphStats {
     pub entities: usize,
 }
 
-pub struct TransactionLog {
-    operations: Vec<TransactionOperation>,
-}
-
-#[derive(Debug, Clone)]
-pub enum TransactionOperation {
-    InsertTriple { subject: String, predicate: String, object: String, graph: Option<String> },
-    DeleteTriple { subject: String, predicate: String, object: String, graph: Option<String> },
-}
-
-impl TransactionLog {
-    pub fn new() -> Self {
-        Self { operations: Vec::new() }
-    }
-
-    pub fn log_insert(&mut self, subject: &str, predicate: &str, object: &str, graph: Option<&str>) {
-        self.operations.push(TransactionOperation::InsertTriple {
-            subject: subject.to_string(),
-            predicate: predicate.to_string(),
-            object: object.to_string(),
-            graph: graph.map(|g| g.to_string()),
-        });
-    }
-
-    pub fn log_delete(&mut self, subject: &str, predicate: &str, object: &str, graph: Option<&str>) {
-        self.operations.push(TransactionOperation::DeleteTriple {
-            subject: subject.to_string(),
-            predicate: predicate.to_string(),
-            object: object.to_string(),
-            graph: graph.map(|g| g.to_string()),
-        });
-    }
-
-    pub fn clear(&mut self) {
-        self.operations.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.operations.len()
-    }
-}
-
 pub struct UnifiedGraphStore {
     store: Arc<Store>,
     default_graph: String,
-    transaction_log: RwLock<TransactionLog>,
-    in_transaction: RwLock<bool>,
 }
 
 impl UnifiedGraphStore {
@@ -125,18 +80,14 @@ impl UnifiedGraphStore {
         Ok(Self {
             store: Arc::new(Store::new()?),
             default_graph: "http://agent-os.org/graph/default".to_string(),
-            transaction_log: RwLock::new(TransactionLog::new()),
-            in_transaction: RwLock::new(false),
         })
     }
 
     pub fn new_persistent<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        info!(path = %path.as_ref().display(), "Initializing Unified Oxigraph Store (in-memory, rocksdb unavailable)");
+        info!(path = %path.as_ref().display(), "Initializing persistent Unified Oxigraph Store");
         Ok(Self {
-            store: Arc::new(Store::new()?),
+            store: Arc::new(Store::open(path)?),
             default_graph: "http://agent-os.org/graph/default".to_string(),
-            transaction_log: RwLock::new(TransactionLog::new()),
-            in_transaction: RwLock::new(false),
         })
     }
 
@@ -153,13 +104,23 @@ impl UnifiedGraphStore {
         Self {
             store,
             default_graph: "http://agent-os.org/graph/default".to_string(),
-            transaction_log: RwLock::new(TransactionLog::new()),
-            in_transaction: RwLock::new(false),
         }
     }
 
     pub fn store(&self) -> Arc<Store> {
         self.store.clone()
+    }
+
+    /// Execute a real Oxigraph transaction.  The closure's writes are visible
+    /// only if it returns `Ok`; returning an error aborts all writes.
+    pub fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&mut Transaction<'_>) -> Result<T, Box<dyn std::error::Error>>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let mut transaction = self.store.start_transaction()?;
+        let result = operation(&mut transaction)?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn ref_count(&self) -> usize {
@@ -169,88 +130,109 @@ impl UnifiedGraphStore {
     fn parse_uri(&self, uri: &str) -> NamedNode {
         NamedNode::new_unchecked(uri)
     }
-    fn term_to_string(&self, term: &Term) -> String {
-        match term {
-            Term::NamedNode(node) => node.as_str().to_string(),
-            Term::BlankNode(node) => node.as_str().to_string(),
-            Term::Literal(lit) => {
-                let value = lit.value();
-                if let Some(lang) = lit.language() {
-                    format!("\"{}\"@{}", value, lang)
-                } else {
-                    let datatype = lit.datatype();
-                    format!("\"{}\"^^<{}>", value, datatype.as_str())
-                }
-            }
-        }
+
+    pub fn add_entity(
+        &self,
+        entity: &Entity,
+        graph: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.add_entities_atomic(std::slice::from_ref(entity), graph)
     }
 
-    pub fn add_entity(&self, entity: &Entity, graph: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    /// Atomically insert one or more complete entities into the selected graph.
+    ///
+    /// Oxigraph commits the closure only when every quad insert succeeds.  This
+    /// replaces the former begin/commit/rollback façade whose writes had
+    /// already escaped to the store before rollback was requested.
+    pub fn add_entities_atomic(
+        &self,
+        entities: &[Entity],
+        graph: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let graph_uri = graph.unwrap_or(&self.default_graph);
         let graph_node = self.parse_uri(graph_uri);
-        let subject = self.parse_uri(&entity.id);
 
-        for type_uri in &entity.types {
-            let quad = Quad::new(
-                subject.clone(),
-                NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
-                self.parse_uri(type_uri),
-                graph_node.clone(),
-            );
-            self.store.insert(&quad)?;
-            self.transaction_log.write().log_insert(&entity.id, "rdf:type", type_uri, Some(graph_uri));
-        }
+        self.transaction(|transaction| {
+            for entity in entities {
+                let subject = self.parse_uri(&entity.id);
+                for type_uri in &entity.types {
+                    transaction.insert(&Quad::new(
+                        subject.clone(),
+                        NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                        self.parse_uri(type_uri),
+                        graph_node.clone(),
+                    ));
+                }
+                for (predicate, value) in &entity.properties {
+                    transaction.insert(&Quad::new(
+                        subject.clone(),
+                        NamedNode::new_unchecked(predicate),
+                        self.property_value_to_term(value)?,
+                        graph_node.clone(),
+                    ));
+                }
+            }
+            Ok(())
+        })?;
 
-        for (predicate, value) in &entity.properties {
-            let predicate_node = NamedNode::new_unchecked(predicate);
-            let object_term = self.property_value_to_term(value);
-            let quad = Quad::new(
-                subject.clone(),
-                predicate_node,
-                object_term.clone(),
-                graph_node.clone(),
-            );
-            self.store.insert(&quad)?;
-            self.transaction_log.write().log_insert(&entity.id, predicate, &self.term_to_string(&object_term), Some(graph_uri));
-        }
-
-        debug!(entity_id = %entity.id, graph = %graph_uri, "Entity added");
+        debug!(entities = entities.len(), graph = %graph_uri, "Entities added atomically");
         Ok(())
     }
 
-    fn property_value_to_term(&self, value: &PropertyValue) -> Term {
-        match value {
+    fn property_value_to_term(
+        &self,
+        value: &PropertyValue,
+    ) -> Result<Term, Box<dyn std::error::Error>> {
+        Ok(match value {
             PropertyValue::String(s) => Term::Literal(Literal::new_simple_literal(s)),
-            PropertyValue::Integer(n) => Term::Literal(Literal::new_typed_literal(n.to_string(), NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"))),
-            PropertyValue::Float(f) => Term::Literal(Literal::new_typed_literal(f.to_string(), NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#double"))),
-            PropertyValue::Boolean(b) => Term::Literal(Literal::new_typed_literal(b.to_string(), NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#boolean"))),
+            PropertyValue::Integer(n) => Term::Literal(Literal::new_typed_literal(
+                n.to_string(),
+                NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+            )),
+            PropertyValue::Float(f) => Term::Literal(Literal::new_typed_literal(
+                f.to_string(),
+                NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#double"),
+            )),
+            PropertyValue::Boolean(b) => Term::Literal(Literal::new_typed_literal(
+                b.to_string(),
+                NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#boolean"),
+            )),
             PropertyValue::Reference(uri) => Term::NamedNode(self.parse_uri(uri)),
             PropertyValue::Array(items) => {
-                if items.is_empty() {
-                    Term::Literal(Literal::new_simple_literal(""))
-                } else {
-                    self.property_value_to_term(&items[0])
-                }
+                // A repeated RDF predicate would lose the distinction between
+                // a scalar and a one-element array. `rdf:JSON` is the RDF 1.1
+                // typed-literal representation and preserves nested arrays
+                // without creating orphaned RDF list blank nodes on updates.
+                let serialized = serde_json::to_string(items)?;
+                Term::Literal(Literal::new_typed_literal(
+                    serialized,
+                    NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"),
+                ))
             }
-        }
+        })
     }
 
     pub fn get_entity(&self, id: &str, graph: Option<&str>) -> Option<Entity> {
         let subject = self.parse_uri(id);
         let mut types = Vec::new();
-        let mut properties = HashMap::new();
+        let mut property_values: HashMap<String, Vec<PropertyValue>> = HashMap::new();
 
         let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
 
         let graph_node = graph.map(|g| self.parse_uri(g));
-        let graph_name: Option<oxigraph::model::GraphNameRef<'_>> = graph_node
-            .as_ref()
-            .map(|node| node.as_ref().into());
+        let graph_name: Option<oxigraph::model::GraphNameRef<'_>> =
+            graph_node.as_ref().map(|node| node.as_ref().into());
 
-        let results: Vec<Quad> = self.store
+        let mut results: Vec<Quad> = self
+            .store
             .quads_for_pattern(Some(subject.as_ref().into()), None, None, graph_name)
             .collect::<Result<Vec<_>, _>>()
             .ok()?;
+        // RDF does not define an insertion order for repeated predicates.
+        // Canonicalize external multi-value reads while retaining the exact
+        // order of `PropertyValue::Array`, which is stored as one rdf:JSON
+        // literal rather than repeated predicates.
+        results.sort_by_key(|quad| (quad.predicate.as_str().to_string(), quad.object.to_string()));
 
         for quad in &results {
             if quad.predicate == rdf_type {
@@ -259,15 +241,36 @@ impl UnifiedGraphStore {
                 }
             } else {
                 let value = self.term_to_property_value(&quad.object);
-                properties.insert(quad.predicate.as_str().to_string(), value);
+                property_values
+                    .entry(quad.predicate.as_str().to_string())
+                    .or_default()
+                    .push(value);
             }
         }
+
+        let properties = property_values
+            .into_iter()
+            .map(|(predicate, mut values)| {
+                let value = if values.len() == 1 {
+                    values.pop().expect("single property value must exist")
+                } else {
+                    PropertyValue::Array(values)
+                };
+                (predicate, value)
+            })
+            .collect::<HashMap<_, _>>();
 
         if types.is_empty() && properties.is_empty() {
             None
         } else {
             let now = Utc::now();
-            Some(Entity { id: id.to_string(), types, properties, created_at: now, updated_at: now })
+            Some(Entity {
+                id: id.to_string(),
+                types,
+                properties,
+                created_at: now,
+                updated_at: now,
+            })
         }
     }
 
@@ -280,12 +283,29 @@ impl UnifiedGraphStore {
                     return PropertyValue::String(value.to_string());
                 }
                 let dtype = lit.datatype().as_str();
+                if dtype == "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON" {
+                    return serde_json::from_str::<Vec<PropertyValue>>(value)
+                        .map(PropertyValue::Array)
+                        .unwrap_or_else(|_| PropertyValue::String(value.to_string()));
+                }
                 if dtype.contains("integer") {
-                    value.parse::<i64>().map(PropertyValue::Integer).unwrap_or_else(|_| PropertyValue::String(value.to_string()))
-                } else if dtype.contains("double") || dtype.contains("float") || dtype.contains("decimal") {
-                    value.parse::<f64>().map(PropertyValue::Float).unwrap_or_else(|_| PropertyValue::String(value.to_string()))
+                    value
+                        .parse::<i64>()
+                        .map(PropertyValue::Integer)
+                        .unwrap_or_else(|_| PropertyValue::String(value.to_string()))
+                } else if dtype.contains("double")
+                    || dtype.contains("float")
+                    || dtype.contains("decimal")
+                {
+                    value
+                        .parse::<f64>()
+                        .map(PropertyValue::Float)
+                        .unwrap_or_else(|_| PropertyValue::String(value.to_string()))
                 } else if dtype.contains("boolean") {
-                    value.parse::<bool>().map(PropertyValue::Boolean).unwrap_or_else(|_| PropertyValue::String(value.to_string()))
+                    value
+                        .parse::<bool>()
+                        .map(PropertyValue::Boolean)
+                        .unwrap_or_else(|_| PropertyValue::String(value.to_string()))
                 } else {
                     PropertyValue::String(value.to_string())
                 }
@@ -294,20 +314,65 @@ impl UnifiedGraphStore {
         }
     }
 
-    pub fn update_entity(&self, entity: &Entity, graph: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        self.delete_entity(&entity.id, graph)?;
-        self.add_entity(entity, graph)?;
+    pub fn update_entity(
+        &self,
+        entity: &Entity,
+        graph: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let graph_uri = graph.unwrap_or(&self.default_graph);
+        let graph_node = self.parse_uri(graph_uri);
+        let subject = self.parse_uri(&entity.id);
+        self.transaction(|transaction| {
+            let old_quads: Vec<Quad> = transaction
+                .quads_for_pattern(
+                    Some(subject.as_ref().into()),
+                    None,
+                    None,
+                    Some(graph_node.as_ref().into()),
+                )
+                .collect::<Result<_, _>>()?;
+            for quad in old_quads {
+                transaction.remove(&quad);
+            }
+            for type_uri in &entity.types {
+                transaction.insert(&Quad::new(
+                    subject.clone(),
+                    NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                    self.parse_uri(type_uri),
+                    graph_node.clone(),
+                ));
+            }
+            for (predicate, value) in &entity.properties {
+                transaction.insert(&Quad::new(
+                    subject.clone(),
+                    NamedNode::new_unchecked(predicate),
+                    self.property_value_to_term(value)?,
+                    graph_node.clone(),
+                ));
+            }
+            Ok(())
+        })?;
         debug!(entity_id = %entity.id, "Entity updated");
         Ok(())
     }
 
-    pub fn delete_entity(&self, id: &str, graph: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn delete_entity(
+        &self,
+        id: &str,
+        graph: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let subject = self.parse_uri(id);
         let graph_uri = graph.unwrap_or(&self.default_graph);
         let graph_ref = self.parse_uri(graph_uri);
 
-        let quads_to_remove: Vec<Quad> = self.store
-            .quads_for_pattern(Some(subject.as_ref().into()), None, None, Some(graph_ref.as_ref().into()))
+        let quads_to_remove: Vec<Quad> = self
+            .store
+            .quads_for_pattern(
+                Some(subject.as_ref().into()),
+                None,
+                None,
+                Some(graph_ref.as_ref().into()),
+            )
             .collect::<Result<Vec<_>, _>>()?;
 
         for quad in &quads_to_remove {
@@ -318,14 +383,18 @@ impl UnifiedGraphStore {
         Ok(())
     }
 
-    pub fn add_relation(&self, relation: &Relation, graph: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn add_relation(
+        &self,
+        relation: &Relation,
+        graph: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let graph_uri = graph.unwrap_or(&self.default_graph);
         let graph_node = self.parse_uri(graph_uri);
         let subject = self.parse_uri(&relation.subject);
         let predicate = NamedNode::new_unchecked(&relation.predicate);
         let object = match &relation.object {
             RelationObject::Node(uri) => self.parse_uri(uri).into(),
-            RelationObject::Value(v) => self.property_value_to_term(v),
+            RelationObject::Value(v) => self.property_value_to_term(v)?,
         };
 
         let quad = Quad::new(subject, predicate, object, graph_node);
@@ -335,14 +404,18 @@ impl UnifiedGraphStore {
         Ok(())
     }
 
-    pub fn delete_relation(&self, relation: &Relation, graph: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn delete_relation(
+        &self,
+        relation: &Relation,
+        graph: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let graph_uri = graph.unwrap_or(&self.default_graph);
         let graph_node = self.parse_uri(graph_uri);
         let subject = self.parse_uri(&relation.subject);
         let predicate = NamedNode::new_unchecked(&relation.predicate);
         let object = match &relation.object {
             RelationObject::Node(uri) => self.parse_uri(uri).into(),
-            RelationObject::Value(v) => self.property_value_to_term(v),
+            RelationObject::Value(v) => self.property_value_to_term(v)?,
         };
 
         let quad = Quad::new(subject, predicate, object, graph_node);
@@ -365,7 +438,11 @@ impl UnifiedGraphStore {
                 for result in solutions {
                     let result = result?;
                     if variables.is_empty() {
-                        variables = result.variables().iter().map(|v| v.as_str().to_string()).collect();
+                        variables = result
+                            .variables()
+                            .iter()
+                            .map(|v| v.as_str().to_string())
+                            .collect();
                     }
 
                     let mut row = HashMap::new();
@@ -376,7 +453,9 @@ impl UnifiedGraphStore {
                                 let lang = lit.language().map(|l| l.to_string());
                                 SparqlValue::Literal(lit.value().to_string(), lang)
                             }
-                            Term::BlankNode(node) => SparqlValue::BlankNode(node.as_str().to_string()),
+                            Term::BlankNode(node) => {
+                                SparqlValue::BlankNode(node.as_str().to_string())
+                            }
                         };
                         row.insert(var.as_str().to_string(), sparql_value);
                     }
@@ -391,8 +470,15 @@ impl UnifiedGraphStore {
             }
         }
 
-        debug!(variables = variables.len(), bindings = bindings.len(), "SPARQL query completed");
-        Ok(SparqlQueryResult { variables, bindings })
+        debug!(
+            variables = variables.len(),
+            bindings = bindings.len(),
+            "SPARQL query completed"
+        );
+        Ok(SparqlQueryResult {
+            variables,
+            bindings,
+        })
     }
 
     pub fn query_as_json(&self, sparql: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -438,7 +524,8 @@ impl UnifiedGraphStore {
 
     pub fn drop_named_graph(&self, graph_uri: &str) -> Result<(), Box<dyn std::error::Error>> {
         let graph_node = self.parse_uri(graph_uri);
-        let quads_to_remove: Vec<Quad> = self.store
+        let quads_to_remove: Vec<Quad> = self
+            .store
             .quads_for_pattern(None, None, None, Some(graph_node.as_ref().into()))
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -451,7 +538,8 @@ impl UnifiedGraphStore {
     }
 
     pub fn list_named_graphs(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let graphs: Vec<String> = self.store
+        let graphs: Vec<String> = self
+            .store
             .named_graphs()
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -459,25 +547,158 @@ impl UnifiedGraphStore {
             .collect();
         Ok(graphs)
     }
+}
 
-    pub fn begin_transaction(&self) {
-        *self.in_transaction.write() = true;
-        self.transaction_log.write().clear();
-        debug!("Transaction begun");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_store_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("unified-graph");
+        let entity = Entity {
+            id: "https://example.org/entity".to_string(),
+            types: vec!["https://example.org/Type".to_string()],
+            properties: HashMap::from([(
+                "https://example.org/name".to_string(),
+                PropertyValue::String("persisted".to_string()),
+            )]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        {
+            let store = UnifiedGraphStore::new_persistent(&graph_path).unwrap();
+            store
+                .add_entity(&entity, Some("https://example.org/graph"))
+                .unwrap();
+        }
+
+        let reopened = UnifiedGraphStore::new_persistent(&graph_path).unwrap();
+        let loaded = reopened
+            .get_entity(
+                "https://example.org/entity",
+                Some("https://example.org/graph"),
+            )
+            .expect("entity should be present after reopening persistent store");
+        assert_eq!(loaded.types, entity.types);
+        assert!(matches!(
+            loaded.properties.get("https://example.org/name"),
+            Some(PropertyValue::String(value)) if value == "persisted"
+        ));
     }
 
-    pub fn commit_transaction(&self) -> Result<(), Box<dyn std::error::Error>> {
-        *self.in_transaction.write() = false;
-        let ops = self.transaction_log.read().len();
-        self.transaction_log.write().clear();
-        debug!(operations = ops, "Transaction committed");
-        Ok(())
+    #[test]
+    fn transaction_error_rolls_back_all_written_quads() {
+        let store = UnifiedGraphStore::new().unwrap();
+        let subject = NamedNode::new("https://example.org/transactional").unwrap();
+        let predicate = NamedNode::new("https://example.org/name").unwrap();
+        let graph = NamedNode::new("https://example.org/graph").unwrap();
+        let quad = Quad::new(
+            subject,
+            predicate,
+            Literal::new_simple_literal("temporary"),
+            graph,
+        );
+
+        let result: Result<(), Box<dyn std::error::Error>> = store.transaction(|transaction| {
+            transaction.insert(&quad);
+            Err(Box::new(std::io::Error::other("abort")))
+        });
+        assert!(result.is_err());
+        assert!(store
+            .get_entity(
+                "https://example.org/transactional",
+                Some("https://example.org/graph")
+            )
+            .is_none());
     }
 
-    pub fn rollback_transaction(&self) {
-        *self.in_transaction.write() = false;
-        let ops = self.transaction_log.read().len();
-        self.transaction_log.write().clear();
-        debug!(operations = ops, "Transaction rolled back");
+    #[test]
+    fn update_entity_replaces_the_complete_entity_atomically() {
+        let store = UnifiedGraphStore::new().unwrap();
+        let graph = "https://example.org/graph";
+        let mut first = Entity {
+            id: "https://example.org/entity".to_string(),
+            types: vec!["https://example.org/OldType".to_string()],
+            properties: HashMap::from([(
+                "https://example.org/name".to_string(),
+                PropertyValue::String("old".to_string()),
+            )]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.add_entity(&first, Some(graph)).unwrap();
+        first.types = vec!["https://example.org/NewType".to_string()];
+        first.properties.insert(
+            "https://example.org/name".to_string(),
+            PropertyValue::String("new".to_string()),
+        );
+        store.update_entity(&first, Some(graph)).unwrap();
+
+        let updated = store.get_entity(&first.id, Some(graph)).unwrap();
+        assert_eq!(updated.types, first.types);
+        assert!(matches!(
+            updated.properties.get("https://example.org/name"),
+            Some(PropertyValue::String(value)) if value == "new"
+        ));
+    }
+
+    #[test]
+    fn array_property_round_trips_without_losing_values_or_shape() {
+        let store = UnifiedGraphStore::new().unwrap();
+        let graph = "https://example.org/graph";
+        let values = vec![
+            PropertyValue::String("alpha".to_string()),
+            PropertyValue::Integer(7),
+            PropertyValue::Reference("https://example.org/related".to_string()),
+            PropertyValue::Array(vec![PropertyValue::Boolean(true)]),
+        ];
+        let entity = Entity {
+            id: "https://example.org/array-entity".to_string(),
+            types: vec!["https://example.org/Type".to_string()],
+            properties: HashMap::from([(
+                "https://example.org/values".to_string(),
+                PropertyValue::Array(values.clone()),
+            )]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.add_entity(&entity, Some(graph)).unwrap();
+        let loaded = store.get_entity(&entity.id, Some(graph)).unwrap();
+        assert_eq!(
+            loaded.properties.get("https://example.org/values"),
+            Some(&PropertyValue::Array(values)),
+        );
+    }
+
+    #[test]
+    fn repeated_rdf_predicates_are_exposed_as_an_array() {
+        let store = UnifiedGraphStore::new().unwrap();
+        let graph = "https://example.org/graph";
+        let relation = |value: &str| Relation {
+            subject: "https://example.org/repeated-values".to_string(),
+            predicate: "https://example.org/tag".to_string(),
+            object: RelationObject::Value(PropertyValue::String(value.to_string())),
+            created_at: Utc::now(),
+        };
+
+        store.add_relation(&relation("first"), Some(graph)).unwrap();
+        store
+            .add_relation(&relation("second"), Some(graph))
+            .unwrap();
+
+        let loaded = store
+            .get_entity("https://example.org/repeated-values", Some(graph))
+            .unwrap();
+        assert_eq!(
+            loaded.properties.get("https://example.org/tag"),
+            Some(&PropertyValue::Array(vec![
+                PropertyValue::String("first".to_string()),
+                PropertyValue::String("second".to_string()),
+            ])),
+        );
     }
 }

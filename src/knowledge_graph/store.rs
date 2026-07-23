@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use oxigraph::sparql::QueryResults;
 use oxigraph::store::Store;
+use std::sync::Arc;
 
 use super::rdf_mapper::RdfMapper;
 use super::types::RdfQuad;
@@ -82,21 +82,28 @@ impl KnowledgeGraphStore {
     }
 
     #[allow(deprecated)]
-    pub fn delete_quads_by_subject_prefix(&self, prefix: &str, graph: &str) -> Result<usize, String> {
+    pub fn delete_quads_by_subject_prefix(
+        &self,
+        prefix: &str,
+        graph: &str,
+    ) -> Result<usize, String> {
         let sparql = format!(
             "SELECT DISTINCT ?s WHERE {{ GRAPH <{}> {{ ?s ?p ?o . FILTER(STRSTARTS(STR(?s), \"{}\")) }} }}",
             graph, Self::escape_sparql_string(prefix)
         );
 
         let subjects: Vec<String> = match self.store.query(&sparql) {
-            Ok(QueryResults::Solutions(solutions)) => {
-                solutions
-                    .filter_map(|sol| sol.ok())
-                    .filter_map(|sol| {
-                        sol.get(0).map(|v| v.to_string().trim_start_matches('<').trim_end_matches('>').to_string())
+            Ok(QueryResults::Solutions(solutions)) => solutions
+                .filter_map(|sol| sol.ok())
+                .filter_map(|sol| {
+                    sol.get(0).map(|v| {
+                        v.to_string()
+                            .trim_start_matches('<')
+                            .trim_end_matches('>')
+                            .to_string()
                     })
-                    .collect()
-            }
+                })
+                .collect(),
             _ => return Ok(0),
         };
 
@@ -110,6 +117,49 @@ impl KnowledgeGraphStore {
         }
 
         Ok(count)
+    }
+
+    /// Remove the source-file node and every declaration currently owned by
+    /// it. AST declaration IRIs are `fn:/class:/…` rather than descendants of
+    /// the file IRI, so prefix deletion alone leaves stale declarations after
+    /// an incremental re-extraction.
+    #[allow(deprecated)]
+    pub fn delete_code_file_subgraph(&self, file_iri: &str, graph: &str) -> Result<usize, String> {
+        let contains = "https://agentos.ontology/code/contains";
+        let query = format!(
+            "SELECT DISTINCT ?node WHERE {{ GRAPH <{}> {{ <{}> <{}> ?node . }} }}",
+            graph, file_iri, contains
+        );
+        let mut subjects = vec![file_iri.to_string()];
+        if let Ok(QueryResults::Solutions(rows)) = self.store.query(&query) {
+            subjects.extend(rows.filter_map(Result::ok).filter_map(|row| {
+                row.get(0).map(|term| {
+                    term.to_string()
+                        .trim_start_matches('<')
+                        .trim_end_matches('>')
+                        .to_string()
+                })
+            }));
+        }
+        subjects.sort();
+        subjects.dedup();
+
+        for subject in &subjects {
+            let escaped = format!("<{}>", subject);
+            self.store
+                .update(&format!(
+                    "DELETE WHERE {{ GRAPH <{}> {{ {} ?p ?o . }} }}",
+                    graph, escaped
+                ))
+                .map_err(|e| format!("SPARQL DELETE failed: {}", e))?;
+            self.store
+                .update(&format!(
+                    "DELETE WHERE {{ GRAPH <{}> {{ ?s ?p {} . }} }}",
+                    graph, escaped
+                ))
+                .map_err(|e| format!("SPARQL DELETE failed: {}", e))?;
+        }
+        Ok(subjects.len())
     }
 
     #[allow(deprecated)]
@@ -195,9 +245,16 @@ impl KnowledgeGraphStore {
 
         let type_filter = match entity_type {
             Some(t) => {
-                let type_iri = if t.contains("://") { t.to_string() } else { format!("http://agent-os.org/ontology/{}", t) };
-                format!("?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .", type_iri)
-            },
+                let type_iri = if t.contains("://") {
+                    t.to_string()
+                } else {
+                    format!("http://agent-os.org/ontology/{}", t)
+                };
+                format!(
+                    "?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .",
+                    type_iri
+                )
+            }
             None => String::new(),
         };
 
@@ -239,10 +296,8 @@ impl KnowledgeGraphStore {
             for node_id in &current_level {
                 let node = format!("<{}>", node_id);
 
-                let out_sparql = format!(
-                    "SELECT ?p ?o WHERE {{ GRAPH ?g {{ {} ?p ?o . }} }}",
-                    node
-                );
+                let out_sparql =
+                    format!("SELECT ?p ?o WHERE {{ GRAPH ?g {{ {} ?p ?o . }} }}", node);
                 let out_results = self.query_sparql(&out_sparql, None)?;
 
                 for row in &out_results {
@@ -265,10 +320,7 @@ impl KnowledgeGraphStore {
                     }
                 }
 
-                let in_sparql = format!(
-                    "SELECT ?s ?p WHERE {{ GRAPH ?g {{ ?s ?p {} . }} }}",
-                    node
-                );
+                let in_sparql = format!("SELECT ?s ?p WHERE {{ GRAPH ?g {{ ?s ?p {} . }} }}", node);
                 let in_results = self.query_sparql(&in_sparql, None)?;
 
                 for row in &in_results {
@@ -398,10 +450,7 @@ mod tests {
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
         let results = store
-            .query_sparql(
-                "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
-                Some(TEST_GRAPH),
-            )
+            .query_sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", Some(TEST_GRAPH))
             .unwrap();
 
         assert_eq!(results.len(), 3, "should return 3 triples");
@@ -471,41 +520,34 @@ mod tests {
         let label = results[0].get("?label").and_then(|v| v.as_str()).unwrap();
         assert!(label.contains("Alice"));
 
-        let person_results = store
-            .search_entities("o", Some(PERSON))
-            .unwrap();
+        let person_results = store.search_entities("o", Some(PERSON)).unwrap();
         assert!(
             person_results.len() >= 2,
             "search by type Person should find at least 2"
         );
 
-        let vehicle_results = store
-            .search_entities("alice", Some(VEHICLE))
-            .unwrap();
-        assert_eq!(
-            vehicle_results.len(),
-            0,
-            "Alice is not Vehicle type"
-        );
+        let vehicle_results = store.search_entities("alice", Some(VEHICLE)).unwrap();
+        assert_eq!(vehicle_results.len(), 0, "Alice is not Vehicle type");
     }
 
     #[test]
     fn test_search_entities_case_insensitive() {
         let store = KnowledgeGraphStore::new().unwrap();
 
-        let quads = vec![
-            make_quad(
-                "http://example.org/alice",
-                RDFS_LABEL,
-                RdfValue::Literal("Alice".to_string()),
-            ),
-        ];
+        let quads = vec![make_quad(
+            "http://example.org/alice",
+            RDFS_LABEL,
+            RdfValue::Literal("Alice".to_string()),
+        )];
 
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
-        let upper = store.search_entities("ALICE", None)
-            .unwrap();
-        assert_eq!(upper.len(), 1, "case-insensitive search should find results");
+        let upper = store.search_entities("ALICE", None).unwrap();
+        assert_eq!(
+            upper.len(),
+            1,
+            "case-insensitive search should find results"
+        );
 
         let lower = store.search_entities("alice", None).unwrap();
         assert_eq!(lower.len(), 1);
@@ -558,9 +600,7 @@ mod tests {
 
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
-        let result = store
-            .get_neighbors("http://example.org/alice", 1)
-            .unwrap();
+        let result = store.get_neighbors("http://example.org/alice", 1).unwrap();
 
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         assert!(
@@ -570,9 +610,7 @@ mod tests {
 
         let knows: Vec<_> = neighbors
             .iter()
-            .filter(|n| {
-                n.get("predicate").and_then(|v| v.as_str()) == Some(KNOWS)
-            })
+            .filter(|n| n.get("predicate").and_then(|v| v.as_str()) == Some(KNOWS))
             .collect();
         assert_eq!(knows.len(), 1, "should find 1 knows relation");
         assert_eq!(
@@ -600,9 +638,7 @@ mod tests {
 
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
-        let result = store
-            .get_neighbors("http://example.org/alice", 2)
-            .unwrap();
+        let result = store.get_neighbors("http://example.org/alice", 2).unwrap();
 
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         assert!(
@@ -633,11 +669,12 @@ mod tests {
     #[test]
     fn test_get_neighbors_zero_depth() {
         let store = KnowledgeGraphStore::new().unwrap();
-        let result = store
-            .get_neighbors("http://example.org/alice", 0)
-            .unwrap();
+        let result = store.get_neighbors("http://example.org/alice", 0).unwrap();
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
-        assert!(neighbors.is_empty(), "depth=0 should return empty neighbor list");
+        assert!(
+            neighbors.is_empty(),
+            "depth=0 should return empty neighbor list"
+        );
     }
 
     #[test]
@@ -656,21 +693,16 @@ mod tests {
     fn test_query_sparql_no_named_graph() {
         let store = KnowledgeGraphStore::new().unwrap();
 
-        let quads = vec![
-            make_quad(
-                "http://example.org/x",
-                RDFS_LABEL,
-                RdfValue::Literal("X".to_string()),
-            ),
-        ];
+        let quads = vec![make_quad(
+            "http://example.org/x",
+            RDFS_LABEL,
+            RdfValue::Literal("X".to_string()),
+        )];
 
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
         let results = store
-            .query_sparql(
-                "SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }",
-                None,
-            )
+            .query_sparql("SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }", None)
             .unwrap();
         assert!(
             !results.is_empty(),
@@ -682,13 +714,11 @@ mod tests {
     fn test_query_sparql_with_graph_clause() {
         let store = KnowledgeGraphStore::new().unwrap();
 
-        let quads = vec![
-            make_quad(
-                "http://example.org/x",
-                RDFS_LABEL,
-                RdfValue::Literal("X".to_string()),
-            ),
-        ];
+        let quads = vec![make_quad(
+            "http://example.org/x",
+            RDFS_LABEL,
+            RdfValue::Literal("X".to_string()),
+        )];
 
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
@@ -697,33 +727,37 @@ mod tests {
             TEST_GRAPH
         );
         let results = store.query_sparql(&sparql, Some(TEST_GRAPH)).unwrap();
-        assert_eq!(results.len(), 1, "should not double-wrap when GRAPH clause already exists");
+        assert_eq!(
+            results.len(),
+            1,
+            "should not double-wrap when GRAPH clause already exists"
+        );
     }
 
     #[test]
     fn test_incoming_neighbors() {
         let store = KnowledgeGraphStore::new().unwrap();
 
-        let quads = vec![
-            make_quad(
-                "http://example.org/alice",
-                KNOWS,
-                RdfValue::Iri("http://example.org/bob".to_string()),
-            ),
-        ];
+        let quads = vec![make_quad(
+            "http://example.org/alice",
+            KNOWS,
+            RdfValue::Iri("http://example.org/bob".to_string()),
+        )];
 
         store.write_quads(&quads, TEST_GRAPH).unwrap();
 
-        let result = store
-            .get_neighbors("http://example.org/bob", 1)
-            .unwrap();
+        let result = store.get_neighbors("http://example.org/bob", 1).unwrap();
 
         let neighbors = result.get("neighbors").unwrap().as_array().unwrap();
         let incoming: Vec<_> = neighbors
             .iter()
             .filter(|n| n.get("direction").and_then(|v| v.as_str()) == Some("incoming"))
             .collect();
-        assert_eq!(incoming.len(), 1, "bob should have 1 incoming edge (from alice)");
+        assert_eq!(
+            incoming.len(),
+            1,
+            "bob should have 1 incoming edge (from alice)"
+        );
         assert_eq!(
             incoming[0].get("source").and_then(|v| v.as_str()),
             Some("http://example.org/alice")

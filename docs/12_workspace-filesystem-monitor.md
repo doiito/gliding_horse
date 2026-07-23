@@ -28,7 +28,7 @@
 | **ImportScanner** | `src/tools/import_scanner.rs` | 6 语言 import 解析（Rust/TS/JS/Py/Go/Java/C） |
 | **CodeAst** | `src/knowledge_graph/code_ast.rs` | tree-sitter AST + 内容哈希缓存 + `file:` IRI 映射 |
 | **PerceptionEngine** | `src/perception/proactive_engine.rs` | 10 触发器 + 异常去重 + EventBus 消费 |
-| **Batch Agent** | `src/batch/manager.rs` | 后台知识提取 + 实体/关系检测 + 自进化 |
+| **Batch Agent** | `src/batch/manager.rs` | 后台知识提取与实体/关系检测组件；自动知识自进化未完成 |
 | **L0Store** | `src/memory/l0_store.rs` | 持久化存储 + MESI 状态 + prefix scan |
 | **MCP Client** | `src/tools/mcp_client.rs` | 外部工具发现（可透传文件状态到 MCP 工具） |
 
@@ -73,9 +73,9 @@
 
 | 增强 | 实现 |
 |------|------|
-| **Batch Agent 触发** | `WORKSPACE_FILE_MODIFIED` 事件 → 触发知识抽取 / 记忆压缩 |
-| **经验学习** | 高频读取/修改文件统计 → 反馈到 Prompt 模板 / Skill Graph |
-| **自动 AST 重提取** | 文件变更 → CodeAst 重解析 → 更新 Knowledge Graph 中的代码实体 |
+| **Batch Agent 触发** | 根 gRPC 已提供 opt-in 链路：配置 `CustomEvent("WORKSPACE_FILE_MODIFIED")` 的运行中 Agent 会收到窗口条目并执行；流式 RPC 复用，输入 event 已通过 L0 journal 持久化、去重并启动重放。抽取结果持久化尚未接线，handler 图变更无幂等/审批门禁，LLM E2E 尚未完成 |
+| **经验学习** | 记录与建议能力存在；自动写回 Prompt/Skill Graph 尚未实现治理门禁 |
+| **自动 AST 重提取** | 当前由 Gliding Code 每个任务开始时扫描工作区；文件事件直接触发重解析尚未接线 |
 
 ---
 

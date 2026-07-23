@@ -1,21 +1,21 @@
+pub mod api;
+pub mod batch;
+pub mod config;
 pub mod core;
 pub mod gateway;
-pub mod memory;
-pub mod perception;
-pub mod tools;
-pub mod llm;
-pub mod templates;
-pub mod api;
-pub mod utils;
-pub mod config;
-pub mod permissions;
 pub mod jsonld;
-pub mod skill_graph;
-pub mod worker;
-pub mod batch;
-pub mod methodology;
 pub mod knowledge_graph;
+pub mod llm;
+pub mod memory;
+pub mod methodology;
+pub mod perception;
+pub mod permissions;
 pub mod root_cause;
+pub mod skill_graph;
+pub mod templates;
+pub mod tools;
+pub mod utils;
+pub mod worker;
 
 pub mod causal;
 /// Skill graph versioned snapshots & temporal hyperedges.
@@ -24,12 +24,12 @@ pub mod causal;
 /// Renamed from `temporal` to `snapshots` for clarity.
 pub mod snapshots;
 
+pub mod graph_backend;
 /// Topological feature extraction & neighborhood aggregation.
 ///
 /// **Experimental** — API may change without notice.
 /// Renamed from `gnn` to `graph_features` for clarity.
 pub mod graph_features;
-pub mod graph_backend;
 
 #[cfg(feature = "ontology")]
 pub mod ontology;
@@ -43,20 +43,20 @@ pub mod ontology_bridge;
 
 #[cfg(feature = "ontology")]
 pub use ontology_bridge::{
-    FallbackStructuralEmbeddingService, HyperspaceEmbedStore, OntologyBridgeConfig,
-    OntologyBridgeManager, OntologyEmbedStore, OntologySearchBridge,
-    StructuralEmbeddingService, StructuralFeatures,
+    CrossSpaceProjection, FallbackStructuralEmbeddingService, HyperspaceEmbedStore,
+    LinearCrossSpaceProjection, LinearCrossSpaceProjectionConfig, OntologyBridgeConfig,
+    OntologyBridgeManager, OntologyEmbedStore, OntologySearchBridge, StructuralEmbeddingService,
+    StructuralFeatures,
 };
 
+pub use config::Settings;
 pub use core::{
-    AgentRunner, AgentInstance, SupervisorAgent,
-    agent_runner::{TaskContext, TaskResult},
     agent_instance::{AgentRole, AgentStatus},
-    sa::{ExecutionPlan, TaskComplexity, CyclePhase, CycleState, PlanStep},
-    CoreError, CoreConfig,
+    agent_runner::{TaskContext, TaskResult},
+    sa::{CyclePhase, CycleState, ExecutionPlan, PlanStep, TaskComplexity},
+    AgentInstance, AgentRunner, CoreConfig, CoreError, SupervisorAgent,
 };
 pub use gateway::UnifiedGateway;
-pub use memory::{L0Store, L1Session, Blackboard, ProjectionEngine};
-pub use tools::SkillRegistry;
-pub use config::Settings;
 pub use jsonld::JsonLdContext;
+pub use memory::{Blackboard, L0Store, L1Session, ProjectionEngine};
+pub use tools::SkillRegistry;

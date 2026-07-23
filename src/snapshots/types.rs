@@ -24,6 +24,9 @@ pub enum GraphMutation {
         source: String,
         target: String,
         link_type: SkillLinkType,
+        /// Complete source state after the link mutation.  The link fields
+        /// alone are insufficient to reconstruct strength/description.
+        source_after: SkillGraphNode,
     },
     LinkRemoved {
         source: String,
@@ -180,7 +183,9 @@ impl Default for TemporalIndex {
 
 impl TemporalIndex {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Insert a new entry (maintains sorted order).
@@ -203,10 +208,7 @@ impl TemporalIndex {
             .binary_search_by(|(t, _)| t.cmp(&end))
             .unwrap_or_else(|e| e);
 
-        self.entries[lo..hi]
-            .iter()
-            .map(|(_, e)| e)
-            .collect()
+        self.entries[lo..hi].iter().map(|(_, e)| e).collect()
     }
 
     /// Find all entries for a specific hyperedge, ordered by time.
@@ -230,6 +232,11 @@ impl TemporalIndex {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TemporalHypergraphStore
+//
+// Experimental library component.  It is intentionally not updated by the
+// SkillGraph mutation path and CausalEngine does not consume it as a prior, so
+// callers must opt in explicitly and must not describe it as runtime temporal
+// reasoning.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Store for temporal hyperedges with versioning and time-range queries.
@@ -264,7 +271,11 @@ impl TemporalHypergraphStore {
         he.version = TemporalVersion(1);
 
         let id = he.hyperedge_id.clone();
-        self.hyperedges.write().entry(id.clone()).or_default().push(he);
+        self.hyperedges
+            .write()
+            .entry(id.clone())
+            .or_default()
+            .push(he);
 
         self.index.write().insert(
             now,
@@ -368,14 +379,17 @@ impl TemporalHypergraphStore {
     }
 
     /// Find hyperedges active within a time range.
-    pub fn active_between(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<TemporalHyperedge> {
+    pub fn active_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<TemporalHyperedge> {
         self.hyperedges
             .read()
             .values()
             .flat_map(|versions| {
                 versions.last().filter(|he| {
-                    he.valid_from <= end
-                        && he.valid_until.map_or(true, |until| until >= start)
+                    he.valid_from <= end && he.valid_until.map_or(true, |until| until >= start)
                 })
             })
             .cloned()
@@ -418,7 +432,12 @@ impl TemporalHypergraphStore {
 
     /// Get temporal index entries for debug/audit.
     pub fn index_entries(&self) -> Vec<TemporalIndexEntry> {
-        self.index.read().entries.iter().map(|(_, e)| e.clone()).collect()
+        self.index
+            .read()
+            .entries
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect()
     }
 
     /// Number of unique hyperedges (latest version only).
@@ -504,14 +523,20 @@ mod tests {
     fn test_temporal_index() {
         let mut idx = TemporalIndex::new();
         let now = Utc::now();
-        idx.insert(now, TemporalIndexEntry {
-            hyperedge_id: "he-1".to_string(),
-            timestamp: now,
-            event_kind: TemporalEventKind::Created,
-        });
+        idx.insert(
+            now,
+            TemporalIndexEntry {
+                hyperedge_id: "he-1".to_string(),
+                timestamp: now,
+                event_kind: TemporalEventKind::Created,
+            },
+        );
 
         assert_eq!(idx.len(), 1);
-        let range = idx.range(now - chrono::Duration::seconds(1), now + chrono::Duration::seconds(1));
+        let range = idx.range(
+            now - chrono::Duration::seconds(1),
+            now + chrono::Duration::seconds(1),
+        );
         assert_eq!(range.len(), 1);
     }
 
@@ -527,6 +552,9 @@ mod tests {
         store.register(he2);
 
         let candidates = store.find_causal_candidates();
-        assert!(!candidates.is_empty(), "Should find he-1 → he-2 via shared component b");
+        assert!(
+            !candidates.is_empty(),
+            "Should find he-1 → he-2 via shared component b"
+        );
     }
 }

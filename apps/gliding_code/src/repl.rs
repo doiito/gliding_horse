@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rustyline::error::ReadlineError;
 use rustyline::{Config, DefaultEditor, EditMode};
@@ -49,7 +49,8 @@ pub async fn run_repl(mut config: CliConfig) -> anyhow::Result<()> {
                                     renderer.handle_event(&event);
                                 }
                                 Err(broadcast::error::TryRecvError::Empty) => {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(50))
+                                        .await;
                                 }
                                 Err(broadcast::error::TryRecvError::Closed) => break,
                                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,

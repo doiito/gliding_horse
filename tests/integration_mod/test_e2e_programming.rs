@@ -1,8 +1,9 @@
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
-use glidinghorse::config::GatewaySettings;
 use glidinghorse::config::settings::LoggingSettings;
+use glidinghorse::config::AgentSettings;
+use glidinghorse::config::GatewaySettings;
 use glidinghorse::core::agent_runner::AgentRunner;
 use glidinghorse::core::event_bus::EventBus;
 use glidinghorse::core::sa::SupervisorAgent;
@@ -14,11 +15,10 @@ use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::skill_registry::SkillRegistry;
-use glidinghorse::config::AgentSettings;
 use glidinghorse::utils::init_logging;
 use glidinghorse::CoreConfig;
-use tempfile::TempDir;
 use serde_json::Value;
+use tempfile::TempDir;
 
 static LOGGING_INITIALIZED: std::sync::Once = std::sync::Once::new();
 
@@ -65,38 +65,43 @@ fn init_e2e_logging() {
 }
 
 fn validate_jsonld_basic(json_str: &str) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_str(json_str)
-        .map_err(|e| format!("JSON解析失败: {}", e))?;
-    
+    let parsed: Value =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON解析失败: {}", e))?;
+
     if parsed.get("@id").is_none() {
         return Err("缺少 @id 字段".to_string());
     }
     if parsed.get("@type").is_none() {
         return Err("缺少 @type 字段".to_string());
     }
-    
+
     Ok(parsed)
 }
 
 #[allow(dead_code)]
 fn validate_jsonld_with_context(json_str: &str) -> Result<Value, String> {
     let parsed = validate_jsonld_basic(json_str)?;
-    
+
     if parsed.get("@context").is_none() {
         return Err("缺少 @context 字段".to_string());
     }
-    
+
     Ok(parsed)
 }
 
-fn validate_agent_output_jsonld(blackboard: &Blackboard, task_iri: &str, expected_role: &str) -> Result<Vec<Value>, String> {
-    let nodes = blackboard.query_nodes(task_iri)
+fn validate_agent_output_jsonld(
+    blackboard: &Blackboard,
+    task_iri: &str,
+    expected_role: &str,
+) -> Result<Vec<Value>, String> {
+    let nodes = blackboard
+        .query_nodes(task_iri)
         .map_err(|e| format!("查询节点失败: {}", e))?;
-    
+
     if nodes.is_empty() {
         return Err(format!("任务 {} 没有找到任何节点", task_iri));
     }
-    
+
     let mut valid_nodes = Vec::new();
     for node in nodes {
         match validate_jsonld_basic(&node.json_ld) {
@@ -112,14 +117,15 @@ fn validate_agent_output_jsonld(blackboard: &Blackboard, task_iri: &str, expecte
             }
         }
     }
-    
+
     Ok(valid_nodes)
 }
 
 fn verify_entity_alignment(blackboard: &Blackboard, iri: &str) -> Result<bool, String> {
-    let nodes = blackboard.query_nodes(iri)
+    let nodes = blackboard
+        .query_nodes(iri)
         .map_err(|e| format!("查询节点失败: {}", e))?;
-    
+
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node in &nodes {
         if let Ok(parsed) = serde_json::from_str::<Value>(&node.json_ld) {
@@ -131,13 +137,12 @@ fn verify_entity_alignment(blackboard: &Blackboard, iri: &str) -> Result<bool, S
             }
         }
     }
-    
+
     Ok(false)
 }
 
 fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .expect("DEEPSEEK_API_KEY must be set");
+    let api_key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set");
     let base_url = std::env::var("DEEPSEEK_API_URL")
         .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
 
@@ -158,7 +163,10 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let core_config = CoreConfig::default();
     let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
-        l0.clone(), l2.clone(), proj.clone(), core_config,
+        l0.clone(),
+        l2.clone(),
+        proj.clone(),
+        core_config,
     )));
     let templates_dir = dir.path().join("templates");
     std::fs::create_dir_all(&templates_dir).unwrap();
@@ -166,10 +174,20 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
     let skills = Arc::new(SkillRegistry::new());
     let agent_settings = AgentSettings::default();
     let runner = Arc::new(AgentRunner::new(
-        gateway, skills.clone(), l2.clone(), l0, mm, tmpl.clone(), agent_settings,
+        gateway,
+        skills.clone(),
+        l2.clone(),
+        l0,
+        mm,
+        tmpl.clone(),
+        agent_settings,
     ));
     let sa = SupervisorAgent::new(
-        runner, tmpl, skills, Arc::new(EventBus::new(100)), max_iterations,
+        runner,
+        tmpl,
+        skills,
+        Arc::new(EventBus::new(100)),
+        max_iterations,
     )
     .with_memory(Some(l2), None, None);
     (sa, dir)
@@ -185,9 +203,9 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
 #[ignore]
 async fn test_e2e_complex_programming_task() {
     init_e2e_logging();
-    
+
     std::fs::create_dir_all("/tmp/agent_os_e2e/calculator").ok();
-    
+
     let (mut sa, _dir) = build_system(50);
 
     let user_input = r#"
@@ -212,53 +230,67 @@ async fn test_e2e_complex_programming_task() {
 "#;
 
     let task_iri = "iri://task/e2e_complex_programming";
-    
+
     tracing::info!("========== 开始复杂编程任务测试 ==========");
     tracing::info!("任务: {}", user_input.replace('\n', " "));
-    
+
     let result = sa.process_task(user_input, task_iri).await;
 
-    assert!(result.is_ok(), "任务应该完成，不应该报错: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "任务应该完成，不应该报错: {:?}",
+        result.err()
+    );
     let task_result = result.unwrap();
-    
+
     tracing::info!("========== 任务完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
-    tracing::info!("轮次: {}, 工具调用: {}", task_result.turn_count, task_result.tool_call_count);
+    tracing::info!(
+        "轮次: {}, 工具调用: {}",
+        task_result.turn_count,
+        task_result.tool_call_count
+    );
     tracing::info!("错误: {:?}", task_result.errors);
 
     // 验证文件是否创建
     let calculator_path = Path::new("/tmp/agent_os_e2e/calculator/calculator.py");
     let test_path = Path::new("/tmp/agent_os_e2e/calculator/test_calculator.py");
-    
+
     if calculator_path.exists() {
         let content = std::fs::read_to_string(calculator_path).unwrap();
         tracing::info!("========== calculator.py 内容 ==========\n{}", content);
-        assert!(content.contains("Calculator") || content.contains("calculator"), "应该包含 Calculator 类");
+        assert!(
+            content.contains("Calculator") || content.contains("calculator"),
+            "应该包含 Calculator 类"
+        );
     } else {
         tracing::warn!("calculator.py 未创建");
     }
-    
+
     if test_path.exists() {
         let content = std::fs::read_to_string(test_path).unwrap();
         tracing::info!("========== test_calculator.py 内容 ==========\n{}", content);
-        assert!(content.contains("pytest") || content.contains("test_"), "应该包含测试代码");
+        assert!(
+            content.contains("pytest") || content.contains("test_"),
+            "应该包含测试代码"
+        );
     } else {
         tracing::warn!("test_calculator.py 未创建");
     }
 
     assert_ne!(task_result.status, "failed", "任务不应该完全失败");
-    
+
     // ===== JSON-LD 验证 =====
     tracing::info!("========== 开始 JSON-LD 验证 ==========");
-    
+
     if let Some(blackboard) = sa.blackboard() {
         // 验证所有Agent输出节点是否为有效JSON-LD
         match validate_agent_output_jsonld(blackboard, task_iri, "") {
             Ok(nodes) => {
                 tracing::info!("JSON-LD 验证通过: {} 个有效节点", nodes.len());
                 assert!(!nodes.is_empty(), "应该至少有一个有效的JSON-LD节点");
-                
+
                 // 验证每个节点都有 @id, @type
                 for node in &nodes {
                     assert!(node.get("@id").is_some(), "节点必须有 @id");
@@ -269,23 +301,27 @@ async fn test_e2e_complex_programming_task() {
                 tracing::warn!("JSON-LD 验证失败: {}", e);
             }
         }
-        
+
         // 验证PA输出包含正确的@type
-        let pa_nodes = blackboard.query_by_types(&["PlanNode".to_string(), "Plan".to_string()])
+        let pa_nodes = blackboard
+            .query_by_types(&["PlanNode".to_string(), "Plan".to_string()])
             .unwrap_or_default();
         if !pa_nodes.is_empty() {
             tracing::info!("找到 {} 个 PA 节点", pa_nodes.len());
             for node in &pa_nodes {
                 if node.parent_task.as_deref() == Some(task_iri) {
-                    assert!(node.jsonld_types.contains(&"PlanNode".to_string()) 
-                         || node.jsonld_types.contains(&"Plan".to_string()),
-                        "PA节点应该有正确的@type");
+                    assert!(
+                        node.jsonld_types.contains(&"PlanNode".to_string())
+                            || node.jsonld_types.contains(&"Plan".to_string()),
+                        "PA节点应该有正确的@type"
+                    );
                 }
             }
         }
-        
+
         // 验证DA输出包含正确的IRI引用
-        let da_nodes = blackboard.query_by_types(&["ExecutionResult".to_string(), "Do".to_string()])
+        let da_nodes = blackboard
+            .query_by_types(&["ExecutionResult".to_string(), "Do".to_string()])
             .unwrap_or_default();
         if !da_nodes.is_empty() {
             tracing::info!("找到 {} 个 DA 节点", da_nodes.len());
@@ -297,28 +333,40 @@ async fn test_e2e_complex_programming_task() {
                 }
             }
         }
-        
+
         // 验证CA能查询到DA创建的节点
         let all_nodes = blackboard.query_nodes(task_iri).unwrap_or_default();
-        let da_node_count = all_nodes.iter()
-            .filter(|n| n.jsonld_types.iter().any(|t| t.contains("Execution") || t.contains("Do")))
+        let da_node_count = all_nodes
+            .iter()
+            .filter(|n| {
+                n.jsonld_types
+                    .iter()
+                    .any(|t| t.contains("Execution") || t.contains("Do"))
+            })
             .count();
         tracing::info!("DA创建的节点数: {}", da_node_count);
-        
+
         // 验证AA能访问所有Agent的输出
         let total_nodes = blackboard.node_count();
         tracing::info!("总节点数: {}", total_nodes);
-        
+
         // 验证实体对齐（相同@id的节点合并）
         match verify_entity_alignment(blackboard, task_iri) {
             Ok(has_alignment) => {
-                tracing::info!("实体对齐检查: {}", if has_alignment { "发现重复@id" } else { "无重复@id" });
+                tracing::info!(
+                    "实体对齐检查: {}",
+                    if has_alignment {
+                        "发现重复@id"
+                    } else {
+                        "无重复@id"
+                    }
+                );
             }
             Err(e) => {
                 tracing::warn!("实体对齐检查失败: {}", e);
             }
         }
-        
+
         // 使用 ValidationEngine 验证
         let validator = ValidationEngine::new(2048);
         for node in &all_nodes {
@@ -339,35 +387,39 @@ async fn test_e2e_complex_programming_task() {
 #[ignore]
 async fn test_e2e_sa_llm_plan_generation() {
     init_e2e_logging();
-    
+
     let (mut sa, _dir) = build_system(20);
 
-    let user_input = "分析当前目录结构，找出所有 Rust 源文件，统计每个文件的行数，并生成一个报告文件。";
+    let user_input =
+        "分析当前目录结构，找出所有 Rust 源文件，统计每个文件的行数，并生成一个报告文件。";
 
     let task_iri = "iri://task/e2e_llm_plan";
-    
+
     tracing::info!("========== 开始 LLM 计划生成测试 ==========");
-    
+
     let result = sa.process_task(user_input, task_iri).await;
 
     assert!(result.is_ok(), "任务应该完成: {:?}", result.err());
     let task_result = result.unwrap();
-    
+
     tracing::info!("========== LLM 计划生成测试完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
 
     assert_ne!(task_result.status, "failed", "任务不应该失败");
-    
+
     // JSON-LD 验证
     if let Some(blackboard) = sa.blackboard() {
         let nodes = blackboard.query_nodes(task_iri).unwrap_or_default();
         tracing::info!("任务节点数: {}", nodes.len());
-        
+
         for node in &nodes {
             if let Ok(parsed) = validate_jsonld_basic(&node.json_ld) {
-                tracing::debug!("节点 {} JSON-LD 有效, @type: {:?}", 
-                    node.iri, parsed.get("@type"));
+                tracing::debug!(
+                    "节点 {} JSON-LD 有效, @type: {:?}",
+                    node.iri,
+                    parsed.get("@type")
+                );
             }
         }
     }
@@ -378,7 +430,7 @@ async fn test_e2e_sa_llm_plan_generation() {
 #[ignore]
 async fn test_e2e_agent_isolation() {
     init_e2e_logging();
-    
+
     let (mut sa, _dir) = build_system(20);
 
     // 这个任务需要多个步骤，测试 Agent 隔离
@@ -391,18 +443,22 @@ async fn test_e2e_agent_isolation() {
 "#;
 
     let task_iri = "iri://task/e2e_isolation";
-    
+
     tracing::info!("========== 开始 Agent 隔离测试 ==========");
-    
+
     let result = sa.process_task(user_input, task_iri).await;
 
     assert!(result.is_ok(), "任务应该完成: {:?}", result.err());
     let task_result = result.unwrap();
-    
+
     tracing::info!("========== Agent 隔离测试完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
-    tracing::info!("轮次: {}, 工具调用: {}", task_result.turn_count, task_result.tool_call_count);
+    tracing::info!(
+        "轮次: {}, 工具调用: {}",
+        task_result.turn_count,
+        task_result.tool_call_count
+    );
 
     // 验证最终文件内容
     let data_path = Path::new("/tmp/agent_os_e2e/data.txt");
@@ -411,25 +467,29 @@ async fn test_e2e_agent_isolation() {
         tracing::info!("最终文件内容: {}", content);
         assert!(content.contains("HELLO"), "内容应该是大写");
     }
-    
+
     // JSON-LD 验证
     if let Some(blackboard) = sa.blackboard() {
         let nodes: Vec<_> = blackboard.query_nodes(task_iri).unwrap_or_default();
         tracing::info!("任务节点数: {}", nodes.len());
-        
+
         // 验证每个Agent的输出都有正确的JSON-LD格式
         for node in &nodes {
             match validate_jsonld_basic(&node.json_ld) {
                 Ok(parsed) => {
-                    tracing::debug!("节点 {} 验证通过, @id: {:?}, @type: {:?}", 
-                        node.iri, parsed.get("@id"), parsed.get("@type"));
+                    tracing::debug!(
+                        "节点 {} 验证通过, @id: {:?}, @type: {:?}",
+                        node.iri,
+                        parsed.get("@id"),
+                        parsed.get("@type")
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("节点 {} JSON-LD验证失败: {}", node.iri, e);
                 }
             }
         }
-        
+
         // 验证跨Agent实体对齐
         match verify_entity_alignment(blackboard, task_iri) {
             Ok(_) => {
@@ -456,12 +516,12 @@ async fn test_e2e_agent_isolation() {
 #[ignore]
 async fn test_e2e_full_project_creation() {
     init_e2e_logging();
-    
+
     let project_dir = "/tmp/agent_os_e2e/myapi";
     std::fs::create_dir_all(project_dir).ok();
     std::fs::create_dir_all(format!("{}/app", project_dir)).ok();
     std::fs::create_dir_all(format!("{}/tests", project_dir)).ok();
-    
+
     let (mut sa, _dir) = build_system(40);
 
     let user_input = r#"
@@ -534,17 +594,18 @@ myapi/
 "#;
 
     let task_iri = "iri://task/e2e_full_project";
-    
+
     tracing::info!("========== 开始完整项目创建测试 ==========");
     tracing::info!("任务: 创建 FastAPI Web API 项目");
-    
+
     let start_time = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(600),
-        sa.process_task(user_input, task_iri)
-    ).await;
+        sa.process_task(user_input, task_iri),
+    )
+    .await;
     let elapsed = start_time.elapsed();
-    
+
     tracing::info!("执行时间: {:?}", elapsed);
 
     let task_result = match result {
@@ -552,29 +613,45 @@ myapi/
         Ok(Err(e)) => panic!("任务执行失败: {:?}", e),
         Err(_) => panic!("任务执行超时 (600秒)"),
     };
-    
+
     tracing::info!("========== 项目创建完成 ==========");
     tracing::info!("状态: {}", task_result.status);
     tracing::info!("摘要: {}", task_result.summary);
-    tracing::info!("轮次: {}, 工具调用: {}", task_result.turn_count, task_result.tool_call_count);
+    tracing::info!(
+        "轮次: {}, 工具调用: {}",
+        task_result.turn_count,
+        task_result.tool_call_count
+    );
     tracing::info!("错误: {:?}", task_result.errors);
 
     // 验证项目结构
     let expected_files = vec![
-        (format!("{}/app/__init__.py", project_dir), "app/__init__.py"),
+        (
+            format!("{}/app/__init__.py", project_dir),
+            "app/__init__.py",
+        ),
         (format!("{}/app/main.py", project_dir), "app/main.py"),
         (format!("{}/app/models.py", project_dir), "app/models.py"),
         (format!("{}/app/routes.py", project_dir), "app/routes.py"),
-        (format!("{}/tests/__init__.py", project_dir), "tests/__init__.py"),
-        (format!("{}/tests/test_api.py", project_dir), "tests/test_api.py"),
+        (
+            format!("{}/tests/__init__.py", project_dir),
+            "tests/__init__.py",
+        ),
+        (
+            format!("{}/tests/test_api.py", project_dir),
+            "tests/test_api.py",
+        ),
         (format!("{}/pyproject.toml", project_dir), "pyproject.toml"),
-        (format!("{}/requirements.txt", project_dir), "requirements.txt"),
+        (
+            format!("{}/requirements.txt", project_dir),
+            "requirements.txt",
+        ),
         (format!("{}/README.md", project_dir), "README.md"),
     ];
-    
+
     let mut created_count = 0;
     let mut missing_files = Vec::new();
-    
+
     for (path, name) in &expected_files {
         if Path::new(path).exists() {
             created_count += 1;
@@ -585,67 +662,84 @@ myapi/
             tracing::warn!("❌ {} 未创建", name);
         }
     }
-    
+
     tracing::info!("文件创建统计: {}/{}", created_count, expected_files.len());
-    
+
     // 验证关键文件内容
     let main_path = format!("{}/app/main.py", project_dir);
     if Path::new(&main_path).exists() {
         let content = std::fs::read_to_string(&main_path).unwrap();
         assert!(content.contains("FastAPI"), "main.py 应该包含 FastAPI");
-        assert!(content.contains("/health") || content.contains("health"), "main.py 应该包含健康检查端点");
+        assert!(
+            content.contains("/health") || content.contains("health"),
+            "main.py 应该包含健康检查端点"
+        );
         tracing::info!("✅ main.py 内容验证通过");
     }
-    
+
     let models_path = format!("{}/app/models.py", project_dir);
     if Path::new(&models_path).exists() {
         let content = std::fs::read_to_string(&models_path).unwrap();
-        assert!(content.contains("Item") || content.contains("item"), "models.py 应该包含 Item 模型");
+        assert!(
+            content.contains("Item") || content.contains("item"),
+            "models.py 应该包含 Item 模型"
+        );
         tracing::info!("✅ models.py 内容验证通过");
     }
-    
+
     let routes_path = format!("{}/app/routes.py", project_dir);
     if Path::new(&routes_path).exists() {
         let content = std::fs::read_to_string(&routes_path).unwrap();
-        assert!(content.contains("GET") || content.contains("POST") || content.contains("router"), 
-            "routes.py 应该包含路由定义");
+        assert!(
+            content.contains("GET") || content.contains("POST") || content.contains("router"),
+            "routes.py 应该包含路由定义"
+        );
         tracing::info!("✅ routes.py 内容验证通过");
     }
-    
+
     let test_path = format!("{}/tests/test_api.py", project_dir);
     if Path::new(&test_path).exists() {
         let content = std::fs::read_to_string(&test_path).unwrap();
-        assert!(content.contains("pytest") || content.contains("test_") || content.contains("def test"),
-            "test_api.py 应该包含测试代码");
+        assert!(
+            content.contains("pytest") || content.contains("test_") || content.contains("def test"),
+            "test_api.py 应该包含测试代码"
+        );
         tracing::info!("✅ test_api.py 内容验证通过");
     }
-    
+
     let readme_path = format!("{}/README.md", project_dir);
     if Path::new(&readme_path).exists() {
         let content = std::fs::read_to_string(&readme_path).unwrap();
         assert!(content.len() > 50, "README.md 应该有足够的内容");
         tracing::info!("✅ README.md 内容验证通过 ({} 字节)", content.len());
     }
-    
+
     // 至少创建 6 个文件才算成功
-    assert!(created_count >= 6, "至少应该创建 6 个文件，实际创建了 {} 个", created_count);
-    
+    assert!(
+        created_count >= 6,
+        "至少应该创建 6 个文件，实际创建了 {} 个",
+        created_count
+    );
+
     // JSON-LD 验证
     if let Some(blackboard) = sa.blackboard() {
         let nodes = blackboard.query_nodes(task_iri).unwrap_or_default();
         tracing::info!("任务节点数: {}", nodes.len());
-        
+
         // 验证 JSON-LD 格式
         let mut valid_count = 0;
         for node in &nodes {
             if let Ok(parsed) = validate_jsonld_basic(&node.json_ld) {
                 valid_count += 1;
-                tracing::debug!("节点 {} JSON-LD 有效, @type: {:?}", 
-                    node.iri, parsed.get("@type"));
+                tracing::debug!(
+                    "节点 {} JSON-LD 有效, @type: {:?}",
+                    node.iri,
+                    parsed.get("@type")
+                );
             }
         }
         tracing::info!("JSON-LD 验证: {}/{} 节点有效", valid_count, nodes.len());
     }
-    
+
     tracing::info!("========== 测试完成 ==========");
 }

@@ -60,7 +60,10 @@ impl MCPMessage {
             method: None,
             params: None,
             result: None,
-            error: Some(MCPError { code, message: message.to_string() }),
+            error: Some(MCPError {
+                code,
+                message: message.to_string(),
+            }),
         }
     }
 }
@@ -109,7 +112,9 @@ pub struct MCPResource {
     pub mime_type: String,
 }
 
-fn default_mime_type() -> String { "text/plain".to_string() }
+fn default_mime_type() -> String {
+    "text/plain".to_string()
+}
 
 impl MCPResource {
     pub fn new(uri: &str, name: &str, description: &str) -> Self {
@@ -211,7 +216,7 @@ impl MCPToolRegistry {
 
     pub async fn execute(&self, name: &str, arguments: Value) -> Result<Value, CoreError> {
         let handler = self.handlers.read().get(name).cloned();
-        
+
         match handler {
             Some(h) => h.execute(arguments).await,
             None => Err(CoreError::Internal {
@@ -250,7 +255,9 @@ impl MCPServer {
     }
 
     pub fn register_resource(&self, resource: MCPResource) {
-        self.resources.write().insert(resource.uri.clone(), resource);
+        self.resources
+            .write()
+            .insert(resource.uri.clone(), resource);
     }
 
     pub fn register_prompt(&self, prompt: MCPPrompt) {
@@ -269,13 +276,15 @@ impl MCPServer {
 
         match method.as_str() {
             "tools/list" => {
-                let tools: Vec<Value> = self.tools.list_tools()
+                let tools: Vec<Value> = self
+                    .tools
+                    .list_tools()
                     .iter()
                     .map(|t| t.to_mcp_format())
                     .collect();
                 MCPMessage::response(json!({"tools": tools}), message.id.unwrap_or(Value::Null))
             }
-            
+
             "tools/call" => {
                 let params = message.params.clone().unwrap_or(Value::Null);
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -289,23 +298,33 @@ impl MCPServer {
                     Err(e) => MCPMessage::error(-32603, &e.to_string(), message.id),
                 }
             }
-            
+
             "resources/list" => {
-                let resources: Vec<Value> = self.resources.read()
+                let resources: Vec<Value> = self
+                    .resources
+                    .read()
                     .values()
                     .map(|r| r.to_mcp_format())
                     .collect();
-                MCPMessage::response(json!({"resources": resources}), message.id.unwrap_or(Value::Null))
+                MCPMessage::response(
+                    json!({"resources": resources}),
+                    message.id.unwrap_or(Value::Null),
+                )
             }
-            
+
             "prompts/list" => {
-                let prompts: Vec<Value> = self.prompts.read()
+                let prompts: Vec<Value> = self
+                    .prompts
+                    .read()
                     .values()
                     .map(|p| p.to_mcp_format())
                     .collect();
-                MCPMessage::response(json!({"prompts": prompts}), message.id.unwrap_or(Value::Null))
+                MCPMessage::response(
+                    json!({"prompts": prompts}),
+                    message.id.unwrap_or(Value::Null),
+                )
             }
-            
+
             _ => MCPMessage::error(-32601, &format!("Method not found: {}", method), message.id),
         }
     }
@@ -338,7 +357,8 @@ impl MCPClient {
             });
         }
 
-        let tools_data = response.result
+        let tools_data = response
+            .result
             .and_then(|r| r.get("tools").cloned())
             .unwrap_or(Value::Array(Vec::new()));
 
@@ -351,11 +371,14 @@ impl MCPClient {
             message: "Not connected to server".to_string(),
         })?;
 
-        let message = MCPMessage::request("tools/call", Some(json!({
-            "name": name,
-            "arguments": arguments,
-        })));
-        
+        let message = MCPMessage::request(
+            "tools/call",
+            Some(json!({
+                "name": name,
+                "arguments": arguments,
+            })),
+        );
+
         let response = server.handle_message(message).await;
 
         if let Some(error) = response.error {
@@ -364,15 +387,15 @@ impl MCPClient {
             });
         }
 
-        let content = response.result
+        let content = response
+            .result
             .and_then(|r| r.get("content").cloned())
             .unwrap_or(Value::Array(Vec::new()));
 
         if let Some(first) = content.as_array().and_then(|a| a.first()) {
             if first.get("type").and_then(|t| t.as_str()) == Some("text") {
                 let text = first.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                return serde_json::from_str(text)
-                    .or_else(|_| Ok(Value::String(text.to_string())));
+                return serde_json::from_str(text).or_else(|_| Ok(Value::String(text.to_string())));
             }
         }
 
@@ -393,11 +416,13 @@ impl MCPClient {
             });
         }
 
-        let resources_data = response.result
+        let resources_data = response
+            .result
             .and_then(|r| r.get("resources").cloned())
             .unwrap_or(Value::Array(Vec::new()));
 
-        let resources: Vec<MCPResource> = serde_json::from_value(resources_data).unwrap_or_default();
+        let resources: Vec<MCPResource> =
+            serde_json::from_value(resources_data).unwrap_or_default();
         Ok(resources)
     }
 }
@@ -412,61 +437,80 @@ pub fn create_default_mcp_server() -> MCPServer {
     let server = MCPServer::new("agent-os");
 
     server.tools.register_fn(
-        MCPTool::new("file_read", "Read content from a file", json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to read"},
-                "encoding": {"type": "string", "default": "utf-8"},
-            },
-            "required": ["path"],
-        })),
+        MCPTool::new(
+            "file_read",
+            "Read content from a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"},
+                    "encoding": {"type": "string", "default": "utf-8"},
+                },
+                "required": ["path"],
+            }),
+        ),
         |args| async move {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let encoding = args.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf-8");
-            
+            let encoding = args
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("utf-8");
+
             match std::fs::read_to_string(path) {
                 Ok(content) => Ok(json!({"content": content, "path": path, "encoding": encoding})),
-                Err(e) => Err(CoreError::Internal { message: e.to_string() }),
+                Err(e) => Err(CoreError::Internal {
+                    message: e.to_string(),
+                }),
             }
         },
     );
 
     server.tools.register_fn(
-        MCPTool::new("file_write", "Write content to a file", json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to write"},
-                "content": {"type": "string", "description": "Content to write"},
-            },
-            "required": ["path", "content"],
-        })),
+        MCPTool::new(
+            "file_write",
+            "Write content to a file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            }),
+        ),
         |args| async move {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            
+
             match std::fs::write(path, content) {
                 Ok(_) => Ok(json!({"success": true, "path": path})),
-                Err(e) => Err(CoreError::Internal { message: e.to_string() }),
+                Err(e) => Err(CoreError::Internal {
+                    message: e.to_string(),
+                }),
             }
         },
     );
 
     server.tools.register_fn(
-        MCPTool::new("http_request", "Make an HTTP request", json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL to request"},
-                "method": {"type": "string", "default": "GET"},
-                "headers": {"type": "object"},
-                "body": {"type": "object"},
-                "timeout": {"type": "number", "default": 30},
-            },
-            "required": ["url"],
-        })),
+        MCPTool::new(
+            "http_request",
+            "Make an HTTP request",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to request"},
+                    "method": {"type": "string", "default": "GET"},
+                    "headers": {"type": "object"},
+                    "body": {"type": "object"},
+                    "timeout": {"type": "number", "default": 30},
+                },
+                "required": ["url"],
+            }),
+        ),
         |args| async move {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
-            
+
             Ok(json!({
                 "url": url,
                 "method": method,
@@ -486,15 +530,15 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_server() {
         let server = MCPServer::new("test");
-        
+
         server.tools.register_fn(
             MCPTool::new("echo", "Echo input", json!({"type": "object"})),
             |args| async move { Ok(args) },
         );
-        
+
         let message = MCPMessage::request("tools/list", None);
         let response = server.handle_message(message).await;
-        
+
         assert!(response.result.is_some());
         let result = response.result.as_ref().unwrap();
         let tools = result.get("tools").unwrap().as_array().unwrap();
@@ -506,7 +550,7 @@ mod tests {
         let server = Arc::new(create_default_mcp_server());
         let mut client = MCPClient::new();
         client.connect(server);
-        
+
         let tools = client.list_tools().await.unwrap();
         assert!(!tools.is_empty());
     }
@@ -516,10 +560,10 @@ mod tests {
         let req = MCPMessage::request("test/method", Some(json!({"arg": "value"})));
         assert_eq!(req.method, Some("test/method".to_string()));
         assert!(req.id.is_some());
-        
+
         let resp = MCPMessage::response(json!({"result": "ok"}), Value::String("1".to_string()));
         assert!(resp.result.is_some());
-        
+
         let err = MCPMessage::error(-32600, "Invalid request", None);
         assert!(err.error.is_some());
     }

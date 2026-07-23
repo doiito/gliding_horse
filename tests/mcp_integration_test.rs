@@ -157,12 +157,20 @@ async fn test_mcp_client_call_tool() {
 
     // Call navigate tool
     let result = client
-        .call_tool("chrome", "browser_navigate", &json!({"url": "https://example.com"}))
+        .call_tool(
+            "chrome",
+            "browser_navigate",
+            &json!({"url": "https://example.com"}),
+        )
         .await;
     assert!(result.is_ok());
     let content = result.unwrap();
     let content_str = content.to_string();
-    assert!(content_str.contains("browser_navigate"), "result should mention tool name: {}", content_str);
+    assert!(
+        content_str.contains("browser_navigate"),
+        "result should mention tool name: {}",
+        content_str
+    );
 
     // Call unknown tool → should error
     let err = client.call_tool("chrome", "nonexistent", &json!({})).await;
@@ -268,6 +276,8 @@ async fn test_mcp_client_tool_not_found_error() {
     client.register_server("chrome", &url);
 
     // Call before connect — should error because status != connected
-    let result = client.call_tool("chrome", "browser_navigate", &json!({})).await;
+    let result = client
+        .call_tool("chrome", "browser_navigate", &json!({}))
+        .await;
     assert!(result.is_err());
 }

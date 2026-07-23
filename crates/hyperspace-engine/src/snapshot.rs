@@ -104,11 +104,10 @@ pub fn load_snapshot(path: &Path) -> Result<EngineSnapshot, EngineError> {
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::with_capacity(64 * 1024, file);
 
-    let snapshot: EngineSnapshot = bincode::deserialize_from(&mut reader).map_err(|e| {
-        EngineError::StorageError {
+    let snapshot: EngineSnapshot =
+        bincode::deserialize_from(&mut reader).map_err(|e| EngineError::StorageError {
             message: format!("Snapshot deserialization: {e}"),
-        }
-    })?;
+        })?;
 
     info!(
         "Snapshot loaded: {} bytes, {} nodes, clock={}",

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::skill_graph::graph_store::SkillGraphStore;
-use crate::skill_graph::types::KnowledgeFragment;
+use crate::skill_graph::types::{Hyperedge, KnowledgeFragment, MOCNode, SkillGraphNode};
 use crate::CoreError;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -244,7 +244,10 @@ impl GraphBackend for SparqlBackend {
                     .iter()
                     .filter_map(|row| row.get("?node").and_then(|v| v.as_str()))
                     .map(|s| s.to_string())
-                    .filter(|s| !s.starts_with("http://www.w3.org/") && !s.starts_with("https://agentos.ontology"))
+                    .filter(|s| {
+                        !s.starts_with("http://www.w3.org/")
+                            && !s.starts_with("https://agentos.ontology")
+                    })
                     .collect();
                 nodes.sort();
                 nodes.dedup();
@@ -287,7 +290,10 @@ impl GraphBackend for SparqlBackend {
                     let p = row.get("?p")?.as_str()?;
                     let o = row.get("?o")?.as_str()?;
                     // Only IRI objects (skip literal objects)
-                    if o.starts_with("iri:") || o.starts_with("http://") || o.starts_with("https://") {
+                    if o.starts_with("iri:")
+                        || o.starts_with("http://")
+                        || o.starts_with("https://")
+                    {
                         Some(EdgeDescriptor {
                             source: s.to_string(),
                             target: o.to_string(),
@@ -356,11 +362,7 @@ impl SnapshotBackend for SkillGraphSnapshotBackend {
         // Export all skill graph nodes as JSON
         for skill in self.store.list_all_skills() {
             if let Ok(data) = serde_json::to_value(&skill) {
-                nodes.push(SnapshotNode::new(
-                    &skill.skill_iri,
-                    data,
-                    "SkillGraphNode",
-                ));
+                nodes.push(SnapshotNode::new(&skill.skill_iri, data, "SkillGraphNode"));
             }
         }
 
@@ -374,7 +376,11 @@ impl SnapshotBackend for SkillGraphSnapshotBackend {
         // Export knowledge fragments
         for frag in self.store.list_fragments() {
             if let Ok(data) = serde_json::to_value(&frag) {
-                nodes.push(SnapshotNode::new(&frag.fragment_iri, data, "KnowledgeFragment"));
+                nodes.push(SnapshotNode::new(
+                    &frag.fragment_iri,
+                    data,
+                    "KnowledgeFragment",
+                ));
             }
         }
 
@@ -389,43 +395,52 @@ impl SnapshotBackend for SkillGraphSnapshotBackend {
     }
 
     fn apply_snapshot(&self, nodes: &[SnapshotNode]) -> Result<(), CoreError> {
-        for node in nodes {
-            match node.node_type.as_str() {
-                "SkillGraphNode" => {
-                    if let Ok(skill) =
-                        serde_json::from_value(node.data.clone())
-                    {
-                        self.store.register_skill(skill)?;
-                    }
+        // Validate the complete snapshot before changing live state.  A
+        // malformed node must not turn a rollback into a partial restore.
+        enum RestoredNode {
+            Skill(SkillGraphNode),
+            Hyperedge(Hyperedge),
+            Fragment(KnowledgeFragment),
+            Moc(MOCNode),
+        }
+        let restored = nodes
+            .iter()
+            .map(|node| {
+                let decode = |kind: &str| CoreError::StorageError {
+                    message: format!(
+                        "Invalid {} snapshot node '{}': invalid serialized data",
+                        kind, node.iri
+                    ),
+                };
+                match node.node_type.as_str() {
+                    "SkillGraphNode" => serde_json::from_value(node.data.clone())
+                        .map(RestoredNode::Skill)
+                        .map_err(|_| decode("SkillGraphNode")),
+                    "Hyperedge" => serde_json::from_value(node.data.clone())
+                        .map(RestoredNode::Hyperedge)
+                        .map_err(|_| decode("Hyperedge")),
+                    "KnowledgeFragment" => serde_json::from_value(node.data.clone())
+                        .map(RestoredNode::Fragment)
+                        .map_err(|_| decode("KnowledgeFragment")),
+                    "MOCNode" => serde_json::from_value(node.data.clone())
+                        .map(RestoredNode::Moc)
+                        .map_err(|_| decode("MOCNode")),
+                    other => Err(CoreError::ValidationFailed {
+                        message: format!(
+                            "Unsupported snapshot node type '{}' for '{}'",
+                            other, node.iri
+                        ),
+                    }),
                 }
-                "Hyperedge" => {
-                    if let Ok(he) =
-                        serde_json::from_value(node.data.clone())
-                    {
-                        let _ = self.store.register_hyperedge(he);
-                    }
-                }
-                "KnowledgeFragment" => {
-                    if let Ok(frag) =
-                        serde_json::from_value::<KnowledgeFragment>(node.data.clone())
-                    {
-                        let _ = self.store.create_fragment(
-                            &frag.fragment_iri,
-                            &frag.attached_to,
-                            &frag.problem,
-                            &frag.recommendation,
-                            None,
-                        );
-                    }
-                }
-                "MOCNode" => {
-                    if let Ok(moc) =
-                        serde_json::from_value(node.data.clone())
-                    {
-                        let _ = self.store.register_moc(moc);
-                    }
-                }
-                _ => {}
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for node in restored {
+            match node {
+                RestoredNode::Skill(skill) => self.store.register_skill(skill)?,
+                RestoredNode::Hyperedge(hyperedge) => self.store.register_hyperedge(hyperedge)?,
+                RestoredNode::Fragment(fragment) => self.store.register_fragment(fragment)?,
+                RestoredNode::Moc(moc) => self.store.register_moc(moc)?,
             }
         }
         Ok(())
@@ -449,6 +464,24 @@ impl SnapshotBackend for SkillGraphSnapshotBackend {
             .collect();
         for id in &he_ids {
             self.store.remove_hyperedge(id)?;
+        }
+        let moc_iris: Vec<String> = self
+            .store
+            .list_mocs()
+            .into_iter()
+            .map(|moc| moc.moc_iri)
+            .collect();
+        for iri in &moc_iris {
+            self.store.remove_moc(iri)?;
+        }
+        let fragment_iris: Vec<String> = self
+            .store
+            .list_fragments()
+            .into_iter()
+            .map(|fragment| fragment.fragment_iri)
+            .collect();
+        for iri in &fragment_iris {
+            self.store.remove_fragment(iri)?;
         }
         Ok(())
     }
@@ -509,20 +542,18 @@ impl SnapshotBackend for OxigraphSnapshotBackend {
                 iri.replace('>', "\\u003E")
             );
 
-            let props: serde_json::Map<String, serde_json::Value> = match self
-                .store
-                .query_sparql(&prop_sparql, None)
-            {
-                Ok(rows) => rows
-                    .iter()
-                    .filter_map(|row| {
-                        let p = row.get("?p")?.as_str()?;
-                        let o = row.get("?o")?.as_str()?;
-                        Some((p.to_string(), serde_json::Value::String(o.to_string())))
-                    })
-                    .collect(),
-                Err(_) => serde_json::Map::new(),
-            };
+            let props: serde_json::Map<String, serde_json::Value> =
+                match self.store.query_sparql(&prop_sparql, None) {
+                    Ok(rows) => rows
+                        .iter()
+                        .filter_map(|row| {
+                            let p = row.get("?p")?.as_str()?;
+                            let o = row.get("?o")?.as_str()?;
+                            Some((p.to_string(), serde_json::Value::String(o.to_string())))
+                        })
+                        .collect(),
+                    Err(_) => serde_json::Map::new(),
+                };
 
             nodes.push(SnapshotNode::new(
                 iri,
@@ -539,10 +570,7 @@ impl SnapshotBackend for OxigraphSnapshotBackend {
         let graph = self.named_graph.as_deref().unwrap_or("graph:world");
 
         // Clear the existing graph content
-        let clear_sparql = format!(
-            "DROP SILENT GRAPH <{}>",
-            graph
-        );
+        let clear_sparql = format!("DROP SILENT GRAPH <{}>", graph);
         let _ = self.store.query_sparql(&clear_sparql, None);
 
         // Re-insert all triples from snapshot nodes
@@ -550,8 +578,10 @@ impl SnapshotBackend for OxigraphSnapshotBackend {
             if let Some(props) = node.data.as_object() {
                 for (predicate, value) in props {
                     let obj_str = match value.as_str() {
-                        Some(v) if v.starts_with("iri:") || v.starts_with("http://")
-                            || v.starts_with("https://") =>
+                        Some(v)
+                            if v.starts_with("iri:")
+                                || v.starts_with("http://")
+                                || v.starts_with("https://") =>
                         {
                             format!("<{}>", v)
                         }
@@ -589,12 +619,18 @@ use crate::skill_graph::graph_algorithms::SkillGraphAlgorithms;
 
 pub struct SkillGraphFeatureGraph {
     store: Arc<SkillGraphStore>,
-    algorithms: Arc<SkillGraphAlgorithms>,
+    // Kept in the constructor for API compatibility; metrics below rebuild
+    // from the authoritative store so graph mutations cannot leave a stale
+    // algorithm snapshot in the feature pipeline.
+    _algorithms: Arc<SkillGraphAlgorithms>,
 }
 
 impl SkillGraphFeatureGraph {
     pub fn new(store: Arc<SkillGraphStore>, algorithms: Arc<SkillGraphAlgorithms>) -> Self {
-        Self { store, algorithms }
+        Self {
+            store,
+            _algorithms: algorithms,
+        }
     }
 }
 
@@ -674,7 +710,7 @@ impl FeatureGraph for SkillGraphFeatureGraph {
     }
 
     fn page_rank(&self, damping: f32) -> Vec<(String, f64)> {
-        self.algorithms
+        SkillGraphAlgorithms::from_store(&self.store)
             .page_rank(damping)
             .into_iter()
             .map(|s| (s.iri, s.score))
@@ -682,7 +718,7 @@ impl FeatureGraph for SkillGraphFeatureGraph {
     }
 
     fn betweenness_centrality(&self) -> Vec<(String, f64)> {
-        self.algorithms
+        SkillGraphAlgorithms::from_store(&self.store)
             .betweenness_centrality()
             .into_iter()
             .map(|s| (s.iri, s.score))
@@ -690,7 +726,7 @@ impl FeatureGraph for SkillGraphFeatureGraph {
     }
 
     fn detect_communities(&self) -> Vec<Vec<String>> {
-        self.algorithms.detect_communities()
+        SkillGraphAlgorithms::from_store(&self.store).detect_communities()
     }
 
     fn node_data(&self, iri: &str) -> Option<serde_json::Value> {
@@ -708,10 +744,7 @@ impl FeatureGraph for SkillGraphFeatureGraph {
             "success_rate".to_string(),
             serde_json::json!(skill.graph_meta.success_rate),
         );
-        map.insert(
-            "tag_count".to_string(),
-            serde_json::json!(skill.tags.len()),
-        );
+        map.insert("tag_count".to_string(), serde_json::json!(skill.tags.len()));
         if let Some(ref sec) = skill.security_info {
             map.insert(
                 "security_level".to_string(),
@@ -781,10 +814,7 @@ impl FeatureGraph for SparqlFeatureGraph {
                 result
             }
             Direction::Incoming => {
-                let q = format!(
-                    "SELECT ?s WHERE {{ {} {{ ?s ?p <{}> . }} }}",
-                    gc, safe_iri
-                );
+                let q = format!("SELECT ?s WHERE {{ {} {{ ?s ?p <{}> . }} }}", gc, safe_iri);
                 self.exec(&q)
                     .iter()
                     .filter_map(|r| r.get("?s").and_then(|v| v.as_str()))
@@ -835,7 +865,9 @@ impl FeatureGraph for SparqlFeatureGraph {
         ))
         .iter()
         .filter_map(|r| r.get("?s").and_then(|v| v.as_str()))
-        .filter(|s| !s.starts_with("http://www.w3.org/") && !s.starts_with("https://agentos.ontology"))
+        .filter(|s| {
+            !s.starts_with("http://www.w3.org/") && !s.starts_with("https://agentos.ontology")
+        })
         .map(|s| s.to_string())
         .collect()
     }
@@ -847,10 +879,7 @@ impl FeatureGraph for SparqlFeatureGraph {
     fn node_data(&self, iri: &str) -> Option<serde_json::Value> {
         let gc = self.graph_clause();
         let safe_iri = iri.replace('>', "\\u003E");
-        let q = format!(
-            "SELECT ?p ?o WHERE {{ {} {{ <{}> ?p ?o }} }}",
-            gc, safe_iri
-        );
+        let q = format!("SELECT ?p ?o WHERE {{ {} {{ <{}> ?p ?o }} }}", gc, safe_iri);
         let rows = self.exec(&q);
         if rows.is_empty() {
             return None;
@@ -876,8 +905,8 @@ impl FeatureGraph for SparqlFeatureGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge_graph::types::{RdfQuad, RdfValue};
     use crate::knowledge_graph::store::KnowledgeGraphStore;
+    use crate::knowledge_graph::types::{RdfQuad, RdfValue};
     use crate::skill_graph::types::SkillGraphNode;
 
     fn setup_petgraph_backend() -> PetgraphBackend {
@@ -908,7 +937,9 @@ mod tests {
         let backend = setup_petgraph_backend();
         let edges = backend.all_edges();
         assert_eq!(edges.len(), 2);
-        let a_to_b = edges.iter().find(|e| e.source == "iri://skills/a" && e.target == "iri://skills/b");
+        let a_to_b = edges
+            .iter()
+            .find(|e| e.source == "iri://skills/a" && e.target == "iri://skills/b");
         assert!(a_to_b.is_some());
         assert!(a_to_b.unwrap().edge_type.contains("Prerequisite"));
     }
@@ -940,6 +971,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_backend_rejects_invalid_data_without_mutating_store() {
+        let store = Arc::new(SkillGraphStore::new());
+        store
+            .register_skill(SkillGraphNode::new("iri://skills/kept", "Kept", "existing"))
+            .unwrap();
+        let backend = SkillGraphSnapshotBackend::new(store.clone());
+
+        let result = backend.apply_snapshot(&[SnapshotNode::new(
+            "iri://skills/bad",
+            serde_json::json!({"not": "a skill graph node"}),
+            "SkillGraphNode",
+        )]);
+
+        assert!(result.is_err());
+        assert_eq!(store.skill_count(), 1);
+        assert!(store.get_skill("iri://skills/kept").is_some());
+    }
+
+    #[test]
     fn test_feature_graph_degree() {
         let store = Arc::new(SkillGraphStore::new());
         let algo = Arc::new(SkillGraphAlgorithms::from_store(&store));
@@ -958,6 +1008,23 @@ mod tests {
         assert_eq!(fg.degree("iri://skills/a", Direction::Outgoing), 2);
         assert_eq!(fg.degree("iri://skills/b", Direction::Incoming), 1);
         assert_eq!(fg.neighbors("iri://skills/a", Direction::Outgoing).len(), 2);
+    }
+
+    #[test]
+    fn test_feature_graph_metrics_refresh_after_store_mutation() {
+        let store = Arc::new(SkillGraphStore::new());
+        store
+            .register_skill(SkillGraphNode::new("iri://skills/a", "A", "A"))
+            .unwrap();
+        let stale = Arc::new(SkillGraphAlgorithms::from_store(&store));
+        let fg = SkillGraphFeatureGraph::new(store.clone(), stale);
+        store
+            .register_skill(SkillGraphNode::new("iri://skills/b", "B", "B"))
+            .unwrap();
+        assert!(fg
+            .page_rank(0.85)
+            .iter()
+            .any(|(iri, _)| iri == "iri://skills/b"));
     }
 
     // ── SparqlBackend tests ────────────────────────────────────────────
@@ -993,8 +1060,7 @@ mod tests {
             ),
         ];
         kg.write_quads(&quads, SPARQL_TEST_GRAPH).unwrap();
-        SparqlBackend::new(Arc::new(kg))
-            .with_named_graph(SPARQL_TEST_GRAPH)
+        SparqlBackend::new(Arc::new(kg)).with_named_graph(SPARQL_TEST_GRAPH)
     }
 
     #[test]
@@ -1011,7 +1077,9 @@ mod tests {
         let backend = setup_sparql_backend();
         let edges = backend.all_edges();
         assert_eq!(edges.len(), 3);
-        let a_to_b = edges.iter().find(|e| e.source == "iri://skills/a" && e.target == "iri://skills/b");
+        let a_to_b = edges
+            .iter()
+            .find(|e| e.source == "iri://skills/a" && e.target == "iri://skills/b");
         assert!(a_to_b.is_some());
     }
 
@@ -1080,8 +1148,7 @@ mod tests {
             ),
         ];
         kg.write_quads(&quads, SPARQL_TEST_GRAPH).unwrap();
-        SparqlFeatureGraph::new(Arc::new(kg))
-            .with_named_graph(SPARQL_TEST_GRAPH)
+        SparqlFeatureGraph::new(Arc::new(kg)).with_named_graph(SPARQL_TEST_GRAPH)
     }
 
     #[test]
@@ -1136,15 +1203,27 @@ mod tests {
         let fg = setup_sparql_feature_graph();
         let out = fg.neighbors("iri://skills/nonexistent", Direction::Outgoing);
         let inc = fg.neighbors("iri://skills/nonexistent", Direction::Incoming);
-        assert!(out.is_empty(), "Expected empty outgoing for nonexistent IRI");
-        assert!(inc.is_empty(), "Expected empty incoming for nonexistent IRI");
+        assert!(
+            out.is_empty(),
+            "Expected empty outgoing for nonexistent IRI"
+        );
+        assert!(
+            inc.is_empty(),
+            "Expected empty incoming for nonexistent IRI"
+        );
     }
 
     #[test]
     fn test_sparql_feature_degree_nonexistent() {
         let fg = setup_sparql_feature_graph();
-        assert_eq!(fg.degree("iri://skills/nonexistent", Direction::Outgoing), 0);
-        assert_eq!(fg.degree("iri://skills/nonexistent", Direction::Incoming), 0);
+        assert_eq!(
+            fg.degree("iri://skills/nonexistent", Direction::Outgoing),
+            0
+        );
+        assert_eq!(
+            fg.degree("iri://skills/nonexistent", Direction::Incoming),
+            0
+        );
         assert_eq!(fg.degree("iri://skills/nonexistent", Direction::Both), 0);
     }
 
@@ -1191,8 +1270,12 @@ mod tests {
     #[test]
     fn test_empty_sparql_feature_neighbors() {
         let fg = empty_sparql_feature_graph();
-        assert!(fg.neighbors("iri://skills/a", Direction::Outgoing).is_empty());
-        assert!(fg.neighbors("iri://skills/a", Direction::Incoming).is_empty());
+        assert!(fg
+            .neighbors("iri://skills/a", Direction::Outgoing)
+            .is_empty());
+        assert!(fg
+            .neighbors("iri://skills/a", Direction::Incoming)
+            .is_empty());
     }
 
     #[test]

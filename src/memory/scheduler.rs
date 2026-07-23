@@ -32,7 +32,14 @@ impl MemoryScheduler {
         consistency: Arc<ConsistencyEngine>,
         memory_bus: Arc<MemoryBus>,
     ) -> Self {
-        Self::with_hyperspace(l0_store, blackboard, projection, consistency, memory_bus, None)
+        Self::with_hyperspace(
+            l0_store,
+            blackboard,
+            projection,
+            consistency,
+            memory_bus,
+            None,
+        )
     }
 
     pub fn with_hyperspace(
@@ -104,9 +111,11 @@ impl MemoryScheduler {
 
     pub fn on_l1_overflow(&self, session_id: &str) -> Result<usize, CoreError> {
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(session_id).ok_or_else(|| CoreError::Internal {
-            message: format!("Session not found: {}", session_id),
-        })?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| CoreError::Internal {
+                message: format!("Session not found: {}", session_id),
+            })?;
         Ok(session.evict_by_policy())
     }
 
@@ -116,7 +125,9 @@ impl MemoryScheduler {
             tracing::warn!("Consistency on_l2_write failed: {}", e);
         }
         self.blackboard.release_subtree(task_iri)?;
-        self.memory_bus.publish("TASK_COMPLETED", task_iri, "{}").await;
+        self.memory_bus
+            .publish("TASK_COMPLETED", task_iri, "{}")
+            .await;
         Ok(())
     }
 
@@ -131,7 +142,9 @@ impl MemoryScheduler {
     ) -> Result<String, CoreError> {
         if let Some(ref hs) = self.hyperspace {
             let filter = crate::memory::hyperspace_store::HybridSearchFilter::new();
-            let results = hs.search_with_time_decay(task_iri, &filter, decay_lambda, 10).await?;
+            let results = hs
+                .search_with_time_decay(task_iri, &filter, decay_lambda, 10)
+                .await?;
             if !results.is_empty() {
                 let contents: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
                 return Ok(contents.join("\n"));
@@ -148,9 +161,11 @@ impl MemoryScheduler {
     pub fn on_session_close(&self, session_id: &str) -> Result<(), CoreError> {
         let session = {
             let mut sessions = self.sessions.write();
-            sessions.remove(session_id).ok_or_else(|| CoreError::Internal {
-                message: format!("Session not found: {}", session_id),
-            })?
+            sessions
+                .remove(session_id)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("Session not found: {}", session_id),
+                })?
         };
 
         let summary = session.summarize();
@@ -229,9 +244,11 @@ impl MemoryScheduler {
         content: &str,
     ) -> Result<String, CoreError> {
         let sessions = self.sessions.read();
-        let session = sessions.get(session_id).ok_or_else(|| CoreError::Internal {
-            message: format!("Session not found: {}", session_id),
-        })?;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| CoreError::Internal {
+                message: format!("Session not found: {}", session_id),
+            })?;
         let iri = session.archive_full_to_l0(&self.l0_store, role, thought, content)?;
         if let Err(e) = self.consistency.on_l0_update(&iri).await {
             tracing::warn!("Consistency on_l0_update failed: {}", e);
@@ -260,11 +277,11 @@ impl MemoryScheduler {
 mod tests {
     use super::*;
     use crate::core::event_bus::EventBus;
+    use crate::memory::consistency_engine::ConsistencyEngine;
     use crate::memory::l0_store::L0Store;
     use crate::memory::l2_blackboard::Blackboard;
     use crate::memory::l3_projection::ProjectionEngine;
     use crate::memory::memory_bus::MemoryBus;
-    use crate::memory::consistency_engine::ConsistencyEngine;
     use tempfile::tempdir;
 
     fn setup_scheduler() -> (Arc<MemoryScheduler>, tempfile::TempDir) {

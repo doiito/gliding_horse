@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use glidinghorse::config::settings::LoggingSettings;
+use glidinghorse::config::GatewaySettings;
 use glidinghorse::core::agent_instance::AgentRole;
-use glidinghorse::core::sa::{SupervisorAgent, TaskComplexity};
 use glidinghorse::core::event_bus::EventBus;
+use glidinghorse::core::sa::{SupervisorAgent, TaskComplexity};
 use glidinghorse::gateway::UnifiedGateway;
 use glidinghorse::memory::l0_store::L0Store;
 use glidinghorse::memory::l1_session::L1Session;
@@ -13,8 +15,6 @@ use glidinghorse::memory::l3_projection::ProjectionEngine;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::templates::template_engine::TemplateEngine;
 use glidinghorse::tools::skill_registry::SkillRegistry;
-use glidinghorse::config::GatewaySettings;
-use glidinghorse::config::settings::LoggingSettings;
 use glidinghorse::utils::init_logging;
 use glidinghorse::CoreConfig;
 
@@ -81,22 +81,44 @@ fn setup_infra() -> TestInfra {
     let l0 = Arc::new(L0Store::new(l0_path.to_string_lossy().as_ref()).unwrap());
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
-    let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(l0.clone(), l2.clone(), proj.clone(), CoreConfig::default())));
+    let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
+        l0.clone(),
+        l2.clone(),
+        proj.clone(),
+        CoreConfig::default(),
+    )));
     let skills = Arc::new(SkillRegistry::new());
-    let tmpl = Arc::new(TemplateEngine::new(Path::new("src/templates/templates"))
-        .unwrap_or_else(|_| TemplateEngine::new(Path::new("/nonexistent")).unwrap()));
+    let tmpl = Arc::new(
+        TemplateEngine::new(Path::new("src/templates/templates"))
+            .unwrap_or_else(|_| TemplateEngine::new(Path::new("/nonexistent")).unwrap()),
+    );
     let gateway = Arc::new(UnifiedGateway::new(&test_gateway_settings()).unwrap());
     let runner = Arc::new(glidinghorse::core::agent_runner::AgentRunner::new(
-        gateway.clone(), skills.clone(), l2.clone(), l0.clone(), mm.clone(), tmpl.clone(),
+        gateway.clone(),
+        skills.clone(),
+        l2.clone(),
+        l0.clone(),
+        mm.clone(),
+        tmpl.clone(),
         glidinghorse::config::AgentSettings::default(),
     ));
-    TestInfra { _l0_dir: l0_dir, l0, l2, proj, mm, skills, templates: tmpl, gateway, runner }
+    TestInfra {
+        _l0_dir: l0_dir,
+        l0,
+        l2,
+        proj,
+        mm,
+        skills,
+        templates: tmpl,
+        gateway,
+        runner,
+    }
 }
 
 #[test]
 fn test_sa_complexity_classification() {
     init_test_logging();
-    
+
     let infra = setup_infra();
     let sa = SupervisorAgent::new(
         infra.runner.clone(),
@@ -111,7 +133,9 @@ fn test_sa_complexity_classification() {
     assert_eq!(plan.agent_sequence.len(), 1);
     assert_eq!(plan.agent_sequence[0], AgentRole::Do);
 
-    let plan = sa.analyze_task("Build a web application with user authentication and a PostgreSQL database backend");
+    let plan = sa.analyze_task(
+        "Build a web application with user authentication and a PostgreSQL database backend",
+    );
     assert_eq!(plan.task_complexity, TaskComplexity::Recursive);
     assert_eq!(plan.agent_sequence.len(), 4);
 
@@ -134,17 +158,38 @@ fn test_memory_full_pipeline() {
     assert_eq!(l1.turn_count(), 2);
 
     let config = glidinghorse::CoreConfig::default();
-    infra.l2.write_node("iri://task/test_mem/node_1", r#"{"@id":"iri://task/test_mem/node_1","@type":"TestNode","summary":"test"}"#, &config).unwrap();
-    let node = infra.l2.read_node("iri://task/test_mem/node_1").unwrap().unwrap();
+    infra
+        .l2
+        .write_node(
+            "iri://task/test_mem/node_1",
+            r#"{"@id":"iri://task/test_mem/node_1","@type":"TestNode","summary":"test"}"#,
+            &config,
+        )
+        .unwrap();
+    let node = infra
+        .l2
+        .read_node("iri://task/test_mem/node_1")
+        .unwrap()
+        .unwrap();
     assert_eq!(node.node_type.as_ref().unwrap(), "TestNode");
 
     infra.l2.flush_oxigraph();
-    let sparql_results = infra.l2.query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 5").unwrap();
-    assert!(!sparql_results.is_empty(), "SPARQL should return results after write_node");
+    let sparql_results = infra
+        .l2
+        .query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 5")
+        .unwrap();
+    assert!(
+        !sparql_results.is_empty(),
+        "SPARQL should return results after write_node"
+    );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let projection = infra.proj.project("iri://task/test_mem", "reference_only", HashMap::new()).await.unwrap();
+        let projection = infra
+            .proj
+            .project("iri://task/test_mem", "reference_only", HashMap::new())
+            .await
+            .unwrap();
         assert!(projection.contains("task_iri"));
     });
 }
@@ -153,8 +198,14 @@ fn test_memory_full_pipeline() {
 fn test_l0_store_crud() {
     let infra = setup_infra();
 
-    infra.l0.store("iri://test/doc1", "Rust is a systems programming language").unwrap();
-    infra.l0.store("iri://test/doc2", "Python is an interpreted language").unwrap();
+    infra
+        .l0
+        .store("iri://test/doc1", "Rust is a systems programming language")
+        .unwrap();
+    infra
+        .l0
+        .store("iri://test/doc2", "Python is an interpreted language")
+        .unwrap();
 
     let entry = infra.l0.retrieve("iri://test/doc1").unwrap();
     assert!(entry.is_some());

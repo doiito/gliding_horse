@@ -55,7 +55,8 @@ impl SimilarityEngine {
         };
 
         // Existing links
-        let existing_targets: Vec<&str> = skill.links.iter().map(|l| l.target_iri.as_str()).collect();
+        let existing_targets: Vec<&str> =
+            skill.links.iter().map(|l| l.target_iri.as_str()).collect();
 
         let mut scored: Vec<LinkPrediction> = embeddings
             .iter()
@@ -73,7 +74,11 @@ impl SimilarityEngine {
             .collect();
 
         // Sort by score descending
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
         scored
     }
@@ -128,7 +133,9 @@ mod tests {
 
         // Register source skill so predict_links can look up existing links
         let node_a = crate::skill_graph::types::SkillGraphNode::new(
-            "iri://skills/a", "Skill A", "Test skill",
+            "iri://skills/a",
+            "Skill A",
+            "Test skill",
         );
         store.register_skill(node_a).unwrap();
 

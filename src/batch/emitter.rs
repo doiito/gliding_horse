@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::batch::types::{
-    DetectedIntent, EmitCondition, ExtractedEntity, ExtractionResult, ExtractedRelation,
+    DetectedIntent, EmitCondition, ExtractedEntity, ExtractedRelation, ExtractionResult,
 };
 use crate::core::event_bus::{EventBus, EventPriority};
 
@@ -116,11 +116,7 @@ impl BatchEventEmitter {
             .await;
     }
 
-    pub async fn emit_extraction_complete(
-        &self,
-        agent_name: &str,
-        result: &ExtractionResult,
-    ) {
+    pub async fn emit_extraction_complete(&self, agent_name: &str, result: &ExtractionResult) {
         let should_emit = self.should_emit(agent_name, &EmitCondition::Always)
             || self.should_emit(agent_name, &EmitCondition::ConfidenceAbove(0.0));
 
@@ -151,12 +147,7 @@ impl BatchEventEmitter {
             .await;
     }
 
-    pub async fn emit_extraction_failed(
-        &self,
-        agent_name: &str,
-        batch_id: &str,
-        error: &str,
-    ) {
+    pub async fn emit_extraction_failed(&self, agent_name: &str, batch_id: &str, error: &str) {
         let _ = self
             .event_bus
             .emit(
@@ -216,11 +207,7 @@ impl BatchEventEmitter {
             .await;
     }
 
-    pub async fn emit_new_relation(
-        &self,
-        agent_name: &str,
-        relation: &ExtractedRelation,
-    ) {
+    pub async fn emit_new_relation(&self, agent_name: &str, relation: &ExtractedRelation) {
         if !self.should_emit(agent_name, &EmitCondition::NewRelation) {
             return;
         }
@@ -251,18 +238,16 @@ impl BatchEventEmitter {
             .await;
     }
 
-    pub async fn emit_intent_detected(
-        &self,
-        agent_name: &str,
-        intent: &DetectedIntent,
-    ) {
+    pub async fn emit_intent_detected(&self, agent_name: &str, intent: &DetectedIntent) {
         let matched = match &EmitCondition::IntentDetected(vec![]) {
-            EmitCondition::IntentDetected(types) => types.is_empty() || types.contains(&intent.intent_type),
+            EmitCondition::IntentDetected(types) => {
+                types.is_empty() || types.contains(&intent.intent_type)
+            }
             _ => false,
         };
 
-        let should_emit = self.should_emit(agent_name, &EmitCondition::IntentDetected(vec![]))
-            || matched;
+        let should_emit =
+            self.should_emit(agent_name, &EmitCondition::IntentDetected(vec![])) || matched;
 
         if !should_emit {
             return;
@@ -349,8 +334,8 @@ impl BatchEventEmitter {
     fn should_emit(&self, agent_name: &str, condition: &EmitCondition) -> bool {
         self.config
             .get(agent_name)
-            .map(|conditions| conditions.iter().any(|c| {
-                match (c, condition) {
+            .map(|conditions| {
+                conditions.iter().any(|c| match (c, condition) {
                     (EmitCondition::NewEntity, EmitCondition::NewEntity) => true,
                     (EmitCondition::NewRelation, EmitCondition::NewRelation) => true,
                     (EmitCondition::Always, _) => true,
@@ -361,8 +346,8 @@ impl BatchEventEmitter {
                         types.is_empty()
                     }
                     _ => false,
-                }
-            }))
+                })
+            })
             .unwrap_or(true) // Default: emit everything
     }
 }

@@ -25,12 +25,7 @@ pub struct CausalObservation {
 }
 
 impl CausalObservation {
-    pub fn new(
-        event_id: &str,
-        skill_iri: &str,
-        error_class: &str,
-        error_signature: &str,
-    ) -> Self {
+    pub fn new(event_id: &str, skill_iri: &str, error_class: &str, error_signature: &str) -> Self {
         Self {
             event_id: event_id.to_string(),
             timestamp: Utc::now(),

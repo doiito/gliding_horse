@@ -6,67 +6,81 @@ use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend};
 use glidinghorse::skill_graph::*;
 use glidinghorse::tools::{SkillRegistry, ToolExecutor};
 
-const AXURE_TO_VUE2_SKILL_MD: &str = include_str!("../../.trae-test-skills/axure-to-vue2-skill/SKILL.md");
-const AXURE_VUE2_REFACTOR_SKILL_MD: &str = include_str!("../../.trae-test-skills/axure-vue2-refactor/SKILL.md");
+const AXURE_TO_VUE2_SKILL_MD: &str =
+    include_str!("../../.trae-test-skills/axure-to-vue2-skill/SKILL.md");
+const AXURE_VUE2_REFACTOR_SKILL_MD: &str =
+    include_str!("../../.trae-test-skills/axure-vue2-refactor/SKILL.md");
 
 fn create_test_graph_with_skills() -> Arc<SkillGraphStore> {
     let store = Arc::new(SkillGraphStore::new());
 
-    let jwt_auth = SkillGraphNode::new("iri://skills/jwt-auth", "JWT Authentication", "JSON Web Token 认证")
-        .with_node_type(SkillNodeType::Atomic)
-        .with_tag("auth")
-        .with_tag("jwt")
-        .with_tag("security")
-        .with_5w2h(Skill5W2H {
-            what: "JWT 认证".to_string(),
-            why: "保护 API 端点安全".to_string(),
-            who: SkillRole {
-                role_name: "认证中间件".to_string(),
-                required_agent_role: Some("DA".to_string()),
-            },
-            when: SkillTrigger {
-                applicable_phases: vec!["Do".to_string()],
-                trigger_condition: Some("需要认证时".to_string()),
-                deadline_constraint: None,
-            },
-            where_: SkillContext {
-                target_stack: vec!["rust".to_string(), "axum".to_string()],
-                repo_pattern: Some("src/middleware/*".to_string()),
-            },
-            how: SkillApproach {
-                approach: "使用 jsonwebtoken crate".to_string(),
-                plan_iri: None,
-            },
-            how_much: SkillCost {
-                avg_token_cost: 800,
-                avg_duration_seconds: 3,
-                max_sub_agents: 0,
-            },
-        })
-        .with_security_info(
-            SkillSecurityInfo::new(SkillSource::SystemBuiltin).with_trust_level(TrustLevel::High),
-        );
+    let jwt_auth = SkillGraphNode::new(
+        "iri://skills/jwt-auth",
+        "JWT Authentication",
+        "JSON Web Token 认证",
+    )
+    .with_node_type(SkillNodeType::Atomic)
+    .with_tag("auth")
+    .with_tag("jwt")
+    .with_tag("security")
+    .with_5w2h(Skill5W2H {
+        what: "JWT 认证".to_string(),
+        why: "保护 API 端点安全".to_string(),
+        who: SkillRole {
+            role_name: "认证中间件".to_string(),
+            required_agent_role: Some("DA".to_string()),
+        },
+        when: SkillTrigger {
+            applicable_phases: vec!["Do".to_string()],
+            trigger_condition: Some("需要认证时".to_string()),
+            deadline_constraint: None,
+        },
+        where_: SkillContext {
+            target_stack: vec!["rust".to_string(), "axum".to_string()],
+            repo_pattern: Some("src/middleware/*".to_string()),
+        },
+        how: SkillApproach {
+            approach: "使用 jsonwebtoken crate".to_string(),
+            plan_iri: None,
+        },
+        how_much: SkillCost {
+            avg_token_cost: 800,
+            avg_duration_seconds: 3,
+            max_sub_agents: 0,
+        },
+    })
+    .with_security_info(
+        SkillSecurityInfo::new(SkillSource::SystemBuiltin).with_trust_level(TrustLevel::High),
+    );
 
-    let oauth_auth = SkillGraphNode::new("iri://skills/oauth-auth", "OAuth Authentication", "OAuth 2.0 认证")
-        .with_node_type(SkillNodeType::Atomic)
-        .with_tag("auth")
-        .with_tag("oauth")
-        .with_tag("security")
-        .with_security_info(
-            SkillSecurityInfo::new(SkillSource::SystemBuiltin).with_trust_level(TrustLevel::High),
-        );
+    let oauth_auth = SkillGraphNode::new(
+        "iri://skills/oauth-auth",
+        "OAuth Authentication",
+        "OAuth 2.0 认证",
+    )
+    .with_node_type(SkillNodeType::Atomic)
+    .with_tag("auth")
+    .with_tag("oauth")
+    .with_tag("security")
+    .with_security_info(
+        SkillSecurityInfo::new(SkillSource::SystemBuiltin).with_trust_level(TrustLevel::High),
+    );
 
-    let rbac = SkillGraphNode::new("iri://skills/rbac", "RBAC Authorization", "基于角色的访问控制")
-        .with_node_type(SkillNodeType::Atomic)
-        .with_tag("auth")
-        .with_tag("authorization")
-        .with_tag("security")
-        .with_link(SkillLink {
-            link_type: SkillLinkType::Prerequisite,
-            target_iri: "iri://skills/jwt-auth".to_string(),
-            strength: LinkStrength::Required,
-            description: "RBAC 需要 JWT 提供用户身份".to_string(),
-        });
+    let rbac = SkillGraphNode::new(
+        "iri://skills/rbac",
+        "RBAC Authorization",
+        "基于角色的访问控制",
+    )
+    .with_node_type(SkillNodeType::Atomic)
+    .with_tag("auth")
+    .with_tag("authorization")
+    .with_tag("security")
+    .with_link(SkillLink {
+        link_type: SkillLinkType::Prerequisite,
+        target_iri: "iri://skills/jwt-auth".to_string(),
+        strength: LinkStrength::Required,
+        description: "RBAC 需要 JWT 提供用户身份".to_string(),
+    });
 
     let api_guard = SkillGraphNode::new(
         "iri://skills/api-guard",
@@ -90,15 +104,11 @@ fn create_test_graph_with_skills() -> Arc<SkillGraphStore> {
         description: "包含 RBAC 授权".to_string(),
     });
 
-    let rate_limit = SkillGraphNode::new(
-        "iri://skills/rate-limit",
-        "Rate Limiting",
-        "API 限流",
-    )
-    .with_node_type(SkillNodeType::Atomic)
-    .with_tag("security")
-    .with_tag("api")
-    .with_tag("performance");
+    let rate_limit = SkillGraphNode::new("iri://skills/rate-limit", "Rate Limiting", "API 限流")
+        .with_node_type(SkillNodeType::Atomic)
+        .with_tag("security")
+        .with_tag("api")
+        .with_tag("performance");
 
     store.register_skill(jwt_auth).unwrap();
     store.register_skill(oauth_auth).unwrap();
@@ -255,7 +265,9 @@ async fn test_mcp_tool_registration_and_sync() {
     let result = result.unwrap();
     assert_eq!(result.tools_added, 1);
 
-    let mapping = registry.get_mapping("iri://skills/mcp/filesystem-server-read_file").await;
+    let mapping = registry
+        .get_mapping("iri://skills/mcp/filesystem-server-read_file")
+        .await;
     assert!(mapping.is_some());
 
     let tools = registry.list_tools(Some("filesystem-server")).await;
@@ -265,7 +277,9 @@ async fn test_mcp_tool_registration_and_sync() {
 #[test]
 fn test_conflict_detection_and_resolution() {
     let store = create_test_graph_with_skills();
-    let engine = ConflictDetectionEngine::new(Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())));
+    let engine = ConflictDetectionEngine::new(Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::new(),
+    )));
 
     let mut jwt = store.get_skill("iri://skills/jwt-auth").unwrap();
     jwt.add_link(SkillLink {
@@ -278,7 +292,11 @@ fn test_conflict_detection_and_resolution() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let report = rt.block_on(engine.detect_all_conflicts()).unwrap();
-    assert!(report.total_conflicts > 0 || report.conflicts.len() > 0 || report.recommendations.len() > 0);
+    assert!(
+        report.total_conflicts > 0
+            || report.conflicts.len() > 0
+            || report.recommendations.len() > 0
+    );
 }
 
 #[test]
@@ -338,7 +356,12 @@ fn test_audit_trail_and_risk_scoring() {
     assert!(!security.has_permission(PermissionAction::Delete, "/api/users"));
     assert!(!security.has_permission(PermissionAction::Write, "/api/config"));
 
-    security.add_audit_entry(AuditEntry::new("execute", "agent:da/001", "iri://skills/test", AuditOutcome::Success));
+    security.add_audit_entry(AuditEntry::new(
+        "execute",
+        "agent:da/001",
+        "iri://skills/test",
+        AuditOutcome::Success,
+    ));
     assert_eq!(security.audit_trail.len(), 1);
 }
 
@@ -417,7 +440,8 @@ fn test_skill_creator_register_axure_to_vue2() {
     ];
     def.what = "将 Axure RP 导出的 HTML5 原型转换为优化的 Vue 2 前端代码".to_string();
     def.why = "自动化 Axure 原型到 Vue 代码的转换，提高前端开发效率".to_string();
-    def.approach = "三阶段流程：Playwright 信息提取 → LLM 驱动的 Vue2 编码 → 自动化验证与迭代修正".to_string();
+    def.approach =
+        "三阶段流程：Playwright 信息提取 → LLM 驱动的 Vue2 编码 → 自动化验证与迭代修正".to_string();
 
     let config = SkillCreatorConfig {
         output_dir: std::path::PathBuf::from("/tmp/agent_os_test_skills"),
@@ -435,7 +459,8 @@ fn test_skill_creator_register_axure_to_vue2() {
             max_retries: 1,
             retry_base_ms: 500,
             model_mapping: Default::default(),
-        }).unwrap()
+        })
+        .unwrap(),
     );
 
     let creator = SkillCreator::new(gateway, graph_store.clone(), registry.clone(), config);
@@ -447,7 +472,10 @@ fn test_skill_creator_register_axure_to_vue2() {
     let retrieved = graph_store.get_skill(&created.skill_iri);
     assert!(retrieved.is_some(), "Skill 应已注册到 GraphStore");
     let node = retrieved.unwrap();
-    assert!(node.tags.iter().any(|t| t == "axure" || t == "vue2"), "tags 应包含 axure 或 vue2");
+    assert!(
+        node.tags.iter().any(|t| t == "axure" || t == "vue2"),
+        "tags 应包含 axure 或 vue2"
+    );
 
     let registry_meta = registry.get_skill(&created.skill_iri);
     assert!(registry_meta.is_some(), "Skill 应已注册到 SkillRegistry");
@@ -507,8 +535,12 @@ fn test_skill_creator_register_axure_vue2_refactor() {
         "frontend".to_string(),
     ];
     def.what = "将 Axure 风格的 Vue2 代码重构为符合最佳实践的 Vue2 代码，支持 Tailwind CSS、语义化命名、组件抽象、动态数据分析和国际化".to_string();
-    def.why = "Axure 导出的代码质量差，包含无意义 ID、绝对定位、硬编码文本等问题，需要重构为可维护的代码".to_string();
-    def.approach = "六阶段流程：环境搭建 → 分析规划 → 资产重构 → 组件重构 → 样式迁移 → 像素级验证与迭代".to_string();
+    def.why =
+        "Axure 导出的代码质量差，包含无意义 ID、绝对定位、硬编码文本等问题，需要重构为可维护的代码"
+            .to_string();
+    def.approach =
+        "六阶段流程：环境搭建 → 分析规划 → 资产重构 → 组件重构 → 样式迁移 → 像素级验证与迭代"
+            .to_string();
 
     let config = SkillCreatorConfig {
         output_dir: std::path::PathBuf::from("/tmp/agent_os_test_skills"),
@@ -526,7 +558,8 @@ fn test_skill_creator_register_axure_vue2_refactor() {
             max_retries: 1,
             retry_base_ms: 500,
             model_mapping: Default::default(),
-        }).unwrap()
+        })
+        .unwrap(),
     );
 
     let creator = SkillCreator::new(gateway, graph_store.clone(), registry.clone(), config);
@@ -570,7 +603,8 @@ async fn test_skill_creator_two_skills_coexist() {
             max_retries: 1,
             retry_base_ms: 500,
             model_mapping: Default::default(),
-        }).unwrap()
+        })
+        .unwrap(),
     );
 
     let creator = SkillCreator::new(gateway, graph_store.clone(), registry.clone(), config);
@@ -587,8 +621,13 @@ async fn test_skill_creator_two_skills_coexist() {
         },
         "required": ["axure_export_dir"]
     });
-    def1.output_schema = serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
-    def1.tags = vec!["axure".to_string(), "vue2".to_string(), "conversion".to_string()];
+    def1.output_schema =
+        serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
+    def1.tags = vec![
+        "axure".to_string(),
+        "vue2".to_string(),
+        "conversion".to_string(),
+    ];
     def1.what = "Axure 原型转 Vue2 代码".to_string();
     def1.why = "自动化前端开发".to_string();
     def1.approach = "三阶段流程".to_string();
@@ -605,8 +644,13 @@ async fn test_skill_creator_two_skills_coexist() {
         },
         "required": ["vue_component_path"]
     });
-    def2.output_schema = serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
-    def2.tags = vec!["axure".to_string(), "vue2".to_string(), "refactor".to_string()];
+    def2.output_schema =
+        serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
+    def2.tags = vec![
+        "axure".to_string(),
+        "vue2".to_string(),
+        "refactor".to_string(),
+    ];
     def2.what = "Axure Vue2 代码重构".to_string();
     def2.why = "提升代码质量".to_string();
     def2.approach = "六阶段流程".to_string();
@@ -614,13 +658,20 @@ async fn test_skill_creator_two_skills_coexist() {
     let created1 = creator.create_from_definition(def1, None).unwrap();
     let created2 = creator.create_from_definition(def2, None).unwrap();
 
-    assert_ne!(created1.skill_iri, created2.skill_iri, "两个 Skill 的 IRI 应不同");
+    assert_ne!(
+        created1.skill_iri, created2.skill_iri,
+        "两个 Skill 的 IRI 应不同"
+    );
 
     let all_skills = graph_store.list_all_skills();
     assert_eq!(all_skills.len(), 2, "应注册了 2 个 Skill");
 
     let all_registry = registry.list_skills_basic();
-    assert!(all_registry.len() >= 2, "SkillRegistry 中应至少有 2 个 Skill (包含内置技能), 实际: {}", all_registry.len());
+    assert!(
+        all_registry.len() >= 2,
+        "SkillRegistry 中应至少有 2 个 Skill (包含内置技能), 实际: {}",
+        all_registry.len()
+    );
 
     let discovery = SkillDiscoveryEngine::new(graph_store.clone());
     let task = Task5W2H::new("Axure 原型转 Vue2", "前端开发")
@@ -645,7 +696,13 @@ fn test_tool_executor_convert_skill_static() {
     let output = result.unwrap();
     assert!(output["name"].is_string(), "输出应包含 name");
     assert!(output["skill_iri"].is_string(), "输出应包含 skill_iri");
-    assert!(output["skill_iri"].as_str().unwrap().starts_with("iri://skills/"), "skill_iri 应以 iri://skills/ 开头");
+    assert!(
+        output["skill_iri"]
+            .as_str()
+            .unwrap()
+            .starts_with("iri://skills/"),
+        "skill_iri 应以 iri://skills/ 开头"
+    );
 }
 
 #[test]
@@ -685,7 +742,8 @@ fn test_skill_creator_json_ld_validity() {
             max_retries: 1,
             retry_base_ms: 500,
             model_mapping: Default::default(),
-        }).unwrap()
+        })
+        .unwrap(),
     );
 
     let creator = SkillCreator::new(gateway, graph_store.clone(), registry.clone(), config);
@@ -695,7 +753,8 @@ fn test_skill_creator_json_ld_validity() {
     def.security_level = "high".to_string();
     def.allowed_roles = vec!["DA".to_string()];
     def.input_schema = serde_json::json!({"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]});
-    def.output_schema = serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
+    def.output_schema =
+        serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
     def.tags = vec!["axure".to_string(), "vue2".to_string()];
     def.what = "Axure 转 Vue2".to_string();
     def.why = "自动化".to_string();
@@ -706,12 +765,25 @@ fn test_skill_creator_json_ld_validity() {
 
     let context = json_ld.get("@context").unwrap();
     assert!(context.is_object(), "@context 应为对象");
-    assert!(context.get("skill").is_some(), "@context 应包含 skill 命名空间");
-    assert!(context.get("schema").is_some(), "@context 应包含 schema 命名空间");
+    assert!(
+        context.get("skill").is_some(),
+        "@context 应包含 skill 命名空间"
+    );
+    assert!(
+        context.get("schema").is_some(),
+        "@context 应包含 schema 命名空间"
+    );
 
     let at_type = json_ld.get("@type").unwrap();
     assert!(at_type.is_array(), "@type 应为数组");
-    assert!(at_type.as_array().unwrap().iter().any(|t| t == "skill:Skill"), "@type 应包含 skill:Skill");
+    assert!(
+        at_type
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "skill:Skill"),
+        "@type 应包含 skill:Skill"
+    );
 
     let w2h = json_ld.get("skill:5W2H").unwrap();
     assert!(w2h.get("skill:what").is_some(), "5W2H 应包含 what");
@@ -720,7 +792,10 @@ fn test_skill_creator_json_ld_validity() {
 
     let json_str = serde_json::to_string_pretty(&json_ld).unwrap();
     let reparsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-    assert_eq!(reparsed["@id"], json_ld["@id"], "JSON-LD 应可序列化/反序列化");
+    assert_eq!(
+        reparsed["@id"], json_ld["@id"],
+        "JSON-LD 应可序列化/反序列化"
+    );
 }
 
 #[test]
@@ -743,7 +818,8 @@ fn test_skill_creator_disclosure_levels() {
             max_retries: 1,
             retry_base_ms: 500,
             model_mapping: Default::default(),
-        }).unwrap()
+        })
+        .unwrap(),
     );
 
     let creator = SkillCreator::new(gateway, graph_store.clone(), registry.clone(), config);
@@ -753,7 +829,8 @@ fn test_skill_creator_disclosure_levels() {
     def.security_level = "normal".to_string();
     def.allowed_roles = vec!["DA".to_string(), "CA".to_string()];
     def.input_schema = serde_json::json!({"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]});
-    def.output_schema = serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
+    def.output_schema =
+        serde_json::json!({"type": "object", "properties": {"result": {"type": "string"}}});
     def.tags = vec!["axure".to_string(), "refactor".to_string()];
     def.what = "Axure Vue2 重构".to_string();
     def.why = "提升代码质量".to_string();
@@ -829,26 +906,33 @@ fn test_causal_pipeline_e2e() {
         .with_causal_engine(causal);
 
     // Record failure in api-gateway — should trigger Path A (CausalEngine delegate)
-    engine.record_usage(
-        UsageRecord::new(
-            "iri://skills/api-gateway",
-            "iri://task/e2e-001",
-            "agent:da/001",
-            false,
-        ).with_error("Gateway timeout after 30s")
-    ).unwrap();
+    engine
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/api-gateway",
+                "iri://task/e2e-001",
+                "agent:da/001",
+                false,
+            )
+            .with_error("Gateway timeout after 30s"),
+        )
+        .unwrap();
 
     // Should produce at least one evolution suggestion
     let suggestions = engine.get_pending_suggestions();
-    assert!(!suggestions.is_empty(),
-        "Causal failure should produce suggestions");
-    
+    assert!(
+        !suggestions.is_empty(),
+        "Causal failure should produce suggestions"
+    );
+
     // The suggestion should reference the failed skill
     assert_eq!(suggestions[0].skill_iri, "iri://skills/api-gateway");
-    
+
     // Confidence from CausalEngine should be > 0
-    assert!(suggestions[0].confidence > 0.0,
-        "CausalEngine should provide non-zero confidence");
+    assert!(
+        suggestions[0].confidence > 0.0,
+        "CausalEngine should provide non-zero confidence"
+    );
 }
 
 #[test]
@@ -860,35 +944,46 @@ fn test_causal_propagation_chain_e2e() {
         .with_causal_engine(causal);
 
     // Record failure in base (root cause)
-    engine.record_usage(
-        UsageRecord::new(
-            "iri://skills/base",
-            "iri://task/e2e-002",
-            "agent:da/001",
-            false,
-        ).with_error("Base service crashed")
-    ).unwrap();
+    engine
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/base",
+                "iri://task/e2e-002",
+                "agent:da/001",
+                false,
+            )
+            .with_error("Base service crashed"),
+        )
+        .unwrap();
 
     // Record failure in auth (depends on base) — should detect propagation
-    engine.record_usage(
-        UsageRecord::new(
-            "iri://skills/auth",
-            "iri://task/e2e-003",
-            "agent:da/002",
-            false,
-        ).with_error("Auth failed — dependency unavailable")
-    ).unwrap();
+    engine
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/auth",
+                "iri://task/e2e-003",
+                "agent:da/002",
+                false,
+            )
+            .with_error("Auth failed — dependency unavailable"),
+        )
+        .unwrap();
 
     // After two failures, both should be tracked via suggestions
     let suggestions = engine.get_pending_suggestions();
-    assert_eq!(suggestions.len(), 2,
-        "Both failures should produce suggestions");
+    assert_eq!(
+        suggestions.len(),
+        2,
+        "Both failures should produce suggestions"
+    );
 
     // Search root cause on a known-good event via find_root_cause with
     // a generated event ID pattern — verify it returns Some
     let events_found = engine.suggest_preventive_action("iri://skills/base");
-    assert!(!events_found.is_empty() || suggestions.len() >= 2,
-        "Either preventive actions or suggestions should exist");
+    assert!(
+        !events_found.is_empty() || suggestions.len() >= 2,
+        "Either preventive actions or suggestions should exist"
+    );
 }
 
 #[test]
@@ -906,18 +1001,24 @@ fn test_causal_preventive_actions_e2e() {
             &format!("iri://task/e2e-{:03}", i),
             "agent:da/001",
             false,
-        ).with_error("Connection timeout");
+        )
+        .with_error("Connection timeout");
         engine.record_usage(record).unwrap();
     }
 
     // Check that preventive actions exist
     let actions = engine.suggest_preventive_action("iri://skills/base");
-    assert!(!actions.is_empty(),
-        "Multiple failures should generate preventive actions for base");
+    assert!(
+        !actions.is_empty(),
+        "Multiple failures should generate preventive actions for base"
+    );
 
     // At least one action should mention failure count
-    assert!(actions.iter().any(|a| a.contains("failures")),
-        "Preventive actions should reference recorded failures: {:?}", actions);
+    assert!(
+        actions.iter().any(|a| a.contains("failures")),
+        "Preventive actions should reference recorded failures: {:?}",
+        actions
+    );
 }
 
 #[test]
@@ -935,29 +1036,39 @@ fn test_causal_pipeline_shared_engine() {
         .with_causal_engine(causal);
 
     // Both record failures
-    engine_a.record_usage(
-        UsageRecord::new(
-            "iri://skills/api-gateway",
-            "iri://task/shared-001",
-            "agent:da/001",
-            false,
-        ).with_error("Engine A timeout")
-    ).unwrap();
+    engine_a
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/api-gateway",
+                "iri://task/shared-001",
+                "agent:da/001",
+                false,
+            )
+            .with_error("Engine A timeout"),
+        )
+        .unwrap();
 
-    engine_b.record_usage(
-        UsageRecord::new(
-            "iri://skills/auth",
-            "iri://task/shared-002",
-            "agent:da/002",
-            false,
-        ).with_error("Engine B auth error")
-    ).unwrap();
+    engine_b
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/auth",
+                "iri://task/shared-002",
+                "agent:da/002",
+                false,
+            )
+            .with_error("Engine B auth error"),
+        )
+        .unwrap();
 
     // Both should produce suggestions
-    assert!(!engine_a.get_pending_suggestions().is_empty(),
-        "Engine A should have suggestions from shared CausalEngine");
-    assert!(!engine_b.get_pending_suggestions().is_empty(),
-        "Engine B should have suggestions from shared CausalEngine");
+    assert!(
+        !engine_a.get_pending_suggestions().is_empty(),
+        "Engine A should have suggestions from shared CausalEngine"
+    );
+    assert!(
+        !engine_b.get_pending_suggestions().is_empty(),
+        "Engine B should have suggestions from shared CausalEngine"
+    );
 }
 
 #[test]
@@ -969,41 +1080,55 @@ fn test_causal_no_false_positive_on_success() {
         .with_causal_engine(causal);
 
     // Successful usage should NOT trigger causal analysis
-    engine.record_usage(
-        UsageRecord::new(
-            "iri://skills/auth",
-            "iri://task/success-001",
-            "agent:da/001",
-            true,
-        ).with_tokens(500)
-    ).unwrap();
+    engine
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/auth",
+                "iri://task/success-001",
+                "agent:da/001",
+                true,
+            )
+            .with_tokens(500),
+        )
+        .unwrap();
 
     // With no failures, no preventive actions
     let actions = engine.suggest_preventive_action("iri://skills/auth");
-    assert!(actions.is_empty(),
-        "No failures means no preventive actions");
-    assert!(engine.get_pending_suggestions().is_empty(),
-        "Successful usage should not create suggestions");
+    assert!(
+        actions.is_empty(),
+        "No failures means no preventive actions"
+    );
+    assert!(
+        engine.get_pending_suggestions().is_empty(),
+        "Successful usage should not create suggestions"
+    );
 }
 
 #[test]
 fn test_causal_legacy_fallback_without_engine() {
     // Without a CausalEngine, the legacy Path B is used
     let store = create_causal_store_with_links();
-    let mut engine = SkillEvolutionEngine::new(store)
-        .with_causal_analysis(5000);
+    let mut engine = SkillEvolutionEngine::new(store).with_causal_analysis(5000);
 
-    engine.record_usage(
-        UsageRecord::new(
-            "iri://skills/auth",
-            "iri://task/legacy-001",
-            "agent:da/001",
-            false,
-        ).with_error("Legacy path error")
-    ).unwrap();
+    engine
+        .record_usage(
+            UsageRecord::new(
+                "iri://skills/auth",
+                "iri://task/legacy-001",
+                "agent:da/001",
+                false,
+            )
+            .with_error("Legacy path error"),
+        )
+        .unwrap();
 
-    assert!(!engine.get_pending_suggestions().is_empty(),
-        "Legacy path should still produce suggestions");
-    assert_eq!(engine.get_pending_suggestions()[0].confidence, 0.7,
-        "Legacy path defaults to 0.7 confidence");
+    assert!(
+        !engine.get_pending_suggestions().is_empty(),
+        "Legacy path should still produce suggestions"
+    );
+    assert_eq!(
+        engine.get_pending_suggestions()[0].confidence,
+        0.7,
+        "Legacy path defaults to 0.7 confidence"
+    );
 }

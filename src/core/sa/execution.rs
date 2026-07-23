@@ -1,4 +1,3 @@
-
 use petgraph::prelude::NodeIndex;
 use petgraph::Incoming;
 use serde::Deserialize;
@@ -14,7 +13,12 @@ use super::types::*;
 
 impl SupervisorAgent {
     fn create_agent(&self, role: AgentRole, cycle_id: &str) -> AgentInstance {
-        let agent_id = format!("{}_{}_{}", cycle_id, role, uuid::Uuid::new_v4().hyphenated());
+        let agent_id = format!(
+            "{}_{}_{}",
+            cycle_id,
+            role,
+            uuid::Uuid::new_v4().hyphenated()
+        );
         AgentInstance::new(agent_id, role)
     }
 
@@ -46,14 +50,20 @@ impl SupervisorAgent {
                 cycle_id: prev_role.map(|_| cycle_id.to_string()),
                 node_type: None,
             };
-            let nodes = blackboard.query_nodes_filtered(&context.task_iri, &filter).unwrap_or_default();
+            let nodes = blackboard
+                .query_nodes_filtered(&context.task_iri, &filter)
+                .unwrap_or_default();
             if !nodes.is_empty() {
                 let mut contents: Vec<String> = Vec::new();
                 let mut summaries: Vec<String> = Vec::new();
                 for n in nodes.iter() {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&n.json_ld) {
                         let role = parsed.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                        let prefix = if !role.is_empty() { format!("[{}] ", role) } else { String::new() };
+                        let prefix = if !role.is_empty() {
+                            format!("[{}] ", role)
+                        } else {
+                            String::new()
+                        };
                         // Prefer content field (full LLM output)
                         if let Some(content) = parsed.get("content").and_then(|s| s.as_str()) {
                             let trimmed = content.trim();
@@ -95,22 +105,32 @@ impl SupervisorAgent {
         info!(agent_id = %agent.agent_id, role = ?role, task = %context.task_iri, "Dispatching agent with isolation");
 
         self.event_bus
-            .emit(&context.task_iri, &format!("{:?}_STARTED", role), &agent.agent_id,
-                &serde_json::json!({"cycle_id": cycle_id}).to_string())
+            .emit(
+                &context.task_iri,
+                &format!("{:?}_STARTED", role),
+                &agent.agent_id,
+                &serde_json::json!({"cycle_id": cycle_id}).to_string(),
+            )
             .await;
 
         // Execute with independent BizAgent instance (agent isolation), with optional per-node timeout
         let iri = context.task_iri.clone();
-        let exec_fut = self.runner.execute_with_biz_agent(&agent, context, plan_step);
+        let exec_fut = self
+            .runner
+            .execute_with_biz_agent(&agent, context, plan_step);
         let result = if timeout_secs > 0 {
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), exec_fut).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), exec_fut).await
+            {
                 Ok(r) => r?,
                 Err(_) => {
                     warn!(role = ?role, timeout = timeout_secs, "Agent dispatch timed out");
                     return Ok(TaskResult {
                         task_iri: iri,
                         status: "timeout".to_string(),
-                        summary: format!("Agent {:?} timed out after {} seconds", role, timeout_secs),
+                        summary: format!(
+                            "Agent {:?} timed out after {} seconds",
+                            role, timeout_secs
+                        ),
                         output: None,
                         jsonld_output: None,
                         artifacts: vec![],
@@ -129,19 +149,30 @@ impl SupervisorAgent {
 
         match result.status.as_str() {
             "success" => {
-                let task_result = serde_json::json!({"status": "success", "summary": &result.summary});
-                self.perception.on_task_end(&task_result, &result.task_iri).await;
+                let task_result =
+                    serde_json::json!({"status": "success", "summary": &result.summary});
+                self.perception
+                    .on_task_end(&task_result, &result.task_iri)
+                    .await;
             }
             "failed" => {
-                let task_result = serde_json::json!({"status": "failed", "summary": &result.summary});
-                self.perception.on_task_end(&task_result, &result.task_iri).await;
+                let task_result =
+                    serde_json::json!({"status": "failed", "summary": &result.summary});
+                self.perception
+                    .on_task_end(&task_result, &result.task_iri)
+                    .await;
             }
             _ => {}
         }
 
         self.event_bus
-            .emit(&result.task_iri, &format!("{:?}_COMPLETED", role), &agent.agent_id,
-                &serde_json::json!({"status": &result.status, "summary": &result.summary}).to_string())
+            .emit(
+                &result.task_iri,
+                &format!("{:?}_COMPLETED", role),
+                &agent.agent_id,
+                &serde_json::json!({"status": &result.status, "summary": &result.summary})
+                    .to_string(),
+            )
             .await;
 
         Ok(result)
@@ -157,16 +188,20 @@ impl SupervisorAgent {
         max_iterations: u32,
         timeout_secs: u64,
     ) -> Result<Vec<TaskResult>, CoreError> {
-        let _ = self.event_bus.emit(
-            task_iri,
-            "PARALLEL_START",
-            "system:sa",
-            &serde_json::json!({
-                "role": format!("{:?}", role),
-                "count": count,
-                "cycle_id": cycle_id,
-            }).to_string(),
-        ).await;
+        let _ = self
+            .event_bus
+            .emit(
+                task_iri,
+                "PARALLEL_START",
+                "system:sa",
+                &serde_json::json!({
+                    "role": format!("{:?}", role),
+                    "count": count,
+                    "cycle_id": cycle_id,
+                })
+                .to_string(),
+            )
+            .await;
 
         let runner = self.runner.clone();
         let mut handles = Vec::new();
@@ -182,12 +217,20 @@ impl SupervisorAgent {
                 let mut agent = AgentInstance::new(agent_id, role);
                 let iri = ctx.task_iri.clone();
                 if timeout_secs > 0 {
-                    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), runner_clone.execute(&mut agent, ctx)).await {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        runner_clone.execute(&mut agent, ctx),
+                    )
+                    .await
+                    {
                         Ok(r) => r,
                         Err(_) => Ok(TaskResult {
                             task_iri: iri,
                             status: "timeout".to_string(),
-                            summary: format!("Parallel agent {:?} timed out after {}s", role, timeout_secs),
+                            summary: format!(
+                                "Parallel agent {:?} timed out after {}s",
+                                role, timeout_secs
+                            ),
                             output: None,
                             jsonld_output: None,
                             artifacts: vec![],
@@ -214,16 +257,20 @@ impl SupervisorAgent {
             }
         }
 
-        let _ = self.event_bus.emit(
-            task_iri,
-            "PARALLEL_COMPLETE",
-            "system:sa",
-            &serde_json::json!({
-                "role": format!("{:?}", role),
-                "success_count": results.len(),
-                "total_count": count,
-            }).to_string(),
-        ).await;
+        let _ = self
+            .event_bus
+            .emit(
+                task_iri,
+                "PARALLEL_COMPLETE",
+                "system:sa",
+                &serde_json::json!({
+                    "role": format!("{:?}", role),
+                    "success_count": results.len(),
+                    "total_count": count,
+                })
+                .to_string(),
+            )
+            .await;
 
         info!(count = results.len(), "Parallel agents completed");
         Ok(results)
@@ -239,15 +286,15 @@ impl SupervisorAgent {
         resumed_messages: Option<Vec<crate::gateway::unified_gateway::ChatMessage>>,
         initial_prev_summary: Option<String>,
     ) -> Result<TaskResult, CoreError> {
-        
         let cycle_id = self
             .active_cycles
             .iter()
             .find(|(_, c)| c.task_iri == task_iri)
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| format!("cycle_{}", uuid::Uuid::new_v4().hyphenated()));
-        
-        let _task_id = task_iri.strip_prefix("iri://task/")
+
+        let _task_id = task_iri
+            .strip_prefix("iri://task/")
             .unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
 
         if let Some(cycle) = self.active_cycles.get_mut(&cycle_id) {
@@ -258,7 +305,9 @@ impl SupervisorAgent {
         info!(plan_id = %plan.plan_id, steps = plan.steps.len(), "Executing plan with detailed steps");
 
         if let Some(prefetch) = &self.prefetch_engine {
-            let entities: Vec<String> = plan.steps.iter()
+            let entities: Vec<String> = plan
+                .steps
+                .iter()
                 .filter_map(|s| {
                     if s.expected_output.starts_with("iri://") {
                         Some(s.expected_output.clone())
@@ -267,7 +316,9 @@ impl SupervisorAgent {
                     }
                 })
                 .collect();
-            prefetch.on_intent_change(&plan.description, &entities).await;
+            prefetch
+                .on_intent_change(&plan.description, &entities)
+                .await;
         }
 
         let mut last_result: Option<TaskResult> = None;
@@ -278,21 +329,25 @@ impl SupervisorAgent {
         // Resume mode: determine which phase to start from
         // Load latest checkpoint from L0 to resolve phase tags
         let resume_skip_phases: Vec<AgentRole> = if resumed_messages.is_some() {
-            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(self.runner.l0_store.clone());
-            let skip_roles = cm.restore_latest_with_skip_roles(task_iri)
+            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
+                self.runner.l0_store.clone(),
+            );
+            let skip_roles = cm
+                .restore_latest_with_skip_roles(task_iri)
                 .ok()
                 .flatten()
                 .map(|(_, roles)| roles)
                 .unwrap_or_else(|| vec!["Plan".to_string()]);
-            skip_roles.iter().filter_map(|r| {
-                match r.as_str() {
+            skip_roles
+                .iter()
+                .filter_map(|r| match r.as_str() {
                     "Plan" => Some(AgentRole::Plan),
                     "Do" => Some(AgentRole::Do),
                     "Check" => Some(AgentRole::Check),
                     "Act" => Some(AgentRole::Act),
                     _ => None,
-                }
-            }).collect()
+                })
+                .collect()
         } else {
             vec![]
         };
@@ -302,8 +357,13 @@ impl SupervisorAgent {
         // If no prev_summary in checkpoint, extract PA output from history messages
         let resume_prev_summary: Option<String> = if resumed_messages.is_some() {
             // Try to read saved prev_summary from L0 checkpoint
-            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(self.runner.l0_store.clone());
-            let from_cp: Option<String> = cm.restore_latest(task_iri).ok().flatten()
+            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
+                self.runner.l0_store.clone(),
+            );
+            let from_cp: Option<String> = cm
+                .restore_latest(task_iri)
+                .ok()
+                .flatten()
                 .and_then(|cp| cp.prev_summary);
             if from_cp.is_some() {
                 from_cp
@@ -320,7 +380,8 @@ impl SupervisorAgent {
                             return Some(msg.content.clone());
                         }
                     }
-                    msgs.iter().rev()
+                    msgs.iter()
+                        .rev()
                         .find(|m| m.role == "assistant")
                         .map(|m| m.content.clone())
                 })
@@ -342,26 +403,41 @@ impl SupervisorAgent {
         // --- Unified DAG execution path ---
         // Convert ExecutionPlan to DAG (LLM path adapter) or use external JSON-LD DAG directly (--workflow path)
         let dag = if let Some(ref dag_jsonld) = plan.dag_jsonld {
-            let def = crate::core::workflow::loader::load_workflow_jsonld(dag_jsonld)
-                .map_err(|e| CoreError::Internal { message: format!("Workflow parsing failed: {}", e) })?;
-            crate::core::workflow::loader::build_dag(&def)
-                .map_err(|e| CoreError::Internal { message: format!("DAG build failed: {}", e) })?
+            let def =
+                crate::core::workflow::loader::load_workflow_jsonld(dag_jsonld).map_err(|e| {
+                    CoreError::Internal {
+                        message: format!("Workflow parsing failed: {}", e),
+                    }
+                })?;
+            crate::core::workflow::loader::build_dag(&def).map_err(|e| CoreError::Internal {
+                message: format!("DAG build failed: {}", e),
+            })?
         } else {
             let wf = crate::core::workflow::adapter::plan_to_workflow(&plan, task_iri);
-            crate::core::workflow::loader::build_dag(&wf)
-                .map_err(|e| CoreError::Internal { message: format!("DAG build failed: {}", e) })?
+            crate::core::workflow::loader::build_dag(&wf).map_err(|e| CoreError::Internal {
+                message: format!("DAG build failed: {}", e),
+            })?
         };
-        let order = crate::core::workflow::loader::topological_order(&dag)
-            .map_err(|e| CoreError::Internal { message: format!("Topological sort failed: {}", e) })?;
+        let order = crate::core::workflow::loader::topological_order(&dag).map_err(|e| {
+            CoreError::Internal {
+                message: format!("Topological sort failed: {}", e),
+            }
+        })?;
 
-        let mut completed_node_results: std::collections::HashMap<String, crate::core::workflow::NodeResult> = std::collections::HashMap::new();
+        let mut completed_node_results: std::collections::HashMap<
+            String,
+            crate::core::workflow::NodeResult,
+        > = std::collections::HashMap::new();
         let mut skip_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // ── Compute topological depth for wave-based parallel dispatch ──
         // Depth = longest path from entry node (all predecessors must complete before this depth)
-        let mut node_depth: std::collections::HashMap<NodeIndex, usize> = std::collections::HashMap::new();
+        let mut node_depth: std::collections::HashMap<NodeIndex, usize> =
+            std::collections::HashMap::new();
         for &nidx in &order {
-            let depth = dag.graph.neighbors_directed(nidx, Incoming)
+            let depth = dag
+                .graph
+                .neighbors_directed(nidx, Incoming)
                 .filter_map(|p| node_depth.get(&p))
                 .max()
                 .map(|d| d + 1)
@@ -415,33 +491,52 @@ impl SupervisorAgent {
                 if resume_skip_phases.contains(&step.role) {
                     info!(role = ?step.role, "[resume] skipping completed phase");
                     if prev_summary.is_none() {
-                        prev_summary = resume_prev_summary.clone().or_else(|| Some("Restored from checkpoint, preceding phase completed.".to_string()));
+                        prev_summary = resume_prev_summary.clone().or_else(|| {
+                            Some("Restored from checkpoint, preceding phase completed.".to_string())
+                        });
                     }
                     continue;
                 }
 
                 // HumanApprovalNode: blocking, runs inline in the wave's pre-phase
                 if nd.node_type == "HumanApprovalNode" {
-                    let approval = self.request_human_approval_general(
-                        &nd.approval_prompt, &nd.id, task_iri
-                    ).await?;
+                    let approval = self
+                        .request_human_approval_general(&nd.approval_prompt, &nd.id, task_iri)
+                        .await?;
 
-                    let status = if approval.approved { "approved" } else { "rejected" };
-                    let summary = format!("[HumanApproval] {}: {}",
-                        if approval.approved { "Approved" } else { "Rejected" },
-                        approval.comment.as_deref().unwrap_or(""));
+                    let status = if approval.approved {
+                        "approved"
+                    } else {
+                        "rejected"
+                    };
+                    let summary = format!(
+                        "[HumanApproval] {}: {}",
+                        if approval.approved {
+                            "Approved"
+                        } else {
+                            "Rejected"
+                        },
+                        approval.comment.as_deref().unwrap_or("")
+                    );
 
-                    completed_node_results.insert(nd.id.clone(), crate::core::workflow::NodeResult {
-                        node_id: nd.id.clone(),
-                        status: status.to_string(),
-                        summary: summary.clone(),
-                        archive_iri: None,
-                        turn_count: 0,
-                        tool_call_count: 0,
-                        error: if approval.approved { None } else { Some("User rejected".to_string()) },
-                        output: None,
-                        artifacts: vec![],
-                    });
+                    completed_node_results.insert(
+                        nd.id.clone(),
+                        crate::core::workflow::NodeResult {
+                            node_id: nd.id.clone(),
+                            status: status.to_string(),
+                            summary: summary.clone(),
+                            archive_iri: None,
+                            turn_count: 0,
+                            tool_call_count: 0,
+                            error: if approval.approved {
+                                None
+                            } else {
+                                Some("User rejected".to_string())
+                            },
+                            output: None,
+                            artifacts: vec![],
+                        },
+                    );
 
                     let ha_result = TaskResult {
                         task_iri: task_iri.to_string(),
@@ -466,7 +561,10 @@ impl SupervisorAgent {
                             let mut found = false;
                             for skip_idx in (wi + 1)..order.len() {
                                 let sid = dag.graph[order[skip_idx]].def.id.clone();
-                                if sid == *reject_target { found = true; break; }
+                                if sid == *reject_target {
+                                    found = true;
+                                    break;
+                                }
                                 skip_nodes.insert(sid);
                             }
                             if !found {
@@ -482,7 +580,10 @@ impl SupervisorAgent {
                             let mut found = false;
                             for skip_idx in (wi + 1)..order.len() {
                                 let sid = dag.graph[order[skip_idx]].def.id.clone();
-                                if sid == *approve_target { found = true; break; }
+                                if sid == *approve_target {
+                                    found = true;
+                                    break;
+                                }
                                 skip_nodes.insert(sid);
                             }
                             if !found {
@@ -498,27 +599,33 @@ impl SupervisorAgent {
                 }
 
                 // ── Supplementary input processing & pause check ──
-                self.check_and_process_supplementary_inputs(
-                    task_iri, &step.role, &step.objective,
-                ).await?;
+                self.check_and_process_supplementary_inputs(task_iri, &step.role, &step.objective)
+                    .await?;
                 // Cycle timeout check
                 {
                     let cycle_start = self.active_cycles.get(&cycle_id).map(|c| c.started_at);
                     if let Some(started_at) = cycle_start {
                         let elapsed = chrono::Utc::now().signed_duration_since(started_at);
                         if elapsed.num_seconds() > self.perception.cycle_timeout_secs() {
-                            let intervention = self.perception.on_cycle_timeout(&cycle_id, task_iri, elapsed.num_seconds() as f64);
+                            let intervention = self.perception.on_cycle_timeout(
+                                &cycle_id,
+                                task_iri,
+                                elapsed.num_seconds() as f64,
+                            );
                             if intervention.should_interrupt {
                                 let _ = tokio::time::timeout(
                                     std::time::Duration::from_secs(self.execution_timeout_secs),
                                     self.execute_intervention(intervention, task_iri),
-                                ).await;
+                                )
+                                .await;
                             }
                         }
                     }
                 }
                 // Pause check
-                let paused = self.active_cycles.get(&cycle_id)
+                let paused = self
+                    .active_cycles
+                    .get(&cycle_id)
                     .map(|c| c.phase == CyclePhase::Idle)
                     .unwrap_or(false);
                 if paused {
@@ -528,7 +635,9 @@ impl SupervisorAgent {
                         let mut payloads = Vec::new();
                         if let Some(ref mut receiver) = self.event_receiver {
                             while let Ok(event) = receiver.try_recv() {
-                                if event.task_iri != task_iri { continue; }
+                                if event.task_iri != task_iri {
+                                    continue;
+                                }
                                 if event.event_type == "USER_SUPPLEMENTARY_INPUT" {
                                     payloads.push(event.payload.clone());
                                 }
@@ -537,16 +646,26 @@ impl SupervisorAgent {
                         for payload in payloads {
                             self.enqueue_supplementary_input(task_iri, &payload);
                         }
-                        let resumed = self.active_cycles.get(&cycle_id)
+                        let resumed = self
+                            .active_cycles
+                            .get(&cycle_id)
                             .map(|c| c.phase == CyclePhase::Executing)
                             .unwrap_or(false);
-                        if resumed { break; }
+                        if resumed {
+                            break;
+                        }
                     }
                 }
 
                 // ── Check for parallel_groups (ExecutionPlan same-role parallelism) ──
-                if plan.parallel_groups.iter().any(|g| g.len() > 1 && g.contains(&step.role)) {
-                    let matching_groups: Vec<_> = plan.parallel_groups.iter()
+                if plan
+                    .parallel_groups
+                    .iter()
+                    .any(|g| g.len() > 1 && g.contains(&step.role))
+                {
+                    let matching_groups: Vec<_> = plan
+                        .parallel_groups
+                        .iter()
                         .filter(|g| g.contains(&step.role))
                         .collect();
                     let parallel_group = match matching_groups.first() {
@@ -557,9 +676,17 @@ impl SupervisorAgent {
                         }
                     };
                     let count = parallel_group.len();
-                    let results = self.dispatch_agents_parallel(
-                        step.role, count, &step.objective, task_iri, &cycle_id, self.max_iterations, nd.timeout_secs,
-                    ).await?;
+                    let results = self
+                        .dispatch_agents_parallel(
+                            step.role,
+                            count,
+                            &step.objective,
+                            task_iri,
+                            &cycle_id,
+                            self.max_iterations,
+                            nd.timeout_secs,
+                        )
+                        .await?;
 
                     let failed = results.iter().find(|r| r.status == "failed");
                     if let Some(f) = failed {
@@ -580,9 +707,12 @@ impl SupervisorAgent {
                         });
                     }
 
-                    let combined_summary: String = results.iter()
+                    let combined_summary: String = results
+                        .iter()
                         .map(|r| {
-                            let iri_part = r.archive_iri.as_ref()
+                            let iri_part = r
+                                .archive_iri
+                                .as_ref()
                                 .map(|iri| format!(" | read_agent_output query: {}", iri))
                                 .unwrap_or_default();
                             format!("[{}] {}{}", r.task_iri, r.summary, iri_part)
@@ -595,14 +725,23 @@ impl SupervisorAgent {
                 }
 
                 // ── Build objective (PDCA role-specific templates) ──
-                let cycle_hints = self.active_cycles.values()
+                let cycle_hints = self
+                    .active_cycles
+                    .values()
                     .find(|c| c.task_iri == task_iri)
                     .map(|c| c.experience_hints.clone())
                     .unwrap_or_default();
                 let hints_block = if cycle_hints.is_empty() {
                     String::new()
                 } else {
-                    format!("\n\n## Historical Experience\n{}", cycle_hints.iter().map(|h| format!("- {}", h)).collect::<Vec<_>>().join("\n"))
+                    format!(
+                        "\n\n## Historical Experience\n{}",
+                        cycle_hints
+                            .iter()
+                            .map(|h| format!("- {}", h))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
                 };
                 let objective = match (&prev_summary, step.role) {
                     (Some(summary), AgentRole::Plan) => {
@@ -615,7 +754,8 @@ impl SupervisorAgent {
                         format!("{}\n\nExecution Results:\n{}{}\n\nPlease verify whether the execution results are correct and complete.", step.objective, summary, hints_block)
                     }
                     (Some(summary), AgentRole::Act) => {
-                        let da_context = da_output.as_ref()
+                        let da_context = da_output
+                            .as_ref()
                             .filter(|_| da_output.as_ref().map_or(false, |da| da != summary))
                             .map(|da| format!("\n\n## Execution Results\n{}", da))
                             .unwrap_or_default();
@@ -638,14 +778,21 @@ impl SupervisorAgent {
                 let is_first_executed_step = if resume_skip_phases.is_empty() {
                     wi == 0
                 } else {
-                    !resume_skip_phases.contains(&step.role) 
-                        && plan.steps[..wi].iter().all(|s| resume_skip_phases.contains(&s.role))
+                    !resume_skip_phases.contains(&step.role)
+                        && plan.steps[..wi]
+                            .iter()
+                            .all(|s| resume_skip_phases.contains(&s.role))
                 };
                 if is_first_executed_step {
                     if let Some(ref msgs) = resumed_messages {
-                        let turn_count = msgs.iter().filter(|m| m.role == "assistant").count() as u32;
-                        let tool_count = msgs.iter().filter(|m| m.role == "tool" || m.tool_call_id.is_some()).count() as u32;
-                        context = context.with_resumed_messages(msgs.clone(), turn_count, tool_count);
+                        let turn_count =
+                            msgs.iter().filter(|m| m.role == "assistant").count() as u32;
+                        let tool_count = msgs
+                            .iter()
+                            .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
+                            .count() as u32;
+                        context =
+                            context.with_resumed_messages(msgs.clone(), turn_count, tool_count);
                     }
                 }
                 if let Some(ref pv) = prev_summary {
@@ -654,10 +801,18 @@ impl SupervisorAgent {
 
                 // ── Thought emission ──
                 let role_name = format!("{:?}", step.role);
-                self.emit_sa_thought(task_iri,
-                    &format!("Wave step {}/{}: dispatching {} — {}",
-                        wi + 1, plan.steps.len(), role_name, step.objective),
-                    &format!("dispatch_{}", role_name.to_lowercase())).await;
+                self.emit_sa_thought(
+                    task_iri,
+                    &format!(
+                        "Wave step {}/{}: dispatching {} — {}",
+                        wi + 1,
+                        plan.steps.len(),
+                        role_name,
+                        step.objective
+                    ),
+                    &format!("dispatch_{}", role_name.to_lowercase()),
+                )
+                .await;
 
                 agent_tasks.push(WaveTask {
                     wi,
@@ -685,7 +840,12 @@ impl SupervisorAgent {
                     let wi = wt.wi;
                     let to = wt.timeout_secs;
                     futs.push(async move {
-                        (wi, self_ref.dispatch_agent(role, ctx, &cid, Some(step), to).await)
+                        (
+                            wi,
+                            self_ref
+                                .dispatch_agent(role, ctx, &cid, Some(step), to)
+                                .await,
+                        )
                     });
                 }
 
@@ -715,30 +875,65 @@ impl SupervisorAgent {
                             });
                         }
                     };
-                    if let Some(failed_task) = self.handle_step_result(
-                        result, task_step, task_ni, result_wi,
-                        &mut prev_summary, &mut da_output, &mut last_result,
-                        &mut completed_node_results, &mut skip_nodes,
-                        &mut five_w2h, task_iri, &cycle_id, &plan,
-                        &dag, &order, five_w2h_iri,
-                    ).await? {
+                    if let Some(failed_task) = self
+                        .handle_step_result(
+                            result,
+                            task_step,
+                            task_ni,
+                            result_wi,
+                            &mut prev_summary,
+                            &mut da_output,
+                            &mut last_result,
+                            &mut completed_node_results,
+                            &mut skip_nodes,
+                            &mut five_w2h,
+                            task_iri,
+                            &cycle_id,
+                            &plan,
+                            &dag,
+                            &order,
+                            five_w2h_iri,
+                        )
+                        .await?
+                    {
                         return Ok(failed_task);
                     }
                 }
             } else if num_tasks == 1 {
                 let wt = agent_tasks.into_iter().next().unwrap();
-                let result = self.dispatch_agent(wt.step.role, wt.ctx, &cycle_id, Some(wt.step.clone()), wt.timeout_secs).await?;
-                if let Some(failed_task) = self.handle_step_result(
-                    result, wt.step, wt.ni, wt.wi,
-                    &mut prev_summary, &mut da_output, &mut last_result,
-                    &mut completed_node_results, &mut skip_nodes,
-                    &mut five_w2h, task_iri, &cycle_id, &plan,
-                    &dag, &order, five_w2h_iri,
-                ).await? {
+                let result = self
+                    .dispatch_agent(
+                        wt.step.role,
+                        wt.ctx,
+                        &cycle_id,
+                        Some(wt.step.clone()),
+                        wt.timeout_secs,
+                    )
+                    .await?;
+                if let Some(failed_task) = self
+                    .handle_step_result(
+                        result,
+                        wt.step,
+                        wt.ni,
+                        wt.wi,
+                        &mut prev_summary,
+                        &mut da_output,
+                        &mut last_result,
+                        &mut completed_node_results,
+                        &mut skip_nodes,
+                        &mut five_w2h,
+                        task_iri,
+                        &cycle_id,
+                        &plan,
+                        &dag,
+                        &order,
+                        five_w2h_iri,
+                    )
+                    .await?
+                {
                     return Ok(failed_task);
                 }
             }
-
         }
 
         // ── CA→DA correction loop ──
@@ -750,8 +945,10 @@ impl SupervisorAgent {
             let ca_summary = prev_summary.clone();
             let has_ca_failures = ca_summary.as_ref().map_or(false, |ps| {
                 ps.contains("Dimension Audit")
-                    && (ps.contains("[what]") || ps.contains("[why]")
-                        || ps.contains("[how]") || ps.contains("[how_much]"))
+                    && (ps.contains("[what]")
+                        || ps.contains("[why]")
+                        || ps.contains("[how]")
+                        || ps.contains("[how_much]"))
                     && ps.len() > 50
             });
 
@@ -780,7 +977,10 @@ impl SupervisorAgent {
                 .with_original_task(user_input)
                 .with_cycle_id(&cycle_id);
 
-            match self.dispatch_agent(AgentRole::Do, da_ctx, &cycle_id, None, 0).await {
+            match self
+                .dispatch_agent(AgentRole::Do, da_ctx, &cycle_id, None, 0)
+                .await
+            {
                 Ok(da_result) => {
                     let ca_objective = format!(
                         "Re-evaluate corrected execution:\n\n\
@@ -793,10 +993,20 @@ impl SupervisorAgent {
                         .with_original_task(user_input)
                         .with_cycle_id(&cycle_id);
 
-                    match self.dispatch_agent(AgentRole::Check, ca_ctx, &cycle_id, None, 0).await {
+                    match self
+                        .dispatch_agent(AgentRole::Check, ca_ctx, &cycle_id, None, 0)
+                        .await
+                    {
                         Ok(ca_result) => {
-                            let archive_ref = ca_result.archive_iri.as_ref()
-                                .map(|iri| format!("\n\nFor detailed report, use read_agent_output: {}", iri))
+                            let archive_ref = ca_result
+                                .archive_iri
+                                .as_ref()
+                                .map(|iri| {
+                                    format!(
+                                        "\n\nFor detailed report, use read_agent_output: {}",
+                                        iri
+                                    )
+                                })
                                 .unwrap_or_default();
                             prev_summary = Some(format!(
                                 "## Corrected Execution (iter {})\n{}\n\n## CA Re-Evaluation\n{}{}",
@@ -804,9 +1014,12 @@ impl SupervisorAgent {
                             ));
                             last_result = Some(ca_result);
 
-                            self.emit_sa_thought(task_iri,
+                            self.emit_sa_thought(
+                                task_iri,
                                 &format!("CA→DA correction #{} completed", correction_count),
-                                "ca_da_correction").await;
+                                "ca_da_correction",
+                            )
+                            .await;
                         }
                         Err(e) => {
                             warn!(error = %e, "CA re-dispatch after DA correction failed");
@@ -828,8 +1041,12 @@ impl SupervisorAgent {
         }
 
         self.event_bus
-            .emit(task_iri, "CYCLE_COMPLETED", "SA",
-                &serde_json::json!({"cycle_id": &cycle_id}).to_string())
+            .emit(
+                task_iri,
+                "CYCLE_COMPLETED",
+                "SA",
+                &serde_json::json!({"cycle_id": &cycle_id}).to_string(),
+            )
             .await;
 
         Ok(last_result.unwrap_or(TaskResult {
@@ -862,7 +1079,10 @@ impl SupervisorAgent {
         prev_summary: &mut Option<String>,
         da_output: &mut Option<String>,
         last_result: &mut Option<TaskResult>,
-        completed_node_results: &mut std::collections::HashMap<String, crate::core::workflow::NodeResult>,
+        completed_node_results: &mut std::collections::HashMap<
+            String,
+            crate::core::workflow::NodeResult,
+        >,
         skip_nodes: &mut std::collections::HashSet<String>,
         five_w2h: &mut crate::core::five_w2h::Task5W2H,
         task_iri: &str,
@@ -872,19 +1092,25 @@ impl SupervisorAgent {
         order: &[NodeIndex],
         five_w2h_iri: &str,
     ) -> Result<Option<TaskResult>, CoreError> {
-        let task_id = task_iri.strip_prefix("iri://task/")
+        let task_id = task_iri
+            .strip_prefix("iri://task/")
             .unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
 
         // Early return on agent failure
         if result.status == "failed" {
             warn!(role = ?step.role, step_id = %step.step_id, "Agent failed, aborting plan");
-            let error_detail = result.errors.first()
+            let error_detail = result
+                .errors
+                .first()
                 .map(|e| format!("\n\n**Error details**: {}", e))
                 .unwrap_or_default();
             return Ok(Some(TaskResult {
                 task_iri: task_iri.to_string(),
                 status: "failed".to_string(),
-                summary: format!("Agent {:?} failed at step {}{}", step.role, step.step_id, error_detail),
+                summary: format!(
+                    "Agent {:?} failed at step {}{}",
+                    step.role, step.step_id, error_detail
+                ),
                 output: None,
                 jsonld_output: None,
                 artifacts: Vec::new(),
@@ -901,10 +1127,16 @@ impl SupervisorAgent {
         if let Some(ref updates) = result.five_w2h_updates {
             five_w2h.merge_updates(updates);
             if let Ok(updated_json_ld) = five_w2h.to_json_ld(task_iri) {
-                let _ = self.runner.l0_store.store(&five_w2h_iri, &updated_json_ld.to_string());
+                let _ = self
+                    .runner
+                    .l0_store
+                    .store(&five_w2h_iri, &updated_json_ld.to_string());
                 let cfg = crate::CoreConfig::default();
                 if let Some(ref bb) = self.blackboard {
-                    if bb.write_node(&five_w2h_iri, &updated_json_ld.to_string(), &cfg).is_ok() {
+                    if bb
+                        .write_node(&five_w2h_iri, &updated_json_ld.to_string(), &cfg)
+                        .is_ok()
+                    {
                         tracing::debug!(five_w2h_iri = %five_w2h_iri, "5W2H update synced to blackboard");
                     }
                 }
@@ -913,17 +1145,30 @@ impl SupervisorAgent {
 
         // AA freeze
         if step.role == AgentRole::Act && result.status == "success" {
-            let is_last_aa = plan.steps.iter().rposition(|s| s.role == AgentRole::Act)
-                .map(|last_act| plan.steps.iter().position(|s| s.step_id == step.step_id)
-                    .map(|idx| idx >= last_act)
-                    .unwrap_or(true))
+            let is_last_aa = plan
+                .steps
+                .iter()
+                .rposition(|s| s.role == AgentRole::Act)
+                .map(|last_act| {
+                    plan.steps
+                        .iter()
+                        .position(|s| s.step_id == step.step_id)
+                        .map(|idx| idx >= last_act)
+                        .unwrap_or(true)
+                })
                 .unwrap_or(true);
             if is_last_aa {
                 five_w2h.freeze();
                 if let Ok(frozen_json_ld) = five_w2h.to_json_ld(task_iri) {
                     let snapshot_iri = format!("iri://task/{}/snapshot", task_id);
-                    let _ = self.runner.l0_store.store(&snapshot_iri, &frozen_json_ld.to_string());
-                    let _ = self.runner.l0_store.store(&five_w2h_iri, &frozen_json_ld.to_string());
+                    let _ = self
+                        .runner
+                        .l0_store
+                        .store(&snapshot_iri, &frozen_json_ld.to_string());
+                    let _ = self
+                        .runner
+                        .l0_store
+                        .store(&five_w2h_iri, &frozen_json_ld.to_string());
                     let cfg = crate::CoreConfig::default();
                     if let Some(ref bb) = self.blackboard {
                         let _ = bb.write_node(&snapshot_iri, &frozen_json_ld.to_string(), &cfg);
@@ -955,7 +1200,10 @@ impl SupervisorAgent {
             });
             let advisories = self.perception.on_plan_completed(&plan_data, task_iri);
             if !advisories.is_empty() {
-                info!(count = advisories.len(), "PA perception advisories generated");
+                info!(
+                    count = advisories.len(),
+                    "PA perception advisories generated"
+                );
             }
         }
 
@@ -976,15 +1224,24 @@ impl SupervisorAgent {
                 task_iri,
                 self.runner.causal_engine.as_ref().map(|ce| ce.as_ref()),
             );
-            let failures: Vec<&crate::core::five_w2h::DimensionAuditResult> = audit_results.iter()
+            let failures: Vec<&crate::core::five_w2h::DimensionAuditResult> = audit_results
+                .iter()
                 .filter(|r| matches!(r.status, crate::core::five_w2h::AuditStatus::Fail(_)))
                 .collect();
             if !failures.is_empty() {
-                let fail_summary: Vec<String> = failures.iter()
-                    .map(|r| format!("[{}] {}: {}", r.dimension, match &r.status {
-                        crate::core::five_w2h::AuditStatus::Fail(msg) => msg.as_str(),
-                        _ => "failed",
-                    }, r.evidence))
+                let fail_summary: Vec<String> = failures
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "[{}] {}: {}",
+                            r.dimension,
+                            match &r.status {
+                                crate::core::five_w2h::AuditStatus::Fail(msg) => msg.as_str(),
+                                _ => "failed",
+                            },
+                            r.evidence
+                        )
+                    })
                     .collect();
                 warn!(
                     task_iri = %task_iri,
@@ -994,7 +1251,8 @@ impl SupervisorAgent {
                 );
                 // Append dimension audit findings to the CA agent's result summary
                 if result.summary.len() < 4000 {
-                    let audit_note = format!("\n\n--- Dimension Audit ---\n{}", fail_summary.join("\n"));
+                    let audit_note =
+                        format!("\n\n--- Dimension Audit ---\n{}", fail_summary.join("\n"));
                     if !result.summary.contains("Dimension Audit") {
                         result.summary.push_str(&audit_note);
                     }
@@ -1022,18 +1280,21 @@ impl SupervisorAgent {
         if step.role == AgentRole::Do
             && (result.status == "success" || result.status == "partial_success")
             && plan.max_recursion_depth > 0
-            && (plan.task_complexity == crate::core::sa::types::TaskComplexity::Recursive || plan.task_complexity == crate::core::sa::types::TaskComplexity::Complex)
+            && (plan.task_complexity == crate::core::sa::types::TaskComplexity::Recursive
+                || plan.task_complexity == crate::core::sa::types::TaskComplexity::Complex)
         {
-            let sub_results = self.execute_recursive_sub_cycle(
-                &result.summary,
-                task_iri,
-                cycle_id,
-                &step.step_id,
-                plan.max_recursion_depth,
-                1,
-                five_w2h,
-                five_w2h_iri,
-            ).await;
+            let sub_results = self
+                .execute_recursive_sub_cycle(
+                    &result.summary,
+                    task_iri,
+                    cycle_id,
+                    &step.step_id,
+                    plan.max_recursion_depth,
+                    1,
+                    five_w2h,
+                    five_w2h_iri,
+                )
+                .await;
 
             match sub_results {
                 Ok(sub_summary) => {
@@ -1045,14 +1306,20 @@ impl SupervisorAgent {
                 Err(e) => {
                     warn!(error = %e, "Recursive sub-cycle execution failed, using DA original result");
                     *prev_summary = Some(match result.archive_iri {
-                        Some(ref iri) => format!("{}\n\nFor the full report, use read_agent_output tool to query: {}", result.summary, iri),
+                        Some(ref iri) => format!(
+                            "{}\n\nFor the full report, use read_agent_output tool to query: {}",
+                            result.summary, iri
+                        ),
                         None => result.summary.clone(),
                     });
                 }
             }
         } else {
             *prev_summary = Some(match result.archive_iri {
-                Some(ref iri) => format!("{}\n\nFor the full report, use read_agent_output tool to query: {}", result.summary, iri),
+                Some(ref iri) => format!(
+                    "{}\n\nFor the full report, use read_agent_output tool to query: {}",
+                    result.summary, iri
+                ),
                 None => result.summary.clone(),
             });
         }
@@ -1069,14 +1336,23 @@ impl SupervisorAgent {
         // 5W2H constraint check
         if let Some(alert) = self.perception.check_5w2h_constraints(five_w2h_iri) {
             tracing::warn!(alert = %alert, "5W2H constraint alert");
-            self.event_bus.emit(task_iri, &alert, "SA", &serde_json::json!({"task_iri": task_iri}).to_string()).await;
+            self.event_bus
+                .emit(
+                    task_iri,
+                    &alert,
+                    "SA",
+                    &serde_json::json!({"task_iri": task_iri}).to_string(),
+                )
+                .await;
         }
 
         info!(step_id = %step.step_id, role = ?step.role, status = ?last_result.as_ref().map(|r| &r.status), "Step completed");
 
         // ── Checkpoint ──
         {
-            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(self.runner.l0_store.clone());
+            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
+                self.runner.l0_store.clone(),
+            );
             let role_name = format!("{:?}", step.role);
             let state_json = serde_json::json!({
                 "turn": last_result.as_ref().map(|r| r.turn_count).unwrap_or(0),
@@ -1085,13 +1361,16 @@ impl SupervisorAgent {
                 "completion_tokens": self.runner.total_completion_tokens.load(std::sync::atomic::Ordering::Relaxed),
             }).to_string();
 
-            let cycle_state = self.active_cycles.get(cycle_id).map(|c| serde_json::json!({
-                "phase": format!("{:?}", c.phase),
-                "iteration": c.iteration,
-                "phase_history": c.phase_history,
-                "task_completed": c.task_completed,
-                "experience_hints": c.experience_hints,
-            }).to_string());
+            let cycle_state = self.active_cycles.get(cycle_id).map(|c| {
+                serde_json::json!({
+                    "phase": format!("{:?}", c.phase),
+                    "iteration": c.iteration,
+                    "phase_history": c.phase_history,
+                    "task_completed": c.task_completed,
+                    "experience_hints": c.experience_hints,
+                })
+                .to_string()
+            });
 
             let completed_nodes = if completed_node_results.is_empty() {
                 None
@@ -1101,19 +1380,28 @@ impl SupervisorAgent {
 
             let pending_approvals = {
                 let map = self.pending_approvals.lock().await;
-                if map.is_empty() { None }
-                else { Some(serde_json::to_string(&*map).unwrap_or_default()) }
+                if map.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&*map).unwrap_or_default())
+                }
             };
 
             let supplement_data = {
                 let pending = self.supplement_store.take_pending(task_iri);
-                if pending.is_empty() { None }
-                else {
-                    let entries: Vec<serde_json::Value> = pending.iter().map(|e| serde_json::json!({
-                        "content": e.content,
-                        "relevance_score": e.relevance_score,
-                        "timestamp": e.timestamp,
-                    })).collect();
+                if pending.is_empty() {
+                    None
+                } else {
+                    let entries: Vec<serde_json::Value> = pending
+                        .iter()
+                        .map(|e| {
+                            serde_json::json!({
+                                "content": e.content,
+                                "relevance_score": e.relevance_score,
+                                "timestamp": e.timestamp,
+                            })
+                        })
+                        .collect();
                     Some(serde_json::to_string(&entries).unwrap_or_default())
                 }
             };
@@ -1127,7 +1415,9 @@ impl SupervisorAgent {
                     cycle_id: Some(cycle_id.to_string()),
                     node_type: Some("AgentTurn".to_string()),
                 };
-                let nodes = bb.query_nodes_filtered(task_iri, &filter).unwrap_or_default();
+                let nodes = bb
+                    .query_nodes_filtered(task_iri, &filter)
+                    .unwrap_or_default();
                 let msgs: Vec<serde_json::Value> = nodes.iter().filter_map(|n| {
                     let parsed: serde_json::Value = serde_json::from_str(&n.json_ld).ok()?;
                     Some(serde_json::json!({
@@ -1178,36 +1468,55 @@ impl SupervisorAgent {
         current_depth: u32,
         five_w2h: &'a crate::core::five_w2h::Task5W2H,
         five_w2h_iri: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
+    {
         Box::pin(async move {
-        if current_depth > max_depth {
-            info!(depth = current_depth, max_depth, "Recursive depth limit reached, stopping sub-cycle");
-            return Ok("Recursive depth limit reached".to_string());
-        }
+            if current_depth > max_depth {
+                info!(
+                    depth = current_depth,
+                    max_depth, "Recursive depth limit reached, stopping sub-cycle"
+                );
+                return Ok("Recursive depth limit reached".to_string());
+            }
 
-        self.emit_sa_thought(task_iri,
-            &format!("▶ Recursive sub-cycle (depth {}/{})", current_depth, max_depth),
-            "recursive_sub_cycle_start").await;
+            self.emit_sa_thought(
+                task_iri,
+                &format!(
+                    "▶ Recursive sub-cycle (depth {}/{})",
+                    current_depth, max_depth
+                ),
+                "recursive_sub_cycle_start",
+            )
+            .await;
 
-        let sub_task = SubTask::new(
-            &format!("Decomposing sub-tasks from DA result (depth={})", current_depth),
-            parent_step_id,
-            current_depth,
-        );
+            let sub_task = SubTask::new(
+                &format!(
+                    "Decomposing sub-tasks from DA result (depth={})",
+                    current_depth
+                ),
+                parent_step_id,
+                current_depth,
+            );
 
-        info!(
-            sub_task_id = %sub_task.sub_task_id,
-            depth = current_depth,
-            max_depth,
-            "Starting recursive sub-cycle"
-        );
+            info!(
+                sub_task_id = %sub_task.sub_task_id,
+                depth = current_depth,
+                max_depth,
+                "Starting recursive sub-cycle"
+            );
 
-        self.emit_sa_thought(task_iri,
-            &format!("Decomposing DA result, identifying sub-tasks... (depth {}/{})", current_depth, max_depth),
-            "recursive_decompose").await;
+            self.emit_sa_thought(
+                task_iri,
+                &format!(
+                    "Decomposing DA result, identifying sub-tasks... (depth {}/{})",
+                    current_depth, max_depth
+                ),
+                "recursive_decompose",
+            )
+            .await;
 
-        let decompose_prompt = format!(
-            r#"You are a task decomposition expert. Below is an execution result summary of a DA (Do Agent). Analyze whether there are sub-tasks that need further execution.
+            let decompose_prompt = format!(
+                r#"You are a task decomposition expert. Below is an execution result summary of a DA (Do Agent). Analyze whether there are sub-tasks that need further execution.
 
 ## DA Execution Result
 {}
@@ -1239,166 +1548,236 @@ Output the list of sub-tasks that need further execution in JSON format. If no f
 4. Maximum of 3 sub-tasks
 
 Output only JSON."#,
-            da_summary,
-            five_w2h.what,
-            current_depth,
-            max_depth,
-        );
+                da_summary, five_w2h.what, current_depth, max_depth,
+            );
 
-        let model = self.runner.gateway.get_model("default");
-        let messages = vec![crate::gateway::unified_gateway::ChatMessage {
-            role: "user".to_string(),
-            content: decompose_prompt,
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        }];
+            let model = self.runner.gateway.get_model("default");
+            let messages = vec![crate::gateway::unified_gateway::ChatMessage {
+                role: "user".to_string(),
+                content: decompose_prompt,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }];
 
-        let response = self.runner.gateway.chat_with_params(
-            &model,
-            messages,
-            Some(0.3),
-            Some(1000),
-            None,
-            None,
-        ).await.map_err(|e| CoreError::Internal { message: format!("Recursive decomposition LLM call failed: {}", e) })?;
+            let response = self
+                .runner
+                .gateway
+                .chat_with_params(&model, messages, Some(0.3), Some(1000), None, None)
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("Recursive decomposition LLM call failed: {}", e),
+                })?;
 
-        let content = response.choices.first()
-            .and_then(|c| c.message.content.clone())
-            .unwrap_or_default();
+            let content = response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.clone())
+                .unwrap_or_default();
 
-        let json_str = if content.starts_with('{') {
-            content.clone()
-        } else if let Some(start) = content.find('{') {
-            if let Some(end) = content.rfind('}') {
-                content[start..=end].to_string()
-            } else {
+            let json_str = if content.starts_with('{') {
                 content.clone()
-            }
-        } else {
-            return Ok("LLM did not return valid decomposition result".to_string());
-        };
-
-        #[derive(Deserialize)]
-        struct DecomposeResult {
-            has_sub_tasks: bool,
-            sub_tasks: Vec<SubTaskDef>,
-        }
-
-        #[derive(Deserialize)]
-        struct SubTaskDef {
-            objective: String,
-            #[serde(default = "default_role")]
-            #[allow(dead_code)]
-            role: String,
-            success_criteria: String,
-        }
-
-        fn default_role() -> String { "Do".to_string() }
-
-        let parsed: DecomposeResult = serde_json::from_str(&json_str)
-            .map_err(|e| CoreError::Internal { message: format!("Recursive decomposition JSON parse failed: {}", e) })?;
-
-        if !parsed.has_sub_tasks || parsed.sub_tasks.is_empty() {
-            info!(depth = current_depth, "No further decomposition needed for DA result");
-            self.emit_sa_thought(task_iri,
-                &format!("Sub-task decomposition complete: no further decomposition needed (depth {}/{})", current_depth, max_depth),
-                "recursive_no_tasks").await;
-            return Ok("No further decomposition needed".to_string());
-        }
-
-        self.emit_sa_thought(task_iri,
-            &format!("Identified {} sub-tasks (depth {}/{})", parsed.sub_tasks.len(), current_depth, max_depth),
-            "recursive_tasks_found").await;
-
-        let mut sub_summaries = Vec::new();
-
-        for (idx, sub_def) in parsed.sub_tasks.iter().enumerate() {
-            let sub_objective = format!("[recursive depth={}] {}", current_depth, sub_def.objective);
-            info!(sub_idx = idx, objective = %sub_def.objective, "Executing recursive sub-task");
-
-            let mut sub_ctx = TaskContext::new(
-                task_iri,
-                &sub_objective,
-                self.max_iterations.min(8),
-            ).with_original_task(&sub_def.objective);
-
-            sub_ctx = sub_ctx.with_five_w2h(five_w2h_iri, five_w2h.clone());
-
-            if let Some(ref bb) = self.blackboard {
-                let nodes = bb.query_nodes(task_iri).unwrap_or_default();
-                if !nodes.is_empty() {
-                    let summaries: Vec<String> = nodes.iter()
-                        .filter_map(|n| {
-                            let parsed: serde_json::Value = serde_json::from_str(&n.json_ld).ok()?;
-                            parsed.get("summary").and_then(|s| s.as_str()).map(String::from)
-                        })
-                        .collect();
-                    if !summaries.is_empty() {
-                        sub_ctx = sub_ctx.with_prev_summary(&summaries.join("\n"));
-                    }
+            } else if let Some(start) = content.find('{') {
+                if let Some(end) = content.rfind('}') {
+                    content[start..=end].to_string()
+                } else {
+                    content.clone()
                 }
-            }
-
-            let sub_step = PlanStep {
-                step_id: format!("{}_sub_{}", parent_step_id, idx),
-                role: AgentRole::Do,
-                objective: sub_def.objective.clone(),
-                expected_output: sub_def.success_criteria.clone(),
-                dependencies: vec![parent_step_id.to_string()],
-                tools_allowed: vec![],
-                success_criteria: sub_def.success_criteria.clone(),
+            } else {
+                return Ok("LLM did not return valid decomposition result".to_string());
             };
 
-            let total = parsed.sub_tasks.len();
-            self.emit_sa_thought(task_iri,
-                &format!("▶ Executing sub-task {}/{}: {} (depth {})", idx + 1, total, sub_def.objective, current_depth),
-                "recursive_sub_task_start").await;
+            #[derive(Deserialize)]
+            struct DecomposeResult {
+                has_sub_tasks: bool,
+                sub_tasks: Vec<SubTaskDef>,
+            }
 
-            let sub_result = self.dispatch_agent(AgentRole::Do, sub_ctx, cycle_id, Some(sub_step), 0).await?;
+            #[derive(Deserialize)]
+            struct SubTaskDef {
+                objective: String,
+                #[serde(default = "default_role")]
+                #[allow(dead_code)]
+                role: String,
+                success_criteria: String,
+            }
 
-            self.emit_sa_thought(task_iri,
-                &format!("{}/{} sub-task complete [{}]: {}", idx + 1, total,
-                    sub_result.status, sub_def.objective),
-                "recursive_sub_task_end").await;
+            fn default_role() -> String {
+                "Do".to_string()
+            }
 
-            if sub_result.status == "success" || sub_result.status == "partial_success" {
-                let icon = if sub_result.status == "success" { "✅" } else { "⚠️" };
-                sub_summaries.push(format!("### Sub-task {} {}\n{}", idx + 1, icon, sub_result.summary));
+            let parsed: DecomposeResult =
+                serde_json::from_str(&json_str).map_err(|e| CoreError::Internal {
+                    message: format!("Recursive decomposition JSON parse failed: {}", e),
+                })?;
 
-                if current_depth < max_depth && sub_result.status == "success" {
-                    // Only fully successful sub-tasks continue deeper recursion; partial_success continues in upper recursion
-                    self.emit_sa_thought(task_iri,
-                        &format!("Entering deeper recursion (depth {}/{})", current_depth + 1, max_depth),
-                        "recursive_deeper").await;
-                    match self.execute_recursive_sub_cycle(
-                        &sub_result.summary,
-                        task_iri,
-                        cycle_id,
-                        &format!("{}_sub_{}", parent_step_id, idx),
-                        max_depth,
-                        current_depth + 1,
-                        five_w2h,
-                        five_w2h_iri,
-                    ).await {
-                        Ok(deeper_summary) => {
-                            sub_summaries.push(format!("#### Deep sub-task (depth={})\n{}", current_depth + 1, deeper_summary));
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Deep recursive sub-cycle failed");
+            if !parsed.has_sub_tasks || parsed.sub_tasks.is_empty() {
+                info!(
+                    depth = current_depth,
+                    "No further decomposition needed for DA result"
+                );
+                self.emit_sa_thought(task_iri,
+                &format!("Sub-task decomposition complete: no further decomposition needed (depth {}/{})", current_depth, max_depth),
+                "recursive_no_tasks").await;
+                return Ok("No further decomposition needed".to_string());
+            }
+
+            self.emit_sa_thought(
+                task_iri,
+                &format!(
+                    "Identified {} sub-tasks (depth {}/{})",
+                    parsed.sub_tasks.len(),
+                    current_depth,
+                    max_depth
+                ),
+                "recursive_tasks_found",
+            )
+            .await;
+
+            let mut sub_summaries = Vec::new();
+
+            for (idx, sub_def) in parsed.sub_tasks.iter().enumerate() {
+                let sub_objective =
+                    format!("[recursive depth={}] {}", current_depth, sub_def.objective);
+                info!(sub_idx = idx, objective = %sub_def.objective, "Executing recursive sub-task");
+
+                let mut sub_ctx =
+                    TaskContext::new(task_iri, &sub_objective, self.max_iterations.min(8))
+                        .with_original_task(&sub_def.objective);
+
+                sub_ctx = sub_ctx.with_five_w2h(five_w2h_iri, five_w2h.clone());
+
+                if let Some(ref bb) = self.blackboard {
+                    let nodes = bb.query_nodes(task_iri).unwrap_or_default();
+                    if !nodes.is_empty() {
+                        let summaries: Vec<String> = nodes
+                            .iter()
+                            .filter_map(|n| {
+                                let parsed: serde_json::Value =
+                                    serde_json::from_str(&n.json_ld).ok()?;
+                                parsed
+                                    .get("summary")
+                                    .and_then(|s| s.as_str())
+                                    .map(String::from)
+                            })
+                            .collect();
+                        if !summaries.is_empty() {
+                            sub_ctx = sub_ctx.with_prev_summary(&summaries.join("\n"));
                         }
                     }
                 }
-            } else {
-                sub_summaries.push(format!("### Sub-task {} ❌\nExecution failed: {}", idx + 1, sub_result.summary));
-            }
-        }
 
-        self.emit_sa_thought(task_iri,
-            &format!("Recursive sub-cycle complete (depth {}/{})", current_depth, max_depth),
-            "recursive_sub_cycle_end").await;
-        Ok(sub_summaries.join("\n\n"))
+                let sub_step = PlanStep {
+                    step_id: format!("{}_sub_{}", parent_step_id, idx),
+                    role: AgentRole::Do,
+                    objective: sub_def.objective.clone(),
+                    expected_output: sub_def.success_criteria.clone(),
+                    dependencies: vec![parent_step_id.to_string()],
+                    tools_allowed: vec![],
+                    success_criteria: sub_def.success_criteria.clone(),
+                };
+
+                let total = parsed.sub_tasks.len();
+                self.emit_sa_thought(
+                    task_iri,
+                    &format!(
+                        "▶ Executing sub-task {}/{}: {} (depth {})",
+                        idx + 1,
+                        total,
+                        sub_def.objective,
+                        current_depth
+                    ),
+                    "recursive_sub_task_start",
+                )
+                .await;
+
+                let sub_result = self
+                    .dispatch_agent(AgentRole::Do, sub_ctx, cycle_id, Some(sub_step), 0)
+                    .await?;
+
+                self.emit_sa_thought(
+                    task_iri,
+                    &format!(
+                        "{}/{} sub-task complete [{}]: {}",
+                        idx + 1,
+                        total,
+                        sub_result.status,
+                        sub_def.objective
+                    ),
+                    "recursive_sub_task_end",
+                )
+                .await;
+
+                if sub_result.status == "success" || sub_result.status == "partial_success" {
+                    let icon = if sub_result.status == "success" {
+                        "✅"
+                    } else {
+                        "⚠️"
+                    };
+                    sub_summaries.push(format!(
+                        "### Sub-task {} {}\n{}",
+                        idx + 1,
+                        icon,
+                        sub_result.summary
+                    ));
+
+                    if current_depth < max_depth && sub_result.status == "success" {
+                        // Only fully successful sub-tasks continue deeper recursion; partial_success continues in upper recursion
+                        self.emit_sa_thought(
+                            task_iri,
+                            &format!(
+                                "Entering deeper recursion (depth {}/{})",
+                                current_depth + 1,
+                                max_depth
+                            ),
+                            "recursive_deeper",
+                        )
+                        .await;
+                        match self
+                            .execute_recursive_sub_cycle(
+                                &sub_result.summary,
+                                task_iri,
+                                cycle_id,
+                                &format!("{}_sub_{}", parent_step_id, idx),
+                                max_depth,
+                                current_depth + 1,
+                                five_w2h,
+                                five_w2h_iri,
+                            )
+                            .await
+                        {
+                            Ok(deeper_summary) => {
+                                sub_summaries.push(format!(
+                                    "#### Deep sub-task (depth={})\n{}",
+                                    current_depth + 1,
+                                    deeper_summary
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Deep recursive sub-cycle failed");
+                            }
+                        }
+                    }
+                } else {
+                    sub_summaries.push(format!(
+                        "### Sub-task {} ❌\nExecution failed: {}",
+                        idx + 1,
+                        sub_result.summary
+                    ));
+                }
+            }
+
+            self.emit_sa_thought(
+                task_iri,
+                &format!(
+                    "Recursive sub-cycle complete (depth {}/{})",
+                    current_depth, max_depth
+                ),
+                "recursive_sub_cycle_end",
+            )
+            .await;
+            Ok(sub_summaries.join("\n\n"))
         })
     }
 }

@@ -8,10 +8,7 @@
 ///
 /// Corresponds to: superpowers-main/skills/systematic-debugging/defense-in-depth.md
 /// Architecture Layer: L1 — Enforcement (RootCauseEngine)
-
-use super::types::{
-    DefenseLayer, DefenseRecommendation, RootCauseConfig, TraceChain,
-};
+use super::types::{DefenseLayer, DefenseRecommendation, RootCauseConfig, TraceChain};
 
 /// DefenseInDepthManager converts root cause analysis into actionable defense recommendations.
 pub struct DefenseInDepthManager {
@@ -84,38 +81,118 @@ impl DefenseInDepthManager {
             None => return vec![],
         };
 
-        let label = root.evidence.value.get("root_cause_label")
+        let label = root
+            .evidence
+            .value
+            .get("root_cause_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
         match label {
             "network_error" => vec![
-                DefenseRecommendation { layer: DefenseLayer::EntryValidation, title: "Connection Timeout Retry".into(), description: "Add exponential backoff retry mechanism".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::Instrumentation, title: "Network Probing".into(), description: "Add pre-connection network health check".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EntryValidation,
+                    title: "Connection Timeout Retry".into(),
+                    description: "Add exponential backoff retry mechanism".into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::Instrumentation,
+                    title: "Network Probing".into(),
+                    description: "Add pre-connection network health check".into(),
+                    priority: 2,
+                },
             ],
             "resource_not_found" => vec![
-                DefenseRecommendation { layer: DefenseLayer::EntryValidation, title: "Path Validation".into(), description: "Verify path/URL exists before accessing resource".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::BusinessLogic, title: "Degradation Handling".into(), description: "Provide degradation alternatives when resource does not exist".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EntryValidation,
+                    title: "Path Validation".into(),
+                    description: "Verify path/URL exists before accessing resource".into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::BusinessLogic,
+                    title: "Degradation Handling".into(),
+                    description: "Provide degradation alternatives when resource does not exist"
+                        .into(),
+                    priority: 2,
+                },
             ],
             "permission_error" => vec![
-                DefenseRecommendation { layer: DefenseLayer::BusinessLogic, title: "Permission Pre-check".into(), description: "Check current permissions meet requirements before operation".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::EnvironmentGuard, title: "Escalation Advice".into(), description: "Provide clear escalation guidance when permissions are insufficient".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::BusinessLogic,
+                    title: "Permission Pre-check".into(),
+                    description: "Check current permissions meet requirements before operation"
+                        .into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EnvironmentGuard,
+                    title: "Escalation Advice".into(),
+                    description:
+                        "Provide clear escalation guidance when permissions are insufficient".into(),
+                    priority: 2,
+                },
             ],
             "null_reference" => vec![
-                DefenseRecommendation { layer: DefenseLayer::EntryValidation, title: "Null Protection".into(), description: "Check for null/None before dereferencing".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::BusinessLogic, title: "Default Values".into(), description: "Provide safe defaults for potentially null fields".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EntryValidation,
+                    title: "Null Protection".into(),
+                    description: "Check for null/None before dereferencing".into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::BusinessLogic,
+                    title: "Default Values".into(),
+                    description: "Provide safe defaults for potentially null fields".into(),
+                    priority: 2,
+                },
             ],
             "resource_exhausted" => vec![
-                DefenseRecommendation { layer: DefenseLayer::EnvironmentGuard, title: "Resource Monitoring".into(), description: "Check resource usage before operations, alert when exceeding thresholds".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::BusinessLogic, title: "Rate Limiting & Circuit Breaker".into(), description: "Add rate limiting and circuit breaker to prevent cascading failures".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EnvironmentGuard,
+                    title: "Resource Monitoring".into(),
+                    description:
+                        "Check resource usage before operations, alert when exceeding thresholds"
+                            .into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::BusinessLogic,
+                    title: "Rate Limiting & Circuit Breaker".into(),
+                    description:
+                        "Add rate limiting and circuit breaker to prevent cascading failures".into(),
+                    priority: 2,
+                },
             ],
             "invalid_input" => vec![
-                DefenseRecommendation { layer: DefenseLayer::EntryValidation, title: "Parameter Validation".into(), description: "Perform complete parameter validation at entry point".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::Instrumentation, title: "Parameter Logging".into(), description: "Log key parameter values for debugging".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EntryValidation,
+                    title: "Parameter Validation".into(),
+                    description: "Perform complete parameter validation at entry point".into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::Instrumentation,
+                    title: "Parameter Logging".into(),
+                    description: "Log key parameter values for debugging".into(),
+                    priority: 2,
+                },
             ],
             "syntax_error" => vec![
-                DefenseRecommendation { layer: DefenseLayer::EntryValidation, title: "Format Validation".into(), description: "Validate input format before parsing".into(), priority: 1 },
-                DefenseRecommendation { layer: DefenseLayer::BusinessLogic, title: "Format Specification".into(), description: "Provide clear error when input format does not meet expectations".into(), priority: 2 },
+                DefenseRecommendation {
+                    layer: DefenseLayer::EntryValidation,
+                    title: "Format Validation".into(),
+                    description: "Validate input format before parsing".into(),
+                    priority: 1,
+                },
+                DefenseRecommendation {
+                    layer: DefenseLayer::BusinessLogic,
+                    title: "Format Specification".into(),
+                    description: "Provide clear error when input format does not meet expectations"
+                        .into(),
+                    priority: 2,
+                },
             ],
             _ => self.generate_recommendations(chain),
         }
@@ -123,7 +200,8 @@ impl DefenseInDepthManager {
 
     /// Prioritize recommendations based on chain confidence
     pub fn prioritize(&self, recommendations: &mut [DefenseRecommendation], chain: &TraceChain) {
-        let confidence = chain.root_level()
+        let confidence = chain
+            .root_level()
             .map(|r| r.evidence.confidence)
             .unwrap_or(0.5);
         for rec in recommendations.iter_mut() {
@@ -144,7 +222,10 @@ impl DefenseInDepthManager {
         for rec in recommendations {
             s.push_str(&format!(
                 "  [{}.{}] {}: {}\n",
-                rec.layer.name(), rec.priority, rec.title, rec.description
+                rec.layer.name(),
+                rec.priority,
+                rec.title,
+                rec.description
             ));
         }
         s
@@ -163,14 +244,16 @@ mod tests {
     fn make_chain_with_root(root_label: &str) -> TraceChain {
         let mut chain = TraceChain::new("defense_test", "agent_1");
         chain.add_level(super::super::types::TraceLevel {
-            level: 1, label: "symptom".into(),
+            level: 1,
+            label: "symptom".into(),
             description: "error".into(),
             source_location: "src/main.rs:1".into(),
             is_root_cause: false,
             evidence: super::super::types::Evidence::new("src/main.rs:1", json!("error"), 0.9),
         });
         chain.add_level(super::super::types::TraceLevel {
-            level: 5, label: "root_cause".into(),
+            level: 5,
+            label: "root_cause".into(),
             description: "network error".into(),
             source_location: "src/net.rs:50".into(),
             is_root_cause: true,
@@ -230,8 +313,10 @@ mod tests {
         let mut recs = manager.generate_recommendations(&chain);
         manager.prioritize(&mut recs, &chain);
         for i in 1..recs.len() {
-            assert!(recs[i-1].priority <= recs[i].priority,
-                "Priorities should be sorted ascending");
+            assert!(
+                recs[i - 1].priority <= recs[i].priority,
+                "Priorities should be sorted ascending"
+            );
         }
     }
 

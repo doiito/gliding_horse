@@ -13,7 +13,6 @@
 ///   Level 3 (Context):   Examine the surrounding state — "what was the context at the caller?"
 ///   Level 4 (Trigger):   Find the triggering event — "what initiated this chain?"
 ///   Level 5 (Root):      Identify the root cause — "what precondition or assumption was violated?"
-
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -66,25 +65,29 @@ impl BackwardTracer {
             ErrorPattern {
                 pattern: "connection refused|connection reset|timeout",
                 root_cause_label: "network_error",
-                root_cause_description: "Network connection failed — target service unavailable or network unreachable",
+                root_cause_description:
+                    "Network connection failed — target service unavailable or network unreachable",
                 confidence: 0.9,
             },
             ErrorPattern {
                 pattern: "not found|no such file|enoent|no such",
                 root_cause_label: "resource_not_found",
-                root_cause_description: "Resource not found — path/file/URL is incorrect or has been removed",
+                root_cause_description:
+                    "Resource not found — path/file/URL is incorrect or has been removed",
                 confidence: 0.85,
             },
             ErrorPattern {
                 pattern: "permission denied|access denied|forbidden|eacces",
                 root_cause_label: "permission_error",
-                root_cause_description: "Permission denied — current environment lacks access to this resource",
+                root_cause_description:
+                    "Permission denied — current environment lacks access to this resource",
                 confidence: 0.9,
             },
             ErrorPattern {
                 pattern: "syntax error|parse error|invalid syntax",
                 root_cause_label: "syntax_error",
-                root_cause_description: "Syntax error — input data format does not match expectations",
+                root_cause_description:
+                    "Syntax error — input data format does not match expectations",
                 confidence: 0.8,
             },
             ErrorPattern {
@@ -96,7 +99,8 @@ impl BackwardTracer {
             ErrorPattern {
                 pattern: "null pointer|undefined|cannot read property|unwrap.*none",
                 root_cause_label: "null_reference",
-                root_cause_description: "Null reference — accessed uninitialized or non-existent value",
+                root_cause_description:
+                    "Null reference — accessed uninitialized or non-existent value",
                 confidence: 0.85,
             },
             ErrorPattern {
@@ -161,10 +165,10 @@ impl BackwardTracer {
         chain.add_level(root_level);
 
         // Validate evidence chain confidence
-        if root_confidence < self.config.min_confidence
-        {
+        if root_confidence < self.config.min_confidence {
             return Err(RootCauseError::InsufficientEvidence {
-                message: "Root cause evidence confidence insufficient, need more context".to_string(),
+                message: "Root cause evidence confidence insufficient, need more context"
+                    .to_string(),
                 min_confidence: self.config.min_confidence,
                 actual_confidence: root_confidence,
             });
@@ -238,7 +242,10 @@ impl BackwardTracer {
         Ok(TraceLevel {
             level: 4,
             label: "intermediate".to_string(),
-            description: format!("Trigger event: exception occurred during task '{}' execution", context.task_type),
+            description: format!(
+                "Trigger event: exception occurred during task '{}' execution",
+                context.task_type
+            ),
             source_location: "trace_trigger".to_string(),
             is_root_cause: false,
             evidence: Evidence::new(
@@ -290,7 +297,8 @@ impl BackwardTracer {
         Ok(TraceLevel {
             level: 5,
             label: "root_cause".to_string(),
-            description: "Root cause did not match any known pattern — requires manual analysis".to_string(),
+            description: "Root cause did not match any known pattern — requires manual analysis"
+                .to_string(),
             source_location: "unknown".to_string(),
             is_root_cause: true,
             evidence: Evidence::new(
@@ -305,11 +313,7 @@ impl BackwardTracer {
     }
 
     /// Extract caller information from error message and source location
-    fn extract_caller_from_error(
-        &self,
-        error_message: &str,
-        source_location: &str,
-    ) -> CallFrame {
+    fn extract_caller_from_error(&self, error_message: &str, source_location: &str) -> CallFrame {
         let parts: Vec<&str> = source_location.rsplitn(2, ':').collect();
         let (file, line_str) = if parts.len() == 2 {
             (parts[1], parts[0])
@@ -335,13 +339,19 @@ impl BackwardTracer {
         let lower = error.to_lowercase();
         if lower.contains("read") || lower.contains("open") || lower.contains("file") {
             "file_operation".to_string()
-        } else if lower.contains("connect") || lower.contains("network") || lower.contains("timeout") {
+        } else if lower.contains("connect")
+            || lower.contains("network")
+            || lower.contains("timeout")
+        {
             "network_operation".to_string()
         } else if lower.contains("parse") || lower.contains("syntax") || lower.contains("json") {
             "data_parsing".to_string()
         } else if lower.contains("write") || lower.contains("save") || lower.contains("create") {
             "write_operation".to_string()
-        } else if lower.contains("permission") || lower.contains("denied") || lower.contains("forbidden") {
+        } else if lower.contains("permission")
+            || lower.contains("denied")
+            || lower.contains("forbidden")
+        {
             "authorization_check".to_string()
         } else if lower.contains("null") || lower.contains("undefined") || lower.contains("empty") {
             "null_check".to_string()
@@ -360,15 +370,18 @@ impl BackwardTracer {
 
     /// Get a saved trace by ID
     pub fn get_trace(&self, trace_id: &str) -> Option<TraceChain> {
-        self.active_traces.read().ok().and_then(|t| t.get(trace_id).cloned())
+        self.active_traces
+            .read()
+            .ok()
+            .and_then(|t| t.get(trace_id).cloned())
     }
 
     /// Check if a task has an unresolved trace
     pub fn has_unresolved_trace(&self, task_id: &str) -> bool {
         self.active_traces.read().ok().map_or(false, |traces| {
-            traces.values().any(|t| {
-                t.task_id.as_deref() == Some(task_id) && !t.resolved
-            })
+            traces
+                .values()
+                .any(|t| t.task_id.as_deref() == Some(task_id) && !t.resolved)
         })
     }
 }
@@ -403,14 +416,21 @@ mod tests {
             "trace_001",
             "agent_1",
         );
-        assert!(result.is_ok(), "Should trace network error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should trace network error: {:?}",
+            result.err()
+        );
         let chain = result.unwrap();
         assert!(chain.has_root_cause(), "Should identify root cause");
         assert_eq!(chain.depth(), 5, "Should have 5 levels");
         let root = chain.root_level().unwrap();
         assert_eq!(root.level, 5);
-        assert!(root.description.contains("network_error"),
-            "Root cause should be network_error, got: {}", root.description);
+        assert!(
+            root.description.contains("network_error"),
+            "Root cause should be network_error, got: {}",
+            root.description
+        );
     }
 
     #[test]
@@ -447,7 +467,11 @@ mod tests {
         // Unknown errors still resolve with low confidence
         assert!(chain.has_root_cause());
         // But should not match any known pattern
-        assert!(!chain.root_level().unwrap().description.contains("network_error"));
+        assert!(!chain
+            .root_level()
+            .unwrap()
+            .description
+            .contains("network_error"));
     }
 
     #[test]
@@ -471,13 +495,15 @@ mod tests {
     fn test_trace_save_and_retrieve() {
         let tracer = BackwardTracer::new(test_config());
         let ctx = TraceContext::default();
-        let chain = tracer.trace_backward(
-            "disk full: no space left on device",
-            "src/storage.rs:200",
-            &ctx,
-            "trace_005",
-            "agent_5",
-        ).unwrap();
+        let chain = tracer
+            .trace_backward(
+                "disk full: no space left on device",
+                "src/storage.rs:200",
+                &ctx,
+                "trace_005",
+                "agent_5",
+            )
+            .unwrap();
         tracer.save_trace(chain);
         let retrieved = tracer.get_trace("trace_005");
         assert!(retrieved.is_some(), "Should retrieve saved trace");
@@ -491,13 +517,15 @@ mod tests {
             failure_description: "task_abc".to_string(),
             ..Default::default()
         };
-        let chain = tracer.trace_backward(
-            "timeout: connection timed out",
-            "src/network.rs:50",
-            &ctx,
-            "trace_006",
-            "agent_6",
-        ).unwrap();
+        let chain = tracer
+            .trace_backward(
+                "timeout: connection timed out",
+                "src/network.rs:50",
+                &ctx,
+                "trace_006",
+                "agent_6",
+            )
+            .unwrap();
         tracer.save_trace(chain);
         // All test traces are resolved (since they have root cause)
         assert!(!tracer.has_unresolved_trace("task_abc"));
@@ -506,12 +534,33 @@ mod tests {
     #[test]
     fn test_infer_function() {
         let tracer = BackwardTracer::new(test_config());
-        assert_eq!(tracer.infer_function_from_error("file not found"), "file_operation");
-        assert_eq!(tracer.infer_function_from_error("connection timeout"), "network_operation");
-        assert_eq!(tracer.infer_function_from_error("parse error: invalid json"), "data_parsing");
-        assert_eq!(tracer.infer_function_from_error("write failed"), "write_operation");
-        assert_eq!(tracer.infer_function_from_error("access denied"), "authorization_check");
-        assert_eq!(tracer.infer_function_from_error("null pointer"), "null_check");
-        assert_eq!(tracer.infer_function_from_error("something random"), "unknown_operation");
+        assert_eq!(
+            tracer.infer_function_from_error("file not found"),
+            "file_operation"
+        );
+        assert_eq!(
+            tracer.infer_function_from_error("connection timeout"),
+            "network_operation"
+        );
+        assert_eq!(
+            tracer.infer_function_from_error("parse error: invalid json"),
+            "data_parsing"
+        );
+        assert_eq!(
+            tracer.infer_function_from_error("write failed"),
+            "write_operation"
+        );
+        assert_eq!(
+            tracer.infer_function_from_error("access denied"),
+            "authorization_check"
+        );
+        assert_eq!(
+            tracer.infer_function_from_error("null pointer"),
+            "null_check"
+        );
+        assert_eq!(
+            tracer.infer_function_from_error("something random"),
+            "unknown_operation"
+        );
     }
 }

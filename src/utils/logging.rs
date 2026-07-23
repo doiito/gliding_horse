@@ -1,7 +1,5 @@
-use tracing_subscriber::{
-    fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
-};
 use tracing_appender::{non_blocking, rolling};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use crate::config::settings::LoggingSettings;
 
@@ -17,21 +15,21 @@ impl LoggingGuard {
 
 pub fn init_logging(settings: &LoggingSettings) -> LoggingGuard {
     let mut guard = LoggingGuard::new();
-    
+
     let level = parse_level(&settings.level);
     let mut env_filter = EnvFilter::from_default_env()
         .add_directive(level.into())
         .add_directive("redb=warn".parse().unwrap_or_default());
-    
+
     for filter in &settings.filters {
         let directive_str = format!("{}={}", filter.module, filter.level.to_lowercase());
         if let Ok(directive) = directive_str.parse() {
             env_filter = env_filter.add_directive(directive);
         }
     }
-    
+
     let mut layers = Vec::new();
-    
+
     if settings.console_output {
         let console_layer = if settings.format == "json" {
             fmt::layer()
@@ -49,7 +47,7 @@ pub fn init_logging(settings: &LoggingSettings) -> LoggingGuard {
         };
         layers.push(console_layer);
     }
-    
+
     if settings.file_output.enabled {
         if let Ok(()) = std::fs::create_dir_all(&settings.file_output.path) {
             let file_appender = match settings.file_output.rotation.as_str() {
@@ -74,10 +72,10 @@ pub fn init_logging(settings: &LoggingSettings) -> LoggingGuard {
                     &settings.file_output.prefix,
                 ),
             };
-            
+
             let (non_blocking_file, file_guard) = non_blocking(file_appender);
             guard._file_guard = Some(file_guard);
-            
+
             let file_layer = if settings.format == "json" {
                 fmt::layer()
                     .with_target(true)
@@ -97,13 +95,11 @@ pub fn init_logging(settings: &LoggingSettings) -> LoggingGuard {
             layers.push(file_layer);
         }
     }
-    
+
     if !layers.is_empty() {
-        let _ = tracing_subscriber::registry()
-            .with(layers)
-            .try_init();
+        let _ = tracing_subscriber::registry().with(layers).try_init();
     }
-    
+
     guard
 }
 
@@ -126,7 +122,7 @@ pub fn sanitize_sensitive_fields(value: &str, sensitive_fields: &[String]) -> St
             format!(r#"{field}=[^,\s\]]+"#),
             format!(r#"{field}:\s*[^,\s\}}]+"#),
         ];
-        
+
         for pattern in patterns {
             if let Ok(re) = regex::Regex::new(&pattern) {
                 let replacement = format!(r#""{}": "[REDACTED]""#, field);
@@ -154,12 +150,12 @@ mod tests {
     #[test]
     fn test_sanitize_sensitive_fields() {
         let sensitive = vec!["api_key".to_string(), "password".to_string()];
-        
+
         let input = r#"{"api_key": "sk-secret123", "name": "test"}"#;
         let sanitized = sanitize_sensitive_fields(input, &sensitive);
         assert!(sanitized.contains("[REDACTED]"));
         assert!(!sanitized.contains("sk-secret123"));
-        
+
         let input2 = r#"api_key=secret123, name=test"#;
         let sanitized2 = sanitize_sensitive_fields(input2, &sensitive);
         assert!(sanitized2.contains("[REDACTED]"));

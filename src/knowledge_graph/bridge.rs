@@ -32,7 +32,9 @@ impl KnowledgeBridge {
 
     /// Bridge backed by an OO `SharedGraphStore` (feature-gated).
     #[cfg(feature = "ontology")]
-    pub fn with_shared_graph_store(shared: &crate::ontology::SharedGraphStore) -> Result<Self, String> {
+    pub fn with_shared_graph_store(
+        shared: &crate::ontology::SharedGraphStore,
+    ) -> Result<Self, String> {
         let store = KnowledgeGraphStore::with_shared_graph_store(shared)?;
         Ok(Self {
             store,
@@ -100,7 +102,11 @@ impl KnowledgeBridge {
 
         let entities = results
             .iter()
-            .filter_map(|row| row.get("?entity").and_then(|v| v.as_str()).map(String::from))
+            .filter_map(|row| {
+                row.get("?entity")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .collect();
 
         Ok(entities)
@@ -166,7 +172,10 @@ mod tests {
         assert_eq!(skills.len(), 2, "should query 2 skills");
 
         let empty = bridge.query_bridged_skills("nonexistent").unwrap();
-        assert!(empty.is_empty(), "nonexistent entity should return empty list");
+        assert!(
+            empty.is_empty(),
+            "nonexistent entity should return empty list"
+        );
     }
 
     #[test]
@@ -199,8 +208,13 @@ mod tests {
             "should include entity_y"
         );
 
-        let empty = bridge.query_bridged_entities("iri://skill/nonexistent").unwrap();
-        assert!(empty.is_empty(), "nonexistent skill should return empty list");
+        let empty = bridge
+            .query_bridged_entities("iri://skill/nonexistent")
+            .unwrap();
+        assert!(
+            empty.is_empty(),
+            "nonexistent skill should return empty list"
+        );
     }
 
     #[test]
@@ -211,7 +225,11 @@ mod tests {
 
         // When: creating a bridge link through the bridge
         bridge
-            .create_bridge("entity_shared", "iri://skill/shared-test", BridgeRelationType::HasSkill)
+            .create_bridge(
+                "entity_shared",
+                "iri://skill/shared-test",
+                BridgeRelationType::HasSkill,
+            )
             .unwrap();
 
         // Then: the data must be visible through the original kg_store
@@ -221,7 +239,14 @@ mod tests {
             .iter()
             .filter_map(|row| row.get("?skill").and_then(|v| v.as_str()))
             .collect();
-        assert_eq!(skills.len(), 1, "Should see 1 bridged skill via original kg_store");
-        assert!(skills.contains(&"iri://skill/shared-test"), "Should contain the correct skill IRI");
+        assert_eq!(
+            skills.len(),
+            1,
+            "Should see 1 bridged skill via original kg_store"
+        );
+        assert!(
+            skills.contains(&"iri://skill/shared-test"),
+            "Should contain the correct skill IRI"
+        );
     }
 }

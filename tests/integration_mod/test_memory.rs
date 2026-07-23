@@ -29,14 +29,22 @@ fn test_memory_pipeline() {
     // L2 blackboard
     let json_ld = r#"{"@id":"iri://task/1","@type":"Test"}"#;
     let config = glidinghorse::CoreConfig::default();
-    l2.write_node("iri://task/1/node_1", json_ld, &config).unwrap();
+    l2.write_node("iri://task/1/node_1", json_ld, &config)
+        .unwrap();
     let node = l2.read_node("iri://task/1/node_1").unwrap().unwrap();
     assert_eq!(node.node_type.as_ref().unwrap(), "Test");
 
     // L3 projection
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let result = proj.project("iri://task/1", "reference_only", std::collections::HashMap::new()).await.unwrap();
+        let result = proj
+            .project(
+                "iri://task/1",
+                "reference_only",
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
         assert!(result.contains("task_iri"));
     });
 }
@@ -77,25 +85,44 @@ fn test_memory_manager_with_vector_store() {
         let store = Arc::new(HyperspaceStore::open(vdir.path(), embed).unwrap());
 
         // Insert entries via HyperspaceStore
-        store.upsert("iri://vec/1", "memory search test alpha", &["tag_a".into()]).await.unwrap();
-        store.upsert("iri://vec/2", "memory search test beta",  &["tag_a".into()]).await.unwrap();
-        store.upsert("iri://vec/3", "unrelated gamma entry",    &["tag_b".into()]).await.unwrap();
+        store
+            .upsert("iri://vec/1", "memory search test alpha", &["tag_a".into()])
+            .await
+            .unwrap();
+        store
+            .upsert("iri://vec/2", "memory search test beta", &["tag_a".into()])
+            .await
+            .unwrap();
+        store
+            .upsert("iri://vec/3", "unrelated gamma entry", &["tag_b".into()])
+            .await
+            .unwrap();
 
         // Search without filter – all match because FallbackEmbeddingService returns unit vector
         let all = store.search("test", 10).await.unwrap();
-        assert_eq!(all.len(), 3, "All 3 entries should match zero-vector search");
+        assert_eq!(
+            all.len(),
+            3,
+            "All 3 entries should match zero-vector search"
+        );
 
         // Filter by tag
-        let filtered = store.search_with_filter(
-            "test",
-            &glidinghorse::memory::hyperspace_store::HybridSearchFilter::new()
-                .with_must_tags(vec!["tag_a".into()]),
-            10,
-        ).await.unwrap();
+        let filtered = store
+            .search_with_filter(
+                "test",
+                &glidinghorse::memory::hyperspace_store::HybridSearchFilter::new()
+                    .with_must_tags(vec!["tag_a".into()]),
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(filtered.len(), 2, "Only tag_a entries");
 
         // Hybrid search (query + tag filter)
-        let hybrid = store.hybrid_search("search", &["tag_a".into()], &[], None, 10).await.unwrap();
+        let hybrid = store
+            .hybrid_search("search", &["tag_a".into()], &[], None, 10)
+            .await
+            .unwrap();
         assert_eq!(hybrid.len(), 2);
 
         // Count & delete
@@ -138,11 +165,15 @@ fn test_full_pipeline_with_vector_store() {
         );
 
         // Upsert via MemoryManager's vector store reference
-        mm.vector_store().unwrap().upsert(
-            "iri://mm/1",
-            "MemoryManager threaded vector store",
-            &["mm".into()],
-        ).await.unwrap();
+        mm.vector_store()
+            .unwrap()
+            .upsert(
+                "iri://mm/1",
+                "MemoryManager threaded vector store",
+                &["mm".into()],
+            )
+            .await
+            .unwrap();
         assert_eq!(mm.vector_store().unwrap().count().await.unwrap(), 1);
 
         // Create a session (L1) + L2 write + L3 projection still works

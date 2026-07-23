@@ -160,14 +160,17 @@ pub const AA_BEHAVIORAL_ADDENDUM: &str = r#"
 
 pub fn build_five_w2h_section(snapshot: &crate::core::five_w2h::Task5W2H) -> String {
     let mut lines = Vec::new();
-    
+
     lines.push(format!("- Objective: {}", snapshot.what));
-    
+
     lines.push(format!("- Reason: {}", snapshot.why.description));
     if !snapshot.why.success_criteria.is_empty() {
-        lines.push(format!("- Success Criteria: {}", snapshot.why.success_criteria.join(", ")));
+        lines.push(format!(
+            "- Success Criteria: {}",
+            snapshot.why.success_criteria.join(", ")
+        ));
     }
-    
+
     if let Some(ref who) = snapshot.who {
         if let Some(ref requestor) = who.requestor {
             lines.push(format!("- Requestor: {}", requestor));
@@ -179,34 +182,43 @@ pub fn build_five_w2h_section(snapshot: &crate::core::five_w2h::Task5W2H) -> Str
             lines.push(format!("- Assignees: {}", who.assignees.join(", ")));
         }
     }
-    
+
     if let Some(ref when) = snapshot.when {
         if let Some(ref deadline) = when.deadline {
             lines.push(format!("- Deadline: {}", deadline));
         }
     }
-    
+
     if let Some(ref where_) = snapshot.where_ {
         if let Some(ref env) = where_.execution_environment {
             lines.push(format!("- Execution Env: {}", env));
         }
         if !where_.data_sources.is_empty() {
-            lines.push(format!("- Data Sources: {}", where_.data_sources.join(", ")));
+            lines.push(format!(
+                "- Data Sources: {}",
+                where_.data_sources.join(", ")
+            ));
         }
     }
-    
+
     if let Some(ref how) = snapshot.how {
         if !how.forbidden_tools.is_empty() {
-            lines.push(format!("- Forbidden Tools: {}", how.forbidden_tools.join(", ")));
+            lines.push(format!(
+                "- Forbidden Tools: {}",
+                how.forbidden_tools.join(", ")
+            ));
         }
         if let Some(ref steps) = how.required_steps {
             lines.push(format!("- Required Steps: {}", steps));
         }
         if !how.preferred_skills.is_empty() {
-            lines.push(format!("- Preferred Skills: {}", how.preferred_skills.join(", ")));
+            lines.push(format!(
+                "- Preferred Skills: {}",
+                how.preferred_skills.join(", ")
+            ));
         }
     }
-    
+
     if let Some(ref how_much) = snapshot.how_much {
         if let Some(ref budget) = how_much.token_budget {
             lines.push(format!("- Token Budget: {}", budget));
@@ -215,7 +227,7 @@ pub fn build_five_w2h_section(snapshot: &crate::core::five_w2h::Task5W2H) -> Str
             lines.push(format!("- Max Cycles: {}", cycles));
         }
     }
-    
+
     lines.join("\n")
 }
 
@@ -244,15 +256,18 @@ impl ToolRegionContent {
 
     pub fn build(&self) -> String {
         let mut parts = Vec::new();
-        
+
         if !self.builtin_tools.is_empty() {
             parts.push(format!("## Built-in Tools (Fixed)\n{}", self.builtin_tools));
         }
-        
+
         if !self.dynamic_tools.is_empty() {
-            parts.push(format!("## Dynamic Tools (On-demand)\n{}", self.dynamic_tools));
+            parts.push(format!(
+                "## Dynamic Tools (On-demand)\n{}",
+                self.dynamic_tools
+            ));
         }
-        
+
         parts.join("\n\n")
     }
 }
@@ -301,7 +316,7 @@ impl SystemPromptBuilder {
     }
 
     pub fn build(&self) -> String {
-        let mut ordered_regions: Vec<(&SystemPromptRegion, &String)> = 
+        let mut ordered_regions: Vec<(&SystemPromptRegion, &String)> =
             self.regions.iter().collect();
         ordered_regions.sort_by_key(|(r, _)| r.order());
 
@@ -362,11 +377,25 @@ mod tests {
 
     #[test]
     fn test_region_order() {
-        assert!(SystemPromptRegion::RoleDefinition.order() < SystemPromptRegion::BehavioralPolicy.order());
-        assert!(SystemPromptRegion::BehavioralPolicy.order() < SystemPromptRegion::FiveW2HConstraints.order());
-        assert!(SystemPromptRegion::FiveW2HConstraints.order() < SystemPromptRegion::EmphasizedConstraints.order());
-        assert!(SystemPromptRegion::EmphasizedConstraints.order() < SystemPromptRegion::OutputFormat.order());
-        assert!(SystemPromptRegion::OutputFormat.order() < SystemPromptRegion::OutputManagement.order());
+        assert!(
+            SystemPromptRegion::RoleDefinition.order()
+                < SystemPromptRegion::BehavioralPolicy.order()
+        );
+        assert!(
+            SystemPromptRegion::BehavioralPolicy.order()
+                < SystemPromptRegion::FiveW2HConstraints.order()
+        );
+        assert!(
+            SystemPromptRegion::FiveW2HConstraints.order()
+                < SystemPromptRegion::EmphasizedConstraints.order()
+        );
+        assert!(
+            SystemPromptRegion::EmphasizedConstraints.order()
+                < SystemPromptRegion::OutputFormat.order()
+        );
+        assert!(
+            SystemPromptRegion::OutputFormat.order() < SystemPromptRegion::OutputManagement.order()
+        );
         assert!(SystemPromptRegion::OutputManagement.order() < SystemPromptRegion::Tools.order());
         assert!(SystemPromptRegion::Tools.order() < SystemPromptRegion::ExtractionPrompt.order());
     }
@@ -374,9 +403,15 @@ mod tests {
     #[test]
     fn test_build_system_prompt() {
         let mut builder = SystemPromptBuilder::new();
-        builder.set_region(SystemPromptRegion::RoleDefinition, "You are a Plan Agent".to_string());
-        builder.set_region(SystemPromptRegion::OutputFormat, "Output JSON format".to_string());
-        
+        builder.set_region(
+            SystemPromptRegion::RoleDefinition,
+            "You are a Plan Agent".to_string(),
+        );
+        builder.set_region(
+            SystemPromptRegion::OutputFormat,
+            "Output JSON format".to_string(),
+        );
+
         let result = builder.build();
         assert!(result.contains("# Role"));
         assert!(result.contains("# Output Format"));
@@ -386,11 +421,17 @@ mod tests {
     #[test]
     fn test_build_with_emphasis() {
         let mut builder = SystemPromptBuilder::new();
-        builder.set_region(SystemPromptRegion::RoleDefinition, "You are a Plan Agent".to_string());
-        
-        let emphasis = vec!["Must use async mode".to_string(), "Handle errors carefully".to_string()];
+        builder.set_region(
+            SystemPromptRegion::RoleDefinition,
+            "You are a Plan Agent".to_string(),
+        );
+
+        let emphasis = vec![
+            "Must use async mode".to_string(),
+            "Handle errors carefully".to_string(),
+        ];
         let result = builder.build_with_emphasis(&emphasis);
-        
+
         assert!(result.contains("Critical Constraints"));
         assert!(result.contains("Must use async mode"));
         assert!(result.contains("Handle errors carefully"));
@@ -401,7 +442,7 @@ mod tests {
         let tool_content = ToolRegionContent::new()
             .with_builtin("file_read: read files\nfile_write: write files")
             .with_dynamic("http_request: HTTP requests\ncode_execute: execute code");
-        
+
         let result = tool_content.build();
         assert!(result.contains("Built-in Tools (Fixed)"));
         assert!(result.contains("Dynamic Tools (On-demand)"));
@@ -412,14 +453,17 @@ mod tests {
     #[test]
     fn test_build_with_tools() {
         let mut builder = SystemPromptBuilder::new();
-        builder.set_region(SystemPromptRegion::RoleDefinition, "You are an Execution Agent".to_string());
-        
+        builder.set_region(
+            SystemPromptRegion::RoleDefinition,
+            "You are an Execution Agent".to_string(),
+        );
+
         let tool_content = ToolRegionContent::new()
             .with_builtin("file_read: read files")
             .with_dynamic("custom_tool: custom tool")
             .build();
         builder.set_region(SystemPromptRegion::Tools, tool_content);
-        
+
         let result = builder.build();
         assert!(result.contains("# Tools"));
         assert!(result.contains("Built-in Tools (Fixed)"));

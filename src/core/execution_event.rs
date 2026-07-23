@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -215,7 +215,9 @@ impl ExecutionEventEmitter {
             let event_type = event_type.to_string();
             let payload = payload.to_string();
             tokio::spawn(async move {
-                event_bus.emit(&task_iri, &event_type, "ExecutionEventEmitter", &payload).await;
+                event_bus
+                    .emit(&task_iri, &event_type, "ExecutionEventEmitter", &payload)
+                    .await;
             });
         }
     }
@@ -233,10 +235,20 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("PHASE_CHANGE", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "PHASE_CHANGE",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
-    pub fn emit_agent_status(&self, agent_id: &str, role: &str, status: &str, turn: u32, iteration: u32) {
+    pub fn emit_agent_status(
+        &self,
+        agent_id: &str,
+        role: &str,
+        status: &str,
+        turn: u32,
+        iteration: u32,
+    ) {
         let event = ExecutionEvent {
             event_id: Self::generate_event_id(),
             task_iri: self.task_iri.clone(),
@@ -251,10 +263,20 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("AGENT_STATUS", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "AGENT_STATUS",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
-    pub fn emit_llm_content(&self, agent_id: &str, role: &str, delta: &str, is_reasoning: bool, token_count: u32) {
+    pub fn emit_llm_content(
+        &self,
+        agent_id: &str,
+        role: &str,
+        delta: &str,
+        is_reasoning: bool,
+        token_count: u32,
+    ) {
         let event = ExecutionEvent {
             event_id: Self::generate_event_id(),
             task_iri: self.task_iri.clone(),
@@ -270,7 +292,14 @@ impl ExecutionEventEmitter {
         self.emit(event.clone());
     }
 
-    pub fn emit_tool_call(&self, call_id: &str, tool_name: &str, args: &Value, agent_id: &str, sequence: u32) {
+    pub fn emit_tool_call(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        args: &Value,
+        agent_id: &str,
+        sequence: u32,
+    ) {
         if !self.include_tool_calls {
             return;
         }
@@ -288,10 +317,22 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("TOOL_CALL", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "TOOL_CALL",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
-    pub fn emit_tool_result(&self, call_id: &str, tool_name: &str, result: &str, success: bool, size_bytes: u32, duration_ms: u32, agent_id: &str) {
+    pub fn emit_tool_result(
+        &self,
+        call_id: &str,
+        tool_name: &str,
+        result: &str,
+        success: bool,
+        size_bytes: u32,
+        duration_ms: u32,
+        agent_id: &str,
+    ) {
         if !self.include_tool_calls {
             return;
         }
@@ -310,7 +351,10 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("TOOL_RESULT", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "TOOL_RESULT",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
     pub fn emit_thought(&self, agent_id: &str, thought: &str, action: &str, emphasis: &[String]) {
@@ -329,11 +373,15 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("THOUGHT", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "THOUGHT",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
     pub fn emit_token_usage(&self, prompt: u32, completion: u32, model: &str, turn: u32) {
-        self.token_total.fetch_add((prompt + completion) as u64, Ordering::Relaxed);
+        self.token_total
+            .fetch_add((prompt + completion) as u64, Ordering::Relaxed);
         self.turn_total.fetch_add(1, Ordering::Relaxed);
         let event = ExecutionEvent {
             event_id: Self::generate_event_id(),
@@ -363,14 +411,17 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("EXECUTION_ERROR", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "EXECUTION_ERROR",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
     pub fn emit_completion(&self, status: &str, summary: &str, output: Option<Value>) {
         let total_tokens = self.token_total.load(Ordering::Relaxed) as u32;
         let total_tool_calls = self.tool_call_total.load(Ordering::Relaxed) as u32;
         let total_turns = self.turn_total.load(Ordering::Relaxed) as u32;
-        
+
         let event = ExecutionEvent {
             event_id: Self::generate_event_id(),
             task_iri: self.task_iri.clone(),
@@ -385,7 +436,10 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
-        self.emit_to_event_bus("EXECUTION_COMPLETE", &serde_json::to_string(&event).unwrap_or_default());
+        self.emit_to_event_bus(
+            "EXECUTION_COMPLETE",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
     }
 
     pub fn get_stats(&self) -> (u32, u32, u32) {
@@ -584,7 +638,10 @@ mod tests {
             }),
         };
         state.update_from_event(&event);
-        assert_eq!(state.current_thought_preview, "Need to analyze user requirements");
+        assert_eq!(
+            state.current_thought_preview,
+            "Need to analyze user requirements"
+        );
     }
 
     #[test]
@@ -630,11 +687,7 @@ mod tests {
     #[tokio::test]
     async fn test_execution_event_emitter_emit() {
         let (tx, mut rx) = mpsc::channel::<ExecutionEvent>(64);
-        let emitter = ExecutionEventEmitter::new(
-            "iri://task/test",
-            Some(tx),
-            None,
-        );
+        let emitter = ExecutionEventEmitter::new("iri://task/test", Some(tx), None);
 
         emitter.emit_phase_change("idle", "plan", "PA", "Test started");
         emitter.emit_agent_status("pa_001", "PA", "running", 1, 1);
@@ -653,13 +706,8 @@ mod tests {
     #[tokio::test]
     async fn test_execution_event_emitter_with_options() {
         let (tx, mut rx) = mpsc::channel::<ExecutionEvent>(64);
-        let emitter = ExecutionEventEmitter::with_options(
-            "iri://task/test2",
-            Some(tx),
-            None,
-            false,
-            false,
-        );
+        let emitter =
+            ExecutionEventEmitter::with_options("iri://task/test2", Some(tx), None, false, false);
 
         emitter.emit_thought("pa_001", "thinking...", "continue", &[]);
         emitter.emit_tool_call("tc_1", "write_file", &serde_json::json!({}), "da_001", 1);
@@ -670,11 +718,7 @@ mod tests {
     #[tokio::test]
     async fn test_execution_event_emitter_stats() {
         let (tx, _rx) = mpsc::channel::<ExecutionEvent>(64);
-        let emitter = ExecutionEventEmitter::new(
-            "iri://task/test3",
-            Some(tx),
-            None,
-        );
+        let emitter = ExecutionEventEmitter::new("iri://task/test3", Some(tx), None);
 
         emitter.emit_token_usage(100, 50, "deepseek-v4-flash", 1);
         emitter.emit_token_usage(200, 100, "deepseek-v4-flash", 2);

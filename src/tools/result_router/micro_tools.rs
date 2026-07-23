@@ -146,10 +146,7 @@ impl MicroToolGenerator {
     pub fn format_tool_injection_message(summary: &str, tools: &[MicroToolSchema]) -> String {
         let mut msg = format!("{}\n\nAvailable query tools:\n", summary);
         for tool in tools {
-            msg.push_str(&format!(
-                "- **{}**: {}\n",
-                tool.name, tool.description
-            ));
+            msg.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
         }
         msg.push_str("\nYou can call these tools to query the complete data.");
         msg
@@ -162,10 +159,7 @@ mod tests {
 
     fn make_analysis() -> SchemaAnalysis {
         SchemaAnalysis {
-            entity_types: vec![
-                ("Person".to_string(), 10),
-                ("Organization".to_string(), 3),
-            ],
+            entity_types: vec![("Person".to_string(), 10), ("Organization".to_string(), 3)],
             relation_types: vec!["works_for".to_string()],
             property_names: vec!["name".to_string(), "age".to_string()],
             total_entities: 13,

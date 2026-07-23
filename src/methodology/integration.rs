@@ -12,7 +12,6 @@
 ///
 /// Architecture Layer: L2/L1 boundary — Methodology → Agent Prompt
 /// See design: PR-res/superpowers-skills-full-integration-design.md §3
-
 use crate::core::agent_instance::AgentRole;
 use crate::methodology::MethodologyRegistry;
 
@@ -97,7 +96,8 @@ impl MethodologyPromptInjector {
         let verification = registry.get("methodology:verification-before-completion");
 
         let mut sections = vec![
-            "\n## 📋 Methodology Discipline — Dual-Stage Audit + Anti-Pattern Detection".to_string(),
+            "\n## 📋 Methodology Discipline — Dual-Stage Audit + Anti-Pattern Detection"
+                .to_string(),
             "As the Checking Agent, you must perform a dual-stage audit:".to_string(),
         ];
 
@@ -187,7 +187,12 @@ impl MethodologyPromptInjector {
         let always_on: Vec<&str> = registry
             .all()
             .iter()
-            .filter(|m| matches!(m.activation, crate::methodology::ActivationCondition::Always))
+            .filter(|m| {
+                matches!(
+                    m.activation,
+                    crate::methodology::ActivationCondition::Always
+                )
+            })
             .map(|m| m.name)
             .collect();
 
@@ -205,7 +210,8 @@ impl MethodologyPromptInjector {
 
         let mut sections = vec![
             "\n## 📋 Methodology Discipline — Auto-Trigger Protocol".to_string(),
-            "As the Supervisor Agent, consider the following methodologies when creating plans:".to_string(),
+            "As the Supervisor Agent, consider the following methodologies when creating plans:"
+                .to_string(),
         ];
 
         if !always_on.is_empty() {
@@ -304,9 +310,18 @@ mod tests {
         let addendum = MethodologyPromptInjector::build_for_role(AgentRole::Plan);
         assert!(addendum.is_some(), "PA should have a methodology addendum");
         let text = addendum.unwrap();
-        assert!(text.contains("Granularity Check"), "PA addendum should mention granularity");
-        assert!(text.contains("Complexity Matching"), "PA addendum should mention complexity");
-        assert!(text.contains("Boundary Check"), "PA addendum should mention boundary");
+        assert!(
+            text.contains("Granularity Check"),
+            "PA addendum should mention granularity"
+        );
+        assert!(
+            text.contains("Complexity Matching"),
+            "PA addendum should mention complexity"
+        );
+        assert!(
+            text.contains("Boundary Check"),
+            "PA addendum should mention boundary"
+        );
     }
 
     #[test]
@@ -314,10 +329,16 @@ mod tests {
         let addendum = MethodologyPromptInjector::build_for_role(AgentRole::Check);
         assert!(addendum.is_some(), "CA should have a methodology addendum");
         let text = addendum.unwrap();
-        assert!(text.contains("Dual-Stage Audit"), "CA addendum should mention dual-stage audit");
+        assert!(
+            text.contains("Dual-Stage Audit"),
+            "CA addendum should mention dual-stage audit"
+        );
         assert!(text.contains("Stage 1"), "CA addendum should have Stage 1");
         assert!(text.contains("Stage 2"), "CA addendum should have Stage 2");
-        assert!(text.contains("Anti-Pattern Detection"), "CA addendum should mention anti-pattern detection");
+        assert!(
+            text.contains("Anti-Pattern Detection"),
+            "CA addendum should mention anti-pattern detection"
+        );
     }
 
     #[test]
@@ -325,33 +346,64 @@ mod tests {
         let addendum = MethodologyPromptInjector::build_for_role(AgentRole::Act);
         assert!(addendum.is_some(), "AA should have a methodology addendum");
         let text = addendum.unwrap();
-        assert!(text.contains("Pressure Testing"), "AA addendum should mention pressure testing");
-        assert!(text.contains("Meta-Test"), "AA addendum should mention meta-test");
-        assert!(text.contains("rubber stamp"), "AA addendum should warn against rubber-stamping");
+        assert!(
+            text.contains("Pressure Testing"),
+            "AA addendum should mention pressure testing"
+        );
+        assert!(
+            text.contains("Meta-Test"),
+            "AA addendum should mention meta-test"
+        );
+        assert!(
+            text.contains("rubber stamp"),
+            "AA addendum should warn against rubber-stamping"
+        );
     }
 
     #[test]
     fn test_da_addendum_exists() {
         let addendum = MethodologyPromptInjector::build_for_role(AgentRole::Do);
-        assert!(addendum.is_some(), "DA should now have a methodology addendum");
+        assert!(
+            addendum.is_some(),
+            "DA should now have a methodology addendum"
+        );
         let text = addendum.unwrap();
-        assert!(text.contains("Least Privilege Execution"), "DA addendum should mention least privilege");
-        assert!(text.contains("Cost Awareness"), "DA addendum should mention cost awareness");
+        assert!(
+            text.contains("Least Privilege Execution"),
+            "DA addendum should mention least privilege"
+        );
+        assert!(
+            text.contains("Cost Awareness"),
+            "DA addendum should mention cost awareness"
+        );
     }
 
     #[test]
     fn test_sa_addendum_exists() {
         let text = MethodologyPromptInjector::build_for_sa();
         assert!(!text.is_empty(), "SA addendum should not be empty");
-        assert!(text.contains("Always-Active Methodologies"), "SA addendum should mention always-on");
-        assert!(text.contains("Plan Generation Requirements"), "SA addendum should have plan generation requirements");
+        assert!(
+            text.contains("Always-Active Methodologies"),
+            "SA addendum should mention always-on"
+        );
+        assert!(
+            text.contains("Plan Generation Requirements"),
+            "SA addendum should have plan generation requirements"
+        );
     }
 
     #[test]
     fn test_addendum_includes_methodology_names() {
         let registry = MethodologyRegistry::new();
-        let always_on_count = registry.all().iter()
-            .filter(|m| matches!(m.activation, crate::methodology::ActivationCondition::Always))
+        let always_on_count = registry
+            .all()
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.activation,
+                    crate::methodology::ActivationCondition::Always
+                )
+            })
             .count();
 
         let sa_text = MethodologyPromptInjector::build_for_sa();
@@ -364,26 +416,44 @@ mod tests {
     #[test]
     fn test_pa_addendum_references_granularity_rules() {
         let text = MethodologyPromptInjector::build_for_role(AgentRole::Plan).unwrap();
-        assert!(text.contains("Too coarse") || text.contains("Too fine"), "PA granularity check should define granularity levels");
+        assert!(
+            text.contains("Too coarse") || text.contains("Too fine"),
+            "PA granularity check should define granularity levels"
+        );
     }
 
     #[test]
     fn test_ca_addendum_has_evidence_requirement() {
         let text = MethodologyPromptInjector::build_for_role(AgentRole::Check).unwrap();
-        assert!(text.contains("Evidence"), "CA dual-stage audit should require evidence");
+        assert!(
+            text.contains("Evidence"),
+            "CA dual-stage audit should require evidence"
+        );
     }
 
     #[test]
     fn test_aa_addendum_mentions_decision_responsibility() {
         let text = MethodologyPromptInjector::build_for_role(AgentRole::Act).unwrap();
-        assert!(text.contains("Decision Responsibility"), "AA pressure testing should mention decision responsibility");
+        assert!(
+            text.contains("Decision Responsibility"),
+            "AA pressure testing should mention decision responsibility"
+        );
     }
 
     #[test]
     fn test_all_roles_have_consistent_structure() {
-        for role in &[AgentRole::Plan, AgentRole::Check, AgentRole::Act, AgentRole::Do] {
+        for role in &[
+            AgentRole::Plan,
+            AgentRole::Check,
+            AgentRole::Act,
+            AgentRole::Do,
+        ] {
             if let Some(text) = MethodologyPromptInjector::build_for_role(*role) {
-                assert!(text.starts_with("\n##"), "{} addendum should start with a header", role);
+                assert!(
+                    text.starts_with("\n##"),
+                    "{} addendum should start with a header",
+                    role
+                );
                 assert!(text.len() > 100, "{} addendum should be substantial", role);
             }
         }

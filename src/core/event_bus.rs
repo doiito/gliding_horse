@@ -8,7 +8,7 @@
 //! - Zero-copy event broadcasting using Arc
 //! - SSE streaming support for real-time clients
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +28,7 @@ pub enum EventType {
     TaskCompleted,
     TaskFailed,
     TaskArchived,
-    
+
     // PDCA phase events
     PlanStarted,
     PlanCompleted,
@@ -38,39 +38,39 @@ pub enum EventType {
     CheckCompleted,
     ActStarted,
     ActCompleted,
-    
+
     // Node events
     NodeCreated,
     NodeUpdated,
     NodeDeleted,
-    
+
     // Agent events
     AgentStarted,
     AgentCompleted,
     AgentError,
-    
+
     // System events
     CycleIteration,
     ThresholdExceeded,
     InterventionRequired,
-    
+
     // Memory events
     MemoryInvalidate,
     MemoryWriteBack,
     MemoryPrefetch,
     MemoryLoad,
-    
+
     // 5W2H constraint events
     DeadlineApproaching,
     BudgetExceeded,
-    
+
     // Human approval events
     HumanApprovalRequired,
     HumanApprovalResult,
-    
+
     // User supplementary input event
     UserSupplementaryInput,
-    
+
     // ===== Batch Agent events =====
     BatchAgentRegistered,
     BatchAgentStarted,
@@ -172,7 +172,7 @@ impl EventType {
             EventType::Custom(s) => s.as_str(),
         }
     }
-    
+
     pub fn from_str(s: &str) -> Self {
         match s {
             "TASK_CREATED" => EventType::TaskCreated,
@@ -247,7 +247,7 @@ impl FromStr for EventType {
 }
 
 /// Type mask for O(1) bitmap routing
-/// 
+///
 /// Each @type gets assigned a unique bit position.
 /// Event matching is done via bitwise AND operation.
 #[derive(Debug, Clone)]
@@ -263,32 +263,33 @@ impl TypeMask {
             next_bit: 0,
         }
     }
-    
+
     pub fn get_or_create_mask(&mut self, type_name: &str) -> u64 {
         if let Some(&mask) = self.masks.get(type_name) {
             return mask;
         }
-        
+
         if self.next_bit >= 64 {
             panic!("TypeMask overflow: more than 64 types registered");
         }
-        
+
         let mask = 1u64 << self.next_bit;
         self.next_bit += 1;
         self.masks.insert(type_name.to_string(), mask);
         mask
     }
-    
+
     pub fn combine_masks(&self, types: &[String]) -> u64 {
-        types.iter()
+        types
+            .iter()
             .filter_map(|t| self.masks.get(t))
             .fold(0u64, |acc, &mask| acc | mask)
     }
-    
+
     pub fn get_mask(&self, type_name: &str) -> Option<u64> {
         self.masks.get(type_name).copied()
     }
-    
+
     pub fn type_count(&self) -> usize {
         self.masks.len()
     }
@@ -322,7 +323,9 @@ pub enum EventPriority {
 }
 
 impl Default for EventPriority {
-    fn default() -> Self { Self::Normal }
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -357,38 +360,38 @@ impl Subscription {
             event_types: Vec::new(),
         }
     }
-    
+
     pub fn with_type_mask(mut self, mask: u64) -> Self {
         self.type_mask = mask;
         self
     }
-    
+
     pub fn with_scope(mut self, scope_iri: String) -> Self {
         self.scope_iri = Some(scope_iri);
         self
     }
-    
+
     pub fn with_event_types(mut self, types: Vec<String>) -> Self {
         self.event_types = types;
         self
     }
-    
+
     /// O(1) check if event matches subscription
     pub fn matches(&self, event: &Event) -> bool {
         if self.type_mask != 0 && (event.type_mask & self.type_mask) == 0 {
             return false;
         }
-        
+
         if let Some(ref scope) = self.scope_iri {
             if &event.task_iri != scope {
                 return false;
             }
         }
-        
+
         if !self.event_types.is_empty() && !self.event_types.contains(&event.event_type) {
             return false;
         }
-        
+
         true
     }
 }
@@ -398,7 +401,7 @@ impl Subscription {
 pub struct EventBusConfig {
     /// Buffer size for broadcast channel
     pub buffer_size: usize,
-    
+
     /// Maximum events to keep in history
     pub max_history: usize,
 }
@@ -416,30 +419,65 @@ impl Default for EventBusConfig {
 pub struct EventBus {
     /// Broadcast sender
     sender: broadcast::Sender<Event>,
-    
+
     /// Event counter
     event_count: AtomicU64,
-    
+
     /// Subscriber count
     subscriber_count: AtomicU64,
-    
+
     /// Type mask registry
     type_mask: std::sync::Mutex<TypeMask>,
+
+    /// Process-local bounded audit history. This is intentionally separate
+    /// from broadcast delivery and is not a durable event log.
+    history: std::sync::Mutex<VecDeque<Event>>,
+    max_history: usize,
+}
+
+/// A broadcast receiver that applies a `Subscription` before exposing an
+/// event. Lag/closed errors retain Tokio broadcast semantics so callers can
+/// decide how to recover rather than silently losing them.
+pub struct FilteredEventReceiver {
+    receiver: broadcast::Receiver<Event>,
+    subscription: Subscription,
+}
+
+impl FilteredEventReceiver {
+    pub async fn recv(&mut self) -> Result<Event, broadcast::error::RecvError> {
+        loop {
+            let event = self.receiver.recv().await?;
+            if self.subscription.matches(&event) {
+                return Ok(event);
+            }
+        }
+    }
 }
 
 impl EventBus {
     /// Create a new event bus
     pub fn new(buffer_size: usize) -> Self {
-        let (sender, _) = broadcast::channel(buffer_size);
-        
+        Self::with_config(EventBusConfig {
+            buffer_size,
+            ..EventBusConfig::default()
+        })
+    }
+
+    /// Create an event bus with independently configured broadcast and
+    /// process-local history capacities.
+    pub fn with_config(config: EventBusConfig) -> Self {
+        let (sender, _) = broadcast::channel(config.buffer_size);
+
         Self {
             sender,
             event_count: AtomicU64::new(0),
             subscriber_count: AtomicU64::new(0),
             type_mask: std::sync::Mutex::new(TypeMask::new()),
+            history: std::sync::Mutex::new(VecDeque::with_capacity(config.max_history)),
+            max_history: config.max_history,
         }
     }
-    
+
     /// Emit an event
     pub async fn emit(
         &self,
@@ -448,7 +486,14 @@ impl EventBus {
         source_agent_iri: &str,
         payload: &str,
     ) -> String {
-        self.emit_with_priority(task_iri, event_type, source_agent_iri, payload, EventPriority::Normal).await
+        self.emit_with_priority(
+            task_iri,
+            event_type,
+            source_agent_iri,
+            payload,
+            EventPriority::Normal,
+        )
+        .await
     }
 
     pub async fn emit_with_priority(
@@ -461,12 +506,12 @@ impl EventBus {
     ) -> String {
         let sequence = self.event_count.fetch_add(1, Ordering::Relaxed);
         let event_id = format!("evt_{}", uuid::Uuid::new_v4().hyphenated());
-        
+
         let type_mask = {
             let mut mask = self.type_mask.lock().expect("type_mask Mutex poisoned");
             mask.get_or_create_mask(event_type)
         };
-        
+
         let event = Event {
             event_id: event_id.clone(),
             task_iri: task_iri.to_string(),
@@ -479,7 +524,7 @@ impl EventBus {
             type_mask,
             priority,
         };
-        
+
         debug!(
             event_id = %event_id,
             event_type = %event_type,
@@ -487,49 +532,90 @@ impl EventBus {
             type_mask = %type_mask,
             "Event emitted"
         );
-        
+
+        if self.max_history > 0 {
+            let mut history = self.history.lock().expect("event history Mutex poisoned");
+            if history.len() >= self.max_history {
+                history.pop_front();
+            }
+            history.push_back(event.clone());
+        }
+
         let _ = self.sender.send(event);
-        
+
         event_id
     }
-    
+
     /// Subscribe to events
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         self.sender.subscribe()
     }
-    
-    /// Subscribe with a specific subscription filter
-    pub fn subscribe_with_filter(&self, _subscription: Subscription) -> broadcast::Receiver<Event> {
+
+    /// Subscribe with a specific subscription filter. Events that do not
+    /// match are consumed from this receiver and never exposed to its caller.
+    pub fn subscribe_with_filter(&self, subscription: Subscription) -> FilteredEventReceiver {
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
-        self.sender.subscribe()
+        FilteredEventReceiver {
+            receiver: self.sender.subscribe(),
+            subscription,
+        }
     }
-    
+
     /// Register a type for bitmap routing
     pub fn register_type(&self, type_name: &str) -> u64 {
         let mut mask = self.type_mask.lock().expect("type_mask Mutex poisoned");
         mask.get_or_create_mask(type_name)
     }
-    
+
     /// Get combined mask for multiple types
     pub fn get_combined_mask(&self, types: &[String]) -> u64 {
         let mask = self.type_mask.lock().expect("type_mask Mutex poisoned");
         mask.combine_masks(types)
     }
-    
+
     /// Get event count
     pub fn event_count(&self) -> u64 {
         self.event_count.load(Ordering::Relaxed)
     }
-    
+
     /// Get subscriber count
     pub fn subscriber_count(&self) -> u64 {
         self.subscriber_count.load(Ordering::Relaxed)
     }
-    
+
     /// Get registered type count
     pub fn type_count(&self) -> usize {
-        self.type_mask.lock().expect("type_mask Mutex poisoned").type_count()
+        self.type_mask
+            .lock()
+            .expect("type_mask Mutex poisoned")
+            .type_count()
+    }
+
+    /// Return up to `limit` matching events in chronological order from the
+    /// bounded in-process history. It is useful for diagnostics and task
+    /// audits, not for durable replay.
+    pub fn recent_events(&self, filter: &EventFilter, limit: usize) -> Vec<Event> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let history = self.history.lock().expect("event history Mutex poisoned");
+        let mut result: Vec<Event> = history
+            .iter()
+            .rev()
+            .filter(|event| filter.matches(event))
+            .take(limit)
+            .cloned()
+            .collect();
+        result.reverse();
+        result
+    }
+
+    pub fn history_len(&self) -> usize {
+        self.history
+            .lock()
+            .expect("event history Mutex poisoned")
+            .len()
     }
 
     pub fn try_recv(&self) -> Result<Event, broadcast::error::TryRecvError> {
@@ -537,11 +623,8 @@ impl EventBus {
         receiver.try_recv()
     }
 
-    pub fn spawn_consumer<F, Fut>(
-        &self,
-        event_types: Vec<String>,
-        handler: F,
-    ) where
+    pub fn spawn_consumer<F, Fut>(&self, event_types: Vec<String>, handler: F)
+    where
         F: Fn(Event) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
@@ -551,9 +634,7 @@ impl EventBus {
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
-                        if event_types.is_empty()
-                            || event_types.contains(&event.event_type)
-                        {
+                        if event_types.is_empty() || event_types.contains(&event.event_type) {
                             handler(event).await;
                         }
                     }
@@ -572,13 +653,13 @@ impl EventBus {
 pub struct EventFilter {
     /// Filter by task IRI
     pub task_iri: Option<String>,
-    
+
     /// Filter by event types
     pub event_types: Vec<String>,
-    
+
     /// Filter by source agent
     pub source_agent: Option<String>,
-    
+
     /// Type mask for O(1) routing
     pub type_mask: u64,
 }
@@ -589,26 +670,26 @@ impl EventFilter {
         if self.type_mask != 0 && (event.type_mask & self.type_mask) == 0 {
             return false;
         }
-        
+
         if let Some(ref task_iri) = self.task_iri {
             if &event.task_iri != task_iri {
                 return false;
             }
         }
-        
+
         if !self.event_types.is_empty() && !self.event_types.contains(&event.event_type) {
             return false;
         }
-        
+
         if let Some(ref source) = self.source_agent {
             if &event.source_agent_iri != source {
                 return false;
             }
         }
-        
+
         true
     }
-    
+
     /// Create filter with type mask for O(1) matching
     pub fn with_type_mask(mut self, mask: u64) -> Self {
         self.type_mask = mask;
@@ -619,53 +700,109 @@ impl EventFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_event_bus() {
         let bus = EventBus::new(100);
         let mut receiver = bus.subscribe();
-        
-        let event_id = bus.emit(
-            "iri://task_1",
-            "TEST_EVENT",
-            "iri://agent_1",
-            r#"{"test": true}"#,
-        ).await;
-        
+
+        let event_id = bus
+            .emit(
+                "iri://task_1",
+                "TEST_EVENT",
+                "iri://agent_1",
+                r#"{"test": true}"#,
+            )
+            .await;
+
         assert!(!event_id.is_empty());
-        
+
         let event = receiver.recv().await.unwrap();
         assert_eq!(event.event_type, "TEST_EVENT");
     }
-    
+
+    #[tokio::test]
+    async fn bounded_history_keeps_newest_matching_events_in_chronological_order() {
+        let bus = EventBus::with_config(EventBusConfig {
+            buffer_size: 8,
+            max_history: 2,
+        });
+        bus.emit("task:a", "FIRST", "agent:a", "{}").await;
+        bus.emit("task:b", "SECOND", "agent:b", "{}").await;
+        bus.emit("task:a", "THIRD", "agent:a", "{}").await;
+
+        assert_eq!(bus.history_len(), 2);
+        let task_a = bus.recent_events(
+            &EventFilter {
+                task_iri: Some("task:a".to_string()),
+                ..EventFilter::default()
+            },
+            10,
+        );
+        assert_eq!(
+            task_a
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["THIRD"]
+        );
+
+        let all = bus.recent_events(&EventFilter::default(), 10);
+        assert_eq!(
+            all.iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SECOND", "THIRD"]
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_subscription_skips_non_matching_broadcast_events() {
+        let bus = EventBus::new(8);
+        let task_mask = bus.register_type("TASK_MATCH");
+        let mut receiver = bus.subscribe_with_filter(
+            Subscription::new("task-only".to_string())
+                .with_scope("task:target".to_string())
+                .with_type_mask(task_mask),
+        );
+
+        bus.emit("task:other", "TASK_MATCH", "agent", "{}").await;
+        bus.emit("task:target", "UNRELATED", "agent", "{}").await;
+        bus.emit("task:target", "TASK_MATCH", "agent", "{}").await;
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.task_iri, "task:target");
+        assert_eq!(event.event_type, "TASK_MATCH");
+    }
+
     #[test]
     fn test_type_mask() {
         let mut mask = TypeMask::new();
-        
+
         let mask1 = mask.get_or_create_mask("PLAN_NODE");
         let mask2 = mask.get_or_create_mask("CODE_ARTIFACT");
         let mask3 = mask.get_or_create_mask("REVIEW_RESULT");
-        
+
         assert_ne!(mask1, mask2);
         assert_ne!(mask2, mask3);
-        
+
         let combined = mask.combine_masks(&["PLAN_NODE".to_string(), "CODE_ARTIFACT".to_string()]);
         assert_eq!(combined, mask1 | mask2);
-        
+
         assert!((combined & mask1) != 0);
         assert!((combined & mask2) != 0);
         assert!((combined & mask3) == 0);
     }
-    
+
     #[test]
     fn test_subscription_matching() {
         let mut type_mask = TypeMask::new();
         let plan_mask = type_mask.get_or_create_mask("PLAN_NODE");
         let code_mask = type_mask.get_or_create_mask("CODE_ARTIFACT");
-        
-        let subscription = Subscription::new("sub_1".to_string())
-            .with_type_mask(plan_mask | code_mask);
-        
+
+        let subscription =
+            Subscription::new("sub_1".to_string()).with_type_mask(plan_mask | code_mask);
+
         let plan_event = Event {
             event_id: "evt_1".to_string(),
             task_iri: "iri://task_1".to_string(),
@@ -678,7 +815,7 @@ mod tests {
             type_mask: plan_mask,
             priority: EventPriority::Normal,
         };
-        
+
         let review_event = Event {
             event_id: "evt_2".to_string(),
             task_iri: "iri://task_1".to_string(),
@@ -691,16 +828,25 @@ mod tests {
             type_mask: type_mask.get_or_create_mask("REVIEW_RESULT"),
             priority: EventPriority::Normal,
         };
-        
+
         assert!(subscription.matches(&plan_event));
         assert!(!subscription.matches(&review_event));
     }
 
     #[test]
     fn test_event_type_5w2h_variants() {
-        assert_eq!(EventType::DeadlineApproaching.as_str(), "DEADLINE_APPROACHING");
+        assert_eq!(
+            EventType::DeadlineApproaching.as_str(),
+            "DEADLINE_APPROACHING"
+        );
         assert_eq!(EventType::BudgetExceeded.as_str(), "BUDGET_EXCEEDED");
-        assert_eq!("DEADLINE_APPROACHING".parse::<EventType>(), Ok(EventType::DeadlineApproaching));
-        assert_eq!("BUDGET_EXCEEDED".parse::<EventType>(), Ok(EventType::BudgetExceeded));
+        assert_eq!(
+            "DEADLINE_APPROACHING".parse::<EventType>(),
+            Ok(EventType::DeadlineApproaching)
+        );
+        assert_eq!(
+            "BUDGET_EXCEEDED".parse::<EventType>(),
+            Ok(EventType::BudgetExceeded)
+        );
     }
 }

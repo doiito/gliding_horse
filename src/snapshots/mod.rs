@@ -5,7 +5,9 @@
 //!
 //! Provides:
 //! - `TimelineStore`: point-in-time snapshots, rollback, and diff for the skill graph
-//! - `TemporalHypergraphStore`: time-aware N-ary hyperedges with versioning + time-range queries
+//! - `TemporalHypergraphStore`: experimental time-aware N-ary hyperedges with
+//!   versioning + time-range queries. It is a library component and is not wired
+//!   into `SkillGraphStore`, `CausalEngine`, or a production retrieval path.
 //!
 //! # Architecture
 //!

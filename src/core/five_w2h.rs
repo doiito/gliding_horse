@@ -63,7 +63,12 @@ pub fn audit_dimensions(
         results.push(DimensionAuditResult {
             dimension: "what".to_string(),
             status: detail,
-            evidence: format!("status={}, has_output={}, summary_len={}", result.status, has_content, result.summary.len()),
+            evidence: format!(
+                "status={}, has_output={}, summary_len={}",
+                result.status,
+                has_content,
+                result.summary.len()
+            ),
             details: vec![format!("Task status: {}", result.status)],
         });
     }
@@ -79,7 +84,10 @@ pub fn audit_dimensions(
                 details: vec![],
             });
         } else {
-            let matched: Vec<&String> = criteria.iter().filter(|c| result.summary.contains(c.as_str())).collect();
+            let matched: Vec<&String> = criteria
+                .iter()
+                .filter(|c| result.summary.contains(c.as_str()))
+                .collect();
             let ratio = matched.len() as f64 / criteria.len().max(1) as f64;
             let detail = if ratio >= 0.8 {
                 AuditStatus::Pass
@@ -88,7 +96,12 @@ pub fn audit_dimensions(
             } else {
                 if let Some(ce) = causal_engine {
                     for c in criteria.iter().filter(|c| !matched.contains(c)) {
-                        let obs_id = format!("obs-{}-{}-why-{}", task_iri, now.timestamp_millis(), c.chars().take(16).collect::<String>());
+                        let obs_id = format!(
+                            "obs-{}-{}-why-{}",
+                            task_iri,
+                            now.timestamp_millis(),
+                            c.chars().take(16).collect::<String>()
+                        );
                         ce.record_observation(CausalObservation::new(
                             &obs_id,
                             "iri://system/5w2h/why",
@@ -97,13 +110,19 @@ pub fn audit_dimensions(
                         ));
                     }
                 }
-                AuditStatus::Fail(format!("Only {:.0}% of success criteria met", ratio * 100.0))
+                AuditStatus::Fail(format!(
+                    "Only {:.0}% of success criteria met",
+                    ratio * 100.0
+                ))
             };
             results.push(DimensionAuditResult {
                 dimension: "why".to_string(),
                 status: detail,
                 evidence: format!("{}/{} criteria matched", matched.len(), criteria.len()),
-                details: criteria.iter().map(|c| format!("Criterion: {}", c)).collect(),
+                details: criteria
+                    .iter()
+                    .map(|c| format!("Criterion: {}", c))
+                    .collect(),
             });
         }
     }
@@ -115,7 +134,10 @@ pub fn audit_dimensions(
                 if result.status == "success" || result.status == "partial_success" {
                     AuditStatus::Pass
                 } else {
-                    AuditStatus::Warning(format!("Required role '{}' but execution had issues", required_role))
+                    AuditStatus::Warning(format!(
+                        "Required role '{}' but execution had issues",
+                        required_role
+                    ))
                 }
             } else {
                 AuditStatus::Pass
@@ -126,7 +148,10 @@ pub fn audit_dimensions(
         results.push(DimensionAuditResult {
             dimension: "who".to_string(),
             status: detail,
-            evidence: format!("required_role={:?}", five_w2h.who.as_ref().and_then(|w| w.required_role.as_ref())),
+            evidence: format!(
+                "required_role={:?}",
+                five_w2h.who.as_ref().and_then(|w| w.required_role.as_ref())
+            ),
             details: vec![],
         });
     }
@@ -136,7 +161,10 @@ pub fn audit_dimensions(
         let detail = if let Some(ref when) = five_w2h.when {
             if let Some(ref deadline) = when.deadline {
                 if now > *deadline {
-                    AuditStatus::Warning(format!("Deadline exceeded: deadline={}, now={}", deadline, now))
+                    AuditStatus::Warning(format!(
+                        "Deadline exceeded: deadline={}, now={}",
+                        deadline, now
+                    ))
                 } else {
                     AuditStatus::Pass
                 }
@@ -149,7 +177,10 @@ pub fn audit_dimensions(
         results.push(DimensionAuditResult {
             dimension: "when".to_string(),
             status: detail,
-            evidence: format!("deadline={:?}", five_w2h.when.as_ref().and_then(|w| w.deadline)),
+            evidence: format!(
+                "deadline={:?}",
+                five_w2h.when.as_ref().and_then(|w| w.deadline)
+            ),
             details: vec![],
         });
     }
@@ -161,7 +192,10 @@ pub fn audit_dimensions(
                 if let Ok(cwd) = std::env::current_dir() {
                     let cwd_str = cwd.to_string_lossy().to_string();
                     if !cwd_str.contains(env.trim_end_matches('/')) {
-                        AuditStatus::Warning(format!("Execution environment mismatch: expected={}, actual={}", env, cwd_str))
+                        AuditStatus::Warning(format!(
+                            "Execution environment mismatch: expected={}, actual={}",
+                            env, cwd_str
+                        ))
                     } else {
                         AuditStatus::Pass
                     }
@@ -177,7 +211,13 @@ pub fn audit_dimensions(
         results.push(DimensionAuditResult {
             dimension: "where".to_string(),
             status: detail,
-            evidence: format!("execution_environment={:?}", five_w2h.where_.as_ref().and_then(|w| w.execution_environment.as_ref())),
+            evidence: format!(
+                "execution_environment={:?}",
+                five_w2h
+                    .where_
+                    .as_ref()
+                    .and_then(|w| w.execution_environment.as_ref())
+            ),
             details: vec![],
         });
     }
@@ -186,7 +226,9 @@ pub fn audit_dimensions(
     {
         let detail = match result.status.as_str() {
             "success" => AuditStatus::Pass,
-            "partial_success" => AuditStatus::Warning("Task partially succeeded — approach had gaps".to_string()),
+            "partial_success" => {
+                AuditStatus::Warning("Task partially succeeded — approach had gaps".to_string())
+            }
             s => {
                 if let Some(ce) = causal_engine {
                     ce.record_observation(CausalObservation::new(
@@ -214,12 +256,18 @@ pub fn audit_dimensions(
             if let Some(ref budget) = hm.token_budget {
                 let usage = result.tool_call_count as u64 * 1000; // rough estimate
                 if usage > *budget {
-                    warnings.push(format!("Token budget exceeded: budget={}, estimated={}", budget, usage));
+                    warnings.push(format!(
+                        "Token budget exceeded: budget={}, estimated={}",
+                        budget, usage
+                    ));
                 }
             }
             if let Some(ref max_cycles) = hm.max_pdca_cycles {
                 if result.turn_count > *max_cycles {
-                    warnings.push(format!("Turn count exceeded: max={}, actual={}", max_cycles, result.turn_count));
+                    warnings.push(format!(
+                        "Turn count exceeded: max={}, actual={}",
+                        max_cycles, result.turn_count
+                    ));
                 }
             }
             if warnings.is_empty() {
@@ -233,7 +281,12 @@ pub fn audit_dimensions(
         results.push(DimensionAuditResult {
             dimension: "how_much".to_string(),
             status: detail,
-            evidence: format!("turns={}, tool_calls={}, errors={}", result.turn_count, result.tool_call_count, result.errors.len()),
+            evidence: format!(
+                "turns={}, tool_calls={}, errors={}",
+                result.turn_count,
+                result.tool_call_count,
+                result.errors.len()
+            ),
             details: vec![],
         });
     }
@@ -355,16 +408,22 @@ impl Task5W2H {
     pub fn new(what: &str, why_description: &str) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         let mut dimension_meta = HashMap::new();
-        dimension_meta.insert("what".to_string(), DimensionMeta {
-            fill_stage: FillStage::Create,
-            filled_by: Some("SA".to_string()),
-            filled_at: Some(now.clone()),
-        });
-        dimension_meta.insert("why".to_string(), DimensionMeta {
-            fill_stage: FillStage::Create,
-            filled_by: Some("SA".to_string()),
-            filled_at: Some(now),
-        });
+        dimension_meta.insert(
+            "what".to_string(),
+            DimensionMeta {
+                fill_stage: FillStage::Create,
+                filled_by: Some("SA".to_string()),
+                filled_at: Some(now.clone()),
+            },
+        );
+        dimension_meta.insert(
+            "why".to_string(),
+            DimensionMeta {
+                fill_stage: FillStage::Create,
+                filled_by: Some("SA".to_string()),
+                filled_at: Some(now),
+            },
+        );
         Self {
             what: what.to_string(),
             why: WhyDetail {
@@ -408,11 +467,14 @@ impl Task5W2H {
     }
 
     pub fn record_fill(&mut self, dimension: &str, stage: FillStage, filled_by: &str) {
-        self.dimension_meta.insert(dimension.to_string(), DimensionMeta {
-            fill_stage: stage,
-            filled_by: Some(filled_by.to_string()),
-            filled_at: Some(chrono::Utc::now().to_rfc3339()),
-        });
+        self.dimension_meta.insert(
+            dimension.to_string(),
+            DimensionMeta {
+                fill_stage: stage,
+                filled_by: Some(filled_by.to_string()),
+                filled_at: Some(chrono::Utc::now().to_rfc3339()),
+            },
+        );
     }
 
     /// Merge structured five_w2h_updates from agent (typically PA) output into this Task5W2H.
@@ -427,82 +489,193 @@ impl Task5W2H {
 
         // ── who ──
         if let Some(who_val) = obj.get("who").and_then(|v| v.as_object()) {
-            let requestor = who_val.get("requestor").and_then(|v| v.as_str()).map(String::from);
-            let assignees = who_val.get("assignees").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let requestor = who_val
+                .get("requestor")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let assignees = who_val
+                .get("assignees")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let stakeholders = who_val.get("stakeholders").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let stakeholders = who_val
+                .get("stakeholders")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let required_role = who_val.get("requiredRole").and_then(|v| v.as_str()).map(String::from);
-            let access_level = who_val.get("accessLevel").and_then(|v| v.as_str())
+            let required_role = who_val
+                .get("requiredRole")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let access_level = who_val
+                .get("accessLevel")
+                .and_then(|v| v.as_str())
                 .and_then(|s| match s {
                     "Read" => Some(AccessLevel::Read),
                     "Write" => Some(AccessLevel::Write),
                     "Admin" => Some(AccessLevel::Admin),
                     _ => None,
                 });
-            self.who = Some(WhoDetail { requestor, assignees, stakeholders, required_role, access_level });
+            self.who = Some(WhoDetail {
+                requestor,
+                assignees,
+                stakeholders,
+                required_role,
+                access_level,
+            });
             self.record_fill("who", FillStage::Plan, "PA");
         }
 
         // ── when ──
         if let Some(when_val) = obj.get("when").and_then(|v| v.as_object()) {
-            let deadline = when_val.get("deadline").and_then(|v| v.as_str())
+            let deadline = when_val
+                .get("deadline")
+                .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc));
-            let start_after = when_val.get("startAfter").and_then(|v| v.as_str())
+            let start_after = when_val
+                .get("startAfter")
+                .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc));
-            let estimated_duration = when_val.get("estimatedDuration").and_then(|v| v.as_str()).map(String::from);
-            let timezone = when_val.get("timezone").and_then(|v| v.as_str()).map(String::from);
-            let reminder_before = when_val.get("reminderBefore").and_then(|v| v.as_str()).map(String::from);
+            let estimated_duration = when_val
+                .get("estimatedDuration")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let timezone = when_val
+                .get("timezone")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let reminder_before = when_val
+                .get("reminderBefore")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             if deadline.is_some() || estimated_duration.is_some() {
-                self.when = Some(WhenDetail { deadline, start_after, estimated_duration, timezone, reminder_before });
+                self.when = Some(WhenDetail {
+                    deadline,
+                    start_after,
+                    estimated_duration,
+                    timezone,
+                    reminder_before,
+                });
                 self.record_fill("when", FillStage::Plan, "PA");
             }
         }
 
         // ── where ──
         if let Some(where_val) = obj.get("where").and_then(|v| v.as_object()) {
-            let data_sources: Vec<String> = where_val.get("dataSources").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let data_sources: Vec<String> = where_val
+                .get("dataSources")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let execution_environment = where_val.get("executionEnvironment").and_then(|v| v.as_str()).map(String::from);
-            let target_repository = where_val.get("targetRepository").and_then(|v| v.as_str()).map(String::from);
-            let target_branch = where_val.get("targetBranch").and_then(|v| v.as_str()).map(String::from);
+            let execution_environment = where_val
+                .get("executionEnvironment")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let target_repository = where_val
+                .get("targetRepository")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let target_branch = where_val
+                .get("targetBranch")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             if !data_sources.is_empty() || execution_environment.is_some() {
-                self.where_ = Some(WhereDetail { data_sources, execution_environment, target_repository, target_branch });
+                self.where_ = Some(WhereDetail {
+                    data_sources,
+                    execution_environment,
+                    target_repository,
+                    target_branch,
+                });
                 self.record_fill("where", FillStage::Plan, "PA");
             }
         }
 
         // ── how ──
         if let Some(how_val) = obj.get("how").and_then(|v| v.as_object()) {
-            let plan_iri = how_val.get("planIRI").and_then(|v| v.as_str()).map(String::from);
-            let preferred_skills = how_val.get("preferredSkills").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let plan_iri = how_val
+                .get("planIRI")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let preferred_skills = how_val
+                .get("preferredSkills")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let forbidden_tools = how_val.get("forbiddenTools").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let forbidden_tools = how_val
+                .get("forbiddenTools")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let required_steps = how_val.get("requiredSteps").and_then(|v| v.as_str()).map(String::from);
-            let dependencies = how_val.get("dependencies").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let required_steps = how_val
+                .get("requiredSteps")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let dependencies = how_val
+                .get("dependencies")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            self.how = Some(HowDetail { plan_iri, preferred_skills, forbidden_tools, required_steps, dependencies });
+            self.how = Some(HowDetail {
+                plan_iri,
+                preferred_skills,
+                forbidden_tools,
+                required_steps,
+                dependencies,
+            });
             self.record_fill("how", FillStage::Plan, "PA");
         }
 
         // ── how_much ──
-        if let Some(hm_val) = obj.get("howMuch").or_else(|| obj.get("how_much")).and_then(|v| v.as_object()) {
+        if let Some(hm_val) = obj
+            .get("howMuch")
+            .or_else(|| obj.get("how_much"))
+            .and_then(|v| v.as_object())
+        {
             let token_budget = hm_val.get("tokenBudget").and_then(|v| v.as_u64());
-            let max_sub_agents = hm_val.get("maxSubAgents").and_then(|v| v.as_u64()).map(|n| n as u32);
-            let max_pdca_cycles = hm_val.get("maxPdcaCycles").and_then(|v| v.as_u64()).map(|n| n as u32);
-            let expected_quality = hm_val.get("expectedQuality").and_then(|v| v.as_f64()).map(|n| n as f32);
+            let max_sub_agents = hm_val
+                .get("maxSubAgents")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let max_pdca_cycles = hm_val
+                .get("maxPdcaCycles")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let expected_quality = hm_val
+                .get("expectedQuality")
+                .and_then(|v| v.as_f64())
+                .map(|n| n as f32);
             self.how_much = Some(HowMuchDetail {
-                token_budget, max_sub_agents, max_pdca_cycles,
-                expected_quality, actual_cost: None,
+                token_budget,
+                max_sub_agents,
+                max_pdca_cycles,
+                expected_quality,
+                actual_cost: None,
             });
             self.record_fill("how_much", FillStage::Plan, "PA");
         }
@@ -564,7 +737,11 @@ impl Task5W2H {
             "Standard" | "Complex" => all_dims.clone(),
             _ => vec!["what", "why"],
         };
-        required.into_iter().filter(|d| !self.dimension_meta.contains_key(*d)).map(String::from).collect()
+        required
+            .into_iter()
+            .filter(|d| !self.dimension_meta.contains_key(*d))
+            .map(String::from)
+            .collect()
     }
 
     pub fn freeze(&mut self) {
@@ -597,7 +774,8 @@ impl Task5W2H {
             }
         });
 
-        let map = result.as_object_mut()
+        let map = result
+            .as_object_mut()
             .expect("json!({}) always creates an object");
 
         if let Some(ref who) = self.who {
@@ -662,42 +840,37 @@ impl Task5W2H {
                 hm.as_object_mut()
                     .expect("json!({}) always creates an object")
                     .insert(
-                    "task:actualCost".to_string(),
-                    json!({
-                        "task:tokensUsed": cost.tokens_used,
-                        "task:cyclesUsed": cost.cycles_used,
-                        "task:durationSecs": cost.duration_secs
-                    }),
-                );
+                        "task:actualCost".to_string(),
+                        json!({
+                            "task:tokensUsed": cost.tokens_used,
+                            "task:cyclesUsed": cost.cycles_used,
+                            "task:durationSecs": cost.duration_secs
+                        }),
+                    );
             }
             map.insert("task:howMuch".to_string(), hm);
         }
 
-        map.insert(
-            "task:frozen".to_string(),
-            json!(self.frozen),
-        );
+        map.insert("task:frozen".to_string(), json!(self.frozen));
 
         let mut meta_map = serde_json::Map::new();
         for (dim, meta) in &self.dimension_meta {
-            meta_map.insert(dim.clone(), json!({
-                "task:fillStage": format!("{:?}", meta.fill_stage),
-                "task:filledBy": meta.filled_by,
-                "task:filledAt": meta.filled_at
-            }));
+            meta_map.insert(
+                dim.clone(),
+                json!({
+                    "task:fillStage": format!("{:?}", meta.fill_stage),
+                    "task:filledBy": meta.filled_by,
+                    "task:filledAt": meta.filled_at
+                }),
+            );
         }
-        map.insert(
-            "task:dimensionMeta".to_string(),
-            Value::Object(meta_map),
-        );
+        map.insert("task:dimensionMeta".to_string(), Value::Object(meta_map));
 
         Ok(result)
     }
 
     pub fn from_json_ld(value: &Value) -> Result<Self, String> {
-        let obj = value
-            .as_object()
-            .ok_or("JSON-LD value is not an object")?;
+        let obj = value.as_object().ok_or("JSON-LD value is not an object")?;
 
         let what = obj
             .get("task:what")
@@ -878,9 +1051,7 @@ impl Task5W2H {
             .get("task:howMuch")
             .and_then(|v| v.as_object())
             .map(|hm_obj| HowMuchDetail {
-                token_budget: hm_obj
-                    .get("task:tokenBudget")
-                    .and_then(|v| v.as_u64()),
+                token_budget: hm_obj.get("task:tokenBudget").and_then(|v| v.as_u64()),
                 max_sub_agents: hm_obj
                     .get("task:maxSubAgents")
                     .and_then(|v| v.as_u64())
@@ -944,11 +1115,14 @@ impl Task5W2H {
                             .get("task:filledAt")
                             .and_then(|v| v.as_str())
                             .map(String::from);
-                        map.insert(dim.clone(), DimensionMeta {
-                            fill_stage,
-                            filled_by,
-                            filled_at,
-                        });
+                        map.insert(
+                            dim.clone(),
+                            DimensionMeta {
+                                fill_stage,
+                                filled_by,
+                                filled_at,
+                            },
+                        );
                     }
                 }
                 map
@@ -1000,18 +1174,20 @@ mod tests {
         assert!(w2h.how.is_none());
         assert!(w2h.where_.is_none());
 
-        w2h = w2h.with_how(HowDetail {
-            plan_iri: Some("iri://plan/web-service".to_string()),
-            preferred_skills: vec!["file_read".to_string(), "file_write".to_string()],
-            forbidden_tools: vec!["bash".to_string()],
-            required_steps: Some("1. Design API 2. Implement routes 3. Test".to_string()),
-            dependencies: vec![],
-        }).with_where(WhereDetail {
-            data_sources: vec!["src/api/".to_string()],
-            execution_environment: Some("sandbox".to_string()),
-            target_repository: None,
-            target_branch: None,
-        });
+        w2h = w2h
+            .with_how(HowDetail {
+                plan_iri: Some("iri://plan/web-service".to_string()),
+                preferred_skills: vec!["file_read".to_string(), "file_write".to_string()],
+                forbidden_tools: vec!["bash".to_string()],
+                required_steps: Some("1. Design API 2. Implement routes 3. Test".to_string()),
+                dependencies: vec![],
+            })
+            .with_where(WhereDetail {
+                data_sources: vec!["src/api/".to_string()],
+                execution_environment: Some("sandbox".to_string()),
+                target_repository: None,
+                target_branch: None,
+            });
         assert!(w2h.how.is_some());
         assert!(w2h.where_.is_some());
 
@@ -1087,7 +1263,10 @@ mod tests {
         let restored = Task5W2H::from_json_ld(&json_ld).unwrap();
         assert_eq!(restored.what, "Full test");
         assert_eq!(restored.who.unwrap().access_level, Some(AccessLevel::Write));
-        assert_eq!(restored.how_much.unwrap().actual_cost.unwrap().tokens_used, 80000);
+        assert_eq!(
+            restored.how_much.unwrap().actual_cost.unwrap().tokens_used,
+            80000
+        );
         assert!(!restored.frozen);
         assert!(restored.dimension_meta.contains_key("what"));
         assert!(restored.dimension_meta.contains_key("why"));
@@ -1108,7 +1287,10 @@ mod tests {
         assert!(!w2h.frozen);
         assert!(w2h.dimension_meta.contains_key("what"));
         assert!(w2h.dimension_meta.contains_key("why"));
-        assert_eq!(w2h.dimension_meta.get("what").unwrap().fill_stage, FillStage::Create);
+        assert_eq!(
+            w2h.dimension_meta.get("what").unwrap().fill_stage,
+            FillStage::Create
+        );
     }
 
     #[test]
@@ -1200,11 +1382,23 @@ mod tests {
     #[test]
     fn test_priority_access_level_serialization() {
         assert_eq!(serde_json::to_string(&Priority::High).unwrap(), "\"High\"");
-        assert_eq!(serde_json::to_string(&Priority::Medium).unwrap(), "\"Medium\"");
+        assert_eq!(
+            serde_json::to_string(&Priority::Medium).unwrap(),
+            "\"Medium\""
+        );
         assert_eq!(serde_json::to_string(&Priority::Low).unwrap(), "\"Low\"");
-        assert_eq!(serde_json::to_string(&AccessLevel::Read).unwrap(), "\"Read\"");
-        assert_eq!(serde_json::to_string(&AccessLevel::Write).unwrap(), "\"Write\"");
-        assert_eq!(serde_json::to_string(&AccessLevel::Admin).unwrap(), "\"Admin\"");
+        assert_eq!(
+            serde_json::to_string(&AccessLevel::Read).unwrap(),
+            "\"Read\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AccessLevel::Write).unwrap(),
+            "\"Write\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AccessLevel::Admin).unwrap(),
+            "\"Admin\""
+        );
     }
 
     #[test]
@@ -1227,8 +1421,14 @@ mod tests {
         assert_eq!(w2h.dimension_meta.len(), 2);
         w2h.record_fill("who", FillStage::Plan, "PA");
         assert!(w2h.dimension_meta.contains_key("who"));
-        assert_eq!(w2h.dimension_meta.get("who").unwrap().fill_stage, FillStage::Plan);
-        assert_eq!(w2h.dimension_meta.get("who").unwrap().filled_by, Some("PA".to_string()));
+        assert_eq!(
+            w2h.dimension_meta.get("who").unwrap().fill_stage,
+            FillStage::Plan
+        );
+        assert_eq!(
+            w2h.dimension_meta.get("who").unwrap().filled_by,
+            Some("PA".to_string())
+        );
         assert!(w2h.dimension_meta.get("who").unwrap().filled_at.is_some());
     }
 
@@ -1257,18 +1457,23 @@ mod tests {
 
     #[test]
     fn test_reminder_before_json_ld_roundtrip() {
-        let w2h = Task5W2H::new("Reminder test", "Verify reminder")
-            .with_when(WhenDetail {
-                deadline: Some("2026-12-31T23:59:59Z".parse().unwrap()),
-                start_after: None,
-                estimated_duration: None,
-                timezone: None,
-                reminder_before: Some("1h".to_string()),
-            });
+        let w2h = Task5W2H::new("Reminder test", "Verify reminder").with_when(WhenDetail {
+            deadline: Some("2026-12-31T23:59:59Z".parse().unwrap()),
+            start_after: None,
+            estimated_duration: None,
+            timezone: None,
+            reminder_before: Some("1h".to_string()),
+        });
         let json_ld = w2h.to_json_ld("reminder-001").unwrap();
         let when_obj = json_ld.get("task:when").unwrap().as_object().unwrap();
-        assert_eq!(when_obj.get("task:reminderBefore").unwrap().as_str(), Some("1h"));
+        assert_eq!(
+            when_obj.get("task:reminderBefore").unwrap().as_str(),
+            Some("1h")
+        );
         let restored = Task5W2H::from_json_ld(&json_ld).unwrap();
-        assert_eq!(restored.when.unwrap().reminder_before, Some("1h".to_string()));
+        assert_eq!(
+            restored.when.unwrap().reminder_before,
+            Some("1h".to_string())
+        );
     }
 }

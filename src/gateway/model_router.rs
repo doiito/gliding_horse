@@ -11,7 +11,8 @@ pub struct ModelRouter {
 
 impl ModelRouter {
     pub fn new() -> Self {
-        let default = std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+        let default =
+            std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         Self {
             mapping: HashMap::from([
                 ("planning".to_string(), default.clone()),
@@ -43,7 +44,8 @@ impl ModelRouter {
 
     /// Set or override a task type mapping
     pub fn set_mapping(&mut self, task_type: &str, model: &str) {
-        self.mapping.insert(task_type.to_string(), model.to_string());
+        self.mapping
+            .insert(task_type.to_string(), model.to_string());
     }
 
     /// Set the fallback chain
@@ -78,7 +80,10 @@ mod tests {
     #[test]
     fn test_fallback() {
         let router = ModelRouter::new();
-        assert_eq!(router.next_fallback("deepseek-v4-pro"), Some("deepseek-v4-flash".to_string()));
+        assert_eq!(
+            router.next_fallback("deepseek-v4-pro"),
+            Some("deepseek-v4-flash".to_string())
+        );
         assert!(router.next_fallback("deepseek-v4-flash").is_none());
     }
 }

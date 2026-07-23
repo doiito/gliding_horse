@@ -29,7 +29,13 @@ mod tests {
 
     #[test]
     fn test_deterministic() {
-        assert_eq!(CryptoUtils::sha256_hex("abc"), CryptoUtils::sha256_hex("abc"));
-        assert_ne!(CryptoUtils::sha256_hex("abc"), CryptoUtils::sha256_hex("abd"));
+        assert_eq!(
+            CryptoUtils::sha256_hex("abc"),
+            CryptoUtils::sha256_hex("abc")
+        );
+        assert_ne!(
+            CryptoUtils::sha256_hex("abc"),
+            CryptoUtils::sha256_hex("abd")
+        );
     }
 }

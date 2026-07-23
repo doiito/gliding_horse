@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
-use oxigraph::store::Store;
 use oxigraph::sparql::QueryResults;
+use oxigraph::store::Store;
 use parking_lot::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -125,7 +125,10 @@ impl Blackboard {
     ) -> Result<(), CoreError> {
         let task_iri = extract_task_iri(node_iri);
         let graph_name = task_iri.as_deref().unwrap_or("system:default");
-        if !self.permission_matrix.check_permission("system", graph_name, GraphPermission::Write) {
+        if !self
+            .permission_matrix
+            .check_permission("system", graph_name, GraphPermission::Write)
+        {
             return Err(CoreError::PermissionDenied {
                 agent: "system".to_string(),
                 resource: node_iri.to_string(),
@@ -142,8 +145,8 @@ impl Blackboard {
             });
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(json_ld)
-            .map_err(|e| CoreError::InvalidJsonLd {
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("JSON parse error: {}", e),
             })?;
 
@@ -158,16 +161,31 @@ impl Blackboard {
             json_ld: json_ld.to_string(),
             size,
             created_at: chrono::Utc::now(),
-            created_by: parsed.get("created_by").and_then(|v| v.as_str()).map(String::from),
-            tags: parsed.get("tags")
+            created_by: parsed
+                .get("created_by")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            tags: parsed
+                .get("tags")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             node_type: jsonld_types.first().cloned(),
             dirty: is_update,
-            mesi_state: if is_update { MesiState::Modified } else { MesiState::Shared },
+            mesi_state: if is_update {
+                MesiState::Modified
+            } else {
+                MesiState::Shared
+            },
             parent_task: task_iri.clone(),
-            named_graph: parsed.get("named_graph").and_then(|v| v.as_str()).map(String::from),
+            named_graph: parsed
+                .get("named_graph")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             jsonld_types: jsonld_types.clone(),
         };
 
@@ -194,15 +212,17 @@ impl Blackboard {
             }
 
             let mut tree = self.task_tree.write();
-            let tree_node = tree.entry(task_iri.clone()).or_insert_with(|| TaskTreeNode {
-                task_iri: task_iri.clone(),
-                parent: None,
-                children: Vec::new(),
-                dependencies: Vec::new(),
-                dependents: Vec::new(),
-                status: "running".to_string(),
-                node_iris: Vec::new(),
-            });
+            let tree_node = tree
+                .entry(task_iri.clone())
+                .or_insert_with(|| TaskTreeNode {
+                    task_iri: task_iri.clone(),
+                    parent: None,
+                    children: Vec::new(),
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    status: "running".to_string(),
+                    node_iris: Vec::new(),
+                });
             if !tree_node.node_iris.contains(&node_iri.to_string()) {
                 tree_node.node_iris.push(node_iri.to_string());
             }
@@ -224,7 +244,9 @@ impl Blackboard {
             // Cycle index
             if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
                 let mut idx = self.cycle_index.write();
-                let entry = idx.entry((task_iri.clone(), cycle_id.to_string())).or_default();
+                let entry = idx
+                    .entry((task_iri.clone(), cycle_id.to_string()))
+                    .or_default();
                 if !entry.contains(&node_iri.to_string()) {
                     entry.push(node_iri.to_string());
                 }
@@ -233,7 +255,9 @@ impl Blackboard {
             // Type index
             if let Some(node_type) = jsonld_types.first() {
                 let mut idx = self.type_index.write();
-                let entry = idx.entry((task_iri.clone(), node_type.clone())).or_default();
+                let entry = idx
+                    .entry((task_iri.clone(), node_type.clone()))
+                    .or_default();
                 if !entry.contains(&node_iri.to_string()) {
                     entry.push(node_iri.to_string());
                 }
@@ -258,11 +282,19 @@ impl Blackboard {
                 if key.starts_with('@') {
                     if key == "@type" {
                         if let Some(t) = value.as_str() {
-                            let type_uri = if t.contains("://") { format!("<{}>", t) } else { format!("<http://agent-os.org/ontology/{}>", t) };
+                            let type_uri = if t.contains("://") {
+                                format!("<{}>", t)
+                            } else {
+                                format!("<http://agent-os.org/ontology/{}>", t)
+                            };
                             triples.push(format!("{} a {} .", subject, type_uri));
                         } else if let Some(arr) = value.as_array() {
                             for t in arr.iter().filter_map(|v| v.as_str()) {
-                                let type_uri = if t.contains("://") { format!("<{}>", t) } else { format!("<http://agent-os.org/ontology/{}>", t) };
+                                let type_uri = if t.contains("://") {
+                                    format!("<{}>", t)
+                                } else {
+                                    format!("<http://agent-os.org/ontology/{}>", t)
+                                };
                                 triples.push(format!("{} a {} .", subject, type_uri));
                             }
                         }
@@ -282,7 +314,12 @@ impl Blackboard {
                         triples.push(format!("{} {} {} .", subject, predicate, n));
                     }
                     serde_json::Value::Bool(b) => {
-                        triples.push(format!("{} {} {} .", subject, predicate, if *b { "true" } else { "false" }));
+                        triples.push(format!(
+                            "{} {} {} .",
+                            subject,
+                            predicate,
+                            if *b { "true" } else { "false" }
+                        ));
                     }
                     serde_json::Value::Null => {}
                     _ => {
@@ -298,7 +335,11 @@ impl Blackboard {
 
     /// Background-sync a node to Oxigraph (called from std::thread::spawn).
     /// Uses build_triples + SPARQL UPDATE to keep ogx in sync with the cache.
-    fn sync_to_oxigraph_sync(store: &Store, node_iri: &str, parsed: &serde_json::Value) -> Result<(), CoreError> {
+    fn sync_to_oxigraph_sync(
+        store: &Store,
+        node_iri: &str,
+        parsed: &serde_json::Value,
+    ) -> Result<(), CoreError> {
         let triples = Self::build_triples(node_iri, parsed);
 
         if !triples.is_empty() {
@@ -308,7 +349,8 @@ impl Blackboard {
                 subject,
                 triples.join("\n")
             );
-            store.update(&combined_sparql)
+            store
+                .update(&combined_sparql)
                 .map_err(|e| CoreError::SparqlError {
                     message: format!("Failed to execute atomic DELETE+INSERT: {}", e),
                 })?;
@@ -344,12 +386,16 @@ impl Blackboard {
     pub fn delete_node(&self, node_iri: &str) -> Result<bool, CoreError> {
         if let Some((_, node)) = self.node_cache.remove(node_iri) {
             self.node_count.fetch_sub(1, Ordering::Relaxed);
-            self.total_bytes.fetch_sub(node.size as u64, Ordering::Relaxed);
+            self.total_bytes
+                .fetch_sub(node.size as u64, Ordering::Relaxed);
 
             let subject = format!("<{}>", node_iri);
             let delete_sparql = if let Some(ref graph_name) = node.named_graph {
                 let graph = format!("<{}>", graph_name);
-                format!("DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}", graph, subject)
+                format!(
+                    "DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}",
+                    graph, subject
+                )
             } else {
                 format!("DELETE WHERE {{ {} ?p ?o . }}", subject)
             };
@@ -368,7 +414,9 @@ impl Blackboard {
                     // Role index
                     if let Some(role_str) = parsed.get("role").and_then(|v| v.as_str()) {
                         if let Ok(role) = role_str.parse::<AgentRole>() {
-                            if let Some(role_nodes) = self.role_index.write().get_mut(&(task_iri.clone(), role)) {
+                            if let Some(role_nodes) =
+                                self.role_index.write().get_mut(&(task_iri.clone(), role))
+                            {
                                 role_nodes.retain(|iri| iri != node_iri);
                             }
                         }
@@ -408,9 +456,14 @@ impl Blackboard {
         }
     }
 
-    pub fn flush_dirty_nodes(&self, l0_store: &crate::memory::l0_store::L0Store) -> Result<usize, CoreError> {
+    pub fn flush_dirty_nodes(
+        &self,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<usize, CoreError> {
         let mut flushed = 0;
-        let dirty_iris: Vec<String> = self.node_cache.iter()
+        let dirty_iris: Vec<String> = self
+            .node_cache
+            .iter()
             .filter(|e| e.value().dirty)
             .map(|e| e.key().clone())
             .collect();
@@ -481,15 +534,17 @@ impl Blackboard {
 
     pub fn register_task(&self, task_iri: &str, parent: Option<String>) {
         let mut tree = self.task_tree.write();
-        let tree_node = tree.entry(task_iri.to_string()).or_insert_with(|| TaskTreeNode {
-            task_iri: task_iri.to_string(),
-            parent: parent.clone(),
-            children: Vec::new(),
-            dependencies: Vec::new(),
-            dependents: Vec::new(),
-            status: "running".to_string(),
-            node_iris: Vec::new(),
-        });
+        let tree_node = tree
+            .entry(task_iri.to_string())
+            .or_insert_with(|| TaskTreeNode {
+                task_iri: task_iri.to_string(),
+                parent: parent.clone(),
+                children: Vec::new(),
+                dependencies: Vec::new(),
+                dependents: Vec::new(),
+                status: "running".to_string(),
+                node_iris: Vec::new(),
+            });
         tree_node.parent = parent.clone();
 
         if let Some(parent_iri) = &parent {
@@ -529,7 +584,10 @@ impl Blackboard {
                     let solution = solution?;
                     let mut obj = serde_json::Map::new();
                     for (var, value) in solution.iter() {
-                        obj.insert(var.to_string(), serde_json::Value::String(value.to_string()));
+                        obj.insert(
+                            var.to_string(),
+                            serde_json::Value::String(value.to_string()),
+                        );
                     }
                     values.push(serde_json::Value::Object(obj));
                 }
@@ -538,9 +596,18 @@ impl Blackboard {
                 for triple in graph {
                     let triple = triple?;
                     let mut obj = serde_json::Map::new();
-                    obj.insert("subject".to_string(), serde_json::Value::String(triple.subject.to_string()));
-                    obj.insert("predicate".to_string(), serde_json::Value::String(triple.predicate.to_string()));
-                    obj.insert("object".to_string(), serde_json::Value::String(triple.object.to_string()));
+                    obj.insert(
+                        "subject".to_string(),
+                        serde_json::Value::String(triple.subject.to_string()),
+                    );
+                    obj.insert(
+                        "predicate".to_string(),
+                        serde_json::Value::String(triple.predicate.to_string()),
+                    );
+                    obj.insert(
+                        "object".to_string(),
+                        serde_json::Value::String(triple.object.to_string()),
+                    );
                     values.push(serde_json::Value::Object(obj));
                 }
             }
@@ -573,7 +640,9 @@ impl Blackboard {
         task_iri: &str,
         filter: &QueryFilter,
     ) -> Result<Vec<Arc<Node>>, CoreError> {
-        let all_iris: Vec<String> = self.task_nodes.read()
+        let all_iris: Vec<String> = self
+            .task_nodes
+            .read()
             .get(task_iri)
             .cloned()
             .unwrap_or_default();
@@ -585,32 +654,44 @@ impl Blackboard {
         let mut filtered: Option<Vec<String>> = None;
 
         if let Some(role) = &filter.role {
-            let role_iris = self.role_index.read()
+            let role_iris = self
+                .role_index
+                .read()
                 .get(&(task_iri.to_string(), role.clone()))
                 .cloned()
                 .unwrap_or_default();
             filtered = Some(filtered.map_or(role_iris.clone(), |f| {
-                f.into_iter().filter(|iri| role_iris.contains(iri)).collect()
+                f.into_iter()
+                    .filter(|iri| role_iris.contains(iri))
+                    .collect()
             }));
         }
 
         if let Some(cycle_id) = &filter.cycle_id {
-            let cycle_iris = self.cycle_index.read()
+            let cycle_iris = self
+                .cycle_index
+                .read()
                 .get(&(task_iri.to_string(), cycle_id.clone()))
                 .cloned()
                 .unwrap_or_default();
             filtered = Some(filtered.map_or(cycle_iris.clone(), |f| {
-                f.into_iter().filter(|iri| cycle_iris.contains(iri)).collect()
+                f.into_iter()
+                    .filter(|iri| cycle_iris.contains(iri))
+                    .collect()
             }));
         }
 
         if let Some(node_type) = &filter.node_type {
-            let type_iris = self.type_index.read()
+            let type_iris = self
+                .type_index
+                .read()
                 .get(&(task_iri.to_string(), node_type.clone()))
                 .cloned()
                 .unwrap_or_default();
             filtered = Some(filtered.map_or(type_iris.clone(), |f| {
-                f.into_iter().filter(|iri| type_iris.contains(iri)).collect()
+                f.into_iter()
+                    .filter(|iri| type_iris.contains(iri))
+                    .collect()
             }));
         }
 
@@ -626,7 +707,8 @@ impl Blackboard {
     }
 
     pub fn get_task_nodes(&self, task_iri: &str) -> Vec<String> {
-        self.task_nodes.read()
+        self.task_nodes
+            .read()
             .get(task_iri)
             .cloned()
             .unwrap_or_default()
@@ -666,7 +748,11 @@ impl Blackboard {
         }
 
         if released > 0 {
-            debug!(released = released, tasks = tasks_to_release.len(), "Auto GC completed");
+            debug!(
+                released = released,
+                tasks = tasks_to_release.len(),
+                "Auto GC completed"
+            );
         }
 
         Ok(released)
@@ -714,8 +800,8 @@ impl Blackboard {
             });
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(json_ld)
-            .map_err(|e| CoreError::InvalidJsonLd {
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("JSON parse error: {}", e),
             })?;
 
@@ -728,14 +814,26 @@ impl Blackboard {
             json_ld: json_ld.to_string(),
             size,
             created_at: chrono::Utc::now(),
-            created_by: parsed.get("created_by").and_then(|v| v.as_str()).map(String::from),
-            tags: parsed.get("tags")
+            created_by: parsed
+                .get("created_by")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            tags: parsed
+                .get("tags")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             node_type: jsonld_types.first().cloned(),
             dirty: is_update,
-            mesi_state: if is_update { MesiState::Modified } else { MesiState::Shared },
+            mesi_state: if is_update {
+                MesiState::Modified
+            } else {
+                MesiState::Shared
+            },
             parent_task: task_iri.clone(),
             named_graph: Some(graph_name.to_string()),
             jsonld_types: jsonld_types.clone(),
@@ -749,7 +847,9 @@ impl Blackboard {
         let gname = graph_name.to_string();
         let parsed_json = parsed.clone();
         let handle = std::thread::spawn(move || {
-            if let Err(e) = Self::sync_to_oxigraph_with_graph_sync(&store, &iri, &parsed_json, &gname) {
+            if let Err(e) =
+                Self::sync_to_oxigraph_with_graph_sync(&store, &iri, &parsed_json, &gname)
+            {
                 warn!(error = %e, node_iri = %iri, graph = %gname, "Background Oxigraph sync failed");
             }
         });
@@ -763,48 +863,54 @@ impl Blackboard {
             }
 
             let mut tree = self.task_tree.write();
-            let tree_node = tree.entry(task_iri.clone()).or_insert_with(|| TaskTreeNode {
-                task_iri: task_iri.clone(),
-                parent: None,
-                children: Vec::new(),
-                dependencies: Vec::new(),
-                dependents: Vec::new(),
-                status: "running".to_string(),
-                node_iris: Vec::new(),
-            });
-                if !tree_node.node_iris.contains(&node_iri.to_string()) {
-                    tree_node.node_iris.push(node_iri.to_string());
-                }
+            let tree_node = tree
+                .entry(task_iri.clone())
+                .or_insert_with(|| TaskTreeNode {
+                    task_iri: task_iri.clone(),
+                    parent: None,
+                    children: Vec::new(),
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    status: "running".to_string(),
+                    node_iris: Vec::new(),
+                });
+            if !tree_node.node_iris.contains(&node_iri.to_string()) {
+                tree_node.node_iris.push(node_iri.to_string());
             }
+        }
 
-            // Secondary indices for named-graph write (same logic as write_node)
-            if let Some(task_iri) = &task_iri {
-                if let Some(role_str) = parsed.get("role").and_then(|v| v.as_str()) {
-                    if let Ok(role) = role_str.parse::<AgentRole>() {
-                        let mut idx = self.role_index.write();
-                        let entry = idx.entry((task_iri.clone(), role)).or_default();
-                        if !entry.contains(&node_iri.to_string()) {
-                            entry.push(node_iri.to_string());
-                        }
-                    }
-                }
-                if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
-                    let mut idx = self.cycle_index.write();
-                    let entry = idx.entry((task_iri.clone(), cycle_id.to_string())).or_default();
-                    if !entry.contains(&node_iri.to_string()) {
-                        entry.push(node_iri.to_string());
-                    }
-                }
-                if let Some(node_type) = jsonld_types.first() {
-                    let mut idx = self.type_index.write();
-                    let entry = idx.entry((task_iri.clone(), node_type.clone())).or_default();
+        // Secondary indices for named-graph write (same logic as write_node)
+        if let Some(task_iri) = &task_iri {
+            if let Some(role_str) = parsed.get("role").and_then(|v| v.as_str()) {
+                if let Ok(role) = role_str.parse::<AgentRole>() {
+                    let mut idx = self.role_index.write();
+                    let entry = idx.entry((task_iri.clone(), role)).or_default();
                     if !entry.contains(&node_iri.to_string()) {
                         entry.push(node_iri.to_string());
                     }
                 }
             }
+            if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
+                let mut idx = self.cycle_index.write();
+                let entry = idx
+                    .entry((task_iri.clone(), cycle_id.to_string()))
+                    .or_default();
+                if !entry.contains(&node_iri.to_string()) {
+                    entry.push(node_iri.to_string());
+                }
+            }
+            if let Some(node_type) = jsonld_types.first() {
+                let mut idx = self.type_index.write();
+                let entry = idx
+                    .entry((task_iri.clone(), node_type.clone()))
+                    .or_default();
+                if !entry.contains(&node_iri.to_string()) {
+                    entry.push(node_iri.to_string());
+                }
+            }
+        }
 
-            if !is_update {
+        if !is_update {
             self.node_count.fetch_add(1, Ordering::Relaxed);
         }
         self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
@@ -825,13 +931,18 @@ impl Blackboard {
         if !triples.is_empty() {
             let subject = format!("<{}>", node_iri);
             let graph = format!("<{}>", graph_name);
-            let combined_sparql = format!(
+            let combined_sparql =
+                format!(
                 "DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}; INSERT DATA {{ GRAPH {} {{ {} }} }}",
                 graph, subject, graph, triples.join("\n")
             );
-            store.update(&combined_sparql)
+            store
+                .update(&combined_sparql)
                 .map_err(|e| CoreError::SparqlError {
-                    message: format!("Failed to execute atomic DELETE+INSERT in named graph: {}", e),
+                    message: format!(
+                        "Failed to execute atomic DELETE+INSERT in named graph: {}",
+                        e
+                    ),
                 })?;
         }
 
@@ -847,7 +958,11 @@ impl Blackboard {
         }
     }
 
-    pub fn query_graph(&self, graph_name: &str, sparql: &str) -> Result<Vec<serde_json::Value>, CoreError> {
+    pub fn query_graph(
+        &self,
+        graph_name: &str,
+        sparql: &str,
+    ) -> Result<Vec<serde_json::Value>, CoreError> {
         let graph_sparql = if sparql.to_uppercase().contains("GRAPH") {
             sparql.to_string()
         } else {
@@ -874,8 +989,8 @@ impl Blackboard {
                 });
             }
 
-            let parsed: serde_json::Value = serde_json::from_str(json_ld)
-                .map_err(|e| CoreError::InvalidJsonLd {
+            let parsed: serde_json::Value =
+                serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                     message: format!("Batch item {} JSON parse error: {}", i, e),
                 })?;
 
@@ -898,7 +1013,8 @@ impl Blackboard {
             let mut combined_parts = delete_parts;
             combined_parts.extend(insert_parts);
             let combined_sparql = combined_parts.join("; ");
-            self.store.update(&combined_sparql)
+            self.store
+                .update(&combined_sparql)
                 .map_err(|e| CoreError::SparqlError {
                     message: format!("Failed to execute batch atomic DELETE+INSERT: {}", e),
                 })?;
@@ -916,16 +1032,31 @@ impl Blackboard {
                 json_ld: json_ld.clone(),
                 size,
                 created_at: chrono::Utc::now(),
-                created_by: parsed.get("created_by").and_then(|v| v.as_str()).map(String::from),
-                tags: parsed.get("tags")
+                created_by: parsed
+                    .get("created_by")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                tags: parsed
+                    .get("tags")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 node_type: jsonld_types.first().cloned(),
                 dirty: is_update,
-                mesi_state: if is_update { MesiState::Modified } else { MesiState::Shared },
+                mesi_state: if is_update {
+                    MesiState::Modified
+                } else {
+                    MesiState::Shared
+                },
                 parent_task: task_iri.clone(),
-                named_graph: parsed.get("named_graph").and_then(|v| v.as_str()).map(String::from),
+                named_graph: parsed
+                    .get("named_graph")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 jsonld_types: jsonld_types.clone(),
             };
 
@@ -939,15 +1070,17 @@ impl Blackboard {
                 }
 
                 let mut tree = self.task_tree.write();
-                let tree_node = tree.entry(task_iri.clone()).or_insert_with(|| TaskTreeNode {
-                    task_iri: task_iri.clone(),
-                    parent: None,
-                    children: Vec::new(),
-                    dependencies: Vec::new(),
-                    dependents: Vec::new(),
-                    status: "running".to_string(),
-                    node_iris: Vec::new(),
-                });
+                let tree_node = tree
+                    .entry(task_iri.clone())
+                    .or_insert_with(|| TaskTreeNode {
+                        task_iri: task_iri.clone(),
+                        parent: None,
+                        children: Vec::new(),
+                        dependencies: Vec::new(),
+                        dependents: Vec::new(),
+                        status: "running".to_string(),
+                        node_iris: Vec::new(),
+                    });
                 if !tree_node.node_iris.contains(&node_iri.to_string()) {
                     tree_node.node_iris.push(node_iri.to_string());
                 }
@@ -981,12 +1114,17 @@ impl Blackboard {
                 });
             }
 
-            let parsed: serde_json::Value = serde_json::from_str(json_ld)
-                .map_err(|e| CoreError::InvalidJsonLd {
+            let parsed: serde_json::Value =
+                serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                     message: format!("Batch item {} JSON parse error: {}", i, e),
                 })?;
 
-            validated.push((node_iri.clone(), json_ld.clone(), graph_name.clone(), parsed));
+            validated.push((
+                node_iri.clone(),
+                json_ld.clone(),
+                graph_name.clone(),
+                parsed,
+            ));
         }
 
         let mut delete_parts = Vec::with_capacity(validated.len());
@@ -997,8 +1135,15 @@ impl Blackboard {
             let graph = format!("<{}>", graph_name);
             let triples = Self::build_triples(node_iri, parsed);
             if !triples.is_empty() {
-                delete_parts.push(format!("DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}", graph, subject));
-                insert_parts.push(format!("INSERT DATA {{ GRAPH {} {{ {} }} }}", graph, triples.join("\n")));
+                delete_parts.push(format!(
+                    "DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}",
+                    graph, subject
+                ));
+                insert_parts.push(format!(
+                    "INSERT DATA {{ GRAPH {} {{ {} }} }}",
+                    graph,
+                    triples.join("\n")
+                ));
             }
         }
 
@@ -1006,9 +1151,13 @@ impl Blackboard {
             let mut combined_parts = delete_parts;
             combined_parts.extend(insert_parts);
             let combined_sparql = combined_parts.join("; ");
-            self.store.update(&combined_sparql)
+            self.store
+                .update(&combined_sparql)
                 .map_err(|e| CoreError::SparqlError {
-                    message: format!("Failed to execute batch atomic DELETE+INSERT in named graphs: {}", e),
+                    message: format!(
+                        "Failed to execute batch atomic DELETE+INSERT in named graphs: {}",
+                        e
+                    ),
                 })?;
         }
 
@@ -1024,14 +1173,26 @@ impl Blackboard {
                 json_ld: json_ld.clone(),
                 size,
                 created_at: chrono::Utc::now(),
-                created_by: parsed.get("created_by").and_then(|v| v.as_str()).map(String::from),
-                tags: parsed.get("tags")
+                created_by: parsed
+                    .get("created_by")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                tags: parsed
+                    .get("tags")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 node_type: jsonld_types.first().cloned(),
                 dirty: is_update,
-                mesi_state: if is_update { MesiState::Modified } else { MesiState::Shared },
+                mesi_state: if is_update {
+                    MesiState::Modified
+                } else {
+                    MesiState::Shared
+                },
                 parent_task: task_iri.clone(),
                 named_graph: Some(graph_name.clone()),
                 jsonld_types: jsonld_types.clone(),
@@ -1047,15 +1208,17 @@ impl Blackboard {
                 }
 
                 let mut tree = self.task_tree.write();
-                let tree_node = tree.entry(task_iri.clone()).or_insert_with(|| TaskTreeNode {
-                    task_iri: task_iri.clone(),
-                    parent: None,
-                    children: Vec::new(),
-                    dependencies: Vec::new(),
-                    dependents: Vec::new(),
-                    status: "running".to_string(),
-                    node_iris: Vec::new(),
-                });
+                let tree_node = tree
+                    .entry(task_iri.clone())
+                    .or_insert_with(|| TaskTreeNode {
+                        task_iri: task_iri.clone(),
+                        parent: None,
+                        children: Vec::new(),
+                        dependencies: Vec::new(),
+                        dependents: Vec::new(),
+                        status: "running".to_string(),
+                        node_iris: Vec::new(),
+                    });
                 if !tree_node.node_iris.contains(&node_iri.to_string()) {
                     tree_node.node_iris.push(node_iri.to_string());
                 }
@@ -1074,14 +1237,18 @@ impl Blackboard {
                 }
                 if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
                     let mut idx = self.cycle_index.write();
-                    let entry = idx.entry((task_iri.clone(), cycle_id.to_string())).or_default();
+                    let entry = idx
+                        .entry((task_iri.clone(), cycle_id.to_string()))
+                        .or_default();
                     if !entry.contains(&node_iri.to_string()) {
                         entry.push(node_iri.to_string());
                     }
                 }
                 if let Some(node_type) = jsonld_types.first() {
                     let mut idx = self.type_index.write();
-                    let entry = idx.entry((task_iri.clone(), node_type.clone())).or_default();
+                    let entry = idx
+                        .entry((task_iri.clone(), node_type.clone()))
+                        .or_default();
                     if !entry.contains(&node_iri.to_string()) {
                         entry.push(node_iri.to_string());
                     }
@@ -1147,7 +1314,8 @@ impl Blackboard {
         graph_name: &str,
         permission: GraphPermission,
     ) -> bool {
-        self.permission_matrix.check_permission(agent_role, graph_name, permission)
+        self.permission_matrix
+            .check_permission(agent_role, graph_name, permission)
     }
 
     pub fn get_permission_matrix(&self) -> &PermissionMatrix {
@@ -1159,16 +1327,19 @@ impl Blackboard {
     pub fn register_agent(&self, agent_id: &str, role: &str, task_iri: &str) {
         let mut registry = self.agent_registry.write();
         let now = chrono::Utc::now();
-        registry.insert(agent_id.to_string(), AgentStatus {
-            agent_id: agent_id.to_string(),
-            agent_role: role.to_string(),
-            task_iri: task_iri.to_string(),
-            status: AgentActivity::Idle,
-            started_at: now,
-            last_heartbeat: now,
-            current_operation: None,
-            resource_locks: Vec::new(),
-        });
+        registry.insert(
+            agent_id.to_string(),
+            AgentStatus {
+                agent_id: agent_id.to_string(),
+                agent_role: role.to_string(),
+                task_iri: task_iri.to_string(),
+                status: AgentActivity::Idle,
+                started_at: now,
+                last_heartbeat: now,
+                current_operation: None,
+                resource_locks: Vec::new(),
+            },
+        );
         debug!(agent_id = %agent_id, role = %role, "Agent registered in battle map");
     }
 
@@ -1179,7 +1350,12 @@ impl Blackboard {
         }
     }
 
-    pub fn update_agent_status(&self, agent_id: &str, status: AgentActivity, operation: Option<&str>) {
+    pub fn update_agent_status(
+        &self,
+        agent_id: &str,
+        status: AgentActivity,
+        operation: Option<&str>,
+    ) {
         let mut registry = self.agent_registry.write();
         if let Some(s) = registry.get_mut(agent_id) {
             s.status = status;
@@ -1289,13 +1465,17 @@ impl Blackboard {
     }
 
     pub fn get_task_dependencies(&self, task_iri: &str) -> Vec<String> {
-        self.task_tree.read().get(task_iri)
+        self.task_tree
+            .read()
+            .get(task_iri)
             .map(|n| n.dependencies.clone())
             .unwrap_or_default()
     }
 
     pub fn get_task_dependents(&self, task_iri: &str) -> Vec<String> {
-        self.task_tree.read().get(task_iri)
+        self.task_tree
+            .read()
+            .get(task_iri)
             .map(|n| n.dependents.clone())
             .unwrap_or_default()
     }
@@ -1335,8 +1515,10 @@ impl Blackboard {
 
         // Kahn's algorithm: compute in-degree within the reachable subgraph
         // Edge direction: dependency -> dependent means "dependency must finish before dependent"
-        let mut in_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut adj: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut in_degree: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut adj: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
 
         for iri in &reachable {
             in_degree.entry(iri.clone()).or_insert(0);
@@ -1363,13 +1545,15 @@ impl Blackboard {
         }
 
         let mut layers = Vec::new();
-        let mut current_layer: Vec<String> = in_degree.iter()
+        let mut current_layer: Vec<String> = in_degree
+            .iter()
             .filter(|(_, &deg)| deg == 0)
             .map(|(iri, _)| iri.clone())
             .collect();
         current_layer.sort();
 
-        let mut remaining: std::collections::HashSet<String> = reachable.iter()
+        let mut remaining: std::collections::HashSet<String> = reachable
+            .iter()
             .filter(|iri| {
                 let deg = in_degree.get(*iri).copied().unwrap_or(0);
                 deg > 0
@@ -1416,7 +1600,10 @@ impl Blackboard {
             "payload": msg.payload,
             "timestamp": msg.timestamp.to_rfc3339(),
         });
-        let config = CoreConfig { max_node_size: 65536, ..CoreConfig::default() };
+        let config = CoreConfig {
+            max_node_size: 65536,
+            ..CoreConfig::default()
+        };
         self.write_node_to_graph(&iri, &json_ld.to_string(), "blackboard:shared", &config)
     }
 
@@ -1424,10 +1611,13 @@ impl Blackboard {
         self.read_coordination_messages_since(&chrono::DateTime::UNIX_EPOCH)
     }
 
-    pub fn read_coordination_messages_since(&self, since: &chrono::DateTime<chrono::Utc>) -> Result<Vec<CoordinationMessage>, CoreError> {
-        let subjects = self.query(
-            "SELECT DISTINCT ?s WHERE { GRAPH <blackboard:shared> { ?s a ?type } } LIMIT 50"
-        ).unwrap_or_default();
+    pub fn read_coordination_messages_since(
+        &self,
+        since: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<CoordinationMessage>, CoreError> {
+        let subjects = self
+            .query("SELECT DISTINCT ?s WHERE { GRAPH <blackboard:shared> { ?s a ?type } } LIMIT 50")
+            .unwrap_or_default();
 
         let mut msgs = Vec::new();
         for r in &subjects {
@@ -1435,12 +1625,26 @@ impl Blackboard {
                 let iri = s_val.trim_start_matches('<').trim_end_matches('>');
                 if iri.starts_with("iri://coordination/") {
                     if let Ok(Some(node)) = self.read_node(iri) {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&node.json_ld) {
-                            let from_agent = parsed.get("from_agent").and_then(|v| v.as_str()).unwrap_or("unknown");
-                            let msg_type_str = parsed.get("msg_type").and_then(|v| v.as_str()).unwrap_or("TaskAnnouncement");
-                            let payload = parsed.get("payload").cloned().unwrap_or(serde_json::Value::Null);
-                            let ts = parsed.get("timestamp").and_then(|v| v.as_str()).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                                .map(|dt| dt.into()).unwrap_or_else(chrono::Utc::now);
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&node.json_ld)
+                        {
+                            let from_agent = parsed
+                                .get("from_agent")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let msg_type_str = parsed
+                                .get("msg_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("TaskAnnouncement");
+                            let payload = parsed
+                                .get("payload")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            let ts = parsed
+                                .get("timestamp")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                .map(|dt| dt.into())
+                                .unwrap_or_else(chrono::Utc::now);
                             if ts < *since {
                                 continue;
                             }
@@ -1471,15 +1675,20 @@ impl Blackboard {
         }
     }
 
-
-
-
     pub fn publish_agent_snapshot_to_shared(&self, agent_id: &str) -> Result<(), CoreError> {
         let status = match self.get_agent_status(agent_id) {
             Some(s) => s,
-            None => return Err(CoreError::NodeNotFound { iri: agent_id.to_string() }),
+            None => {
+                return Err(CoreError::NodeNotFound {
+                    iri: agent_id.to_string(),
+                })
+            }
         };
-        let iri = format!("iri://snapshot/{}/{}", agent_id, uuid::Uuid::new_v4().hyphenated());
+        let iri = format!(
+            "iri://snapshot/{}/{}",
+            agent_id,
+            uuid::Uuid::new_v4().hyphenated()
+        );
         let snapshot = serde_json::json!({
             "@id": &iri,
             "@type": "AgentSnapshot",
@@ -1492,12 +1701,22 @@ impl Blackboard {
             "current_operation": status.current_operation,
             "resource_count": status.resource_locks.len(),
         });
-        let config = CoreConfig { max_node_size: 65536, ..CoreConfig::default() };
+        let config = CoreConfig {
+            max_node_size: 65536,
+            ..CoreConfig::default()
+        };
         self.write_node_to_graph(&iri, &snapshot.to_string(), "blackboard:shared", &config)
     }
 
-    pub fn publish_shared_state(&self, task_iri: &str, state: &serde_json::Value) -> Result<(), CoreError> {
-        let iri = format!("iri://shared/state/{}", task_iri.trim_start_matches("iri://task/"));
+    pub fn publish_shared_state(
+        &self,
+        task_iri: &str,
+        state: &serde_json::Value,
+    ) -> Result<(), CoreError> {
+        let iri = format!(
+            "iri://shared/state/{}",
+            task_iri.trim_start_matches("iri://task/")
+        );
         let payload = serde_json::json!({
             "@id": &iri,
             "@type": "SharedState",
@@ -1505,12 +1724,18 @@ impl Blackboard {
             "state": state,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
-        let config = CoreConfig { max_node_size: 65536, ..CoreConfig::default() };
+        let config = CoreConfig {
+            max_node_size: 65536,
+            ..CoreConfig::default()
+        };
         self.write_node_to_graph(&iri, &payload.to_string(), "blackboard:shared", &config)
     }
 
     pub fn get_shared_state(&self, task_iri: &str) -> Result<Option<serde_json::Value>, CoreError> {
-        let iri = format!("iri://shared/state/{}", task_iri.trim_start_matches("iri://task/"));
+        let iri = format!(
+            "iri://shared/state/{}",
+            task_iri.trim_start_matches("iri://task/")
+        );
         match self.read_node(&iri) {
             Ok(Some(node)) => {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&node.json_ld) {
@@ -1548,11 +1773,10 @@ fn extract_jsonld_types(parsed: &serde_json::Value) -> Vec<String> {
     if let Some(type_val) = parsed.get("@type") {
         match type_val {
             serde_json::Value::String(s) => vec![s.clone()],
-            serde_json::Value::Array(arr) => {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            }
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
             _ => Vec::new(),
         }
     } else {
@@ -1657,13 +1881,29 @@ impl PermissionMatrix {
 
     fn initialize_default_permissions(&self) {
         let default_rules = vec![
-            ("Plan", "system:plan", vec![GraphPermission::Read, GraphPermission::Write]),
+            (
+                "Plan",
+                "system:plan",
+                vec![GraphPermission::Read, GraphPermission::Write],
+            ),
             ("Plan", "system:knowledge", vec![GraphPermission::Read]),
-            ("Do", "system:execution", vec![GraphPermission::Read, GraphPermission::Write]),
+            (
+                "Do",
+                "system:execution",
+                vec![GraphPermission::Read, GraphPermission::Write],
+            ),
             ("Do", "system:knowledge", vec![GraphPermission::Read]),
-            ("Check", "system:review", vec![GraphPermission::Read, GraphPermission::Write]),
+            (
+                "Check",
+                "system:review",
+                vec![GraphPermission::Read, GraphPermission::Write],
+            ),
             ("Check", "system:execution", vec![GraphPermission::Read]),
-            ("Act", "system:decision", vec![GraphPermission::Read, GraphPermission::Write]),
+            (
+                "Act",
+                "system:decision",
+                vec![GraphPermission::Read, GraphPermission::Write],
+            ),
             ("Act", "system:review", vec![GraphPermission::Read]),
         ];
 
@@ -1672,14 +1912,24 @@ impl PermissionMatrix {
         }
     }
 
-    pub fn set_permission(&self, agent_role: &str, graph_name: &str, permissions: Vec<GraphPermission>) {
+    pub fn set_permission(
+        &self,
+        agent_role: &str,
+        graph_name: &str,
+        permissions: Vec<GraphPermission>,
+    ) {
         self.permissions
             .entry(agent_role.to_string())
             .or_insert_with(DashMap::new)
             .insert(graph_name.to_string(), permissions);
     }
 
-    pub fn check_permission(&self, agent_role: &str, graph_name: &str, permission: GraphPermission) -> bool {
+    pub fn check_permission(
+        &self,
+        agent_role: &str,
+        graph_name: &str,
+        permission: GraphPermission,
+    ) -> bool {
         if agent_role == "system" {
             return true;
         }
@@ -1710,7 +1960,8 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test","value":42}"#;
-        bb.write_node("iri://test/node_1", json_ld, &config).unwrap();
+        bb.write_node("iri://test/node_1", json_ld, &config)
+            .unwrap();
         let result = bb.read_node("iri://test/node_1").unwrap();
         assert!(result.is_some());
     }
@@ -1718,7 +1969,10 @@ mod tests {
     #[test]
     fn test_size_limit() {
         let bb = Blackboard::new().unwrap();
-        let config = CoreConfig { max_node_size: 100, ..Default::default() };
+        let config = CoreConfig {
+            max_node_size: 100,
+            ..Default::default()
+        };
         let large_json = format!(r#"{{"@id":"iri://test/1","data":"{}"}}"#, "x".repeat(200));
         let result = bb.write_node("iri://test/node_1", &large_json, &config);
         assert!(result.is_err());
@@ -1726,9 +1980,18 @@ mod tests {
 
     #[test]
     fn test_extract_task_iri() {
-        assert_eq!(extract_task_iri("iri://task/abc/turn_1"), Some("iri://task/abc".to_string()));
-        assert_eq!(extract_task_iri("iri://task/abc"), Some("iri://task/abc".to_string()));
-        assert_eq!(extract_task_iri("iri://project/xyz/node_1"), Some("iri://project/xyz".to_string()));
+        assert_eq!(
+            extract_task_iri("iri://task/abc/turn_1"),
+            Some("iri://task/abc".to_string())
+        );
+        assert_eq!(
+            extract_task_iri("iri://task/abc"),
+            Some("iri://task/abc".to_string())
+        );
+        assert_eq!(
+            extract_task_iri("iri://project/xyz/node_1"),
+            Some("iri://project/xyz".to_string())
+        );
         assert_eq!(extract_task_iri("not_an_iri"), None);
     }
 
@@ -1737,11 +2000,17 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://task/t1/node_1","@type":"Test","status":"running"}"#;
-        bb.write_node("iri://task/t1/node_1", json_ld, &config).unwrap();
+        bb.write_node("iri://task/t1/node_1", json_ld, &config)
+            .unwrap();
         bb.flush_oxigraph();
 
-        let results = bb.query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10").unwrap();
-        assert!(!results.is_empty(), "SPARQL query should return results after write_node");
+        let results = bb
+            .query("SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10")
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "SPARQL query should return results after write_node"
+        );
     }
 
     #[test]
@@ -1749,11 +2018,15 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://task/t1/node_1","@type":"Test","status":"running"}"#;
-        bb.write_node("iri://task/t1/node_1", json_ld, &config).unwrap();
+        bb.write_node("iri://task/t1/node_1", json_ld, &config)
+            .unwrap();
         bb.clear();
 
         let results = bb.query("SELECT ?s WHERE { ?s ?p ?o }").unwrap();
-        assert!(results.is_empty(), "Oxigraph store should be cleared after clear()");
+        assert!(
+            results.is_empty(),
+            "Oxigraph store should be cleared after clear()"
+        );
     }
 
     #[test]
@@ -1766,7 +2039,8 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test"}"#;
-        bb.write_node("iri://test/node_1", json_ld, &config).unwrap();
+        bb.write_node("iri://test/node_1", json_ld, &config)
+            .unwrap();
 
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
         assert!(!node.dirty);
@@ -1783,14 +2057,16 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test"}"#;
-        bb.write_node("iri://test/node_1", json_ld, &config).unwrap();
+        bb.write_node("iri://test/node_1", json_ld, &config)
+            .unwrap();
 
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
         assert!(!node.dirty);
         assert_eq!(node.mesi_state, MesiState::Shared);
 
         let json_ld_v2 = r#"{"@id":"iri://test/1","@type":"Test","version":2}"#;
-        bb.write_node("iri://test/node_1", json_ld_v2, &config).unwrap();
+        bb.write_node("iri://test/node_1", json_ld_v2, &config)
+            .unwrap();
 
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
         assert!(node.dirty);
@@ -1830,7 +2106,8 @@ mod tests {
         let json_ld = r#"{"@id":"iri://task/t1/n1","@type":"Test"}"#;
         bb.write_node("iri://task/t1/n1", json_ld, &config).unwrap();
         let json_ld2 = r#"{"@id":"iri://task/t1/sub1/n2","@type":"Test"}"#;
-        bb.write_node("iri://task/t1/sub1/n2", json_ld2, &config).unwrap();
+        bb.write_node("iri://task/t1/sub1/n2", json_ld2, &config)
+            .unwrap();
 
         assert_eq!(bb.node_count(), 2);
 
@@ -1848,7 +2125,8 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://task/abc/node_1","@type":"Test"}"#;
-        bb.write_node("iri://task/abc/node_1", json_ld, &config).unwrap();
+        bb.write_node("iri://task/abc/node_1", json_ld, &config)
+            .unwrap();
 
         let node = bb.read_node("iri://task/abc/node_1").unwrap().unwrap();
         assert_eq!(node.parent_task, Some("iri://task/abc".to_string()));
@@ -1860,7 +2138,8 @@ mod tests {
         let types = extract_jsonld_types(&parsed);
         assert_eq!(types, vec!["TestType"]);
 
-        let parsed_multi = serde_json::json!({"@id": "iri://test/2", "@type": ["Type1", "Type2", "Type3"]});
+        let parsed_multi =
+            serde_json::json!({"@id": "iri://test/2", "@type": ["Type1", "Type2", "Type3"]});
         let types_multi = extract_jsonld_types(&parsed_multi);
         assert_eq!(types_multi, vec!["Type1", "Type2", "Type3"]);
 
@@ -1874,9 +2153,10 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test","value":42}"#;
-        
-        bb.write_node_to_graph("iri://test/node_1", json_ld, "system:plan", &config).unwrap();
-        
+
+        bb.write_node_to_graph("iri://test/node_1", json_ld, "system:plan", &config)
+            .unwrap();
+
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
         assert_eq!(node.named_graph, Some("system:plan".to_string()));
         assert_eq!(node.jsonld_types, vec!["Test"]);
@@ -1886,32 +2166,49 @@ mod tests {
     fn test_named_graph_isolation() {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
-        
+
         let json_ld1 = r#"{"@id":"iri://test/1","@type":"Plan","status":"draft"}"#;
         let json_ld2 = r#"{"@id":"iri://test/2","@type":"Execution","status":"running"}"#;
-        
-        bb.write_node_to_graph("iri://test/node_1", json_ld1, "system:plan", &config).unwrap();
-        bb.write_node_to_graph("iri://test/node_2", json_ld2, "system:execution", &config).unwrap();
+
+        bb.write_node_to_graph("iri://test/node_1", json_ld1, "system:plan", &config)
+            .unwrap();
+        bb.write_node_to_graph("iri://test/node_2", json_ld2, "system:execution", &config)
+            .unwrap();
         bb.flush_oxigraph();
-        
+
         let plan_results = bb.query_graph("system:plan", "?s ?p ?o").unwrap();
         assert!(!plan_results.is_empty(), "Plan graph should have nodes");
-        
+
         let exec_results = bb.query_graph("system:execution", "?s ?p ?o").unwrap();
-        assert!(!exec_results.is_empty(), "Execution graph should have nodes");
+        assert!(
+            !exec_results.is_empty(),
+            "Execution graph should have nodes"
+        );
     }
 
     #[test]
     fn test_write_batch_to_graphs() {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
-        
+
         let nodes = vec![
-            ("iri://test/node_1".to_string(), r#"{"@id":"iri://test/1","@type":"Plan"}"#.to_string(), "system:plan".to_string()),
-            ("iri://test/node_2".to_string(), r#"{"@id":"iri://test/2","@type":"Execution"}"#.to_string(), "system:execution".to_string()),
-            ("iri://test/node_3".to_string(), r#"{"@id":"iri://test/3","@type":"Review"}"#.to_string(), "system:review".to_string()),
+            (
+                "iri://test/node_1".to_string(),
+                r#"{"@id":"iri://test/1","@type":"Plan"}"#.to_string(),
+                "system:plan".to_string(),
+            ),
+            (
+                "iri://test/node_2".to_string(),
+                r#"{"@id":"iri://test/2","@type":"Execution"}"#.to_string(),
+                "system:execution".to_string(),
+            ),
+            (
+                "iri://test/node_3".to_string(),
+                r#"{"@id":"iri://test/3","@type":"Review"}"#.to_string(),
+                "system:review".to_string(),
+            ),
         ];
-        
+
         let count = bb.write_batch_to_graphs(nodes, &config).unwrap();
         assert_eq!(count, 3);
         assert_eq!(bb.node_count(), 3);
@@ -1921,19 +2218,22 @@ mod tests {
     fn test_query_by_types() {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
-        
+
         let json_ld1 = r#"{"@id":"iri://test/1","@type":"Plan"}"#;
         let json_ld2 = r#"{"@id":"iri://test/2","@type":"Execution"}"#;
         let json_ld3 = r#"{"@id":"iri://test/3","@type":["Plan","Urgent"]}"#;
-        
-        bb.write_node("iri://test/node_1", json_ld1, &config).unwrap();
-        bb.write_node("iri://test/node_2", json_ld2, &config).unwrap();
-        bb.write_node("iri://test/node_3", json_ld3, &config).unwrap();
+
+        bb.write_node("iri://test/node_1", json_ld1, &config)
+            .unwrap();
+        bb.write_node("iri://test/node_2", json_ld2, &config)
+            .unwrap();
+        bb.write_node("iri://test/node_3", json_ld3, &config)
+            .unwrap();
         bb.flush_oxigraph();
-        
+
         let plan_nodes = bb.query_by_types(&["Plan".to_string()]).unwrap();
         assert_eq!(plan_nodes.len(), 2);
-        
+
         let exec_nodes = bb.query_by_types(&["Execution".to_string()]).unwrap();
         assert_eq!(exec_nodes.len(), 1);
     }
@@ -1941,15 +2241,15 @@ mod tests {
     #[test]
     fn test_permission_matrix() {
         let matrix = PermissionMatrix::new();
-        
+
         assert!(matrix.check_permission("Plan", "system:plan", GraphPermission::Read));
         assert!(matrix.check_permission("Plan", "system:plan", GraphPermission::Write));
         assert!(matrix.check_permission("Plan", "system:knowledge", GraphPermission::Read));
         assert!(!matrix.check_permission("Plan", "system:knowledge", GraphPermission::Write));
-        
+
         assert!(matrix.check_permission("Do", "system:execution", GraphPermission::Write));
         assert!(!matrix.check_permission("Do", "system:plan", GraphPermission::Write));
-        
+
         assert!(!matrix.check_permission("Unknown", "system:plan", GraphPermission::Read));
     }
 
@@ -1957,7 +2257,7 @@ mod tests {
     fn test_blackboard_permission_check() {
         let bb = Blackboard::new();
         assert!(bb.is_ok());
-        
+
         if let Ok(bb) = bb {
             assert!(bb.check_permission("Plan", "system:plan", GraphPermission::Write));
             assert!(!bb.check_permission("Plan", "system:execution", GraphPermission::Write));
@@ -1968,10 +2268,11 @@ mod tests {
     fn test_multi_type_jsonld() {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
-        
+
         let json_ld = r#"{"@id":"iri://test/1","@type":["Plan","Urgent","Priority"]}"#;
-        bb.write_node("iri://test/node_1", json_ld, &config).unwrap();
-        
+        bb.write_node("iri://test/node_1", json_ld, &config)
+            .unwrap();
+
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
         assert_eq!(node.jsonld_types, vec!["Plan", "Urgent", "Priority"]);
         assert_eq!(node.node_type, Some("Plan".to_string()));
@@ -1980,9 +2281,9 @@ mod tests {
     #[test]
     fn test_permission_matrix_custom_rules() {
         let matrix = PermissionMatrix::new();
-        
+
         matrix.set_permission("CustomAgent", "custom:graph", vec![GraphPermission::Read]);
-        
+
         assert!(matrix.check_permission("CustomAgent", "custom:graph", GraphPermission::Read));
         assert!(!matrix.check_permission("CustomAgent", "custom:graph", GraphPermission::Write));
     }
@@ -1990,12 +2291,12 @@ mod tests {
     #[test]
     fn test_get_permissions() {
         let matrix = PermissionMatrix::new();
-        
+
         let perms = matrix.get_permissions("Plan", "system:plan");
         assert_eq!(perms.len(), 2);
         assert!(perms.contains(&GraphPermission::Read));
         assert!(perms.contains(&GraphPermission::Write));
-        
+
         let perms_empty = matrix.get_permissions("Plan", "nonexistent:graph");
         assert!(perms_empty.is_empty());
     }
@@ -2004,41 +2305,52 @@ mod tests {
     fn test_delete_node_from_named_graph() {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
-        
+
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test","value":42}"#;
-        bb.write_node_to_graph("iri://test/node_1", json_ld, "system:plan", &config).unwrap();
+        bb.write_node_to_graph("iri://test/node_1", json_ld, "system:plan", &config)
+            .unwrap();
         bb.flush_oxigraph();
-        
+
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
         assert_eq!(node.named_graph, Some("system:plan".to_string()));
-        
+
         let plan_results = bb.query_graph("system:plan", "?s ?p ?o").unwrap();
-        assert!(!plan_results.is_empty(), "Plan graph should have nodes before delete");
-        
+        assert!(
+            !plan_results.is_empty(),
+            "Plan graph should have nodes before delete"
+        );
+
         let deleted = bb.delete_node("iri://test/node_1").unwrap();
         assert!(deleted);
-        
+
         let node_after = bb.read_node("iri://test/node_1").unwrap();
         assert!(node_after.is_none(), "Node should be deleted from cache");
-        
+
         let plan_results_after = bb.query_graph("system:plan", "?s ?p ?o").unwrap();
-        assert!(plan_results_after.is_empty(), "Plan graph should be empty after delete");
+        assert!(
+            plan_results_after.is_empty(),
+            "Plan graph should be empty after delete"
+        );
     }
 
     #[test]
     fn test_delete_node_from_default_graph() {
         let bb = Blackboard::new().unwrap();
         let config = CoreConfig::default();
-        
+
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test","value":42}"#;
-        bb.write_node("iri://test/node_1", json_ld, &config).unwrap();
-        
+        bb.write_node("iri://test/node_1", json_ld, &config)
+            .unwrap();
+
         let node = bb.read_node("iri://test/node_1").unwrap().unwrap();
-        assert!(node.named_graph.is_none(), "Node should be in default graph");
-        
+        assert!(
+            node.named_graph.is_none(),
+            "Node should be in default graph"
+        );
+
         let deleted = bb.delete_node("iri://test/node_1").unwrap();
         assert!(deleted);
-        
+
         let node_after = bb.read_node("iri://test/node_1").unwrap();
         assert!(node_after.is_none(), "Node should be deleted from cache");
     }
@@ -2049,7 +2361,9 @@ mod tests {
     fn test_agent_register_and_status() {
         let bb = Blackboard::new().unwrap();
         bb.register_agent("agent_1", "DA", "iri://task/test");
-        let status = bb.get_agent_status("agent_1").expect("Agent should be registered");
+        let status = bb
+            .get_agent_status("agent_1")
+            .expect("Agent should be registered");
         assert_eq!(status.agent_id, "agent_1");
         assert_eq!(status.agent_role, "DA");
         assert_eq!(status.task_iri, "iri://task/test");
@@ -2063,7 +2377,10 @@ mod tests {
         bb.update_agent_status("agent_1", AgentActivity::Working, Some("crunching numbers"));
         let status = bb.get_agent_status("agent_1").unwrap();
         assert_eq!(status.status, AgentActivity::Working);
-        assert_eq!(status.current_operation, Some("crunching numbers".to_string()));
+        assert_eq!(
+            status.current_operation,
+            Some("crunching numbers".to_string())
+        );
     }
 
     #[test]
@@ -2140,7 +2457,10 @@ mod tests {
             acquired_by: "agent_2".to_string(),
             lock_type: LockType::Write,
         };
-        assert!(!bb.acquire_resource(lock2).unwrap(), "Two Write locks on same resource should conflict");
+        assert!(
+            !bb.acquire_resource(lock2).unwrap(),
+            "Two Write locks on same resource should conflict"
+        );
     }
 
     #[test]
@@ -2161,7 +2481,10 @@ mod tests {
             acquired_by: "agent_2".to_string(),
             lock_type: LockType::Read,
         };
-        assert!(bb.acquire_resource(lock2).unwrap(), "Two Read locks should coexist");
+        assert!(
+            bb.acquire_resource(lock2).unwrap(),
+            "Two Read locks should coexist"
+        );
     }
 
     #[test]
@@ -2183,22 +2506,31 @@ mod tests {
             acquired_by: "agent_2".to_string(),
             lock_type: LockType::Read,
         };
-        assert!(!bb.acquire_resource(lock2).unwrap(), "Exclusive lock should block Read");
+        assert!(
+            !bb.acquire_resource(lock2).unwrap(),
+            "Exclusive lock should block Read"
+        );
     }
 
     #[test]
     fn test_release_agent_resources() {
         let bb = Blackboard::new().unwrap();
         bb.acquire_resource(ResourceLock {
-            resource_type: "file".to_string(), resource_id: "f1".to_string(),
-            acquired_at: chrono::Utc::now(), acquired_by: "agent_1".to_string(),
+            resource_type: "file".to_string(),
+            resource_id: "f1".to_string(),
+            acquired_at: chrono::Utc::now(),
+            acquired_by: "agent_1".to_string(),
             lock_type: LockType::Read,
-        }).unwrap();
+        })
+        .unwrap();
         bb.acquire_resource(ResourceLock {
-            resource_type: "file".to_string(), resource_id: "f2".to_string(),
-            acquired_at: chrono::Utc::now(), acquired_by: "agent_1".to_string(),
+            resource_type: "file".to_string(),
+            resource_id: "f2".to_string(),
+            acquired_at: chrono::Utc::now(),
+            acquired_by: "agent_1".to_string(),
             lock_type: LockType::Read,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(bb.list_resource_locks().len(), 2);
         bb.release_agent_resources("agent_1");
         assert_eq!(bb.list_resource_locks().len(), 0);
@@ -2209,10 +2541,13 @@ mod tests {
         let bb = Blackboard::new().unwrap();
         assert!(bb.check_resource_available("file:///data/test.csv", LockType::Write));
         bb.acquire_resource(ResourceLock {
-            resource_type: "file".to_string(), resource_id: "file:///data/test.csv".to_string(),
-            acquired_at: chrono::Utc::now(), acquired_by: "agent_1".to_string(),
+            resource_type: "file".to_string(),
+            resource_id: "file:///data/test.csv".to_string(),
+            acquired_at: chrono::Utc::now(),
+            acquired_by: "agent_1".to_string(),
             lock_type: LockType::Write,
-        }).unwrap();
+        })
+        .unwrap();
         assert!(!bb.check_resource_available("file:///data/test.csv", LockType::Write));
         assert!(bb.check_resource_available("file:///data/other.csv", LockType::Write));
     }
@@ -2269,7 +2604,11 @@ mod tests {
         bb.flush_oxigraph();
 
         let msgs = bb.read_coordination_messages().unwrap();
-        assert!(!msgs.is_empty(), "Should have at least one coordination message, got {} messages", msgs.len());
+        assert!(
+            !msgs.is_empty(),
+            "Should have at least one coordination message, got {} messages",
+            msgs.len()
+        );
         assert_eq!(msgs[0].from_agent, "agent_1");
         assert_eq!(msgs[0].msg_type, CoordinationMsgType::TaskAnnouncement);
     }
@@ -2282,7 +2621,10 @@ mod tests {
         bb.publish_agent_snapshot_to_shared("agent_x").unwrap();
         bb.flush_oxigraph();
         let results = bb.query_graph("blackboard:shared", "?s ?p ?o").unwrap();
-        assert!(!results.is_empty(), "blackboard:shared should have snapshot data");
+        assert!(
+            !results.is_empty(),
+            "blackboard:shared should have snapshot data"
+        );
     }
 
     // ========== DAG Topology Layer Tests ==========
@@ -2373,11 +2715,17 @@ mod tests {
 
         // Filter with past timestamp should include the message
         let msgs = bb.read_coordination_messages_since(&past).unwrap();
-        assert!(!msgs.is_empty(), "Should find messages after past timestamp");
+        assert!(
+            !msgs.is_empty(),
+            "Should find messages after past timestamp"
+        );
 
         // Filter with future timestamp should exclude the message
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let msgs_future = bb.read_coordination_messages_since(&future).unwrap();
-        assert!(msgs_future.is_empty(), "Should not find messages after future timestamp");
+        assert!(
+            msgs_future.is_empty(),
+            "Should not find messages after future timestamp"
+        );
     }
 }

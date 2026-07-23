@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::tools::hooks::{
-    FunctionHook, HookContext, HookManager, HookPoint, HookResult,
-};
+use crate::tools::hooks::{FunctionHook, HookContext, HookManager, HookPoint, HookResult};
 
 /// Global shared audit log accessible to HTTP endpoints.
 pub static GUARD_AUDIT_LOG: Lazy<Arc<RwLock<Vec<GuardAuditEntry>>>> =
@@ -167,7 +165,9 @@ impl ToolGuard {
             validations: Arc::new(RwLock::new(HashMap::new())),
             tool_categories: Self::default_tool_categories(),
             audit_log: Arc::new(RwLock::new(Vec::new())),
-            config_path: Arc::new(RwLock::new(Some(path.as_ref().to_string_lossy().to_string()))),
+            config_path: Arc::new(RwLock::new(Some(
+                path.as_ref().to_string_lossy().to_string(),
+            ))),
             file_coverage: Arc::new(Mutex::new(HashMap::new())),
             stale_check: Arc::new(RwLock::new(None)),
         };
@@ -200,9 +200,15 @@ impl ToolGuard {
         map.insert("powershell".to_string(), ToolCategory::CodeExecution);
         map.insert("code_execute".to_string(), ToolCategory::CodeExecution);
         map.insert("knowledge_query".to_string(), ToolCategory::KnowledgeGraph);
-        map.insert("knowledge_neighbors".to_string(), ToolCategory::KnowledgeGraph);
+        map.insert(
+            "knowledge_neighbors".to_string(),
+            ToolCategory::KnowledgeGraph,
+        );
         map.insert("kg_search".to_string(), ToolCategory::KnowledgeGraph);
-        map.insert("knowledge_extract".to_string(), ToolCategory::KnowledgeExtract);
+        map.insert(
+            "knowledge_extract".to_string(),
+            ToolCategory::KnowledgeExtract,
+        );
         map.insert("web_fetch".to_string(), ToolCategory::HttpRequest);
         map.insert("web_search".to_string(), ToolCategory::HttpRequest);
         map.insert("http_request".to_string(), ToolCategory::HttpRequest);
@@ -333,9 +339,10 @@ impl ToolGuard {
                 },
                 PreInjectionRule {
                     enforcement: EnforcementLevel::Should,
-                    instruction: "When traversing neighbors, the depth parameter should be at least 2 \
+                    instruction:
+                        "When traversing neighbors, the depth parameter should be at least 2 \
                         to obtain meaningful context."
-                        .to_string(),
+                            .to_string(),
                     tool_names: vec!["knowledge_neighbors".to_string()],
                 },
             ],
@@ -439,9 +446,7 @@ impl ToolGuard {
                             .collect();
                         ctx.metadata.insert(
                             "guard_pre_injections".to_string(),
-                            Value::Array(
-                                instructions.into_iter().map(Value::String).collect(),
-                            ),
+                            Value::Array(instructions.into_iter().map(Value::String).collect()),
                         );
                         debug!(
                             tool = %tool_name,
@@ -495,29 +500,41 @@ impl ToolGuard {
                 if let Some(category) = post_guard.tool_categories.get(&tool_name) {
                     if let Some(rules) = post_guard.validations.read().get(category) {
                         for rule in rules {
-                            let outcome =
-                                post_guard.run_validator(&rule.validator, &result);
+                            let outcome = post_guard.run_validator(&rule.validator, &result);
                             match outcome {
                                 ValidationOutcome::Fail(msg) => {
                                     if rule.validator == "file_length_check" {
                                         let path_opt = result.get("path").and_then(|v| v.as_str());
-                                        let total_opt = result.get("total_lines").and_then(|v| v.as_u64());
-                                        let offset_opt = result.get("offset").and_then(|v| v.as_u64());
-                                        let returned_opt = result.get("returned").and_then(|v| v.as_u64());
+                                        let total_opt =
+                                            result.get("total_lines").and_then(|v| v.as_u64());
+                                        let offset_opt =
+                                            result.get("offset").and_then(|v| v.as_u64());
+                                        let returned_opt =
+                                            result.get("returned").and_then(|v| v.as_u64());
 
-                                        if let (Some(path), Some(total), Some(offset), Some(returned)) =
-                                            (path_opt, total_opt, offset_opt, returned_opt)
+                                        if let (
+                                            Some(path),
+                                            Some(total),
+                                            Some(offset),
+                                            Some(returned),
+                                        ) = (path_opt, total_opt, offset_opt, returned_opt)
                                         {
                                             match post_guard.check_file_coverage(
-                                                path, offset as usize, returned as usize, total as usize,
+                                                path,
+                                                offset as usize,
+                                                returned as usize,
+                                                total as usize,
                                             ) {
                                                 None => {
                                                     // >= 95% covered, or retries exhausted → pass through
                                                     continue;
                                                 }
                                                 Some(ratio) => {
-                                                    let a = post_guard.file_coverage.lock()
-                                                        .get(path).map_or(0, |s| s.attempt_count);
+                                                    let a = post_guard
+                                                        .file_coverage
+                                                        .lock()
+                                                        .get(path)
+                                                        .map_or(0, |s| s.attempt_count);
                                                     debug!(
                                                         tool = %tool_name,
                                                         ratio = ratio,
@@ -542,18 +559,15 @@ impl ToolGuard {
                                     );
                                     ctx.error = Some(error_msg);
 
-                                    post_guard
-                                        .audit_log
-                                        .write()
-                                        .push(GuardAuditEntry {
-                                            timestamp: chrono::Utc::now().timestamp(),
-                                            tool_name: tool_name.clone(),
-                                            agent_id: ctx.agent_id.clone(),
-                                            pre_injected: true,
-                                            validation_passed: false,
-                                            retry_count: 0,
-                                            error: Some(msg.clone()),
-                                        });
+                                    post_guard.audit_log.write().push(GuardAuditEntry {
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        tool_name: tool_name.clone(),
+                                        agent_id: ctx.agent_id.clone(),
+                                        pre_injected: true,
+                                        validation_passed: false,
+                                        retry_count: 0,
+                                        error: Some(msg.clone()),
+                                    });
                                     GUARD_AUDIT_LOG.write().push(GuardAuditEntry {
                                         timestamp: chrono::Utc::now().timestamp(),
                                         tool_name: tool_name.clone(),
@@ -647,7 +661,10 @@ impl ToolGuard {
 
     /// Reload rules from a JSON config file at runtime.
     /// Overrides rules for categories present in the file, keeps others unchanged.
-    pub fn reload_from_json<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn reload_from_json<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let path_ref = path.as_ref().to_path_buf();
         let config = GuardRulesConfig::from_file(&path_ref)?;
         {
@@ -664,7 +681,11 @@ impl ToolGuard {
                 }
             }
         }
-        info!("ToolGuard: Hot-reloaded {} categories from {:?}", config.categories.len(), path_ref);
+        info!(
+            "ToolGuard: Hot-reloaded {} categories from {:?}",
+            config.categories.len(),
+            path_ref
+        );
         Ok(())
     }
 
@@ -680,7 +701,8 @@ impl ToolGuard {
         let guard = self.clone();
         tokio::spawn(async move {
             let mut last_mtime = std::time::SystemTime::UNIX_EPOCH;
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             interval.tick().await; // skip immediate tick
             loop {
                 interval.tick().await;
@@ -689,8 +711,12 @@ impl ToolGuard {
                         if mtime != last_mtime {
                             last_mtime = mtime;
                             match guard.reload_from_json(&watch_path) {
-                                Ok(()) => debug!("ToolGuard: Config hot-reloaded from {}", watch_path),
-                                Err(e) => warn!("ToolGuard: Hot-reload failed for {}: {}", watch_path, e),
+                                Ok(()) => {
+                                    debug!("ToolGuard: Config hot-reloaded from {}", watch_path)
+                                }
+                                Err(e) => {
+                                    warn!("ToolGuard: Hot-reload failed for {}: {}", watch_path, e)
+                                }
                             }
                         }
                     }
@@ -715,17 +741,25 @@ impl ToolGuard {
     /// Returns `Some(cumulative_ratio)` if coverage < 95% and within retry limit,
     /// or `None` if coverage >= 95% or retry limit exceeded.
     /// The caller should treat the result as Warn (don't block) regardless.
-    fn check_file_coverage(&self, path: &str, offset: usize, returned: usize, total: usize) -> Option<f64> {
+    fn check_file_coverage(
+        &self,
+        path: &str,
+        offset: usize,
+        returned: usize,
+        total: usize,
+    ) -> Option<f64> {
         if total == 0 {
             return None;
         }
         let end = offset + returned;
         let mut cov_guard = self.file_coverage.lock();
-        let state = cov_guard.entry(path.to_string()).or_insert_with(|| FileCoverage {
-            ranges: Vec::new(),
-            attempt_count: 0,
-            total_lines: total,
-        });
+        let state = cov_guard
+            .entry(path.to_string())
+            .or_insert_with(|| FileCoverage {
+                ranges: Vec::new(),
+                attempt_count: 0,
+                total_lines: total,
+            });
         state.attempt_count += 1;
 
         let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(state.ranges.len() + 1);
@@ -778,12 +812,16 @@ impl ToolGuard {
 // ─── Validator Implementations ───
 
 mod validators {
-    use serde_json::Value;
     use super::ValidationOutcome;
+    use serde_json::Value;
 
     pub fn file_length_check(result: &Value) -> ValidationOutcome {
         // Cache hit: content already provided in a previous read, skip length check
-        if result.get("from_cache").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if result
+            .get("from_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return ValidationOutcome::Pass;
         }
         // file_list output: {"entries": [...]} → skip
@@ -801,14 +839,18 @@ mod validators {
             if total > 0 {
                 let returned = result["returned"].as_u64().unwrap_or(0);
                 if returned == 0 {
-                    return ValidationOutcome::Warn("File read result empty (total_lines > 0 but returned is 0)".to_string());
+                    return ValidationOutcome::Warn(
+                        "File read result empty (total_lines > 0 but returned is 0)".to_string(),
+                    );
                 }
                 // Check if read is complete: returned >= total_lines * 0.80
                 let min_expected = (total as f64 * 0.80).ceil() as u64;
                 if returned < min_expected {
                     return ValidationOutcome::Fail(format!(
                         "File read incomplete: {} total lines, only {} returned ({:.1}%)",
-                        total, returned, (returned as f64 / total as f64) * 100.0
+                        total,
+                        returned,
+                        (returned as f64 / total as f64) * 100.0
                     ));
                 }
             }
@@ -842,11 +884,7 @@ mod validators {
             let returned_count = result["counts"]
                 .as_array()
                 .map(|a| a.len() as u64)
-                .or_else(|| {
-                    result["filenames"]
-                        .as_array()
-                        .map(|a| a.len() as u64)
-                })
+                .or_else(|| result["filenames"].as_array().map(|a| a.len() as u64))
                 .unwrap_or(0);
             if returned_count > 0 && returned_count < num_matches {
                 return ValidationOutcome::Warn(format!(
@@ -882,7 +920,9 @@ mod validators {
             .or_else(|| results_arr.map(|a| a.len()))
             .unwrap_or(0);
         if count == 0 {
-            return ValidationOutcome::Warn("Query returned no results, try more relaxed query conditions".to_string());
+            return ValidationOutcome::Warn(
+                "Query returned no results, try more relaxed query conditions".to_string(),
+            );
         }
         ValidationOutcome::Pass
     }
@@ -966,7 +1006,11 @@ impl ToolGuard {
     /// Format rationalization checks from active methodologies as pre-injection rules.
     pub fn format_methodology_rationalizations(
         &self,
-        rationalizations: &[(&ActivatedMethodology, &crate::methodology::RedFlagEntry, &str)],
+        rationalizations: &[(
+            &ActivatedMethodology,
+            &crate::methodology::RedFlagEntry,
+            &str,
+        )],
     ) -> Vec<String> {
         rationalizations
             .iter()
@@ -984,17 +1028,11 @@ impl ToolGuard {
         &self,
         anti_patterns: &[AntiPatternGateResult],
     ) -> Vec<String> {
-        anti_patterns
-            .iter()
-            .map(|ap| ap.message.clone())
-            .collect()
+        anti_patterns.iter().map(|ap| ap.message.clone()).collect()
     }
 
     /// Format persuasion directives as pre-injection rules.
-    pub fn format_methodology_persuasion(
-        &self,
-        directives: &[String],
-    ) -> Vec<String> {
+    pub fn format_methodology_persuasion(&self, directives: &[String]) -> Vec<String> {
         directives
             .iter()
             .map(|d| format!("[Methodology-Persuasion] {}", d))
@@ -1207,7 +1245,10 @@ mod tests {
             let pre = guard.pre_injections.read();
             let code_rules = pre.get(&ToolCategory::CodeExecution);
             assert!(code_rules.is_some());
-            assert_eq!(code_rules.unwrap()[0].instruction, "Check exit code carefully");
+            assert_eq!(
+                code_rules.unwrap()[0].instruction,
+                "Check exit code carefully"
+            );
             assert_eq!(code_rules.unwrap()[0].enforcement, EnforcementLevel::Should);
         }
 
@@ -1268,15 +1309,27 @@ mod tests {
         guard.register_hooks(&hm);
 
         let mut ctx = HookContext::new(HookPoint::SkillBefore, "test_agent", "DA");
-        ctx.data.insert("tool_name".to_string(), Value::String("file_write".to_string()));
-        ctx.data.insert("path".to_string(), Value::String("stale.rs".to_string()));
+        ctx.data.insert(
+            "tool_name".to_string(),
+            Value::String("file_write".to_string()),
+        );
+        ctx.data
+            .insert("path".to_string(), Value::String("stale.rs".to_string()));
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(hm.execute(HookPoint::SkillBefore, &mut ctx));
 
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let warning = ctx.metadata.get("stale_file_warning").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(warning.contains("stale"), "Expected stale warning, got: {}", warning);
+        let warning = ctx
+            .metadata
+            .get("stale_file_warning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            warning.contains("stale"),
+            "Expected stale warning, got: {}",
+            warning
+        );
     }
 
     #[test]
@@ -1294,8 +1347,12 @@ mod tests {
         guard.register_hooks(&hm);
 
         let mut ctx = HookContext::new(HookPoint::SkillBefore, "test_agent", "DA");
-        ctx.data.insert("tool_name".to_string(), Value::String("file_read".to_string()));
-        ctx.data.insert("path".to_string(), Value::String("ok.rs".to_string()));
+        ctx.data.insert(
+            "tool_name".to_string(),
+            Value::String("file_read".to_string()),
+        );
+        ctx.data
+            .insert("path".to_string(), Value::String("ok.rs".to_string()));
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(hm.execute(HookPoint::SkillBefore, &mut ctx));

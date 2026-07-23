@@ -102,10 +102,9 @@ impl TimelineEntry {
     pub fn timestamp(&self) -> Option<DateTime<Utc>> {
         match self {
             TimelineEntry::Skill(s) => Some(s.created_at),
-            TimelineEntry::Vector(v) => {
-                v.stored_at
-                    .and_then(|ts| DateTime::from_timestamp(ts as i64, 0))
-            }
+            TimelineEntry::Vector(v) => v
+                .stored_at
+                .and_then(|ts| DateTime::from_timestamp(ts as i64, 0)),
         }
     }
 }
@@ -199,7 +198,11 @@ pub fn apply_time_decay(entries: &mut [ScoredEntry], decay_lambda: f64) {
         }
     }
     // Re-sort descending by new score
-    entries.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 #[cfg(test)]
@@ -254,8 +257,7 @@ mod tests {
     #[test]
     fn test_query_unused_since() {
         let store = SkillGraphStore::new();
-        let fresh = SkillGraphNode::new("iri://fresh", "Fresh", "Recently used")
-            .with_last_used();
+        let fresh = SkillGraphNode::new("iri://fresh", "Fresh", "Recently used").with_last_used();
         let _ = store.register_skill(fresh);
 
         let stale = SkillGraphNode::new("iri://stale", "Stale", "Never used");
@@ -310,4 +312,3 @@ mod tests {
         assert_eq!(entries[0].iri, "new");
     }
 }
-

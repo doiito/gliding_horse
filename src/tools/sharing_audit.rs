@@ -178,8 +178,15 @@ mod tests {
     #[test]
     fn test_log_share_created() {
         let log = SharingAuditLog::new();
-        log.log_share_created("iri://share/abc", "iri://agent/pa", "iri://agent/da",
-            "iri://task/123", "Projection", "Read", Some(3600));
+        log.log_share_created(
+            "iri://share/abc",
+            "iri://agent/pa",
+            "iri://agent/da",
+            "iri://task/123",
+            "Projection",
+            "Read",
+            Some(3600),
+        );
         assert_eq!(log.len(), 1);
 
         let entry = &log.all_entries()[0];

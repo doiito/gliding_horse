@@ -1,4 +1,3 @@
-
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -51,10 +50,7 @@ pub fn run_handler(
 // ---------------------------------------------------------------------------
 // 1. Skill Merge Agent
 // ---------------------------------------------------------------------------
-fn handle_skill_merge(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_skill_merge(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "skill_merge".to_string(),
         ..Default::default()
@@ -75,10 +71,7 @@ fn handle_skill_merge(
             continue;
         }
 
-        let component_iris: Vec<String> = merge_relations
-            .iter()
-            .map(|r| r.to.clone())
-            .collect();
+        let component_iris: Vec<String> = merge_relations.iter().map(|r| r.to.clone()).collect();
 
         let target_iri = format!("iri://skills/composite/{}", entity.name);
         match graph.create_composite_skill(
@@ -91,7 +84,8 @@ fn handle_skill_merge(
             Ok(skill) => {
                 outcome.actions_taken.push(format!(
                     "Created composite skill {} from {} components",
-                    skill.name, component_iris.len()
+                    skill.name,
+                    component_iris.len()
                 ));
                 outcome.success_count += 1;
                 outcome.pending_events.push(PendingEvent {
@@ -112,10 +106,7 @@ fn handle_skill_merge(
 // ---------------------------------------------------------------------------
 // 2. Fragment Refine Agent
 // ---------------------------------------------------------------------------
-fn handle_fragment_refine(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_fragment_refine(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "fragment_refine".to_string(),
         ..Default::default()
@@ -129,7 +120,13 @@ fn handle_fragment_refine(
         let fragment_iri = format!("iri://fragment/refined/{}", entity.name);
         let skill_iri = format!("iri://skills/{}", entity.name);
 
-        match graph.create_fragment(&fragment_iri, &skill_iri, problem, problem, Some("batch:fragment_refine")) {
+        match graph.create_fragment(
+            &fragment_iri,
+            &skill_iri,
+            problem,
+            problem,
+            Some("batch:fragment_refine"),
+        ) {
             Ok(frag) => {
                 outcome.actions_taken.push(format!(
                     "Created fragment {} for skill {}",
@@ -154,10 +151,7 @@ fn handle_fragment_refine(
 // ---------------------------------------------------------------------------
 // 3. Entity Resolution Agent
 // ---------------------------------------------------------------------------
-fn handle_entity_resolution(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_entity_resolution(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "entity_resolution".to_string(),
         ..Default::default()
@@ -172,7 +166,10 @@ fn handle_entity_resolution(
         let mut matched = false;
         for skill in &all_skills {
             if skill.name.to_lowercase() == entity.name.to_lowercase()
-                || skill.tags.iter().any(|t| t.to_lowercase() == entity.name.to_lowercase())
+                || skill
+                    .tags
+                    .iter()
+                    .any(|t| t.to_lowercase() == entity.name.to_lowercase())
             {
                 matched = true;
                 if let Err(e) = graph.add_link(
@@ -180,7 +177,10 @@ fn handle_entity_resolution(
                     &format!("iri://concept/{}", entity.name),
                     SkillLinkType::Related,
                     LinkStrength::Recommended,
-                    &format!("Entity resolution: {}", entity.description.as_deref().unwrap_or("")),
+                    &format!(
+                        "Entity resolution: {}",
+                        entity.description.as_deref().unwrap_or("")
+                    ),
                 ) {
                     warn!("Entity resolution add_link failed: {:?}", e);
                     outcome.error_count += 1;
@@ -213,10 +213,7 @@ fn handle_entity_resolution(
 // ---------------------------------------------------------------------------
 // 4. Failure Mining Agent
 // ---------------------------------------------------------------------------
-fn handle_failure_mining(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_failure_mining(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "failure_mining".to_string(),
         ..Default::default()
@@ -226,7 +223,10 @@ fn handle_failure_mining(
         if entity.confidence < 0.65 {
             continue;
         }
-        let problem = entity.description.as_deref().unwrap_or("Unknown failure pattern");
+        let problem = entity
+            .description
+            .as_deref()
+            .unwrap_or("Unknown failure pattern");
         let skill_iri = format!("iri://skills/{}", entity.name);
 
         let frag_iri = format!("iri://fragment/failure/{}", entity.name);
@@ -234,7 +234,10 @@ fn handle_failure_mining(
             &frag_iri,
             &skill_iri,
             problem,
-            &format!("Auto-detected failure. {} actions suggested.", result.key_decisions.len()),
+            &format!(
+                "Auto-detected failure. {} actions suggested.",
+                result.key_decisions.len()
+            ),
             Some("batch:failure_mining"),
         ) {
             Ok(frag) => {
@@ -261,10 +264,7 @@ fn handle_failure_mining(
 // ---------------------------------------------------------------------------
 // 5. Skill Health Agent
 // ---------------------------------------------------------------------------
-fn handle_skill_health(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_skill_health(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "skill_health".to_string(),
         ..Default::default()
@@ -278,7 +278,10 @@ fn handle_skill_health(
 
     outcome.actions_taken.push(format!(
         "Health report: {} skills total, {} deprecated, {} tags, {} roles",
-        total, deprecated.len(), stats.tag_count, stats.role_count,
+        total,
+        deprecated.len(),
+        stats.tag_count,
+        stats.role_count,
     ));
     outcome.success_count = total;
 
@@ -298,10 +301,7 @@ fn handle_skill_health(
 // ---------------------------------------------------------------------------
 // 6. Memory Compact Agent
 // ---------------------------------------------------------------------------
-fn handle_memory_compact(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_memory_compact(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "memory_compact".to_string(),
         ..Default::default()
@@ -327,7 +327,10 @@ fn handle_memory_compact(
                     });
                 }
                 Err(e) => {
-                    warn!("Memory compact deprecation failed for {}: {:?}", skill_iri, e);
+                    warn!(
+                        "Memory compact deprecation failed for {}: {:?}",
+                        skill_iri, e
+                    );
                     outcome.error_count += 1;
                 }
             }
@@ -335,7 +338,9 @@ fn handle_memory_compact(
     }
 
     if outcome.success_count == 0 {
-        outcome.actions_taken.push("No skills identified for compaction".to_string());
+        outcome
+            .actions_taken
+            .push("No skills identified for compaction".to_string());
     }
 
     outcome
@@ -344,10 +349,7 @@ fn handle_memory_compact(
 // ---------------------------------------------------------------------------
 // 7. Link Recommend Agent
 // ---------------------------------------------------------------------------
-fn handle_link_recommend(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_link_recommend(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "link_recommend".to_string(),
         ..Default::default()
@@ -380,7 +382,10 @@ fn handle_link_recommend(
             to_iri,
             link_type,
             strength,
-            rel.properties.get("description").cloned().unwrap_or_default(),
+            rel.properties
+                .get("description")
+                .cloned()
+                .unwrap_or_default(),
         ));
     }
 
@@ -389,14 +394,17 @@ fn handle_link_recommend(
         outcome.success_count = added;
         outcome.actions_taken.push(format!(
             "Added {} batch links from {} extracted relations",
-            added, batch_links.len(),
+            added,
+            batch_links.len(),
         ));
         outcome.pending_events.push(PendingEvent {
             event_type: "BATCH_LINK_APPLIED".into(),
             payload: json!({ "links_added": added, "total_candidates": batch_links.len() }),
         });
     } else {
-        outcome.actions_taken.push("No link recommendations from extraction".to_string());
+        outcome
+            .actions_taken
+            .push("No link recommendations from extraction".to_string());
     }
 
     outcome
@@ -405,10 +413,7 @@ fn handle_link_recommend(
 // ---------------------------------------------------------------------------
 // 8. Template Analyze Agent
 // ---------------------------------------------------------------------------
-fn handle_template_analyze(
-    result: &ExtractionResult,
-    graph: &SkillGraphStore,
-) -> HandlerOutcome {
+fn handle_template_analyze(result: &ExtractionResult, graph: &SkillGraphStore) -> HandlerOutcome {
     let mut outcome = HandlerOutcome {
         handler_name: "template_analyze".to_string(),
         ..Default::default()
@@ -442,8 +447,7 @@ fn handle_template_analyze(
 mod tests {
     use super::*;
     use crate::batch::types::{
-        DetectedIntent, ExtractedDecision, ExtractedEntity,
-        ExtractedRelation, ExtractionResult,
+        DetectedIntent, ExtractedDecision, ExtractedEntity, ExtractedRelation, ExtractionResult,
     };
     use crate::skill_graph::graph_store::SkillGraphStore;
     use crate::skill_graph::types::SkillGraphNode;
@@ -512,14 +516,12 @@ mod tests {
                 confidence: 0.8,
                 details: HashMap::new(),
             }),
-            key_decisions: vec![
-                ExtractedDecision {
-                    decision: "Merge skills".into(),
-                    rationale: Some("They overlap significantly".into()),
-                    evidence: vec![],
-                    confidence: "0.8".into(),
-                },
-            ],
+            key_decisions: vec![ExtractedDecision {
+                decision: "Merge skills".into(),
+                rationale: Some("They overlap significantly".into()),
+                evidence: vec![],
+                confidence: "0.8".into(),
+            }],
             context_summary: "Analysis of skill graph health".into(),
             llm_calls: 1,
             tokens_consumed: 500,
@@ -548,9 +550,15 @@ mod tests {
         graph.register_skill(oauth).unwrap();
 
         let outcome = handle_skill_merge(&result, &graph);
-        assert!(outcome.success_count > 0, "Expected at least one merge action");
         assert!(
-            outcome.actions_taken.iter().any(|a| a.contains("composite")),
+            outcome.success_count > 0,
+            "Expected at least one merge action"
+        );
+        assert!(
+            outcome
+                .actions_taken
+                .iter()
+                .any(|a| a.contains("composite")),
             "Actions should mention composite creation: {:?}",
             outcome.actions_taken,
         );
@@ -559,7 +567,10 @@ mod tests {
         assert!(composite.is_some(), "Composite skill should exist");
         if let Some(skill) = composite {
             assert!(
-                skill.links.iter().any(|l| l.target_iri == "iri://skills/jwt"),
+                skill
+                    .links
+                    .iter()
+                    .any(|l| l.target_iri == "iri://skills/jwt"),
                 "Composite should link to jwt"
             );
         }
@@ -571,13 +582,19 @@ mod tests {
         let graph = SkillGraphStore::new();
 
         let skill = SkillGraphNode::new(
-            "iri://skills/auth_combo", "auth_combo", "Combined auth service",
+            "iri://skills/auth_combo",
+            "auth_combo",
+            "Combined auth service",
         );
         graph.register_skill(skill).unwrap();
 
         let outcome = handle_entity_resolution(&result, &graph);
         assert!(
-            outcome.success_count > 0 || outcome.actions_taken.iter().any(|a| a.contains("unresolved")),
+            outcome.success_count > 0
+                || outcome
+                    .actions_taken
+                    .iter()
+                    .any(|a| a.contains("unresolved")),
             "Expected at least resolution or unresolvable notice: {:?}",
             outcome.actions_taken,
         );
@@ -608,9 +625,15 @@ mod tests {
         graph.register_skill(s2).unwrap();
 
         let outcome = handle_skill_health(&result, &graph);
-        assert!(outcome.success_count >= 2, "Health report should count all skills");
         assert!(
-            outcome.actions_taken.iter().any(|a| a.contains("Health report")),
+            outcome.success_count >= 2,
+            "Health report should count all skills"
+        );
+        assert!(
+            outcome
+                .actions_taken
+                .iter()
+                .any(|a| a.contains("Health report")),
             "Should contain health report summary"
         );
     }
@@ -621,12 +644,17 @@ mod tests {
         let graph = SkillGraphStore::new();
 
         let skill = SkillGraphNode::new(
-            "iri://skills/failure_pattern_x", "failure_pattern_x", "Has failures",
+            "iri://skills/failure_pattern_x",
+            "failure_pattern_x",
+            "Has failures",
         );
         graph.register_skill(skill).unwrap();
 
         let outcome = handle_failure_mining(&result, &graph);
-        assert!(outcome.success_count > 0, "Expected failure patterns recorded");
+        assert!(
+            outcome.success_count > 0,
+            "Expected failure patterns recorded"
+        );
     }
 
     #[test]
@@ -635,7 +663,9 @@ mod tests {
         let graph = SkillGraphStore::new();
 
         let skill = SkillGraphNode::new(
-            "iri://skills/failure_pattern_x", "failure_pattern_x", "Deprecate me",
+            "iri://skills/failure_pattern_x",
+            "failure_pattern_x",
+            "Deprecate me",
         );
         graph.register_skill(skill).unwrap();
 
@@ -649,7 +679,10 @@ mod tests {
         let graph = SkillGraphStore::new();
 
         let outcome = handle_template_analyze(&result, &graph);
-        assert_eq!(outcome.success_count, 1, "Template analysis always succeeds");
+        assert_eq!(
+            outcome.success_count, 1,
+            "Template analysis always succeeds"
+        );
     }
 
     #[test]

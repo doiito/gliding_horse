@@ -73,15 +73,18 @@ impl PrefetchEngine {
 
         let to_enqueue: Vec<(String, f64)> = {
             let mut pending_set = self.pending.write();
-            top_candidates.into_iter().filter(|(iri, _)| {
-                if pending_set.contains(iri) {
-                    debug!(entity_iri = %iri, "skipping duplicate prefetch");
-                    false
-                } else {
-                    pending_set.insert(iri.clone());
-                    true
-                }
-            }).collect()
+            top_candidates
+                .into_iter()
+                .filter(|(iri, _)| {
+                    if pending_set.contains(iri) {
+                        debug!(entity_iri = %iri, "skipping duplicate prefetch");
+                        false
+                    } else {
+                        pending_set.insert(iri.clone());
+                        true
+                    }
+                })
+                .collect()
         };
 
         {
@@ -163,8 +166,10 @@ impl PrefetchEngine {
         let config = CoreConfig::default();
         let mut handles = Vec::new();
 
-        let success_set: Arc<parking_lot::RwLock<HashSet<String>>> = Arc::new(parking_lot::RwLock::new(HashSet::new()));
-        let fail_set: Arc<parking_lot::RwLock<Vec<(String, u32)>>> = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let success_set: Arc<parking_lot::RwLock<HashSet<String>>> =
+            Arc::new(parking_lot::RwLock::new(HashSet::new()));
+        let fail_set: Arc<parking_lot::RwLock<Vec<(String, u32)>>> =
+            Arc::new(parking_lot::RwLock::new(Vec::new()));
 
         for task in &tasks {
             let semaphore = self.semaphore.clone();
@@ -194,8 +199,7 @@ impl PrefetchEngine {
                                 parsed.get("artifacts").and_then(|a| a.as_array())
                             {
                                 for artifact in artifacts {
-                                    if let Some(iri) =
-                                        artifact.get("@id").and_then(|v| v.as_str())
+                                    if let Some(iri) = artifact.get("@id").and_then(|v| v.as_str())
                                     {
                                         let node_json =
                                             serde_json::to_string(artifact).unwrap_or_default();

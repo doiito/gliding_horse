@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
-use serde::{Deserialize, Serialize};
-use crate::config::settings::{ToolResultCompressorSettings, ContextWindowSettings};
+use crate::config::settings::{ContextWindowSettings, ToolResultCompressorSettings};
 use crate::gateway::unified_gateway::ChatMessage;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultEntry {
@@ -34,7 +34,7 @@ impl ToolResultCompressor {
             results: VecDeque::new(),
         }
     }
-    
+
     pub fn add_result(&mut self, turn: u32, tool_name: &str, tool_call_id: &str, content: &str) {
         let entry = ToolResultEntry {
             turn,
@@ -44,24 +44,29 @@ impl ToolResultCompressor {
             is_compressed: false,
         };
         self.results.push_back(entry);
-        
+
         if self.results.len() >= self.compression_trigger {
             self.compress_old_results();
         }
     }
-    
+
     fn compress_old_results(&mut self) {
         if self.results.len() <= self.max_full_results {
             return;
         }
-        
+
         let to_compress = self.results.len() - self.max_full_results;
-        let summaries: Vec<(usize, String)> = self.results.iter().take(to_compress)
+        let summaries: Vec<(usize, String)> = self
+            .results
+            .iter()
+            .take(to_compress)
             .enumerate()
-            .filter(|(_, entry)| !entry.is_compressed && entry.content.len() > self.max_summary_length)
+            .filter(|(_, entry)| {
+                !entry.is_compressed && entry.content.len() > self.max_summary_length
+            })
             .map(|(i, entry)| (i, self.summarize_content(&entry.content)))
             .collect();
-        
+
         for (i, summary) in summaries {
             if let Some(entry) = self.results.get_mut(i) {
                 entry.content = summary;
@@ -69,26 +74,27 @@ impl ToolResultCompressor {
             }
         }
     }
-    
+
     fn summarize_content(&self, content: &str) -> String {
         if content.len() <= self.max_summary_length {
             return content.to_string();
         }
-        
+
         let lines: Vec<&str> = content.lines().take(5).collect();
         let preview = if lines.len() > 3 {
             lines[..3].join("\n")
         } else {
             lines.join("\n")
         };
-        
-        format!("[Summary {} bytes] {}... (total {} chars)", 
-            self.max_summary_length, 
+
+        format!(
+            "[Summary {} bytes] {}... (total {} chars)",
+            self.max_summary_length,
             preview,
             content.len()
         )
     }
-    
+
     /// Compress tool result content in messages.
     /// Used together with compress_old_results(): the latter compresses entries inside the compressor,
     /// this method writes compressed results back to the corresponding tool messages via tool_call_id matching.
@@ -126,11 +132,11 @@ impl ToolResultCompressor {
     pub fn get_results(&self) -> &VecDeque<ToolResultEntry> {
         &self.results
     }
-    
+
     pub fn clear(&mut self) {
         self.results.clear();
     }
-    
+
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -156,24 +162,27 @@ impl ContextWindowManager {
             preserve_recent: settings.preserve_recent,
         }
     }
-    
+
     /// Estimate token consumption of a message list (4 chars ≈ 1 token, mixed CJK/Latin estimation)
     pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
-        messages.iter().map(|m| {
-            let mut total = m.content.len() / 4 + m.role.len() / 4;
-            if let Some(ref calls) = m.tool_calls {
-                for call in calls {
-                    total += call.function.name.len() / 4;
-                    total += call.function.arguments.len() / 4;
-                    // Include tool_call_id (~36 chars per UUID)
-                    total += call.id.len() / 4;
+        messages
+            .iter()
+            .map(|m| {
+                let mut total = m.content.len() / 4 + m.role.len() / 4;
+                if let Some(ref calls) = m.tool_calls {
+                    for call in calls {
+                        total += call.function.name.len() / 4;
+                        total += call.function.arguments.len() / 4;
+                        // Include tool_call_id (~36 chars per UUID)
+                        total += call.id.len() / 4;
+                    }
                 }
-            }
-            if let Some(ref id) = m.tool_call_id {
-                total += id.len() / 4;
-            }
-            total
-        }).sum()
+                if let Some(ref id) = m.tool_call_id {
+                    total += id.len() / 4;
+                }
+                total
+            })
+            .sum()
     }
 
     /// Determine whether compression is needed. Checks both message count and estimated token count.
@@ -186,7 +195,7 @@ impl ContextWindowManager {
         }
         false
     }
-    
+
     pub fn compress_messages(&self, messages: &[ChatMessage]) -> (Vec<ChatMessage>, String) {
         if messages.len() <= self.max_messages {
             return (messages.to_vec(), String::new());
@@ -306,12 +315,12 @@ impl ContextWindowManager {
         }
         result
     }
-    
+
     fn summarize_middle_messages(&self, messages: &[ChatMessage]) -> String {
         let mut tool_calls = Vec::new();
         let mut summaries = Vec::new();
         let mut errors = Vec::new();
-        
+
         for msg in messages {
             match msg.role.as_str() {
                 "assistant" => {
@@ -332,29 +341,32 @@ impl ContextWindowManager {
                 _ => {}
             }
         }
-        
+
         let mut parts = Vec::new();
-        
+
         if !tool_calls.is_empty() {
             let unique_tools: std::collections::HashSet<_> = tool_calls.into_iter().collect();
-            parts.push(format!("Tools called: {}", unique_tools.into_iter().collect::<Vec<_>>().join(", ")));
+            parts.push(format!(
+                "Tools called: {}",
+                unique_tools.into_iter().collect::<Vec<_>>().join(", ")
+            ));
         }
-        
+
         if !errors.is_empty() {
             parts.push(format!("Errors: {}", errors.len()));
         }
-        
+
         if !summaries.is_empty() {
             parts.push(format!("Key content: {}", summaries.join("; ")));
         }
-        
+
         parts.join(" | ")
     }
-    
+
     pub fn max_messages(&self) -> usize {
         self.max_messages
     }
-    
+
     pub fn max_tokens(&self) -> usize {
         self.max_tokens
     }
@@ -363,7 +375,7 @@ impl ContextWindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn default_settings() -> ToolResultCompressorSettings {
         ToolResultCompressorSettings {
             enabled: true,
@@ -373,7 +385,7 @@ mod tests {
             compress_tool_result_threshold: 500,
         }
     }
-    
+
     fn default_context_settings() -> ContextWindowSettings {
         ContextWindowSettings {
             max_messages: 15,
@@ -382,80 +394,95 @@ mod tests {
             preserve_recent: 4,
         }
     }
-    
+
     #[test]
     fn test_compressor_add_result() {
         let mut compressor = ToolResultCompressor::new(&default_settings());
-        
+
         compressor.add_result(1, "file_read", "call_001", "test content");
         assert_eq!(compressor.get_results().len(), 1);
         assert_eq!(compressor.get_results()[0].tool_call_id, "call_001");
     }
-    
+
     #[test]
     fn test_compressor_compress() {
         let mut compressor = ToolResultCompressor::new(&default_settings());
-        
+
         let long_content = "x".repeat(500);
-        
+
         for i in 1..=6 {
             compressor.add_result(i, "file_read", &format!("call_{}", i), &long_content);
         }
-        
+
         let results = compressor.get_results();
         assert!(results.front().unwrap().is_compressed);
         assert!(!results.back().unwrap().is_compressed);
     }
-    
+
     #[test]
     fn test_compress_tool_messages_by_call_id() {
         let mut compressor = ToolResultCompressor::new(&default_settings());
-        
+
         // Add results and trigger compression
         let long = "y".repeat(500);
         for i in 1..=6 {
             compressor.add_result(i, "file_read", &format!("call_{}", i), &long);
         }
         assert!(compressor.get_results().front().unwrap().is_compressed);
-        
+
         // Build messages: system + several tool messages
         let mut msgs = vec![ChatMessage {
-            role: "system".to_string(), content: "sys".to_string(),
-            name: None, tool_calls: None, tool_call_id: None, reasoning_content: None,
+            role: "system".to_string(),
+            content: "sys".to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         }];
         for i in 1..=4 {
             msgs.push(ChatMessage {
-                role: "tool".to_string(), content: long.clone(),
-                name: None, tool_calls: None,
+                role: "tool".to_string(),
+                content: long.clone(),
+                name: None,
+                tool_calls: None,
                 tool_call_id: Some(format!("call_{}", i)),
                 reasoning_content: None,
             });
         }
-        
+
         compressor.compress_tool_messages(&mut msgs);
-        
+
         // call_1 and call_2 are compressed (first two entries)
-        let compressed_ids: std::collections::HashSet<String> = compressor.results.iter()
+        let compressed_ids: std::collections::HashSet<String> = compressor
+            .results
+            .iter()
             .filter(|e| e.is_compressed)
             .map(|e| e.tool_call_id.clone())
             .collect();
         for msg in msgs.iter().filter(|m| m.role == "tool") {
             let cid = msg.tool_call_id.as_ref().unwrap();
             if compressed_ids.contains(cid) {
-                assert!(msg.content.starts_with("[Summary"), 
-                    "tool_call_id={} should be compressed", cid);
+                assert!(
+                    msg.content.starts_with("[Summary"),
+                    "tool_call_id={} should be compressed",
+                    cid
+                );
             } else {
-                assert_eq!(msg.content.len(), long.len(), 
-                    "tool_call_id={} should remain full", cid);
+                assert_eq!(
+                    msg.content.len(),
+                    long.len(),
+                    "tool_call_id={} should remain full",
+                    cid
+                );
             }
         }
     }
-    
+
     #[test]
     fn test_context_window_should_compress() {
         let manager = ContextWindowManager::new(&default_context_settings());
         let empty: Vec<ChatMessage> = Vec::new();
-        
+
         assert!(!manager.should_compress(10, &empty));
         assert!(manager.should_compress(20, &empty));
     }

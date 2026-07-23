@@ -158,9 +158,13 @@ impl IRIReference {
 
     pub fn from_string(iri: &str) -> Self {
         if iri.starts_with("iri://") {
-            Self { iri: iri.to_string() }
+            Self {
+                iri: iri.to_string(),
+            }
         } else {
-            Self { iri: format!("iri://{}", iri) }
+            Self {
+                iri: format!("iri://{}", iri),
+            }
         }
     }
 }
@@ -318,7 +322,10 @@ mod tests {
         let node = JsonLdNode::new("iri://task/123".to_string(), "TaskNode");
         assert_eq!(extract_type(&node), Some("TaskNode".to_string()));
 
-        let node_multi = JsonLdNode::new("iri://task/456".to_string(), json!(["TaskNode", "PlanNode"]));
+        let node_multi = JsonLdNode::new(
+            "iri://task/456".to_string(),
+            json!(["TaskNode", "PlanNode"]),
+        );
         assert_eq!(extract_type(&node_multi), Some("TaskNode".to_string()));
     }
 

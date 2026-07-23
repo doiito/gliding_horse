@@ -52,12 +52,16 @@ pub enum BatchError {
 
 impl From<serde_json::Error> for BatchError {
     fn from(e: serde_json::Error) -> Self {
-        BatchError::SerializationError { message: e.to_string() }
+        BatchError::SerializationError {
+            message: e.to_string(),
+        }
     }
 }
 
 impl From<std::io::Error> for BatchError {
     fn from(e: std::io::Error) -> Self {
-        BatchError::Internal { message: e.to_string() }
+        BatchError::Internal {
+            message: e.to_string(),
+        }
     }
 }

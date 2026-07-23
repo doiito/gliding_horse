@@ -285,9 +285,13 @@ impl SkillGraphAlgorithms {
     ) {
         let prerequisite_edges: Vec<NodeIndex> = self
             .graph
-            .edges_directed(node, Direction::Incoming)
+            // A prerequisite link is stored as `skill -> prerequisite`.
+            // Traversing outgoing edges therefore follows the requirements of
+            // the requested skill; incoming edges would instead find skills
+            // that depend on it.
+            .edges_directed(node, Direction::Outgoing)
             .filter(|e| *e.weight() == SkillLinkType::Prerequisite)
-            .map(|e| e.source())
+            .map(|e| e.target())
             .collect();
 
         if prerequisite_edges.is_empty() {
@@ -499,11 +503,14 @@ mod tests {
         let algo = SkillGraphAlgorithms::from_store(&store);
 
         let chains = algo.prerequisite_chain("iri://skills/a");
-        assert!(!chains.is_empty());
-        // a -> b -> d
-        for chain in &chains {
-            assert_eq!(chain.first().unwrap(), "iri://skills/a");
-        }
+        assert_eq!(
+            chains,
+            vec![vec![
+                "iri://skills/a".to_string(),
+                "iri://skills/b".to_string(),
+                "iri://skills/d".to_string(),
+            ]]
+        );
     }
 
     #[test]

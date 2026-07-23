@@ -1,27 +1,27 @@
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
-use crate::CoreError;
 use super::PromptSegment;
+use crate::CoreError;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTemplate {
     #[serde(rename = "@context")]
     pub context: String,
-    
+
     #[serde(rename = "@id")]
     pub id: String,
-    
+
     #[serde(rename = "@type")]
     pub type_: Vec<String>,
-    
+
     pub role: String,
-    
+
     #[serde(default)]
     pub system_prompt: Vec<PromptSegment>,
-    
+
     #[serde(default)]
     pub output_mapping: HashMap<String, String>,
-    
+
     #[serde(default)]
     pub skill_whitelist: Vec<String>,
 }
@@ -71,7 +71,10 @@ impl AgentTemplate {
         })
     }
 
-    pub fn render_system_prompt(&self, context: &serde_json::Map<String, serde_json::Value>) -> String {
+    pub fn render_system_prompt(
+        &self,
+        context: &serde_json::Map<String, serde_json::Value>,
+    ) -> String {
         self.system_prompt
             .iter()
             .map(|segment| segment.render(context))

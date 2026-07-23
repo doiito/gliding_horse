@@ -25,11 +25,7 @@ impl GraphVerifier {
         ]
     }
 
-    pub fn verify(
-        &self,
-        store: &SkillGraphStore,
-        invariant: GraphInvariant,
-    ) -> VerificationResult {
+    pub fn verify(&self, store: &SkillGraphStore, invariant: GraphInvariant) -> VerificationResult {
         let start = Instant::now();
         let (passed, violations) = match invariant {
             GraphInvariant::Acyclicity => self.verify_acyclicity(store),
@@ -101,8 +97,11 @@ impl GraphVerifier {
 
     fn verify_composite_reachability(&self, store: &SkillGraphStore) -> (bool, Vec<Violation>) {
         let hyperedges = store.list_hyperedges();
-        let registered: HashSet<String> =
-            store.list_all_skills().into_iter().map(|s| s.skill_iri).collect();
+        let registered: HashSet<String> = store
+            .list_all_skills()
+            .into_iter()
+            .map(|s| s.skill_iri)
+            .collect();
         let mut violations = Vec::new();
 
         for hyperedge in &hyperedges {
@@ -114,10 +113,7 @@ impl GraphVerifier {
                             "Hyperedge '{}' references non-existent component '{}'",
                             hyperedge.name, component_iri
                         ),
-                        affected_iris: vec![
-                            hyperedge.hyperedge_id.clone(),
-                            component_iri.clone(),
-                        ],
+                        affected_iris: vec![hyperedge.hyperedge_id.clone(), component_iri.clone()],
                         suggestion: "Register the component skill or remove it from the hyperedge"
                             .to_string(),
                     });
@@ -151,10 +147,7 @@ impl GraphVerifier {
                                 "Skill '{}' depends on deprecated prerequisite '{}'",
                                 skill.name, target.name
                             ),
-                            affected_iris: vec![
-                                skill.skill_iri.clone(),
-                                link.target_iri.clone(),
-                            ],
+                            affected_iris: vec![skill.skill_iri.clone(), link.target_iri.clone()],
                             suggestion: format!(
                                 "Update '{}' to use a non-deprecated alternative",
                                 skill.name

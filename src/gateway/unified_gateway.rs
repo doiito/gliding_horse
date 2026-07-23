@@ -121,7 +121,10 @@ impl UnifiedGateway {
         self.default_model.read().unwrap().clone()
     }
 
-    pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<ChatCompletionResponse, CoreError> {
+    pub async fn chat(
+        &self,
+        messages: Vec<ChatMessage>,
+    ) -> Result<ChatCompletionResponse, CoreError> {
         let model = self.get_model("default");
         let sanitized = Self::sanitize_tool_messages(messages);
         self.chat_with_model(&model, sanitized).await
@@ -197,7 +200,10 @@ impl UnifiedGateway {
             let req = self
                 .client
                 .post(url)
-                .header("Authorization", format!("Bearer {}", self.api_key.read().unwrap()))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", self.api_key.read().unwrap()),
+                )
                 .header("Content-Type", "application/json")
                 .json(&req_body);
 
@@ -227,7 +233,11 @@ impl UnifiedGateway {
                             Err(e) => {
                                 warn!(error = %e, response_len = response_text.len(), "Failed to parse LLM response");
                                 last_error = Some(CoreError::Internal {
-                                    message: format!("Failed to parse LLM response: {} (response length: {})", e, response_text.len()),
+                                    message: format!(
+                                        "Failed to parse LLM response: {} (response length: {})",
+                                        e,
+                                        response_text.len()
+                                    ),
                                 });
                             }
                         }
@@ -235,15 +245,15 @@ impl UnifiedGateway {
                         let text = resp.text().await.unwrap_or_default();
                         // Embed a preview of the request body into the error message
                         // for debugging 4xx errors directly from the TUI / result display.
-                        let req_body_str = serde_json::to_string_pretty(&req_body)
-                            .unwrap_or_default();
-                        let req_preview: String = req_body_str
-                            .chars()
-                            .take(8000)
-                            .collect();
+                        let req_body_str =
+                            serde_json::to_string_pretty(&req_body).unwrap_or_default();
+                        let req_preview: String = req_body_str.chars().take(8000).collect();
                         warn!(status = %status, body = %text, req_preview = %req_preview, "LLM API error");
                         last_error = Some(CoreError::Internal {
-                            message: format!("LLM API error ({}): {}\nrequest_preview(8k)={}", status, text, req_preview),
+                            message: format!(
+                                "LLM API error ({}): {}\nrequest_preview(8k)={}",
+                                status, text, req_preview
+                            ),
                         });
                         if status.is_client_error() {
                             break;
@@ -274,7 +284,10 @@ impl UnifiedGateway {
 
     pub fn set_default_model(&self, model: String) {
         *self.default_model.write().unwrap() = model.clone();
-        self.model_mapping.write().unwrap().insert("default".to_string(), model);
+        self.model_mapping
+            .write()
+            .unwrap()
+            .insert("default".to_string(), model);
     }
 
     pub fn set_model_mapping(&self, task_type: String, model: String) {
@@ -295,7 +308,10 @@ impl UnifiedGateway {
         match self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key.read().unwrap()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.read().unwrap()),
+            )
             .send()
             .await
         {
@@ -307,28 +323,30 @@ impl UnifiedGateway {
     /// Sanitize messages to avoid OpenAI/DeepSeek API error:
     /// "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
     fn sanitize_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-        crate::core::context_compressor::ContextWindowManager::remove_orphaned_tool_messages(messages)
+        crate::core::context_compressor::ContextWindowManager::remove_orphaned_tool_messages(
+            messages,
+        )
     }
 
     pub fn supports_native_reasoning(&self, model: &str) -> bool {
         let model_lower = model.to_lowercase();
-        
-        if model_lower.contains("deepseek-r1")
-            || model_lower.contains("deepseek-reasoning") {
+
+        if model_lower.contains("deepseek-r1") || model_lower.contains("deepseek-reasoning") {
             return true;
         }
-        
-        if model_lower.starts_with("o1-") 
+
+        if model_lower.starts_with("o1-")
             || model_lower.starts_with("o3-")
             || model_lower.starts_with("o1")
-            || model_lower.starts_with("o3") {
+            || model_lower.starts_with("o3")
+        {
             return true;
         }
-        
+
         if model_lower.contains("gemini") && model_lower.contains("thinking") {
             return true;
         }
-        
+
         false
     }
 
@@ -369,7 +387,10 @@ impl UnifiedGateway {
         let req = self
             .client
             .post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key.read().unwrap()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.read().unwrap()),
+            )
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&body);
@@ -424,7 +445,10 @@ mod tests {
             timeout_seconds: 30,
             max_retries: 3,
             retry_base_ms: 500,
-            model_mapping: HashMap::from([("default".to_string(), "deepseek-v4-flash".to_string())]),
+            model_mapping: HashMap::from([(
+                "default".to_string(),
+                "deepseek-v4-flash".to_string(),
+            )]),
         };
 
         let gateway = UnifiedGateway::new(&settings).unwrap();
@@ -439,6 +463,9 @@ mod tests {
 
         // test updating base URL at runtime
         gateway.set_base_url("https://api.new-endpoint.com".to_string());
-        assert_eq!(*gateway.base_url.read().unwrap(), "https://api.new-endpoint.com");
+        assert_eq!(
+            *gateway.base_url.read().unwrap(),
+            "https://api.new-endpoint.com"
+        );
     }
 }

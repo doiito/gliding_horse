@@ -54,6 +54,105 @@ use hyperspace_engine::wal::WalSyncMode;
 use crate::memory::embedding_service::EmbeddingService;
 use crate::CoreError;
 
+/// Versioned, bidirectional embedding-space projection. Implementations must
+/// reject vectors whose dimensions do not match their declared contract.
+pub trait CrossSpaceProjection: Send + Sync {
+    fn text_dimension(&self) -> usize;
+    fn struct_dimension(&self) -> usize;
+    fn version(&self) -> &str;
+    fn struct_to_text(&self, vector: &[f64]) -> Result<Vec<f64>, EngineError>;
+    fn text_to_struct(&self, vector: &[f64]) -> Result<Vec<f64>, EngineError>;
+}
+
+/// Explicit matrix projection suitable for configured/calibrated deployments.
+/// Matrix rows are output dimensions and columns are input dimensions.
+pub struct LinearCrossSpaceProjection {
+    version: String,
+    struct_to_text_matrix: Vec<Vec<f64>>,
+    text_to_struct_matrix: Vec<Vec<f64>>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct LinearCrossSpaceProjectionConfig {
+    pub version: String,
+    pub struct_to_text_matrix: Vec<Vec<f64>>,
+    pub text_to_struct_matrix: Vec<Vec<f64>>,
+}
+
+impl LinearCrossSpaceProjection {
+    pub fn new(
+        version: impl Into<String>,
+        struct_to_text_matrix: Vec<Vec<f64>>,
+        text_to_struct_matrix: Vec<Vec<f64>>,
+    ) -> Result<Self, EngineError> {
+        let struct_dim = struct_to_text_matrix.first().map(Vec::len).unwrap_or(0);
+        let text_dim = text_to_struct_matrix.first().map(Vec::len).unwrap_or(0);
+        if struct_dim == 0
+            || text_dim == 0
+            || struct_to_text_matrix.len() != text_dim
+            || text_to_struct_matrix.len() != struct_dim
+            || struct_to_text_matrix
+                .iter()
+                .any(|row| row.len() != struct_dim)
+            || text_to_struct_matrix
+                .iter()
+                .any(|row| row.len() != text_dim)
+        {
+            return Err(EngineError::InvalidVector(
+                "invalid bidirectional projection matrix dimensions".to_string(),
+            ));
+        }
+        Ok(Self {
+            version: version.into(),
+            struct_to_text_matrix,
+            text_to_struct_matrix,
+        })
+    }
+
+    pub fn from_config(config: LinearCrossSpaceProjectionConfig) -> Result<Self, EngineError> {
+        Self::new(
+            config.version,
+            config.struct_to_text_matrix,
+            config.text_to_struct_matrix,
+        )
+    }
+
+    fn multiply(matrix: &[Vec<f64>], vector: &[f64]) -> Vec<f64> {
+        matrix
+            .iter()
+            .map(|row| row.iter().zip(vector).map(|(a, b)| a * b).sum())
+            .collect()
+    }
+}
+
+impl CrossSpaceProjection for LinearCrossSpaceProjection {
+    fn text_dimension(&self) -> usize {
+        self.struct_to_text_matrix.len()
+    }
+    fn struct_dimension(&self) -> usize {
+        self.struct_to_text_matrix[0].len()
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
+    fn struct_to_text(&self, vector: &[f64]) -> Result<Vec<f64>, EngineError> {
+        if vector.len() != self.struct_dimension() {
+            return Err(EngineError::InvalidVector(
+                "structural projection input dimension mismatch".to_string(),
+            ));
+        }
+        Ok(Self::multiply(&self.struct_to_text_matrix, vector))
+    }
+    fn text_to_struct(&self, vector: &[f64]) -> Result<Vec<f64>, EngineError> {
+        if vector.len() != self.text_dimension() {
+            return Err(EngineError::InvalidVector(
+                "text projection input dimension mismatch".to_string(),
+            ));
+        }
+        Ok(Self::multiply(&self.text_to_struct_matrix, vector))
+    }
+}
+
 // ─── StructuralEmbeddingService ────────────────────────────────
 
 /// Metadata features that determine structural (Poincaré-space) similarity.
@@ -215,6 +314,11 @@ pub trait OntologyEmbedStore: Send + Sync {
 pub struct HyperspaceEmbedStore {
     text_engine: Arc<dyn HyperspaceEngine>,
     struct_engine: Arc<dyn HyperspaceEngine>,
+    /// Dimensions are optional for backwards-compatible direct construction.
+    /// `OntologyBridgeManager` always supplies them from the embedding services.
+    text_dimension: Option<usize>,
+    struct_dimension: Option<usize>,
+    projection: Option<Arc<dyn CrossSpaceProjection>>,
 }
 
 impl HyperspaceEmbedStore {
@@ -222,7 +326,73 @@ impl HyperspaceEmbedStore {
         text_engine: Arc<dyn HyperspaceEngine>,
         struct_engine: Arc<dyn HyperspaceEngine>,
     ) -> Self {
-        Self { text_engine, struct_engine }
+        Self {
+            text_engine,
+            struct_engine,
+            text_dimension: None,
+            struct_dimension: None,
+            projection: None,
+        }
+    }
+
+    /// Build a store whose embedding-space dimensions are known.
+    ///
+    /// Cross-space lookup is only valid without a projection model when both
+    /// spaces use vectors of the same dimensionality.  The manager has this
+    /// information from its two embedding services and uses this constructor.
+    pub fn new_with_dimensions(
+        text_engine: Arc<dyn HyperspaceEngine>,
+        struct_engine: Arc<dyn HyperspaceEngine>,
+        text_dimension: usize,
+        struct_dimension: usize,
+    ) -> Self {
+        Self {
+            text_engine,
+            struct_engine,
+            text_dimension: Some(text_dimension),
+            struct_dimension: Some(struct_dimension),
+            projection: None,
+        }
+    }
+
+    pub fn with_cross_space_projection(
+        mut self,
+        projection: Arc<dyn CrossSpaceProjection>,
+    ) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+
+    fn ensure_cross_space_dimensions_compatible(&self) -> Result<(), EngineError> {
+        if let (Some(text_dimension), Some(struct_dimension)) =
+            (self.text_dimension, self.struct_dimension)
+        {
+            if text_dimension != struct_dimension && self.projection.is_none() {
+                return Err(EngineError::InvalidVector(format!(
+                    "cross-space retrieval requires an explicit projection when text and structural dimensions differ ({text_dimension} != {struct_dimension})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn projection_for_dimensions(
+        &self,
+    ) -> Result<Option<&Arc<dyn CrossSpaceProjection>>, EngineError> {
+        let Some(projection) = self.projection.as_ref() else {
+            return Ok(None);
+        };
+        if let (Some(text), Some(structure)) = (self.text_dimension, self.struct_dimension) {
+            if projection.text_dimension() != text || projection.struct_dimension() != structure {
+                return Err(EngineError::InvalidVector(format!(
+                    "projection {} dimensions do not match store (text {}, struct {})",
+                    projection.version(),
+                    text,
+                    structure
+                )));
+            }
+        }
+        Ok(Some(projection))
     }
 
     /// Expose the text engine for advanced use (OntologySearchBridge needs cross-store routing).
@@ -247,10 +417,14 @@ impl OntologyEmbedStore for HyperspaceEmbedStore {
     ) -> Result<u32, EngineError> {
         // Store in both engines using the same IRI
         if let Some(tv) = text_vec {
-            self.text_engine.upsert(iri, tv.clone(), jsonld.clone()).await?;
+            self.text_engine
+                .upsert(iri, tv.clone(), jsonld.clone())
+                .await?;
         }
         if let Some(sv) = struct_vec {
-            self.struct_engine.upsert(iri, sv.clone(), jsonld.clone()).await?;
+            self.struct_engine
+                .upsert(iri, sv.clone(), jsonld.clone())
+                .await?;
         }
         // Return ID from text engine (preferred), or fallback to struct engine
         if text_vec.is_some() {
@@ -294,13 +468,32 @@ impl OntologyEmbedStore for HyperspaceEmbedStore {
         source_iri: &str,
         top_k: usize,
     ) -> Result<Vec<SearchHit>, EngineError> {
+        // A structural vector cannot be queried against a text index with a
+        // different dimension.  No projection model is configured here, so
+        // fail explicitly instead of delegating an invalid vector to the
+        // engine (or silently returning misleading results).
+        self.ensure_cross_space_dimensions_compatible()?;
         // Primary: get struct vector → search text space
         if let Some(vec) = self.struct_engine.get_vector(source_iri).await? {
-            return self.text_engine.search(&vec, top_k, &[]).await;
+            let projected = match self.projection_for_dimensions()? {
+                Some(projection) => EmbeddingVector::new(
+                    projection.struct_to_text(&vec.coords)?,
+                    MetricKind::Cosine,
+                )?,
+                None => vec,
+            };
+            return self.text_engine.search(&projected, top_k, &[]).await;
         }
         // Fallback: get text vector → search struct space
         if let Some(vec) = self.text_engine.get_vector(source_iri).await? {
-            return self.struct_engine.search(&vec, top_k, &[]).await;
+            let projected = match self.projection_for_dimensions()? {
+                Some(projection) => EmbeddingVector::new(
+                    projection.text_to_struct(&vec.coords)?,
+                    MetricKind::Poincare,
+                )?,
+                None => vec,
+            };
+            return self.struct_engine.search(&projected, top_k, &[]).await;
         }
         Ok(Vec::new())
     }
@@ -340,7 +533,10 @@ impl OntologySearchBridge {
         agent_store: Arc<dyn OntologyEmbedStore>,
         ontology_store: Arc<dyn OntologyEmbedStore>,
     ) -> Self {
-        Self { agent_store, ontology_store }
+        Self {
+            agent_store,
+            ontology_store,
+        }
     }
 
     /// Find ontology classes whose structural embedding is close to an agent memory IRI.
@@ -413,22 +609,25 @@ pub struct OntologyBridgeManager {
 impl OntologyBridgeManager {
     /// Open or create both engines and wrap them in a manager.
     pub fn open(config: OntologyBridgeConfig) -> Result<Self, CoreError> {
-        let dim = config.embed.dimension();
+        let text_dim = config.embed.dimension();
+        let struct_dim = config.struct_embed.dimension();
         let text_engine = HyperspaceEngineImpl::open(
             &config.text_dir,
             WalSyncMode::Batch { interval_ms: 100 },
-            dim,
+            text_dim,
             Box::new(CosineMetric),
             HnswConfig::default(),
         )
         .map_err(|e| CoreError::Internal {
             message: format!("OntologyBridge text engine init: {e}"),
         })?;
-        // Structural engine uses the same dimension; Poincaré space.
+        // Structural embeddings have their own dimensionality; forcing the
+        // text dimension here makes valid structural vectors fail at write
+        // time whenever the services differ (the default is 384 vs 128).
         let struct_engine = HyperspaceEngineImpl::open(
             &config.struct_dir,
             WalSyncMode::Batch { interval_ms: 100 },
-            dim,
+            struct_dim,
             Box::new(PoincareMetric),
             HnswConfig::default(),
         )
@@ -436,17 +635,30 @@ impl OntologyBridgeManager {
             message: format!("OntologyBridge struct engine init: {e}"),
         })?;
 
-        let store = HyperspaceEmbedStore::new(
+        let store = HyperspaceEmbedStore::new_with_dimensions(
             Arc::new(text_engine),
             Arc::new(struct_engine),
+            text_dim,
+            struct_dim,
         );
 
-        info!(
-            text_dim = dim,
-            struct_dim = config.struct_embed.dimension(),
-            "OntologyBridgeManager initialised"
-        );
-        Ok(Self { store, embed: config.embed, struct_embed: config.struct_embed })
+        info!(text_dim, struct_dim, "OntologyBridgeManager initialised");
+        Ok(Self {
+            store,
+            embed: config.embed,
+            struct_embed: config.struct_embed,
+        })
+    }
+
+    /// Attach a calibrated, versioned cross-space projection after opening.
+    /// Callers own model loading and must supply a model whose dimensions match
+    /// the configured text/structural embedding services.
+    pub fn with_cross_space_projection(
+        mut self,
+        projection: Arc<dyn CrossSpaceProjection>,
+    ) -> Self {
+        self.store = self.store.with_cross_space_projection(projection);
+        self
     }
 
     /// Access the underlying dual-space embed store.
@@ -465,20 +677,35 @@ impl OntologyBridgeManager {
         features: &StructuralFeatures,
         jsonld: &Value,
     ) -> Result<u32, CoreError> {
-        let text_vec_f32 = self.embed.embed(text).await.map_err(|e| CoreError::Internal {
-            message: format!("Text embedding failed: {e}"),
-        })?;
+        let text_vec_f32 = self
+            .embed
+            .embed(text)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Text embedding failed: {e}"),
+            })?;
         let text_vec_f64: Vec<f64> = text_vec_f32.into_iter().map(|x| x as f64).collect();
-        let struct_vec_f64 = self.struct_embed.embed_structural(features).await.map_err(|e| CoreError::Internal {
-            message: format!("Structural embedding failed: {e}"),
+        let struct_vec_f64 = self
+            .struct_embed
+            .embed_structural(features)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Structural embedding failed: {e}"),
+            })?;
+
+        let text_v = EmbeddingVector::new(text_vec_f64, MetricKind::Cosine).map_err(|e| {
+            CoreError::Internal {
+                message: e.to_string(),
+            }
+        })?;
+        let struct_v = EmbeddingVector::new(struct_vec_f64, MetricKind::Poincare).map_err(|e| {
+            CoreError::Internal {
+                message: e.to_string(),
+            }
         })?;
 
-        let text_v = EmbeddingVector::new(text_vec_f64, MetricKind::Cosine)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
-        let struct_v = EmbeddingVector::new(struct_vec_f64, MetricKind::Poincare)
-            .map_err(|e| CoreError::Internal { message: e.to_string() })?;
-
-        self.store.store_embedding(iri, Some(&text_v), Some(&struct_v), jsonld)
+        self.store
+            .store_embedding(iri, Some(&text_v), Some(&struct_v), jsonld)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("OntologyBridge store: {e}"),
@@ -487,9 +714,43 @@ impl OntologyBridgeManager {
 
     /// Number of entries in the text engine.
     pub async fn count(&self) -> Result<u64, CoreError> {
-        self.store.embedding_count().await.map_err(|e| CoreError::Internal {
-            message: format!("OntologyBridge count: {e}"),
-        })
+        self.store
+            .embedding_count()
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("OntologyBridge count: {e}"),
+            })
+    }
+
+    /// Search the text space using the same embedding service used for writes.
+    /// This is deliberately a same-space operation: unlike `cross_search`, it
+    /// never treats a structural vector as a text vector and therefore remains
+    /// valid when the two embedding dimensions differ.
+    pub async fn search_text(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<SearchHit>, CoreError> {
+        let values = self
+            .embed
+            .embed(query)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("OntologyBridge query embedding failed: {e}"),
+            })?;
+        let vector = EmbeddingVector::new(
+            values.into_iter().map(f64::from).collect(),
+            MetricKind::Cosine,
+        )
+        .map_err(|e| CoreError::Internal {
+            message: e.to_string(),
+        })?;
+        self.store
+            .search_text(&vector, top_k)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("OntologyBridge text search: {e}"),
+            })
     }
 }
 
@@ -513,6 +774,29 @@ mod tests {
 
     fn v_poin(coords: Vec<f64>) -> EmbeddingVector {
         EmbeddingVector::new_unchecked(coords, MetricKind::Poincare)
+    }
+
+    #[test]
+    fn linear_projection_enforces_bidirectional_dimensions() {
+        let projection = LinearCrossSpaceProjection::new(
+            "test-v1",
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]],
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+        )
+        .unwrap();
+        assert_eq!(projection.version(), "test-v1");
+        assert_eq!(
+            projection.struct_to_text(&[2.0, 4.0]).unwrap(),
+            vec![2.0, 4.0, 3.0]
+        );
+        assert_eq!(
+            projection.text_to_struct(&[2.0, 4.0, 3.0]).unwrap(),
+            vec![2.0, 4.0]
+        );
+        assert!(projection.struct_to_text(&[1.0]).is_err());
+        assert!(
+            LinearCrossSpaceProjection::new("bad", vec![vec![1.0]], vec![vec![1.0, 0.0]]).is_err()
+        );
     }
 
     fn text_engine(dir: &std::path::Path) -> HyperspaceEngineImpl {
@@ -565,6 +849,32 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].iri, "onto:Person");
+    }
+
+    #[tokio::test]
+    async fn manager_text_search_embeds_queries_in_text_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = OntologyBridgeManager::open(OntologyBridgeConfig {
+            text_dir: dir.path().join("text"),
+            struct_dir: dir.path().join("struct"),
+            embed: Arc::new(
+                crate::memory::embedding_service::FallbackEmbeddingService::with_dimension(32),
+            ),
+            struct_embed: Arc::new(FallbackStructuralEmbeddingService::with_dimension(16)),
+        })
+        .unwrap();
+        manager
+            .store_dual_embedding(
+                "iri://experience/rust",
+                "rust ownership debugging experience",
+                &StructuralFeatures::default(),
+                &json!({"@type": ["Experience"]}),
+            )
+            .await
+            .unwrap();
+
+        let hits = manager.search_text("rust ownership", 3).await.unwrap();
+        assert!(hits.iter().any(|hit| hit.iri == "iri://experience/rust"));
     }
 
     #[tokio::test]
@@ -628,8 +938,15 @@ mod tests {
         // "Person" (struct vec [0.25, 0.05, ...]) is closer to "mem:user_123"
         // (struct vec [0.3, 0.1, ...]) than "Organization" (struct vec [0.0, 0.3, ...]).
         // Both should be returned since they're both structurally close enough.
-        assert_eq!(results.len(), 2, "Should find both Person and Organization as related ontologies");
-        assert_eq!(results[0].iri, "onto:Person", "Person should be the most related");
+        assert_eq!(
+            results.len(),
+            2,
+            "Should find both Person and Organization as related ontologies"
+        );
+        assert_eq!(
+            results[0].iri, "onto:Person",
+            "Person should be the most related"
+        );
     }
 
     #[tokio::test]
@@ -689,11 +1006,12 @@ mod tests {
         // cross_search should find entries in the STRUCTURAL space similar to
         // the TEXT vector — but since both spaces have the same entries,
         // this is primarily testing the routing works (non-panicking, returns results)
-        let results = store
-            .cross_search("onto:Dual", 5)
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1, "cross_search should return at least the source entry");
+        let results = store.cross_search("onto:Dual", 5).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "cross_search should return at least the source entry"
+        );
         assert_eq!(results[0].iri, "onto:Dual");
     }
 
@@ -757,14 +1075,26 @@ mod tests {
         let svc = FallbackStructuralEmbeddingService::with_dimension(4);
         // Many tags → large activations, but must still be < 1
         let features = StructuralFeatures {
-            tags: vec!["a".into(), "b".into(), "c".into(), "d".into(),
-                       "e".into(), "f".into(), "g".into(), "h".into()],
+            tags: vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into(),
+                "g".into(),
+                "h".into(),
+            ],
             jsonld_types: vec!["Type1".into(), "Type2".into()],
             named_graph: Some("graph".into()),
         };
         let v = svc.embed_structural_inner(&features);
         let sq_norm: f64 = v.iter().map(|x| x * x).sum();
-        assert!(sq_norm.sqrt() < 1.0, "Poincaré norm must be < 1, got {}", sq_norm.sqrt());
+        assert!(
+            sq_norm.sqrt() < 1.0,
+            "Poincaré norm must be < 1, got {}",
+            sq_norm.sqrt()
+        );
     }
 
     #[test]
@@ -826,6 +1156,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ontology_bridge_manager_accepts_independent_dimensions() {
+        use crate::memory::embedding_service::FallbackEmbeddingService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = OntologyBridgeManager::open(OntologyBridgeConfig {
+            text_dir: dir.path().join("text"),
+            struct_dir: dir.path().join("struct"),
+            embed: Arc::new(FallbackEmbeddingService::with_dimension(4)),
+            struct_embed: Arc::new(FallbackStructuralEmbeddingService::with_dimension(3)),
+        })
+        .unwrap();
+        mgr.store_dual_embedding(
+            "onto:different-dims",
+            "different dimensions",
+            &StructuralFeatures::default(),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mgr.count().await.unwrap(), 1);
+
+        // Storing independent representations is supported.  Directly using
+        // one representation as the query for the other is not: a projection
+        // model must be provided before that can be meaningful or safe.
+        let err = mgr
+            .embed_store()
+            .cross_search("onto:different-dims", 5)
+            .await
+            .expect_err("cross-search must reject incompatible dimensions");
+        assert!(
+            matches!(err, EngineError::InvalidVector(message) if message.contains("explicit projection"))
+        );
+    }
+
+    #[tokio::test]
     async fn test_ontology_bridge_manager_store_dual() {
         use crate::memory::embedding_service::FallbackEmbeddingService;
 
@@ -848,12 +1213,15 @@ mod tests {
             jsonld_types: vec!["Experience".into()],
             named_graph: None,
         };
-        let id = mgr.store_dual_embedding(
-            "test:001",
-            "some experience text",
-            &features,
-            &serde_json::json!({"@type": ["Experience"]}),
-        ).await.unwrap();
+        let id = mgr
+            .store_dual_embedding(
+                "test:001",
+                "some experience text",
+                &features,
+                &serde_json::json!({"@type": ["Experience"]}),
+            )
+            .await
+            .unwrap();
         assert!(id < 100, "Should return a valid internal ID");
         assert_eq!(mgr.count().await.unwrap(), 1);
     }
@@ -914,6 +1282,9 @@ mod tests {
             .find_related_ontologies("mem:lonely", 5)
             .await
             .unwrap();
-        assert!(results.is_empty(), "Empty ontology store should return no matches");
+        assert!(
+            results.is_empty(),
+            "Empty ontology store should return no matches"
+        );
     }
 }

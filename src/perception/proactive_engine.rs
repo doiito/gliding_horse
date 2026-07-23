@@ -152,7 +152,11 @@ impl ProactiveEngine {
         self.config.cycle_timeout_secs
     }
 
-    pub fn with_config(config: PerceptionConfig, l0: Arc<L0Store>, event_bus: Arc<EventBus>) -> Self {
+    pub fn with_config(
+        config: PerceptionConfig,
+        l0: Arc<L0Store>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
         Self {
             cache: HashMap::new(),
             config,
@@ -197,7 +201,8 @@ impl ProactiveEngine {
             if let Some(deadline_str) = when.get("task:deadline").and_then(|v| v.as_str()) {
                 if let Ok(deadline) = deadline_str.parse::<DateTime<Utc>>() {
                     let now = Utc::now();
-                    let reminder_duration = when.get("task:reminderBefore")
+                    let reminder_duration = when
+                        .get("task:reminderBefore")
                         .and_then(|v| v.as_str())
                         .and_then(|s| parse_iso8601_duration(s))
                         .unwrap_or(chrono::Duration::hours(1));
@@ -241,15 +246,21 @@ impl ProactiveEngine {
                 .with_must_tags(vec!["experience".to_string()])
                 .with_jsonld_types(vec!["Experience".to_string()])
                 .with_min_importance(0.05);
-            match hs.search_with_time_decay(&augmented_query, &filter, 0.5, 5).await {
+            match hs
+                .search_with_time_decay(&augmented_query, &filter, 0.5, 5)
+                .await
+            {
                 Ok(entries) => {
-                    return entries.iter()
+                    let experiences: Vec<serde_json::Value> = entries
+                        .iter()
                         .filter_map(|entry| {
                             // ScoredEntry has iri, text, score, tags, importance, jsonld_types, stored_at
                             // The full experience JSON was stored in L0, indexed by IRI
                             if !entry.iri.is_empty() {
                                 if let Ok(Some(l0_entry)) = self.l0.retrieve(&entry.iri) {
-                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&l0_entry.content) {
+                                    if let Ok(val) =
+                                        serde_json::from_str::<serde_json::Value>(&l0_entry.content)
+                                    {
                                         return Some(val);
                                     }
                                 }
@@ -258,8 +269,35 @@ impl ProactiveEngine {
                         })
                         .take(5)
                         .collect();
+                    if !experiences.is_empty() {
+                        return experiences;
+                    }
                 }
                 Err(_) => {} // Fall through to L0 fallback
+            }
+        }
+
+        // The ontology bridge is a second, same-text-space recall path for
+        // experiences that completed dual-space persistence.  It is only used
+        // after the primary Hyperspace recall has no retrievable L0 payload;
+        // it never performs invalid text/structural cross-space projection.
+        #[cfg(feature = "ontology")]
+        if let Some(ref ontology) = self.ontology_bridge {
+            match ontology.search_text(query, 5).await {
+                Ok(hits) => {
+                    let experiences: Vec<serde_json::Value> = hits
+                        .iter()
+                        .filter_map(|hit| self.l0.retrieve(&hit.iri).ok().flatten())
+                        .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+                        .take(5)
+                        .collect();
+                    if !experiences.is_empty() {
+                        return experiences;
+                    }
+                }
+                Err(error) => {
+                    debug!(%error, "Ontology text recall unavailable; falling back to L0")
+                }
             }
         }
 
@@ -269,10 +307,14 @@ impl ProactiveEngine {
             Err(_) => return Vec::new(),
         };
         let query_lower = query.to_lowercase();
-        results.into_iter()
+        results
+            .into_iter()
             .filter(|entry| {
                 entry.content.to_lowercase().contains(&query_lower)
-                    || entry.tags.iter().any(|t| query_lower.contains(&t.to_lowercase()))
+                    || entry
+                        .tags
+                        .iter()
+                        .any(|t| query_lower.contains(&t.to_lowercase()))
             })
             .take(5)
             .filter_map(|entry| serde_json::from_str(&entry.content).ok())
@@ -290,15 +332,15 @@ impl ProactiveEngine {
     }
 
     fn evict_cache(&mut self) {
-        if self.cache.len() > self.config.cache_max_entries
-            && self.config.cache_max_entries > 0
-        {
+        if self.cache.len() > self.config.cache_max_entries && self.config.cache_max_entries > 0 {
             let now = Utc::now();
             self.cache.retain(|_, (ts, _)| {
                 now.signed_duration_since(*ts).num_seconds() < self.config.cache_ttl_seconds
             });
             while self.cache.len() > self.config.cache_max_entries {
-                let oldest_key = self.cache.iter()
+                let oldest_key = self
+                    .cache
+                    .iter()
                     .min_by_key(|(_, (ts, _))| *ts)
                     .map(|(k, _)| k.clone());
                 if let Some(key) = oldest_key {
@@ -313,7 +355,8 @@ impl ProactiveEngine {
     fn evict_anomaly_history(&mut self) {
         let now = Utc::now();
         self.anomaly_history.retain(|(_, ts)| {
-            now.signed_duration_since(*ts).num_seconds() < self.config.anomaly_dedup_window_seconds * 2
+            now.signed_duration_since(*ts).num_seconds()
+                < self.config.anomaly_dedup_window_seconds * 2
         });
         let max_history = self.config.cache_max_entries.max(1000);
         if self.anomaly_history.len() > max_history {
@@ -322,7 +365,11 @@ impl ProactiveEngine {
         }
     }
 
-    pub async fn on_task_start(&mut self, user_input: &str, task_iri: &str) -> Result<TaskAnalysis, CoreError> {
+    pub async fn on_task_start(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+    ) -> Result<TaskAnalysis, CoreError> {
         let key = Self::cache_key("task_start", task_iri);
         if self.is_cached(&key) {
             return Ok(serde_json::from_value(self.cache[&key].1.clone())
@@ -339,13 +386,21 @@ impl ProactiveEngine {
                 for event_text in &ws_events {
                     analysis.relevant_experience_hints.push(event_text.clone());
                 }
-                analysis.risks.push(format!("External file changes detected ({} event(s))", ws_events.len()));
+                analysis.risks.push(format!(
+                    "External file changes detected ({} event(s))",
+                    ws_events.len()
+                ));
             }
         }
 
         let experiences = self.query_relevant_experiences(user_input).await;
-        analysis.relevant_experience_hints = experiences.iter()
-            .filter_map(|e| e.get("scenario").and_then(|s| s.as_str()).map(|s| s.to_string()))
+        analysis.relevant_experience_hints = experiences
+            .iter()
+            .filter_map(|e| {
+                e.get("scenario")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
             .take(5)
             .collect();
 
@@ -377,11 +432,16 @@ impl ProactiveEngine {
     pub fn on_progress_anomaly(&mut self, anomaly: &Value, task_iri: &str) -> InterventionPlan {
         self.evict_anomaly_history();
 
-        let desc = anomaly.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let desc = anomaly
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let anomaly_id = format!("anomaly_{}", uuid::Uuid::new_v4().hyphenated());
 
         if self.anomaly_history.iter().any(|(d, t)| {
-            d == desc && Utc::now().signed_duration_since(*t).num_seconds() < self.config.anomaly_dedup_window_seconds
+            d == desc
+                && Utc::now().signed_duration_since(*t).num_seconds()
+                    < self.config.anomaly_dedup_window_seconds
         }) {
             return InterventionPlan {
                 anomaly_id: String::new(),
@@ -397,14 +457,20 @@ impl ProactiveEngine {
         InterventionPlan {
             anomaly_id,
             diagnosis: format!("Progress anomaly: {}", desc),
-            actions: vec!["Reassess current plan".to_string(), "Consider additional resources".to_string()],
+            actions: vec![
+                "Reassess current plan".to_string(),
+                "Consider additional resources".to_string(),
+            ],
             priority: "high".to_string(),
             should_interrupt: true,
         }
     }
 
     pub fn on_check_completed(&self, check_result: &Value, task_iri: &str) -> Option<AdvisoryNode> {
-        let verdict = check_result.get("verdict").and_then(|v| v.as_str()).unwrap_or("pass");
+        let verdict = check_result
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pass");
         if verdict == "fail" {
             debug!(task = %task_iri, "Check failed, generating advisory");
             return Some(AdvisoryNode {
@@ -419,17 +485,29 @@ impl ProactiveEngine {
     }
 
     pub async fn on_task_end(&self, task_result: &Value, task_iri: &str) -> Option<Experience> {
-        let status = task_result.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let status = task_result
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         if status == "success" || status == "failed" {
             debug!(task = %task_iri, status = %status, "Extracting experience");
 
             let cache_key = Self::cache_key("task_start", task_iri);
-            let task_analysis = self.cache.get(&cache_key).and_then(|(_, v)| {
-                serde_json::from_value::<TaskAnalysis>(v.clone()).ok()
-            });
+            let task_analysis = self
+                .cache
+                .get(&cache_key)
+                .and_then(|(_, v)| serde_json::from_value::<TaskAnalysis>(v.clone()).ok());
 
-            let scenario = task_result.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let mut tags = vec![format!("task:{}", task_iri), format!("status:{}", status), "experience".to_string()];
+            let scenario = task_result
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut tags = vec![
+                format!("task:{}", task_iri),
+                format!("status:{}", status),
+                "experience".to_string(),
+            ];
             if let Some(ref analysis) = task_analysis {
                 tags.push(format!("complexity:{}", analysis.complexity));
             }
@@ -456,8 +534,14 @@ impl ProactiveEngine {
                 if let Some(obj) = experience_json.as_object_mut() {
                     obj.insert("complexity".to_string(), json!(analysis.complexity));
                     obj.insert("risks".to_string(), json!(analysis.risks));
-                    obj.insert("recommended_approach".to_string(), json!(analysis.recommended_approach));
-                    obj.insert("estimated_steps".to_string(), json!(analysis.estimated_steps));
+                    obj.insert(
+                        "recommended_approach".to_string(),
+                        json!(analysis.recommended_approach),
+                    );
+                    obj.insert(
+                        "estimated_steps".to_string(),
+                        json!(analysis.estimated_steps),
+                    );
                 }
             }
             let content = serde_json::to_string(&experience_json).unwrap_or_default();
@@ -479,19 +563,27 @@ impl ProactiveEngine {
                     jsonld_types: Vec::new(),
                     hyperspace_point_id: None,
                 };
-                let _ = self.l0.store_entry(&entry);
+                if let Err(error) = self.l0.store_entry(&entry) {
+                    warn!(experience_iri = %iri, %error, "failed to persist experience to L0; skipping vector indexes");
+                    return Some(experience);
+                }
 
                 // Also store to HyperspaceStore for semantic retrieval when available
                 if let Some(ref hs) = self.hyperspace {
                     let hs_tags = experience.tags.clone();
-                    let _ = hs.upsert_with_metadata(
-                        &iri,
-                        &hs_content,
-                        &hs_tags,
-                        Some(experience.success_rating as f32),
-                        Some(&["Experience".to_string()]),
-                        None,
-                    ).await;
+                    if let Err(error) = hs
+                        .upsert_with_metadata(
+                            &iri,
+                            &hs_content,
+                            &hs_tags,
+                            Some(experience.success_rating as f32),
+                            Some(&["Experience".to_string()]),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(experience_iri = %iri, %error, "failed to index experience in Hyperspace; L0 recovery remains available");
+                    }
                 }
 
                 // Store dual-space embedding to OntologyBridge (text Cosine + struct Poincaré)
@@ -509,7 +601,12 @@ impl ProactiveEngine {
                         jsonld_types: vec!["Experience".to_string()],
                         named_graph: None,
                     };
-                    let _ = ob.store_dual_embedding(&iri, &hs_content, &features, &jsonld).await;
+                    if let Err(error) = ob
+                        .store_dual_embedding(&iri, &hs_content, &features, &jsonld)
+                        .await
+                    {
+                        warn!(experience_iri = %iri, %error, "failed to index experience in OntologyBridge; L0 recovery remains available");
+                    }
                 }
             }
 
@@ -518,12 +615,20 @@ impl ProactiveEngine {
         None
     }
 
-    pub fn on_cycle_timeout(&self, cycle_id: &str, task_iri: &str, elapsed_secs: f64) -> InterventionPlan {
+    pub fn on_cycle_timeout(
+        &self,
+        cycle_id: &str,
+        task_iri: &str,
+        elapsed_secs: f64,
+    ) -> InterventionPlan {
         warn!(cycle = %cycle_id, task = %task_iri, elapsed = elapsed_secs, "Cycle timeout");
         InterventionPlan {
             anomaly_id: format!("timeout_{}", uuid::Uuid::new_v4().hyphenated()),
             diagnosis: format!("Cycle {} timeout after {:.0}s", cycle_id, elapsed_secs),
-            actions: vec!["Extend timeout".to_string(), "Check agent health".to_string()],
+            actions: vec![
+                "Extend timeout".to_string(),
+                "Check agent health".to_string(),
+            ],
             priority: "critical".to_string(),
             should_interrupt: true,
         }
@@ -534,7 +639,10 @@ impl ProactiveEngine {
         InterventionPlan {
             anomaly_id: format!("blocked_{}", uuid::Uuid::new_v4().hyphenated()),
             diagnosis: format!("Agent {} is blocked", agent_id),
-            actions: vec!["Restart agent".to_string(), "Inject assistance message".to_string()],
+            actions: vec![
+                "Restart agent".to_string(),
+                "Inject assistance message".to_string(),
+            ],
             priority: "high".to_string(),
             should_interrupt: true,
         }
@@ -552,7 +660,8 @@ impl ProactiveEngine {
             let entry = PerceptionEntry::new(
                 PerceptionSource::PerceptionEngine,
                 format!("{}: {} (task: {})", type_label, path, task_iri),
-            ).with_priority(8);
+            )
+            .with_priority(8);
             store.store_global(entry);
         }
     }
@@ -626,14 +735,20 @@ impl ProactiveEngine {
         InterventionPlan {
             anomaly_id: format!("quality_{}", uuid::Uuid::new_v4().hyphenated()),
             diagnosis: "Output quality degraded".to_string(),
-            actions: vec!["Rollback to last checkpoint".to_string(), "Re-run with different approach".to_string()],
+            actions: vec![
+                "Rollback to last checkpoint".to_string(),
+                "Re-run with different approach".to_string(),
+            ],
             priority: "high".to_string(),
             should_interrupt: true,
         }
     }
 
     pub fn on_user_feedback(&self, feedback: &Value, task_iri: &str) -> AdvisoryNode {
-        let message = feedback.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let message = feedback
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         info!(task = %task_iri, feedback = %message, "User feedback received");
         AdvisoryNode {
             advisory_id: format!("fb_{}", uuid::Uuid::new_v4().hyphenated()),
@@ -737,7 +852,11 @@ fn parse_iso8601_duration(s: &str) -> Option<chrono::Duration> {
             }
         }
     }
-    Some(chrono::Duration::hours(hours) + chrono::Duration::minutes(minutes) + chrono::Duration::seconds(secs))
+    Some(
+        chrono::Duration::hours(hours)
+            + chrono::Duration::minutes(minutes)
+            + chrono::Duration::seconds(secs),
+    )
 }
 
 #[cfg(test)]
@@ -762,7 +881,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let mut engine = ProactiveEngine::new(l0, test_event_bus());
-        let analysis = engine.on_task_start("Write a hello world program", "iri://task/1").await.unwrap();
+        let analysis = engine
+            .on_task_start("Write a hello world program", "iri://task/1")
+            .await
+            .unwrap();
         assert_eq!(analysis.complexity, "simple");
         assert_eq!(analysis.estimated_steps, 1);
     }
@@ -796,7 +918,10 @@ mod tests {
             ..Default::default()
         };
         let mut engine = ProactiveEngine::with_config(config, l0, test_event_bus());
-        let analysis = engine.on_task_start("A medium length task description", "iri://task/1").await.unwrap();
+        let analysis = engine
+            .on_task_start("A medium length task description", "iri://task/1")
+            .await
+            .unwrap();
         assert_eq!(analysis.complexity, "simple");
     }
 
@@ -923,15 +1048,61 @@ mod tests {
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let engine = ProactiveEngine::new(l0, test_event_bus());
         let task_result = serde_json::json!({"status": "running"});
-        assert!(engine.on_task_end(&task_result, "iri://task/3").await.is_none());
+        assert!(engine
+            .on_task_end(&task_result, "iri://task/3")
+            .await
+            .is_none());
+    }
+
+    #[cfg(feature = "ontology")]
+    #[tokio::test]
+    async fn ontology_text_recall_falls_back_to_l0_experience_payload() {
+        use crate::memory::embedding_service::FallbackEmbeddingService;
+        use crate::ontology_bridge::{
+            FallbackStructuralEmbeddingService, OntologyBridgeConfig, OntologyBridgeManager,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().join("l0").to_str().unwrap()).unwrap());
+        let ontology = Arc::new(
+            OntologyBridgeManager::open(OntologyBridgeConfig {
+                text_dir: dir.path().join("ontology-text"),
+                struct_dir: dir.path().join("ontology-struct"),
+                embed: Arc::new(FallbackEmbeddingService::with_dimension(32)),
+                struct_embed: Arc::new(FallbackStructuralEmbeddingService::with_dimension(16)),
+            })
+            .unwrap(),
+        );
+        let engine = ProactiveEngine::new(l0, test_event_bus()).with_ontology_bridge(ontology);
+        let written = engine
+            .on_task_end(
+                &serde_json::json!({
+                    "status": "success",
+                    "summary": "rust ownership debugging experience",
+                }),
+                "iri://task/ontology-recall",
+            )
+            .await
+            .unwrap();
+        let experiences = engine.query_relevant_experiences("rust ownership").await;
+
+        assert_eq!(experiences.len(), 1);
+        assert_eq!(
+            experiences[0]["@id"],
+            format!("iri://experience/{}", written.experience_id)
+        );
     }
 
     #[test]
     fn test_plan_completed_subtask_warning() {
         with_l0(|l0| {
             let engine = ProactiveEngine::with_config(
-                PerceptionConfig { complex_subtask_threshold: 3, ..Default::default() },
-                l0, test_event_bus(),
+                PerceptionConfig {
+                    complex_subtask_threshold: 3,
+                    ..Default::default()
+                },
+                l0,
+                test_event_bus(),
             );
             let plan = serde_json::json!({"sub_tasks": ["a", "b", "c", "d", "e"]});
             let advisories = engine.on_plan_completed(&plan, "iri://task/1");
@@ -944,8 +1115,12 @@ mod tests {
     fn test_plan_completed_no_warning_below_threshold() {
         with_l0(|l0| {
             let engine = ProactiveEngine::with_config(
-                PerceptionConfig { complex_subtask_threshold: 10, ..Default::default() },
-                l0, test_event_bus(),
+                PerceptionConfig {
+                    complex_subtask_threshold: 10,
+                    ..Default::default()
+                },
+                l0,
+                test_event_bus(),
             );
             let plan = serde_json::json!({"sub_tasks": ["a", "b", "c"]});
             let advisories = engine.on_plan_completed(&plan, "iri://task/1");
@@ -967,14 +1142,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let mut engine = ProactiveEngine::with_config(
-            PerceptionConfig { cache_ttl_seconds: 300, cache_max_entries: 2, ..Default::default() },
-            l0, test_event_bus(),
+            PerceptionConfig {
+                cache_ttl_seconds: 300,
+                cache_max_entries: 2,
+                ..Default::default()
+            },
+            l0,
+            test_event_bus(),
         );
         let _ = engine.on_task_start("task1", "iri://task/1").await;
         let _ = engine.on_task_start("task2", "iri://task/2").await;
         let _ = engine.on_task_start("task3", "iri://task/3").await;
         let _ = engine.on_task_start("task4", "iri://task/4").await;
-        assert!(engine.cache.len() <= 2, "cache should evict to max_entries=2 got {}", engine.cache.len());
+        assert!(
+            engine.cache.len() <= 2,
+            "cache should evict to max_entries=2 got {}",
+            engine.cache.len()
+        );
     }
 }
 
@@ -1001,7 +1185,9 @@ mod tests_5w2h {
     fn test_check_5w2h_constraints_no_store() {
         with_l0_5w2h(|store| {
             let engine = ProactiveEngine::new(store, test_event_bus());
-            assert!(engine.check_5w2h_constraints("iri://task/test/5w2h").is_none());
+            assert!(engine
+                .check_5w2h_constraints("iri://task/test/5w2h")
+                .is_none());
         })
     }
 
@@ -1017,7 +1203,9 @@ mod tests_5w2h {
                     "task:reminderBefore": "PT1H"
                 }
             });
-            store.store("iri://task/test/5w2h", &json_ld.to_string()).unwrap();
+            store
+                .store("iri://task/test/5w2h", &json_ld.to_string())
+                .unwrap();
             let result = engine.check_5w2h_constraints("iri://task/test/5w2h");
             assert!(result.is_some());
             assert!(result.unwrap().contains("DEADLINE_APPROACHING"));
@@ -1039,7 +1227,9 @@ mod tests_5w2h {
                     }
                 }
             });
-            store.store("iri://task/test/5w2h", &json_ld.to_string()).unwrap();
+            store
+                .store("iri://task/test/5w2h", &json_ld.to_string())
+                .unwrap();
             let result = engine.check_5w2h_constraints("iri://task/test/5w2h");
             assert!(result.is_some());
             assert!(result.unwrap().contains("BUDGET_EXCEEDED"));
@@ -1058,7 +1248,9 @@ mod tests_5w2h {
                     "task:reminderBefore": "PT30M"
                 }
             });
-            store.store("iri://task/test/custom/5w2h", &json_ld.to_string()).unwrap();
+            store
+                .store("iri://task/test/custom/5w2h", &json_ld.to_string())
+                .unwrap();
             let result = engine.check_5w2h_constraints("iri://task/test/custom/5w2h");
             assert!(result.is_some());
             assert!(result.unwrap().contains("DEADLINE_APPROACHING"));
@@ -1071,13 +1263,7 @@ mod tests_5w2h {
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let engine = ProactiveEngine::new(store, test_event_bus());
 
-        let result = engine.check_file_conflict(
-            "/path/to/file.rs",
-            "ReadStale",
-            1,
-            3,
-            "agent_1",
-        );
+        let result = engine.check_file_conflict("/path/to/file.rs", "ReadStale", 1, 3, "agent_1");
         assert!(result.is_some(), "Should detect stale file conflict");
         let conflict = result.unwrap();
         assert_eq!(conflict["conflict_type"], "stale_file_write");
@@ -1091,13 +1277,8 @@ mod tests_5w2h {
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let engine = ProactiveEngine::new(store, test_event_bus());
 
-        let result = engine.check_file_conflict(
-            "/path/to/new.rs",
-            "WrittenUnread",
-            0,
-            0,
-            "agent_1",
-        );
+        let result =
+            engine.check_file_conflict("/path/to/new.rs", "WrittenUnread", 0, 0, "agent_1");
         assert!(result.is_some(), "Should detect unread file conflict");
         let conflict = result.unwrap();
         assert_eq!(conflict["conflict_type"], "unread_write");
@@ -1110,13 +1291,7 @@ mod tests_5w2h {
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let engine = ProactiveEngine::new(store, test_event_bus());
 
-        let result = engine.check_file_conflict(
-            "/path/to/fresh.rs",
-            "ReadFresh",
-            2,
-            2,
-            "agent_1",
-        );
+        let result = engine.check_file_conflict("/path/to/fresh.rs", "ReadFresh", 2, 2, "agent_1");
         assert!(result.is_none(), "Fresh file should have no conflict");
     }
 
@@ -1127,8 +1302,8 @@ mod tests_5w2h {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let ps = Arc::new(PerceptionStore::new());
-        let engine = ProactiveEngine::new(store, test_event_bus())
-            .with_perception_store(ps.clone());
+        let engine =
+            ProactiveEngine::new(store, test_event_bus()).with_perception_store(ps.clone());
 
         let conflict = serde_json::json!({
             "conflict_type": "stale_file_write",
@@ -1139,10 +1314,21 @@ mod tests_5w2h {
         assert!(plan.should_interrupt);
 
         // PerceptionStore should have the conflict entry
-        assert!(ps.has_new("iri://task/store_test"), "PerceptionStore should have entry after conflict");
+        assert!(
+            ps.has_new("iri://task/store_test"),
+            "PerceptionStore should have entry after conflict"
+        );
         let text = ps.take_perception_text("iri://task/store_test");
-        assert!(text.contains("Alert"), "Should contain alert prefix: {}", text);
-        assert!(text.contains("stale"), "Should mention stale file: {}", text);
+        assert!(
+            text.contains("Alert"),
+            "Should contain alert prefix: {}",
+            text
+        );
+        assert!(
+            text.contains("stale"),
+            "Should mention stale file: {}",
+            text
+        );
     }
 
     #[test]
@@ -1150,8 +1336,8 @@ mod tests_5w2h {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let ps = Arc::new(PerceptionStore::new());
-        let engine = ProactiveEngine::new(store, test_event_bus())
-            .with_perception_store(ps.clone());
+        let engine =
+            ProactiveEngine::new(store, test_event_bus()).with_perception_store(ps.clone());
 
         let conflict = serde_json::json!({
             "conflict_type": "concurrent_write",
@@ -1161,7 +1347,11 @@ mod tests_5w2h {
         let _plan = engine.on_resource_conflict(&conflict, "iri://task/concurrent");
 
         let text = ps.take_perception_text("iri://task/concurrent");
-        assert!(text.contains("concurrent"), "Should mention concurrent write: {}", text);
+        assert!(
+            text.contains("concurrent"),
+            "Should mention concurrent write: {}",
+            text
+        );
     }
 
     #[test]
@@ -1169,8 +1359,8 @@ mod tests_5w2h {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let ps = Arc::new(PerceptionStore::new());
-        let engine = ProactiveEngine::new(store, test_event_bus())
-            .with_perception_store(ps.clone());
+        let engine =
+            ProactiveEngine::new(store, test_event_bus()).with_perception_store(ps.clone());
 
         let conflict = serde_json::json!({
             "conflict_type": "unread_write",
@@ -1179,7 +1369,11 @@ mod tests_5w2h {
         let _plan = engine.on_resource_conflict(&conflict, "iri://task/unread");
 
         let text = ps.take_perception_text("iri://task/unread");
-        assert!(text.contains("unread"), "Should mention unread write: {}", text);
+        assert!(
+            text.contains("unread"),
+            "Should mention unread write: {}",
+            text
+        );
     }
 
     #[test]
@@ -1201,11 +1395,9 @@ mod tests_5w2h {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let ps = Arc::new(PerceptionStore::new());
-        let engine = ProactiveEngine::with_config(
-            PerceptionConfig::default(),
-            store,
-            test_event_bus(),
-        ).with_perception_store(ps.clone());
+        let engine =
+            ProactiveEngine::with_config(PerceptionConfig::default(), store, test_event_bus())
+                .with_perception_store(ps.clone());
 
         let conflict = serde_json::json!({
             "conflict_type": "concurrent_write",
@@ -1214,7 +1406,10 @@ mod tests_5w2h {
         let _plan = engine.on_resource_conflict(&conflict, "iri://task/chain");
 
         let text = ps.take_perception_text("iri://task/chain");
-        assert!(!text.is_empty(), "Chain-constructed engine should inject to PerceptionStore");
+        assert!(
+            !text.is_empty(),
+            "Chain-constructed engine should inject to PerceptionStore"
+        );
     }
 
     #[test]

@@ -10,7 +10,6 @@ use crate::batch::types::{
     BatchAgentConfig, BatchMetrics, ExtractionResult, PromptContext, WindowEntry,
 };
 use crate::batch::validator::OutputValidator;
-use crate::batch::window::SlidingWindow;
 use crate::gateway::unified_gateway::{ChatMessage, UnifiedGateway};
 
 pub struct ExtractorPipeline {
@@ -37,12 +36,10 @@ impl ExtractorPipeline {
     pub async fn extract(
         &self,
         config: &BatchAgentConfig,
-        window: &mut SlidingWindow,
+        window_entries: Vec<WindowEntry>,
         context: &PromptContext,
     ) -> Result<ExtractionResult, BatchError> {
         let batch_id = format!("batch_{}", Uuid::new_v4().hyphenated());
-        let window_entries = window.drain();
-
         if window_entries.is_empty() {
             return Err(BatchError::Internal {
                 message: "Cannot extract from empty window".to_string(),
@@ -105,7 +102,14 @@ impl ExtractorPipeline {
         for attempt in 1..=max_retries {
             let user_content = window_entries
                 .iter()
-                .map(|e| format!("[{}] {}: {}", e.role, e.timestamp.format("%H:%M:%S"), e.content))
+                .map(|e| {
+                    format!(
+                        "[{}] {}: {}",
+                        e.role,
+                        e.timestamp.format("%H:%M:%S"),
+                        e.content
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -141,19 +145,15 @@ impl ExtractorPipeline {
                     model,
                     messages,
                     config.temperature,
-                    None,  // max_tokens
-                    None,  // tools
-                    None,  // tool_choice
+                    None, // max_tokens
+                    None, // tools
+                    None, // tool_choice
                 )
                 .await;
 
             match response {
                 Ok(reply) => {
-                    let content = reply.choices[0]
-                        .message
-                        .content
-                        .as_deref()
-                        .unwrap_or("");
+                    let content = reply.choices[0].message.content.as_deref().unwrap_or("");
                     match self.parse_and_validate(config, content) {
                         Ok(result) => return Ok(result),
                         Err(e) => {
@@ -174,8 +174,10 @@ impl ExtractorPipeline {
                         "LLM extraction failed"
                     );
                     if attempt < max_retries {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500 * attempt as u64))
-                            .await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            500 * attempt as u64,
+                        ))
+                        .await;
                     }
                 }
             }
@@ -202,11 +204,10 @@ impl ExtractorPipeline {
             message: "No valid JSON found in LLM response".to_string(),
         })?;
 
-        let json: Value = serde_json::from_str(&json_str).map_err(|e| {
-            BatchError::ValidationFailed {
+        let json: Value =
+            serde_json::from_str(&json_str).map_err(|e| BatchError::ValidationFailed {
                 message: format!("Invalid JSON output: {}", e),
-            }
-        })?;
+            })?;
 
         let mut result = self.validator.validate_llm_json_output(&json, config)?;
         result.raw_response = Some(content.to_string());
@@ -281,10 +282,7 @@ That's all."#;
         let result = extract_json(text);
         assert!(result.is_some());
         let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(
-            parsed["entities"][0]["name"].as_str().unwrap(),
-            "Project X"
-        );
+        assert_eq!(parsed["entities"][0]["name"].as_str().unwrap(), "Project X");
     }
 
     #[test]

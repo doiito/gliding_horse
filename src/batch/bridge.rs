@@ -56,10 +56,7 @@ impl BatchEventBridge {
 
         let callbacks = self.callbacks.clone();
 
-        let event_types: Vec<String> = BATCH_EVENT_TYPES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let event_types: Vec<String> = BATCH_EVENT_TYPES.iter().map(|s| s.to_string()).collect();
 
         let mut rx = self.event_bus.subscribe();
 

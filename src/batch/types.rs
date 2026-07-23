@@ -60,6 +60,10 @@ pub struct BatchAgentConfig {
     pub inject_context_summary: bool,
     #[serde(default = "default_true")]
     pub inject_related_entities: bool,
+    /// Explicit opt-in: maintenance handlers can change SkillGraphStore only
+    /// when deployment governance enables this flag.
+    #[serde(default)]
+    pub apply_graph_mutations: bool,
 }
 
 impl Default for BatchAgentConfig {
@@ -86,14 +90,23 @@ impl Default for BatchAgentConfig {
             inject_user_reminders: default_true(),
             inject_context_summary: default_true(),
             inject_related_entities: default_true(),
+            apply_graph_mutations: false,
         }
     }
 }
 
-fn default_enabled() -> bool { true }
-fn default_max_retries() -> u32 { 3 }
-fn default_timeout() -> u64 { 300 }
-fn default_true() -> bool { true }
+fn default_enabled() -> bool {
+    true
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_timeout() -> u64 {
+    300
+}
+fn default_true() -> bool {
+    true
+}
 
 // ============================================================
 // Window types
@@ -103,13 +116,19 @@ fn default_true() -> bool { true }
 pub enum WindowType {
     MessageCount(usize),
     TimeWindow(u64),
-    Hybrid { max_messages: usize, max_seconds: u64 },
+    Hybrid {
+        max_messages: usize,
+        max_seconds: u64,
+    },
     Manual,
 }
 
 impl Default for WindowType {
     fn default() -> Self {
-        Self::Hybrid { max_messages: 5, max_seconds: 600 }
+        Self::Hybrid {
+            max_messages: 5,
+            max_seconds: 600,
+        }
     }
 }
 
@@ -146,7 +165,9 @@ pub enum PromptSource {
 }
 
 impl Default for PromptSource {
-    fn default() -> Self { Self::HybridWithTemplate }
+    fn default() -> Self {
+        Self::HybridWithTemplate
+    }
 }
 
 // ============================================================
@@ -366,7 +387,9 @@ pub struct BatchMetrics {
 impl BatchMetrics {
     pub fn success_rate(&self) -> f64 {
         let total = self.success_count + self.failure_count;
-        if total == 0 { return 1.0; }
+        if total == 0 {
+            return 1.0;
+        }
         self.success_count as f64 / total as f64
     }
 
@@ -392,8 +415,28 @@ impl BatchMetrics {
     }
 
     pub fn recent_success_rate(&self) -> f64 {
-        if self.last_outcomes.is_empty() { return 1.0; }
+        if self.last_outcomes.is_empty() {
+            return 1.0;
+        }
         let successes = self.last_outcomes.iter().filter(|&&x| x).count();
         successes as f64 / self.last_outcomes.len() as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchAgentConfig;
+
+    #[test]
+    fn graph_mutations_are_opt_in_by_default() {
+        assert!(!BatchAgentConfig::default().apply_graph_mutations);
+
+        let config: BatchAgentConfig = serde_json::from_value(serde_json::json!({
+            "name": "legacy-agent",
+            "description": "legacy config without the new field",
+            "business_domain": "test"
+        }))
+        .unwrap();
+        assert!(!config.apply_graph_mutations);
     }
 }

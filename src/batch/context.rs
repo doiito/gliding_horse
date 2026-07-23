@@ -6,9 +6,9 @@ use tracing::{debug, warn};
 use crate::batch::error::BatchError;
 use crate::batch::types::{BatchAgentConfig, EmphasisItem, PromptContext};
 use crate::batch::window::SlidingWindow;
+use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l3_projection::ProjectionEngine;
-use crate::knowledge_graph::store::KnowledgeGraphStore;
 
 pub struct ContextCollector {
     l0_store: Option<Arc<L0Store>>,
@@ -101,11 +101,11 @@ impl ContextCollector {
             None => return Ok(vec![]),
         };
 
-        let entries = l0
-            .search_by_tags(&["emphasis".to_string()])
-            .map_err(|e| BatchError::MemoryOperationFailed {
+        let entries = l0.search_by_tags(&["emphasis".to_string()]).map_err(|e| {
+            BatchError::MemoryOperationFailed {
                 message: format!("L0 search_by_tags failed: {}", e),
-            })?;
+            }
+        })?;
 
         let mut items: Vec<EmphasisItem> = entries
             .into_iter()
@@ -138,20 +138,14 @@ impl ContextCollector {
         Ok(items)
     }
 
-    async fn load_context_summary(
-        &self,
-        task_iri: &str,
-    ) -> Result<Option<String>, BatchError> {
+    async fn load_context_summary(&self, task_iri: &str) -> Result<Option<String>, BatchError> {
         let projection = match self.projection.as_ref() {
             Some(p) => p,
             None => return Ok(None),
         };
 
         let params = std::collections::HashMap::new();
-        match projection
-            .project(task_iri, "summary_only", params)
-            .await
-        {
+        match projection.project(task_iri, "summary_only", params).await {
             Ok(json_str) => {
                 // Try to extract a meaningful summary from the projection JSON
                 let parsed: Value =
@@ -226,10 +220,7 @@ impl ContextCollector {
 
         for entry in window.entries() {
             for word in entry.content.split_whitespace() {
-                let cleaned: String = word
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect();
+                let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
                 if cleaned.len() > 3 {
                     *word_freq.entry(cleaned.to_lowercase()).or_insert(0) += 1;
                 }
@@ -245,8 +236,8 @@ impl ContextCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::window::{SlidingWindow, WindowConfig};
     use crate::batch::types::WindowEntry;
+    use crate::batch::window::{SlidingWindow, WindowConfig};
     use chrono::Utc;
 
     fn make_entry(content: &str) -> WindowEntry {
@@ -270,13 +261,22 @@ mod tests {
             intent_shift_threshold: 0.3,
         });
 
-        window.push(make_entry("Rust backend framework performance")).unwrap();
-        window.push(make_entry("PostgreSQL database schema design")).unwrap();
-        window.push(make_entry("Rust async web framework comparison")).unwrap();
+        window
+            .push(make_entry("Rust backend framework performance"))
+            .unwrap();
+        window
+            .push(make_entry("PostgreSQL database schema design"))
+            .unwrap();
+        window
+            .push(make_entry("Rust async web framework comparison"))
+            .unwrap();
 
         let keywords = collector.extract_window_keywords(&window);
         assert!(!keywords.is_empty(), "Should extract keywords");
-        assert!(keywords.contains(&"framework".to_string()), "framework should be a top keyword");
+        assert!(
+            keywords.contains(&"framework".to_string()),
+            "framework should be a top keyword"
+        );
     }
 
     #[tokio::test]

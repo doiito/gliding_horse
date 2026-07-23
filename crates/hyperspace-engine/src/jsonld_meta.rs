@@ -39,10 +39,18 @@ impl Default for JsonLdMetadataIndex {
 
 impl Clone for JsonLdMetadataIndex {
     fn clone(&self) -> Self {
-        let deleted = self.deleted.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let deleted = self
+            .deleted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let numeric = DashMap::new();
         for entry in self.numeric.iter() {
-            let tree = entry.value().read().unwrap_or_else(|e| e.into_inner()).clone();
+            let tree = entry
+                .value()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             numeric.insert(entry.key().clone(), RwLock::new(tree));
         }
         Self {
@@ -79,11 +87,11 @@ impl JsonLdMetadataIndex {
                 if let Some(type_str) = t.as_str() {
                     self.type_index
                         .entry(type_str.to_string())
-                        .or_insert_with(RoaringBitmap::new)
+                        .or_default()
                         .insert(id);
                     self.inverted
                         .entry(format!("@type:{type_str}"))
-                        .or_insert_with(RoaringBitmap::new)
+                        .or_default()
                         .insert(id);
                 }
             }
@@ -92,14 +100,14 @@ impl JsonLdMetadataIndex {
         if let Some(ctx) = jsonld.get("@context").and_then(|v| v.as_str()) {
             self.context_index
                 .entry(ctx.to_string())
-                .or_insert_with(RoaringBitmap::new)
+                .or_default()
                 .insert(id);
         }
         // named_graph
         if let Some(graph) = jsonld.get("named_graph").and_then(|v| v.as_str()) {
             self.graph_index
                 .entry(graph.to_string())
-                .or_insert_with(RoaringBitmap::new)
+                .or_default()
                 .insert(id);
         }
         // General properties
@@ -111,10 +119,7 @@ impl JsonLdMetadataIndex {
                 match val {
                     Value::String(s) => {
                         let tag = format!("{key}:{s}");
-                        self.inverted
-                            .entry(tag)
-                            .or_insert_with(RoaringBitmap::new)
-                            .insert(id);
+                        self.inverted.entry(tag).or_default().insert(id);
                     }
                     Value::Number(n) => {
                         if let Some(n64) = n.as_f64() {
@@ -124,9 +129,7 @@ impl JsonLdMetadataIndex {
                                 .or_insert_with(|| RwLock::new(BTreeMap::new()));
                             let quantized = (n64 * 1000.0) as i64; // milliscale quantization
                             if let Ok(mut tree) = entry.write() {
-                                tree.entry(quantized)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(id);
+                                tree.entry(quantized).or_default().insert(id);
                             };
                         }
                     }
@@ -134,10 +137,7 @@ impl JsonLdMetadataIndex {
                         for item in arr {
                             if let Some(s) = item.as_str() {
                                 let tag = format!("{key}:{s}");
-                                self.inverted
-                                    .entry(tag)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(id);
+                                self.inverted.entry(tag).or_default().insert(id);
                             }
                         }
                     }
@@ -155,6 +155,62 @@ impl JsonLdMetadataIndex {
             del.insert(id);
         }
         self.forward.remove(&id);
+        // Deletion and upsert replacement must become visible to filters at
+        // once. Deferring this cleanup to `vacuum` leaves stale memberships.
+        self.remove_id_from_bitmap_map(&self.inverted, id);
+        self.remove_id_from_bitmap_map(&self.type_index, id);
+        self.remove_id_from_bitmap_map(&self.graph_index, id);
+        self.remove_id_from_bitmap_map(&self.context_index, id);
+        self.remove_id_from_numeric_indexes(id);
+    }
+
+    fn remove_id_from_bitmap_map(&self, map: &DashMap<String, RoaringBitmap>, id: u32) {
+        let keys: Vec<String> = map
+            .iter()
+            .filter(|entry| entry.value().contains(id))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            if let Some(mut bitmap) = map.get_mut(&key) {
+                bitmap.remove(id);
+                if bitmap.is_empty() {
+                    drop(bitmap);
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn remove_id_from_numeric_indexes(&self, id: u32) {
+        let keys: Vec<String> = self
+            .numeric
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            let empty = if let Some(entry) = self.numeric.get(&key) {
+                let mut tree = entry.value().write().unwrap_or_else(|e| e.into_inner());
+                let buckets: Vec<i64> = tree
+                    .iter()
+                    .filter(|(_, bitmap)| bitmap.contains(id))
+                    .map(|(bucket, _)| *bucket)
+                    .collect();
+                for bucket in buckets {
+                    if let Some(bitmap) = tree.get_mut(&bucket) {
+                        bitmap.remove(id);
+                        if bitmap.is_empty() {
+                            tree.remove(&bucket);
+                        }
+                    }
+                }
+                tree.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.numeric.remove(&key);
+            }
+        }
     }
 
     pub fn undelete(&self, id: u32) {
@@ -170,7 +226,11 @@ impl JsonLdMetadataIndex {
 
     /// Get all non-deleted IDs, optionally filtered by a starting bitmap.
     pub fn all_ids_filtered(&self, filter: Option<&RoaringBitmap>) -> Vec<u32> {
-        let deleted = self.deleted.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let deleted = self
+            .deleted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let max = self.forward.iter().map(|e| *e.key()).max().unwrap_or(0);
         if let Some(fb) = filter {
             (0..=max)
@@ -190,7 +250,11 @@ impl JsonLdMetadataIndex {
 
     /// Count live entries.
     pub fn count(&self) -> u64 {
-        let deleted = self.deleted.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let deleted = self
+            .deleted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.forward
             .iter()
             .filter(|e| !deleted.contains(*e.key()))
@@ -220,7 +284,12 @@ impl JsonLdMetadataIndex {
 
     /// Get IDs matching a numeric range.
     /// gt and lt are in f64, matched against milliscale (i64) buckets.
-    pub fn ids_for_numeric_range(&self, key: &str, gte: Option<f64>, lte: Option<f64>) -> Option<RoaringBitmap> {
+    pub fn ids_for_numeric_range(
+        &self,
+        key: &str,
+        gte: Option<f64>,
+        lte: Option<f64>,
+    ) -> Option<RoaringBitmap> {
         let entry = self.numeric.get(key)?;
         let tree = entry.value().read().unwrap_or_else(|e| e.into_inner());
         let gte_q = gte.map(|v| (v * 1000.0) as i64).unwrap_or(i64::MIN);
@@ -230,7 +299,11 @@ impl JsonLdMetadataIndex {
         for (_k, bm) in tree.range(gte_q..=lte_q) {
             result |= bm;
         }
-        if result.is_empty() { None } else { Some(result) }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     /// Vacuum: remove all deleted IDs from inverted/type/numeric indexes.
@@ -242,7 +315,9 @@ impl JsonLdMetadataIndex {
         };
         for &id in &deleted_ids {
             // Scan all type_index entries for this ID
-            let type_keys: Vec<String> = self.type_index.iter()
+            let type_keys: Vec<String> = self
+                .type_index
+                .iter()
                 .filter(|e| e.value().contains(id))
                 .map(|e| e.key().clone())
                 .collect();
@@ -256,7 +331,9 @@ impl JsonLdMetadataIndex {
                 }
             }
             // Scan all inverted entries for this ID
-            let inv_keys: Vec<String> = self.inverted.iter()
+            let inv_keys: Vec<String> = self
+                .inverted
+                .iter()
                 .filter(|e| e.value().contains(id))
                 .map(|e| e.key().clone())
                 .collect();
@@ -272,7 +349,8 @@ impl JsonLdMetadataIndex {
             // Scan numeric index entries for this ID
             for mut entry in self.numeric.iter_mut() {
                 if let Ok(mut tree) = entry.value_mut().write() {
-                    let to_remove: Vec<i64> = tree.iter()
+                    let to_remove: Vec<i64> = tree
+                        .iter()
                         .filter(|(_, bm)| bm.contains(id))
                         .map(|(k, _)| *k)
                         .collect();
@@ -318,7 +396,13 @@ mod tests {
         let payload = idx.get_payload(42);
         assert!(payload.is_some());
         assert_eq!(
-            payload.unwrap().get("@type").unwrap().as_array().unwrap().len(),
+            payload
+                .unwrap()
+                .get("@type")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
             2
         );
 

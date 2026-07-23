@@ -68,11 +68,7 @@ impl ContentStore {
     /// * `cache_capacity` - Number of files to hold in LRU cache.
     /// * `max_cache_bytes` - Approximate maximum cache memory usage.
     /// * `db` - Optional redb database for historical version storage.
-    pub fn new(
-        cache_capacity: usize,
-        max_cache_bytes: usize,
-        db: Option<Database>,
-    ) -> Self {
+    pub fn new(cache_capacity: usize, max_cache_bytes: usize, db: Option<Database>) -> Self {
         Self {
             lines_cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
@@ -151,12 +147,15 @@ impl ContentStore {
 
             if disk_hash == cached.hash {
                 let mut cache = self.lines_cache.lock();
-                cache.put(path.to_string(), CachedContent {
-                    lines: cached.lines.clone(),
-                    hash: cached.hash.clone(),
-                    mtime: disk_mtime,
-                    version: cached.version,
-                });
+                cache.put(
+                    path.to_string(),
+                    CachedContent {
+                        lines: cached.lines.clone(),
+                        hash: cached.hash.clone(),
+                        mtime: disk_mtime,
+                        version: cached.version,
+                    },
+                );
                 return ReadResult {
                     path: path.to_string(),
                     lines: cached.lines,
@@ -196,12 +195,15 @@ impl ContentStore {
             };
 
             let mut cache = self.lines_cache.lock();
-            cache.put(path.to_string(), CachedContent {
-                lines: disk_lines.clone(),
-                hash: disk_hash,
-                mtime: disk_mtime,
-                version: new_version,
-            });
+            cache.put(
+                path.to_string(),
+                CachedContent {
+                    lines: disk_lines.clone(),
+                    hash: disk_hash,
+                    mtime: disk_mtime,
+                    version: new_version,
+                },
+            );
 
             return ReadResult {
                 path: path.to_string(),
@@ -222,12 +224,15 @@ impl ContentStore {
         drop(version_index);
 
         let mut cache = self.lines_cache.lock();
-        cache.put(path.to_string(), CachedContent {
-            lines: disk_lines.clone(),
-            hash: disk_hash,
-            mtime: disk_mtime,
-            version: new_version,
-        });
+        cache.put(
+            path.to_string(),
+            CachedContent {
+                lines: disk_lines.clone(),
+                hash: disk_hash,
+                mtime: disk_mtime,
+                version: new_version,
+            },
+        );
 
         ReadResult {
             path: path.to_string(),
@@ -244,10 +249,7 @@ impl ContentStore {
 
     /// Extract only the changed/inserted lines (with 3 lines of context)
     /// from a list of change ranges. Used for ReadMode::ChangedOnly.
-    fn extract_changed_lines(
-        all_lines: &[String],
-        ranges: &[(usize, usize)],
-    ) -> Vec<String> {
+    fn extract_changed_lines(all_lines: &[String], ranges: &[(usize, usize)]) -> Vec<String> {
         if ranges.is_empty() {
             return Vec::new();
         }
@@ -469,7 +471,11 @@ mod tests {
         assert_eq!(r1.version, 1);
 
         // Modify middle lines
-        create_test_file(&dir, "test.txt", "line1\nline2_modified\nline3\nline4_modified\nline5");
+        create_test_file(
+            &dir,
+            "test.txt",
+            "line1\nline2_modified\nline3\nline4_modified\nline5",
+        );
 
         let r2 = store.read_file(&path, ReadMode::Diff).unwrap();
         assert_eq!(r2.version, 2);
@@ -497,7 +503,10 @@ mod tests {
         let changed = r2.changed_lines.unwrap();
         // Should contain the changed line (with + prefix) and some context
         let all_text = changed.join(" ");
-        assert!(all_text.contains("CHANGED"), "ChangedOnly mode should include the modified line");
+        assert!(
+            all_text.contains("CHANGED"),
+            "ChangedOnly mode should include the modified line"
+        );
     }
 
     #[test]
@@ -527,6 +536,9 @@ mod tests {
         let all = extracted.join("\n");
         assert!(all.contains("+line_5"), "Should contain changed line 5");
         assert!(all.contains("+line_15"), "Should contain changed line 15");
-        assert!(all.contains("..."), "Should contain snip markers between changes");
+        assert!(
+            all.contains("..."),
+            "Should contain snip markers between changes"
+        );
     }
 }

@@ -1,5 +1,5 @@
-use crate::config::settings::ToolResultRouterSettings;
 use super::{RouteDecision, ToolResultMeta};
+use crate::config::settings::ToolResultRouterSettings;
 
 pub struct ResultRouter {
     enabled: bool,
@@ -56,7 +56,9 @@ impl ResultRouter {
         }
 
         if size <= self.threshold_large {
-            return RouteDecision::Truncate { max_chars: self.threshold_large };
+            return RouteDecision::Truncate {
+                max_chars: self.threshold_large,
+            };
         }
 
         if Self::is_structured_json(result_str) {
@@ -113,14 +115,21 @@ impl ResultRouter {
                     return false;
                 }
                 if let Some(first) = arr.first() {
-                    matches!(first, serde_json::Value::Object(_) | serde_json::Value::Array(_))
+                    matches!(
+                        first,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    )
                 } else {
                     false
                 }
             }
             serde_json::Value::Object(obj) => {
-                obj.values().any(|v| matches!(v, serde_json::Value::Object(_) | serde_json::Value::Array(_)))
-                    || obj.len() > 5
+                obj.values().any(|v| {
+                    matches!(
+                        v,
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                    )
+                }) || obj.len() > 5
             }
             _ => false,
         }
@@ -171,7 +180,11 @@ mod tests {
             .collect();
         let result = serde_json::to_string(&items).unwrap();
         // must be > threshold_large (32768) + structured JSON to trigger Graphify
-        assert!(result.len() > 32768, "result size {} should exceed threshold_large", result.len());
+        assert!(
+            result.len() > 32768,
+            "result size {} should exceed threshold_large",
+            result.len()
+        );
 
         let decision = router.route(&result, "test_tool", "call_3");
         assert!(matches!(decision, RouteDecision::Graphify { .. }));

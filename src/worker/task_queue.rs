@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::time::Duration;
 use std::io;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,16 +10,16 @@ use thiserror::Error;
 pub enum QueueError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-    
+
     #[error("Serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
-    
+
     #[error("Queue error: {0}")]
     Queue(String),
-    
+
     #[error("Timeout")]
     Timeout,
-    
+
     #[error("Queue closed")]
     Closed,
 }
@@ -151,12 +151,19 @@ impl AgentOsResult {
 impl From<crate::core::agent_runner::TaskResult> for AgentOsResult {
     fn from(result: crate::core::agent_runner::TaskResult) -> Self {
         Self {
-            task_id: result.task_iri.split('/').last().unwrap_or(&result.task_iri).to_string(),
+            task_id: result
+                .task_iri
+                .split('/')
+                .last()
+                .unwrap_or(&result.task_iri)
+                .to_string(),
             status: result.status,
             summary: result.summary,
             output: result.output,
             jsonld_output: result.jsonld_output,
-            artifacts: result.artifacts.into_iter()
+            artifacts: result
+                .artifacts
+                .into_iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect(),
             errors: result.errors,
@@ -171,7 +178,7 @@ impl From<crate::core::agent_runner::TaskResult> for AgentOsResult {
 // yaque queue implementation
 // ============================================================
 
-use yaque::queue::{Sender, Receiver};
+use yaque::queue::{Receiver, Sender};
 
 /// Activity-side task queue
 pub struct TaskQueue {
@@ -186,10 +193,10 @@ impl TaskQueue {
     pub fn new(base_path: &str) -> Result<Self, QueueError> {
         let task_path = format!("{}/tasks", base_path);
         let result_path = format!("{}/results", base_path);
-        
+
         let task_sender = Sender::open(&task_path)?;
         let result_receiver = Receiver::open(&result_path)?;
-        
+
         Ok(Self {
             task_sender,
             result_receiver,
@@ -197,15 +204,15 @@ impl TaskQueue {
             pending_results: HashMap::new(),
         })
     }
-    
+
     /// Create a client queue (only sends tasks, receives results)
     pub fn new_client(base_path: &str) -> Result<Self, QueueError> {
         let task_path = format!("{}/tasks", base_path);
         let result_path = format!("{}/results", base_path);
-        
+
         let task_sender = Sender::open(&task_path)?;
         let result_receiver = Receiver::open(&result_path)?;
-        
+
         Ok(Self {
             task_sender,
             result_receiver,
@@ -213,7 +220,7 @@ impl TaskQueue {
             pending_results: HashMap::new(),
         })
     }
-    
+
     /// Send task
     pub async fn send_task(&mut self, task: &AgentOsTask) -> Result<(), QueueError> {
         let data = serde_json::to_vec(task)?;
@@ -222,38 +229,42 @@ impl TaskQueue {
         tracing::info!(task_id = %task.task_id, "Task sent successfully");
         Ok(())
     }
-    
+
     /// Receive result for a specific task (with timeout, matched by task_id)
-    pub async fn recv_result_for_task(&mut self, task_id: &str, timeout: Duration) -> Result<Option<AgentOsResult>, QueueError> {
+    pub async fn recv_result_for_task(
+        &mut self,
+        task_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<AgentOsResult>, QueueError> {
         tracing::info!(expected_task_id = %task_id, "Starting to wait for result");
-        
+
         if let Some(result) = self.pending_results.remove(task_id) {
             tracing::info!(task_id = %task_id, "Found matching result from cache");
             return Ok(Some(result));
         }
-        
+
         let deadline = tokio::time::Instant::now() + timeout;
-        
+
         loop {
             let remaining = deadline.duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 tracing::warn!(expected_task_id = %task_id, "Timed out waiting for result");
                 return Ok(None);
             }
-            
+
             match tokio::time::timeout(remaining, self.result_receiver.recv()).await {
                 Ok(guard_result) => {
                     let guard = guard_result.map_err(|e| QueueError::Queue(e.to_string()))?;
                     let result: AgentOsResult = serde_json::from_slice(&*guard)?;
                     let _ = guard.commit();
-                    
+
                     tracing::info!(
                         expected_task_id = %task_id,
                         got_task_id = %result.task_id,
                         status = %result.status,
                         "Result received"
                     );
-                    
+
                     if result.task_id == task_id {
                         tracing::info!(task_id = %task_id, "Result matched, returning");
                         return Ok(Some(result));
@@ -269,22 +280,25 @@ impl TaskQueue {
             }
         }
     }
-    
+
     /// Receive result (with timeout, no task_id matching)
-    pub async fn recv_result_timeout(&mut self, timeout: Duration) -> Result<Option<AgentOsResult>, QueueError> {
+    pub async fn recv_result_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<AgentOsResult>, QueueError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        
+
         let guard = tokio::time::timeout_at(deadline, self.result_receiver.recv())
             .await
             .map_err(|_| QueueError::Timeout)?
             .map_err(|e| QueueError::Queue(e.to_string()))?;
-        
+
         let result: AgentOsResult = serde_json::from_slice(&*guard)?;
         let _ = guard.commit();
         tracing::debug!(task_id = %result.task_id, status = %result.status, "Result received");
         Ok(Some(result))
     }
-    
+
     /// Get queue base path
     pub fn base_path(&self) -> &str {
         &self.base_path
@@ -303,27 +317,30 @@ impl WorkerQueue {
     pub fn new(base_path: &str) -> Result<Self, QueueError> {
         let task_path = format!("{}/tasks", base_path);
         let result_path = format!("{}/results", base_path);
-        
+
         let task_receiver = Receiver::open(&task_path)?;
         let result_sender = Sender::open(&result_path)?;
-        
+
         Ok(Self {
             task_receiver,
             result_sender,
             base_path: base_path.to_string(),
         })
     }
-    
+
     /// Receive task
     pub async fn recv_task(&mut self) -> Result<AgentOsTask, QueueError> {
-        let guard = self.task_receiver.recv().await
+        let guard = self
+            .task_receiver
+            .recv()
+            .await
             .map_err(|e| QueueError::Queue(e.to_string()))?;
         let task: AgentOsTask = serde_json::from_slice(&*guard)?;
         let _ = guard.commit();
         tracing::debug!(task_id = %task.task_id, "Task received");
         Ok(task)
     }
-    
+
     /// Send result
     pub async fn send_result(&mut self, result: &AgentOsResult) -> Result<(), QueueError> {
         let data = serde_json::to_vec(result)?;
@@ -332,7 +349,7 @@ impl WorkerQueue {
         tracing::info!(task_id = %result.task_id, "Result sent successfully");
         Ok(())
     }
-    
+
     /// Get queue base path
     pub fn base_path(&self) -> &str {
         &self.base_path
@@ -346,9 +363,9 @@ impl WorkerQueue {
 #[cfg(unix)]
 pub mod uds {
     use super::*;
-    use tokio::net::{UnixStream, UnixListener};
-    use tokio_util::codec::{Framed, LengthDelimitedCodec};
     use futures::{SinkExt, StreamExt};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     /// UDS task client
     pub struct UdsTaskClient {
@@ -365,20 +382,28 @@ pub mod uds {
 
         pub async fn send(&mut self, task: &AgentOsTask) -> Result<(), QueueError> {
             let data = serde_json::to_vec(task)?;
-            self.stream.send(data.into()).await
+            self.stream
+                .send(data.into())
+                .await
                 .map_err(|e| QueueError::Queue(e.to_string()))?;
             Ok(())
         }
 
         pub async fn recv(&mut self) -> Result<AgentOsResult, QueueError> {
-            let data = self.stream.next().await
+            let data = self
+                .stream
+                .next()
+                .await
                 .ok_or(QueueError::Closed)?
                 .map_err(|e| QueueError::Queue(e.to_string()))?;
             let result = serde_json::from_slice(&data)?;
             Ok(result)
         }
 
-        pub async fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<AgentOsResult>, QueueError> {
+        pub async fn recv_timeout(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<AgentOsResult>, QueueError> {
             match tokio::time::timeout(timeout, self.recv()).await {
                 Ok(result) => result.map(Some),
                 Err(_) => Ok(None),
@@ -415,7 +440,10 @@ pub mod uds {
 
     impl UdsTaskConnection {
         pub async fn recv_task(&mut self) -> Result<AgentOsTask, QueueError> {
-            let data = self.stream.next().await
+            let data = self
+                .stream
+                .next()
+                .await
                 .ok_or(QueueError::Closed)?
                 .map_err(|e| QueueError::Queue(e.to_string()))?;
             let task = serde_json::from_slice(&data)?;
@@ -424,7 +452,9 @@ pub mod uds {
 
         pub async fn send_result(&mut self, result: &AgentOsResult) -> Result<(), QueueError> {
             let data = serde_json::to_vec(result)?;
-            self.stream.send(data.into()).await
+            self.stream
+                .send(data.into())
+                .await
                 .map_err(|e| QueueError::Queue(e.to_string()))?;
             Ok(())
         }
@@ -440,10 +470,10 @@ mod tests {
     async fn test_task_queue_basic() {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap();
-        
+
         let mut task_queue = TaskQueue::new(base_path).unwrap();
         let mut worker_queue = WorkerQueue::new(base_path).unwrap();
-        
+
         let task = AgentOsTask::new(
             "iri://task/test".to_string(),
             "Test task".to_string(),
@@ -457,16 +487,20 @@ mod tests {
                 llm_config: LlmConfig::default(),
             },
         );
-        
+
         task_queue.send_task(&task).await.unwrap();
-        
+
         let received = worker_queue.recv_task().await.unwrap();
         assert_eq!(received.task_iri, "iri://task/test");
-        
+
         let result = AgentOsResult::success(task.task_id.clone(), "completed".to_string());
         worker_queue.send_result(&result).await.unwrap();
-        
-        let received_result = task_queue.recv_result_timeout(Duration::from_secs(5)).await.unwrap().unwrap();
+
+        let received_result = task_queue
+            .recv_result_timeout(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received_result.status, "success");
     }
 }

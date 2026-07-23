@@ -8,18 +8,28 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn create_test_runner() -> AgentRunner {
     use crate::config::settings::AgentSettings;
+    use crate::config::settings::GatewaySettings;
     use crate::gateway::unified_gateway::UnifiedGateway;
     use crate::memory::l0_store::L0Store;
     use crate::memory::l2_blackboard::Blackboard;
     use crate::memory::memory_manager::MemoryManager;
     use crate::templates::template_engine::TemplateEngine;
     use crate::tools::skill_registry::SkillRegistry;
-    use crate::config::settings::GatewaySettings;
     use crate::CoreConfig;
     use std::path::Path;
 
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let test_path = format!("./data/test_l0_{}", test_id);
+    // Tests may change the process working directory concurrently.  Use an
+    // absolute, process-scoped directory so separate runners never resolve to
+    // the same redb file and contend for its exclusive lock.
+    let test_path = std::env::temp_dir()
+        .join(format!(
+            "glidinghorse-agent-runner-{}-{}",
+            std::process::id(),
+            test_id
+        ))
+        .to_string_lossy()
+        .into_owned();
     let l0 = Arc::new(L0Store::new(&test_path).unwrap());
     let blackboard = Arc::new(Blackboard::new().unwrap());
     let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
@@ -90,8 +100,10 @@ fn test_parse_jsonld_response_invalid() {
 #[test]
 fn test_extract_emphasis_from_array() {
     let runner = create_test_runner();
-    let node = JsonLdNode::new("iri://task/test".to_string(), "TaskNode")
-        .with_property("emphasis".to_string(), json!(["constraint_1", "constraint_2", "constraint_3"]));
+    let node = JsonLdNode::new("iri://task/test".to_string(), "TaskNode").with_property(
+        "emphasis".to_string(),
+        json!(["constraint_1", "constraint_2", "constraint_3"]),
+    );
 
     let emphasis = runner.extract_emphasis(&node);
     assert_eq!(emphasis.len(), 3);
@@ -114,7 +126,10 @@ fn test_extract_emphasis_with_constraints() {
     let runner = create_test_runner();
     let node = JsonLdNode::new("iri://task/test".to_string(), "TaskNode")
         .with_property("emphasis".to_string(), json!(["emphasis_1"]))
-        .with_property("constraints".to_string(), json!(["constraint_A", "constraint_B"]));
+        .with_property(
+            "constraints".to_string(),
+            json!(["constraint_A", "constraint_B"]),
+        );
 
     let emphasis = runner.extract_emphasis(&node);
     assert_eq!(emphasis.len(), 3);
@@ -136,7 +151,10 @@ fn test_apply_output_mapping_plan() {
 
     let jsonld = result.unwrap();
     assert!(jsonld.get("@id").is_some());
-    assert_eq!(jsonld.get("execution_plan"), Some(&json!("execution_plan_content")));
+    assert_eq!(
+        jsonld.get("execution_plan"),
+        Some(&json!("execution_plan_content"))
+    );
     assert_eq!(jsonld.get("plan_steps"), Some(&json!(["step_1", "step_2"])));
     assert_eq!(jsonld.get("task_iri"), Some(&json!("iri://task/123")));
     assert_eq!(jsonld.get("agent_role"), Some(&json!("PA")));
@@ -154,8 +172,14 @@ fn test_apply_output_mapping_do() {
     assert!(result.is_some());
 
     let jsonld = result.unwrap();
-    assert_eq!(jsonld.get("execution_result"), Some(&json!("execution_result")));
-    assert_eq!(jsonld.get("created_artifacts"), Some(&json!(["file_1.py", "file_2.rs"])));
+    assert_eq!(
+        jsonld.get("execution_result"),
+        Some(&json!("execution_result"))
+    );
+    assert_eq!(
+        jsonld.get("created_artifacts"),
+        Some(&json!(["file_1.py", "file_2.rs"]))
+    );
 }
 
 #[test]
@@ -187,7 +211,10 @@ fn test_apply_output_mapping_act() {
 
     let jsonld = result.unwrap();
     assert_eq!(jsonld.get("final_decision"), Some(&json!("final_decision")));
-    assert_eq!(jsonld.get("recommended_action"), Some(&json!("execute_next_step")));
+    assert_eq!(
+        jsonld.get("recommended_action"),
+        Some(&json!("execute_next_step"))
+    );
 }
 
 #[test]
@@ -289,7 +316,8 @@ fn test_try_extract_json_from_markdown_incomplete_json() {
 
 #[test]
 fn test_try_extract_json_from_markdown_multiple_json_objects() {
-    let input = r#"prefix {"a": 1} suffix {"thought": "second", "content": "content", "action": "finish"}"#;
+    let input =
+        r#"prefix {"a": 1} suffix {"thought": "second", "content": "content", "action": "finish"}"#;
     let result = AgentRunner::try_extract_json_from_markdown(input);
     assert!(result.is_some());
     let parsed: Value = serde_json::from_str(&result.unwrap()).unwrap();

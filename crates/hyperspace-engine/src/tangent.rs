@@ -182,7 +182,10 @@ mod tests {
         assert!(!result.is_empty());
         assert!(result.len() <= 6);
         // The closest in tangent space should include id_5 (x=0.2)
-        assert!(result.contains(&5), "result should contain the point closest to query");
+        assert!(
+            result.contains(&5),
+            "result should contain the point closest to query"
+        );
     }
 
     #[test]

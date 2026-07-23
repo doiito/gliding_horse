@@ -134,7 +134,11 @@ impl super::AgentRunner {
     /// Create an L1 session for the given agent/task.
     /// Planned for SA integration — currently unused.
     #[allow(dead_code)]
-    pub(super) async fn create_session(&self, agent: &AgentInstance, ctx: &TaskContext) -> L1Session {
+    pub(super) async fn create_session(
+        &self,
+        agent: &AgentInstance,
+        ctx: &TaskContext,
+    ) -> L1Session {
         self.memory_manager.lock().await.create_session(
             &agent.agent_id,
             &agent.role.to_string(),
@@ -165,7 +169,10 @@ impl super::AgentRunner {
         }
 
         if !ctx.completed_steps.is_empty() {
-            context_data.insert("completed_steps".to_string(), ctx.completed_steps.join(", "));
+            context_data.insert(
+                "completed_steps".to_string(),
+                ctx.completed_steps.join(", "),
+            );
         }
         if !ctx.pending_steps.is_empty() {
             context_data.insert("pending_steps".to_string(), ctx.pending_steps.join(", "));
@@ -184,13 +191,18 @@ impl super::AgentRunner {
             match role {
                 AgentRole::Plan => {
                     context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
-                    context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
+                    context_data
+                        .insert("five_w2h_why".to_string(), snapshot.why.description.clone());
                     if !snapshot.why.success_criteria.is_empty() {
-                        context_data.insert("five_w2h_success_criteria".to_string(), snapshot.why.success_criteria.join(", "));
+                        context_data.insert(
+                            "five_w2h_success_criteria".to_string(),
+                            snapshot.why.success_criteria.join(", "),
+                        );
                     }
                     if let Some(ref when) = snapshot.when {
                         if let Some(ref deadline) = when.deadline {
-                            context_data.insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
+                            context_data
+                                .insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
                         }
                     }
                     if let Some(ref where_) = snapshot.where_ {
@@ -203,22 +215,31 @@ impl super::AgentRunner {
                     context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
                     if let Some(ref how) = snapshot.how {
                         if let Some(ref steps) = how.required_steps {
-                            context_data.insert("five_w2h_required_steps".to_string(), steps.clone());
+                            context_data
+                                .insert("five_w2h_required_steps".to_string(), steps.clone());
                         }
                         if !how.forbidden_tools.is_empty() {
-                            context_data.insert("five_w2h_forbidden_tools".to_string(), how.forbidden_tools.join(", "));
+                            context_data.insert(
+                                "five_w2h_forbidden_tools".to_string(),
+                                how.forbidden_tools.join(", "),
+                            );
                         }
                     }
                 }
                 AgentRole::Check => {
                     context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
-                    context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
+                    context_data
+                        .insert("five_w2h_why".to_string(), snapshot.why.description.clone());
                     if !snapshot.why.success_criteria.is_empty() {
-                        context_data.insert("five_w2h_success_criteria".to_string(), snapshot.why.success_criteria.join(", "));
+                        context_data.insert(
+                            "five_w2h_success_criteria".to_string(),
+                            snapshot.why.success_criteria.join(", "),
+                        );
                     }
                     if let Some(ref when) = snapshot.when {
                         if let Some(ref deadline) = when.deadline {
-                            context_data.insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
+                            context_data
+                                .insert("five_w2h_deadline".to_string(), deadline.to_rfc3339());
                         }
                     }
                     if let Some(ref where_) = snapshot.where_ {
@@ -228,24 +249,31 @@ impl super::AgentRunner {
                     }
                     if let Some(ref how) = snapshot.how {
                         if let Some(ref steps) = how.required_steps {
-                            context_data.insert("five_w2h_required_steps".to_string(), steps.clone());
+                            context_data
+                                .insert("five_w2h_required_steps".to_string(), steps.clone());
                         }
                         if !how.forbidden_tools.is_empty() {
-                            context_data.insert("five_w2h_forbidden_tools".to_string(), how.forbidden_tools.join(", "));
+                            context_data.insert(
+                                "five_w2h_forbidden_tools".to_string(),
+                                how.forbidden_tools.join(", "),
+                            );
                         }
                     }
                     if let Some(ref how_much) = snapshot.how_much {
                         if let Some(budget) = how_much.token_budget {
-                            context_data.insert("five_w2h_token_budget".to_string(), budget.to_string());
+                            context_data
+                                .insert("five_w2h_token_budget".to_string(), budget.to_string());
                         }
                         if let Some(cycles) = how_much.max_pdca_cycles {
-                            context_data.insert("five_w2h_max_cycles".to_string(), cycles.to_string());
+                            context_data
+                                .insert("five_w2h_max_cycles".to_string(), cycles.to_string());
                         }
                     }
                 }
                 AgentRole::Act => {
                     context_data.insert("five_w2h_what".to_string(), snapshot.what.clone());
-                    context_data.insert("five_w2h_why".to_string(), snapshot.why.description.clone());
+                    context_data
+                        .insert("five_w2h_why".to_string(), snapshot.why.description.clone());
                 }
             }
         }
@@ -361,11 +389,7 @@ impl super::AgentRunner {
             self.templates
                 .render_prompt(&role_lower, "skeleton", &vars, false, None)
         {
-            let md = format!(
-                "# {} Agent.md\n\n{}\n",
-                role_name,
-                rendered,
-            );
+            let md = format!("# {} Agent.md\n\n{}\n", role_name, rendered,);
             debug!(role = %role_name, supports_reasoning = supports_reasoning, "=== agent.md (from template) ===\n{}", md);
             return md;
         }
@@ -464,7 +488,10 @@ impl super::AgentRunner {
 
     pub(super) fn build_readable_tool_menu(&self, role: &AgentRole) -> String {
         let role_str = role.to_string();
-        let tool_defs = self.tool_executor.read().tool_definitions_for_role(&role_str);
+        let tool_defs = self
+            .tool_executor
+            .read()
+            .tool_definitions_for_role(&role_str);
 
         if tool_defs.is_empty() {
             return String::new();

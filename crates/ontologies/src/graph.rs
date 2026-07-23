@@ -87,7 +87,7 @@ impl GraphStore {
         let store = self.store.lock().unwrap();
         match SparqlEvaluator::new()
             .parse_query(query)?
-            .on_store(&*store)
+            .on_store(&store)
             .execute()?
         {
             QueryResults::Solutions(solutions) => {
@@ -214,9 +214,15 @@ impl GraphStore {
                 Ok(p) => p,
                 Err(_) => return 0,
             };
-            let Ok(QueryResults::Solutions(solutions)) = prepared.on_store(&*store).execute() else { return 0 };
-            let Some(Ok(row)) = solutions.into_iter().next() else { return 0 };
-            let Some(Term::Literal(lit)) = row.get("count") else { return 0 };
+            let Ok(QueryResults::Solutions(solutions)) = prepared.on_store(&store).execute() else {
+                return 0;
+            };
+            let Some(Ok(row)) = solutions.into_iter().next() else {
+                return 0;
+            };
+            let Some(Term::Literal(lit)) = row.get("count") else {
+                return 0;
+            };
             lit.value().parse().unwrap_or(0)
         };
 

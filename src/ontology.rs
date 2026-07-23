@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 // ─── Re-exports ────────────────────────────────────────────
 
-pub use ontologies::graph::SharedGraphStore;
 pub use ontologies::graph::GraphStore as OoGraphStore;
+pub use ontologies::graph::SharedGraphStore;
 
 /// Build a `SharedGraphStore` that shares nothing with existing GH stores.
 pub fn new_shared_store() -> anyhow::Result<SharedGraphStore> {

@@ -17,12 +17,21 @@ pub struct GraphifyEngine {
 impl GraphifyEngine {
     pub fn new(max_entities: usize) -> Result<Self, String> {
         let store = KnowledgeGraphStore::new()?;
-        Ok(Self { store, max_entities })
+        Ok(Self {
+            store,
+            max_entities,
+        })
     }
 
-    pub fn with_shared_store(store: Arc<oxigraph::store::Store>, max_entities: usize) -> Result<Self, String> {
+    pub fn with_shared_store(
+        store: Arc<oxigraph::store::Store>,
+        max_entities: usize,
+    ) -> Result<Self, String> {
         let store = KnowledgeGraphStore::with_shared_store(store)?;
-        Ok(Self { store, max_entities })
+        Ok(Self {
+            store,
+            max_entities,
+        })
     }
 
     pub fn graphify_json(
@@ -61,7 +70,11 @@ impl GraphifyEngine {
             graph_name,
             entity_count,
             relation_count,
-            entity_types: analysis.entity_types.iter().map(|(t, _)| t.clone()).collect(),
+            entity_types: analysis
+                .entity_types
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect(),
             summary,
             micro_tools: vec![],
         }
@@ -93,11 +106,12 @@ impl GraphifyEngine {
                             match value {
                                 Value::Object(child) => {
                                     let child_id = format!("{}_{}", id, key);
-                                    let child_label = Self::extract_label(
-                                        child,
-                                        &child_id,
+                                    let child_label = Self::extract_label(child, &child_id);
+                                    let child_type = format!(
+                                        "https://agentos.ontology/tool-result/{}_{}",
+                                        Self::to_iri_short(&node_type),
+                                        key
                                     );
-                                    let child_type = format!("https://agentos.ontology/tool-result/{}_{}", Self::to_iri_short(&node_type), key);
 
                                     let mut child_props = HashMap::new();
                                     for (ck, cv) in child {
@@ -128,22 +142,21 @@ impl GraphifyEngine {
                                             break;
                                         }
                                         if av.is_object() {
-                                            let arr_item_id = format!(
-                                                "{}_{}_{}", id, key, ai
-                                            );
+                                            let arr_item_id = format!("{}_{}_{}", id, key, ai);
                                             let arr_item_label = Self::extract_label(
                                                 av.as_object().expect("checked is_object above"),
                                                 &arr_item_id,
                                             );
-                                            let arr_item_type =
-                                                format!("https://agentos.ontology/tool-result/{}_{}_item", Self::to_iri_short(&node_type), key);
+                                            let arr_item_type = format!(
+                                                "https://agentos.ontology/tool-result/{}_{}_item",
+                                                Self::to_iri_short(&node_type),
+                                                key
+                                            );
 
                                             let mut arr_props = HashMap::new();
                                             if let Some(obj) = av.as_object() {
                                                 for (ak, av_val) in obj {
-                                                    if !av_val.is_object()
-                                                        && !av_val.is_array()
-                                                    {
+                                                    if !av_val.is_object() && !av_val.is_array() {
                                                         arr_props
                                                             .insert(ak.clone(), av_val.clone());
                                                     }
@@ -187,7 +200,8 @@ impl GraphifyEngine {
                         let id = format!("{}_{}", call_id, idx);
                         nodes.push(NodeDef {
                             id: id.clone(),
-                            node_type: "https://agentos.ontology/tool-result/ScalarItem".to_string(),
+                            node_type: "https://agentos.ontology/tool-result/ScalarItem"
+                                .to_string(),
                             label: format!("Item {}", idx),
                             description: None,
                             properties: {
@@ -212,9 +226,9 @@ impl GraphifyEngine {
                         Value::Object(child) => {
                             if nodes.len() < max_entities {
                                 let child_id = format!("{}_{}", id, key);
-                                let child_label =
-                                    Self::extract_label(child, &child_id);
-                                let child_type = format!("https://agentos.ontology/tool-result/Child_{}", key);
+                                let child_label = Self::extract_label(child, &child_id);
+                                let child_type =
+                                    format!("https://agentos.ontology/tool-result/Child_{}", key);
 
                                 let mut child_props = HashMap::new();
                                 for (ck, cv) in child {
@@ -244,19 +258,17 @@ impl GraphifyEngine {
                                     break;
                                 }
                                 if let Some(child_obj) = av.as_object() {
-                                    let arr_item_id =
-                                        format!("{}_{}_{}", id, key, ai);
-                                    let arr_item_label = Self::extract_label(
-                                        child_obj,
-                                        &arr_item_id,
+                                    let arr_item_id = format!("{}_{}_{}", id, key, ai);
+                                    let arr_item_label =
+                                        Self::extract_label(child_obj, &arr_item_id);
+                                    let arr_item_type = format!(
+                                        "https://agentos.ontology/tool-result/{}_item",
+                                        key
                                     );
-                                    let arr_item_type =
-                                            format!("https://agentos.ontology/tool-result/{}_item", key);
 
                                     let mut arr_props = HashMap::new();
                                     for (ak, av_val) in child_obj {
-                                        if !av_val.is_object() && !av_val.is_array()
-                                        {
+                                        if !av_val.is_object() && !av_val.is_array() {
                                             arr_props.insert(ak.clone(), av_val.clone());
                                         }
                                     }
@@ -359,7 +371,10 @@ impl GraphifyEngine {
         for node in nodes.iter_mut() {
             let mut normalized = HashMap::new();
             for (key, value) in node.properties.drain() {
-                let iri_key = if key.starts_with("http://") || key.starts_with("https://") || key.starts_with("iri://") {
+                let iri_key = if key.starts_with("http://")
+                    || key.starts_with("https://")
+                    || key.starts_with("iri://")
+                {
                     key
                 } else {
                     format!("https://agentos.ontology/property/{}", key)
@@ -370,7 +385,10 @@ impl GraphifyEngine {
         }
 
         for edge in edges.iter_mut() {
-            if !edge.relation.starts_with("http://") && !edge.relation.starts_with("https://") && !edge.relation.starts_with("iri://") {
+            if !edge.relation.starts_with("http://")
+                && !edge.relation.starts_with("https://")
+                && !edge.relation.starts_with("iri://")
+            {
                 edge.relation = format!("https://agentos.ontology/relation/{}", edge.relation);
             }
         }
@@ -388,9 +406,7 @@ impl GraphifyEngine {
 
         for quad in quads {
             if quad.predicate == rdf_type {
-                if let crate::knowledge_graph::types::RdfValue::Iri(ref type_iri) =
-                    quad.object
-                {
+                if let crate::knowledge_graph::types::RdfValue::Iri(ref type_iri) = quad.object {
                     *type_counts.entry(type_iri.clone()).or_insert(0) += 1;
                     entity_count += 1;
                 }
@@ -404,10 +420,7 @@ impl GraphifyEngine {
                     .unwrap_or(&quad.predicate)
                     .to_string();
 
-                if matches!(
-                    quad.object,
-                    crate::knowledge_graph::types::RdfValue::Iri(_)
-                ) {
+                if matches!(quad.object, crate::knowledge_graph::types::RdfValue::Iri(_)) {
                     if !relation_types.contains(&pred_short) {
                         relation_types.push(pred_short);
                     }
@@ -456,7 +469,13 @@ impl GraphifyEngine {
         if !analysis.property_names.is_empty() {
             summary.push_str(&format!(
                 "Property fields: {} (total {})\n",
-                analysis.property_names.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+                analysis
+                    .property_names
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 analysis.property_names.len()
             ));
         }
@@ -482,7 +501,11 @@ mod tests {
             .collect();
         let result = engine.graphify_json(&Value::Array(items), "test_call_1", 100);
 
-        assert!(result.entity_count > 0, "entity_count should be > 0, summary: {}", result.summary);
+        assert!(
+            result.entity_count > 0,
+            "entity_count should be > 0, summary: {}",
+            result.summary
+        );
         assert!(result.graph_name.contains("test_call_1"));
         assert!(!result.summary.is_empty());
     }
@@ -499,7 +522,12 @@ mod tests {
         });
         let result = engine.graphify_json(&obj, "test_call_2", 100);
 
-        assert!(result.entity_count >= 2, "entity_count should be >= 2, got: {}, summary: {}", result.entity_count, result.summary);
+        assert!(
+            result.entity_count >= 2,
+            "entity_count should be >= 2, got: {}, summary: {}",
+            result.entity_count,
+            result.summary
+        );
     }
 
     #[test]

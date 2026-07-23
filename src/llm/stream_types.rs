@@ -60,10 +60,20 @@ pub enum ContentBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ContentBlockDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
-    ThinkingDelta { thinking: String },
-    ToolCallDelta { id: Option<String>, name: Option<String>, arguments: Option<String> },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
+    ToolCallDelta {
+        id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,42 +134,44 @@ impl StreamAccumulator {
                     ContentBlock::Thinking { .. } => {}
                 }
             }
-            StreamEvent::ContentBlockDelta(e) => {
-                match &e.delta {
-                    ContentBlockDelta::TextDelta { text } => {
-                        let idx = e.index as usize;
-                        while self.text_blocks.len() <= idx {
-                            self.text_blocks.push(String::new());
-                        }
-                        self.text_blocks[idx].push_str(text);
+            StreamEvent::ContentBlockDelta(e) => match &e.delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    let idx = e.index as usize;
+                    while self.text_blocks.len() <= idx {
+                        self.text_blocks.push(String::new());
                     }
-                    ContentBlockDelta::ThinkingDelta { thinking } => {
-                        self.thinking.push_str(thinking);
+                    self.text_blocks[idx].push_str(text);
+                }
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    self.thinking.push_str(thinking);
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    let idx = e.index as usize;
+                    while self.tool_calls.len() <= idx {
+                        self.tool_calls.push(ToolCallState::default());
                     }
-                    ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        let idx = e.index as usize;
-                        while self.tool_calls.len() <= idx {
-                            self.tool_calls.push(ToolCallState::default());
-                        }
-                        self.tool_calls[idx].arguments.push_str(partial_json);
+                    self.tool_calls[idx].arguments.push_str(partial_json);
+                }
+                ContentBlockDelta::ToolCallDelta {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let idx = e.index as usize;
+                    while self.tool_calls.len() <= idx {
+                        self.tool_calls.push(ToolCallState::default());
                     }
-                    ContentBlockDelta::ToolCallDelta { id, name, arguments } => {
-                        let idx = e.index as usize;
-                        while self.tool_calls.len() <= idx {
-                            self.tool_calls.push(ToolCallState::default());
-                        }
-                        if let Some(i) = id {
-                            self.tool_calls[idx].id = i.clone();
-                        }
-                        if let Some(n) = name {
-                            self.tool_calls[idx].name = n.clone();
-                        }
-                        if let Some(a) = arguments {
-                            self.tool_calls[idx].arguments.push_str(a);
-                        }
+                    if let Some(i) = id {
+                        self.tool_calls[idx].id = i.clone();
+                    }
+                    if let Some(n) = name {
+                        self.tool_calls[idx].name = n.clone();
+                    }
+                    if let Some(a) = arguments {
+                        self.tool_calls[idx].arguments.push_str(a);
                     }
                 }
-            }
+            },
             StreamEvent::MessageDelta(e) => {
                 self.finish_reason = e.finish_reason.clone();
                 if let Some(ref usage) = e.usage {
@@ -186,7 +198,8 @@ impl StreamAccumulator {
     }
 
     pub fn is_tool_call(&self) -> bool {
-        self.finish_reason.as_deref() == Some("tool_calls") || !self.tool_calls.iter().any(|tc| !tc.name.is_empty())
+        self.finish_reason.as_deref() == Some("tool_calls")
+            || !self.tool_calls.iter().any(|tc| !tc.name.is_empty())
     }
 }
 
@@ -240,15 +253,21 @@ mod tests {
         let mut acc = StreamAccumulator::new();
         acc.process_event(&StreamEvent::ContentBlockStart(ContentBlockStartEvent {
             index: 0,
-            content_block: ContentBlock::Text { text: String::new() },
+            content_block: ContentBlock::Text {
+                text: String::new(),
+            },
         }));
         acc.process_event(&StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
             index: 0,
-            delta: ContentBlockDelta::TextDelta { text: "Hello".to_string() },
+            delta: ContentBlockDelta::TextDelta {
+                text: "Hello".to_string(),
+            },
         }));
         acc.process_event(&StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
             index: 0,
-            delta: ContentBlockDelta::TextDelta { text: " World".to_string() },
+            delta: ContentBlockDelta::TextDelta {
+                text: " World".to_string(),
+            },
         }));
 
         assert_eq!(acc.get_text(), "Hello World");

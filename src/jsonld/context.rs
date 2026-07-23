@@ -20,9 +20,9 @@
 //! In a closed system, @context is known at compile time, avoiding remote loading latency and failure modes.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use serde_json::Value;
 
 pub const NS_AGENT: &str = "agent";
 pub const NS_TASK: &str = "task";
@@ -80,10 +80,7 @@ impl JsonLdContext {
         );
 
         for (key, value) in &self.mappings {
-            result.insert(
-                key.clone(),
-                serde_json::Value::String(value.clone()),
-            );
+            result.insert(key.clone(), serde_json::Value::String(value.clone()));
         }
 
         result
@@ -124,7 +121,9 @@ impl JsonLdContext {
             ("adv", URI_ADV),
             ("node", URI_NODE),
         ] {
-            context_map.entry(prefix.to_string()).or_insert(Value::String(uri.to_string()));
+            context_map
+                .entry(prefix.to_string())
+                .or_insert(Value::String(uri.to_string()));
         }
 
         Arc::new(Value::Object(context_map))
@@ -172,7 +171,10 @@ pub fn map_field_to_iri(field: &str) -> String {
 }
 
 /// Create a Skill-specific @context (appends skill_name / skill_version)
-pub fn create_context_for_skill(_skill_name: &str, _skill_version: &str) -> HashMap<String, serde_json::Value> {
+pub fn create_context_for_skill(
+    _skill_name: &str,
+    _skill_version: &str,
+) -> HashMap<String, serde_json::Value> {
     let ctx = JsonLdContext::context_value();
     let mut context: HashMap<String, Value> = ctx
         .as_object()
@@ -205,15 +207,17 @@ mod tests {
         mappings.insert("summary".to_string(), "task:summary".to_string());
         mappings.insert("status".to_string(), "task:status".to_string());
 
-        let ctx = JsonLdContext::with_mappings(
-            "task".to_string(),
-            URI_TASK.to_string(),
-            mappings,
-        );
+        let ctx = JsonLdContext::with_mappings("task".to_string(), URI_TASK.to_string(), mappings);
 
         let dict = ctx.to_dict();
-        assert_eq!(dict.get("task"), Some(&serde_json::Value::String(URI_TASK.to_string())));
-        assert_eq!(dict.get("summary"), Some(&serde_json::Value::String("task:summary".to_string())));
+        assert_eq!(
+            dict.get("task"),
+            Some(&serde_json::Value::String(URI_TASK.to_string()))
+        );
+        assert_eq!(
+            dict.get("summary"),
+            Some(&serde_json::Value::String("task:summary".to_string()))
+        );
     }
 
     #[test]

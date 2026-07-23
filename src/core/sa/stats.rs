@@ -1,6 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-
+use std::sync::Arc;
 
 use super::agent::SupervisorAgent;
 use super::types::*;
@@ -35,7 +34,14 @@ impl SupervisorAgent {
 
     /// Returns the atomic token counters from the agent runner.
     /// Returns (total_prompt, total_completion, last_prompt, last_completion).
-    pub fn token_usage_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    pub fn token_usage_arcs(
+        &self,
+    ) -> (
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
         (
             self.runner.total_prompt_tokens.clone(),
             self.runner.total_completion_tokens.clone(),
@@ -53,7 +59,10 @@ impl SupervisorAgent {
     }
 
     #[allow(dead_code)]
-    fn query_historical_5w2h(&self, limit: usize) -> Vec<(String, crate::core::five_w2h::Task5W2H)> {
+    fn query_historical_5w2h(
+        &self,
+        limit: usize,
+    ) -> Vec<(String, crate::core::five_w2h::Task5W2H)> {
         let mut results = Vec::new();
         let tags = vec!["5w2h".to_string(), "frozen".to_string()];
         if let Ok(entries) = self.runner.l0_store.search_by_tags(&tags) {
@@ -87,7 +96,7 @@ impl SupervisorAgent {
                 (iri.clone(), w2h.clone(), combined)
             })
             .collect();
-        
+
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().take(top_k).collect()
     }
@@ -96,17 +105,17 @@ impl SupervisorAgent {
     fn text_similarity(a: &str, b: &str) -> f32 {
         let a_lower = a.to_lowercase();
         let b_lower = b.to_lowercase();
-        
+
         let a_words: std::collections::HashSet<&str> = a_lower.split_whitespace().collect();
         let b_words: std::collections::HashSet<&str> = b_lower.split_whitespace().collect();
-        
+
         if a_words.is_empty() || b_words.is_empty() {
             return 0.0;
         }
-        
+
         let intersection = a_words.intersection(&b_words).count();
         let union = a_words.union(&b_words).count();
-        
+
         if union == 0 {
             0.0
         } else {
@@ -123,7 +132,8 @@ impl SupervisorAgent {
             return String::new();
         }
 
-        let mut experience_section = String::from("\n## Historical Experience Reference (Similar Tasks)\n");
+        let mut experience_section =
+            String::from("\n## Historical Experience Reference (Similar Tasks)\n");
         experience_section.push_str("The following historical tasks are similar to the current task, for reference only:\n\n");
 
         for (i, (iri, w2h, score)) in similar.iter().enumerate() {
@@ -144,7 +154,5 @@ impl SupervisorAgent {
 
         experience_section.push_str("**Note**: Historical experience is for reference only. Please adjust based on the actual current task.\n");
         experience_section
-    
-
-}
+    }
 }

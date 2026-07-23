@@ -253,7 +253,11 @@ impl IriRegistry {
                 let mut conflicts = Vec::new();
                 for sol in solutions.flatten() {
                     if let Some(iri_val) = sol.get("?iri") {
-                        let iri = iri_val.to_string().trim_start_matches('<').trim_end_matches('>').to_string();
+                        let iri = iri_val
+                            .to_string()
+                            .trim_start_matches('<')
+                            .trim_end_matches('>')
+                            .to_string();
                         let locations = self.resolve_impl(&iri).unwrap_or_default();
                         if locations.len() > 1 {
                             conflicts.push(IriConflict { iri, locations });
@@ -310,8 +314,7 @@ impl IriRegistry {
                 OPTIONAL {{ <{}> <https://pdca-agent.org/vocab#createdAt> ?createdAt . }}
                 }}
             }}",
-            self.registry_graph,
-            iri, iri, iri, iri
+            self.registry_graph, iri, iri, iri, iri
         );
 
         let results = self
@@ -414,7 +417,10 @@ mod tests {
         let result = registry.register("iri://task/dup", loc2);
 
         assert!(!result.is_new);
-        assert!(!result.conflicts.is_empty(), "different StorageLayer should trigger conflict");
+        assert!(
+            !result.conflicts.is_empty(),
+            "different StorageLayer should trigger conflict"
+        );
     }
 
     #[test]
@@ -447,7 +453,11 @@ mod tests {
         );
 
         let tasks = registry.resolve_by_namespace("task");
-        assert_eq!(tasks.len(), 1, "register + SPARQL should find 1 entity in 'task'");
+        assert_eq!(
+            tasks.len(),
+            1,
+            "register + SPARQL should find 1 entity in 'task'"
+        );
     }
 
     #[test]

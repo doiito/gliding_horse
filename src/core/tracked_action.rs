@@ -64,17 +64,25 @@ impl ActionTracker {
             files_created: vec![],
             files_modified: vec![],
             files_read: vec![],
-            error: result.get("error").and_then(|e| e.as_str()).map(String::from),
+            error: result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(String::from),
             tool_args: HashMap::new(),
         };
 
         match tool_name {
             "file_write" => {
                 if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                    action.tool_args.insert("path".to_string(), Value::String(path.to_string()));
+                    action
+                        .tool_args
+                        .insert("path".to_string(), Value::String(path.to_string()));
                     action.files_created.push(FileChange {
                         path: path.to_string(),
-                        size_bytes: args.get("content").and_then(|v| v.as_str()).map(|c| c.len() as u64),
+                        size_bytes: args
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .map(|c| c.len() as u64),
                         hash: None,
                     });
                 }
@@ -95,7 +103,10 @@ impl ActionTracker {
             }
             "bash" | "powershell" => {
                 if result.get("error").is_none() {
-                    action.tool_args.insert("command".to_string(), args.get("command").cloned().unwrap_or_default());
+                    action.tool_args.insert(
+                        "command".to_string(),
+                        args.get("command").cloned().unwrap_or_default(),
+                    );
                 }
             }
             _ => {}
@@ -105,11 +116,17 @@ impl ActionTracker {
     }
 
     pub fn success_count(&self) -> usize {
-        self.actions.iter().filter(|a| a.status == ActionStatus::Success).count()
+        self.actions
+            .iter()
+            .filter(|a| a.status == ActionStatus::Success)
+            .count()
     }
 
     pub fn failure_count(&self) -> usize {
-        self.actions.iter().filter(|a| a.status == ActionStatus::Failed).count()
+        self.actions
+            .iter()
+            .filter(|a| a.status == ActionStatus::Failed)
+            .count()
     }
 
     pub fn files_created_all(&self) -> Vec<&FileChange> {

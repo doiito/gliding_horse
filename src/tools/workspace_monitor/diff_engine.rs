@@ -24,8 +24,10 @@ impl DiffEngine {
             let (start_a, end_a, start_b, end_b) = group_span(&group);
             out.push_str(&format!(
                 "@@ -{},{} +{},{} @@\n",
-                start_a + 1, end_a - start_a,
-                start_b + 1, end_b - start_b,
+                start_a + 1,
+                end_a - start_a,
+                start_b + 1,
+                end_b - start_b,
             ));
 
             for op in &group {
@@ -47,10 +49,7 @@ impl DiffEngine {
         out
     }
 
-    pub fn changed_ranges(
-        old_lines: &[String],
-        new_lines: &[String],
-    ) -> Vec<(usize, usize)> {
+    pub fn changed_ranges(old_lines: &[String], new_lines: &[String]) -> Vec<(usize, usize)> {
         let old_text = old_lines.join("\n") + "\n";
         let new_text = new_lines.join("\n") + "\n";
         let diff = TextDiff::from_lines(&old_text, &new_text);

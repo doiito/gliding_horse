@@ -20,10 +20,10 @@ use glidinghorse::causal::engine::CausalEngine;
 use glidinghorse::causal::store::CausalModelStore;
 use glidinghorse::causal::types::CausalObservation;
 use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend};
-use glidinghorse::skill_graph::*;
 use glidinghorse::skill_graph::evolution::{
     EvolutionSuggestion, HealthStatus, SkillEvolutionEngine, UsageRecord,
 };
+use glidinghorse::skill_graph::*;
 
 // =====================================================================
 // Helpers (same pattern as existing tests)
@@ -39,8 +39,8 @@ fn create_test_store() -> Arc<SkillGraphStore> {
 fn create_store_with_prereqs() -> Arc<SkillGraphStore> {
     let store = Arc::new(SkillGraphStore::new());
 
-    let auth = SkillGraphNode::new("iri://skills/auth", "Auth", "Authentication")
-        .with_link(SkillLink {
+    let auth =
+        SkillGraphNode::new("iri://skills/auth", "Auth", "Authentication").with_link(SkillLink {
             link_type: SkillLinkType::Prerequisite,
             target_iri: "iri://skills/base".to_string(),
             strength: LinkStrength::Required,
@@ -80,14 +80,22 @@ fn test_failure_creates_suggestions() {
     engine.record_usage(record).unwrap();
 
     let suggestions = engine.get_pending_suggestions();
-    assert!(!suggestions.is_empty(),
-        "Recording a failure should produce suggestions, got {} suggestions", suggestions.len());
+    assert!(
+        !suggestions.is_empty(),
+        "Recording a failure should produce suggestions, got {} suggestions",
+        suggestions.len()
+    );
 
     for s in suggestions {
-        assert!(s.confidence > 0.0,
-            "Suggestion confidence should be > 0, got {}", s.confidence);
-        assert!(!s.description.is_empty(),
-            "Suggestion should have description");
+        assert!(
+            s.confidence > 0.0,
+            "Suggestion confidence should be > 0, got {}",
+            s.confidence
+        );
+        assert!(
+            !s.description.is_empty(),
+            "Suggestion should have description"
+        );
     }
 }
 
@@ -111,17 +119,20 @@ fn test_success_creates_no_suggestions() {
     }
 
     let suggestions = engine.get_pending_suggestions();
-    assert!(suggestions.is_empty(),
-        "Successful usage should NOT create suggestions");
+    assert!(
+        suggestions.is_empty(),
+        "Successful usage should NOT create suggestions"
+    );
 
     // But usage stats should be tracked
     let stats = engine.get_usage_stats("iri://skills/test-skill");
-    assert_eq!(stats.total_usage, 5,
-        "Should have recorded 5 usages, got {}", stats.total_usage);
-    assert_eq!(stats.successful, 5,
-        "All 5 should be successful");
-    assert!(stats.avg_tokens > 0,
-        "Average tokens should be > 0");
+    assert_eq!(
+        stats.total_usage, 5,
+        "Should have recorded 5 usages, got {}",
+        stats.total_usage
+    );
+    assert_eq!(stats.successful, 5, "All 5 should be successful");
+    assert!(stats.avg_tokens > 0, "Average tokens should be > 0");
 }
 
 // =====================================================================
@@ -145,8 +156,11 @@ fn test_sequential_failures_cumulative() {
     }
 
     let stats_after_batch1 = engine.get_usage_stats("iri://skills/test-skill");
-    assert_eq!(stats_after_batch1.total_usage, 2,
-        "Should have 2 usages after batch 1, got {}", stats_after_batch1.total_usage);
+    assert_eq!(
+        stats_after_batch1.total_usage, 2,
+        "Should have 2 usages after batch 1, got {}",
+        stats_after_batch1.total_usage
+    );
     assert_eq!(stats_after_batch1.failed, 2);
 
     // Batch 2: 2 more failures = cumulative
@@ -162,16 +176,24 @@ fn test_sequential_failures_cumulative() {
     }
 
     let stats_after_batch2 = engine.get_usage_stats("iri://skills/test-skill");
-    assert_eq!(stats_after_batch2.total_usage, 4,
-        "Should have 4 cumulative usages after batch 2, got {}", stats_after_batch2.total_usage);
+    assert_eq!(
+        stats_after_batch2.total_usage, 4,
+        "Should have 4 cumulative usages after batch 2, got {}",
+        stats_after_batch2.total_usage
+    );
     assert_eq!(stats_after_batch2.failed, 4);
-    assert_eq!(stats_after_batch2.success_rate, 0.0,
-        "Success rate should be 0.0 since all failed");
+    assert_eq!(
+        stats_after_batch2.success_rate, 0.0,
+        "Success rate should be 0.0 since all failed"
+    );
 
     // Suggestions should exist (from failure analysis)
     let suggestions = engine.get_pending_suggestions();
-    assert!(!suggestions.is_empty(),
-        "Cumulative failures should produce suggestions, got {} suggestions", suggestions.len());
+    assert!(
+        !suggestions.is_empty(),
+        "Cumulative failures should produce suggestions, got {} suggestions",
+        suggestions.len()
+    );
 }
 
 // =====================================================================
@@ -196,13 +218,20 @@ fn test_skill_health_analysis() {
     }
 
     let health = engine.analyze_skill_health("iri://skills/test-skill");
-    assert!(health.health_score > 0.0,
-        "Health score should be > 0, got {}", health.health_score);
-    assert_eq!(health.usage_count, 10,
-        "Health report should show 10 usages, got {}", health.usage_count);
-    assert!(!health.recommendations.is_empty()
-        || health.status == HealthStatus::Healthy,
-        "Health should either have recommendations or be Healthy");
+    assert!(
+        health.health_score > 0.0,
+        "Health score should be > 0, got {}",
+        health.health_score
+    );
+    assert_eq!(
+        health.usage_count, 10,
+        "Health report should show 10 usages, got {}",
+        health.usage_count
+    );
+    assert!(
+        !health.recommendations.is_empty() || health.status == HealthStatus::Healthy,
+        "Health should either have recommendations or be Healthy"
+    );
 }
 
 // =====================================================================
@@ -214,10 +243,16 @@ fn test_skill_health_unknown_skill() {
     let engine = SkillEvolutionEngine::new(store);
 
     let health = engine.analyze_skill_health("iri://skills/nonexistent");
-    assert_eq!(health.status, HealthStatus::NotFound,
-        "Unknown skill should be NotFound, got {:?}", health.status);
-    assert_eq!(health.health_score, 0.0,
-        "Health score for unknown should be 0.0");
+    assert_eq!(
+        health.status,
+        HealthStatus::NotFound,
+        "Unknown skill should be NotFound, got {:?}",
+        health.status
+    );
+    assert_eq!(
+        health.health_score, 0.0,
+        "Health score for unknown should be 0.0"
+    );
 }
 
 // =====================================================================
@@ -243,13 +278,15 @@ fn test_preventive_actions() {
     let actions = engine.suggest_preventive_action("iri://skills/test-skill");
     // Should return actionable strings (may or may not have specific error patterns,
     // but should at least return something for 6 failures)
-    assert!(!actions.is_empty(),
-        "Should return preventive actions after 6 failures, got {} actions", actions.len());
+    assert!(
+        !actions.is_empty(),
+        "Should return preventive actions after 6 failures, got {} actions",
+        actions.len()
+    );
 
     // Actions should be human-readable strings
     for action in &actions {
-        assert!(!action.is_empty(),
-            "Preventive action should not be empty");
+        assert!(!action.is_empty(), "Preventive action should not be empty");
     }
 }
 
@@ -278,13 +315,15 @@ fn test_causal_engine_integration() {
     // With CausalEngine attached, the failure should be analyzed
     // and produce suggestions
     let suggestions = engine.get_pending_suggestions();
-    assert!(!suggestions.is_empty(),
-        "Causal engine integration should produce suggestions, got {}", suggestions.len());
+    assert!(
+        !suggestions.is_empty(),
+        "Causal engine integration should produce suggestions, got {}",
+        suggestions.len()
+    );
 
     // All suggestions should have valid confidence
     for s in suggestions {
-        assert!(s.confidence > 0.0,
-            "Suggestion confidence should be > 0");
+        assert!(s.confidence > 0.0, "Suggestion confidence should be > 0");
     }
 }
 
@@ -318,19 +357,27 @@ fn test_causal_propagation_chain() {
 
     // Both failures should produce suggestions
     let suggestions = engine.get_pending_suggestions();
-    assert!(!suggestions.is_empty(),
-        "Propagation chain should produce suggestions, got {}", suggestions.len());
+    assert!(
+        !suggestions.is_empty(),
+        "Propagation chain should produce suggestions, got {}",
+        suggestions.len()
+    );
 
     // Should have at least one suggestion for each failing skill
-    let base_suggestions: Vec<&EvolutionSuggestion> = suggestions.iter()
+    let base_suggestions: Vec<&EvolutionSuggestion> = suggestions
+        .iter()
         .filter(|s| s.skill_iri == "iri://skills/base")
         .collect();
-    let _auth_suggestions: Vec<&EvolutionSuggestion> = suggestions.iter()
+    let _auth_suggestions: Vec<&EvolutionSuggestion> = suggestions
+        .iter()
         .filter(|s| s.skill_iri == "iri://skills/auth")
         .collect();
 
-    assert!(!base_suggestions.is_empty(),
-        "Base skill should have at least one suggestion, got {} base suggestions", base_suggestions.len());
+    assert!(
+        !base_suggestions.is_empty(),
+        "Base skill should have at least one suggestion, got {} base suggestions",
+        base_suggestions.len()
+    );
     // Auth may or may not get suggestions depending on propagation analysis timing
     // (the legacy path checks events within 60 seconds)
 }
@@ -352,12 +399,16 @@ fn test_clear_suggestions() {
     .with_error("Timeout error");
     engine.record_usage(record).unwrap();
 
-    assert!(!engine.get_pending_suggestions().is_empty(),
-        "Should have suggestions after failure");
+    assert!(
+        !engine.get_pending_suggestions().is_empty(),
+        "Should have suggestions after failure"
+    );
 
     engine.clear_suggestions();
-    assert!(engine.get_pending_suggestions().is_empty(),
-        "After clear, pending suggestions should be empty");
+    assert!(
+        engine.get_pending_suggestions().is_empty(),
+        "After clear, pending suggestions should be empty"
+    );
 }
 
 // =====================================================================
@@ -395,14 +446,15 @@ fn test_direct_causal_observation() {
     );
 
     // Infer root cause from observations
-    let _inferences = causal.infer_root_cause(&[
-        CausalObservation::new(
+    let _inferences = causal.infer_root_cause(
+        &[CausalObservation::new(
             "event:infer-001",
             "iri://skills/direct-obs",
             "network",
             "sha256:infer-abc",
-        ),
-    ], 3);
+        )],
+        3,
+    );
 
     // Should not panic - may return empty if no candidates found
     // (which is fine - the engine ran without error)

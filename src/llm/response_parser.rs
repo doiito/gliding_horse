@@ -57,10 +57,7 @@ fn parse_response_value(val: &Value) -> Result<LLMResponse, CoreError> {
         .unwrap_or("")
         .to_string();
 
-    let content = val
-        .get("content")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let content = val.get("content").cloned().unwrap_or(Value::Null);
 
     let summary = val
         .get("summary")
@@ -120,7 +117,11 @@ fn parse_tool_calls(val: &Value) -> Vec<ToolCall> {
             if name.is_empty() {
                 None
             } else {
-                Some(ToolCall { id, name, arguments: args })
+                Some(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                })
             }
         })
         .collect()

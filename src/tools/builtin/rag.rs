@@ -54,19 +54,20 @@ pub fn execute_rag_search(input: &Value) -> Result<Value, String> {
     }
 
     let mut results = Vec::new();
-    let entries = std::fs::read_dir(index_dir).map_err(|e| format!("Failed to read index directory: {}", e))?;
+    let entries = std::fs::read_dir(index_dir)
+        .map_err(|e| format!("Failed to read index directory: {}", e))?;
 
     for entry in entries.flatten() {
         if !entry.file_name().to_string_lossy().ends_with(".json") {
             continue;
         }
-        let content = std::fs::read_to_string(entry.path()).map_err(|e| format!("Failed to read index file: {}", e))?;
+        let content = std::fs::read_to_string(entry.path())
+            .map_err(|e| format!("Failed to read index file: {}", e))?;
         let doc: Value = serde_json::from_str(&content).unwrap_or_default();
 
         let text = doc["content"].as_str().unwrap_or("").to_lowercase();
-        let score = keywords.iter()
-            .filter(|kw| text.contains(*kw))
-            .count() as f64 / keywords.len().max(1) as f64;
+        let score = keywords.iter().filter(|kw| text.contains(*kw)).count() as f64
+            / keywords.len().max(1) as f64;
 
         if score > 0.0 {
             results.push(json!({
@@ -79,7 +80,9 @@ pub fn execute_rag_search(input: &Value) -> Result<Value, String> {
     }
 
     results.sort_by(|a, b| {
-        b["score"].as_f64().unwrap_or(0.0)
+        b["score"]
+            .as_f64()
+            .unwrap_or(0.0)
             .partial_cmp(&a["score"].as_f64().unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
@@ -97,11 +100,12 @@ pub fn execute_rag_index(input: &Value) -> Result<Value, String> {
         serde_json::from_value(input.clone()).map_err(|e| format!("Invalid input: {}", e))?;
 
     let index_dir = rag_index_dir();
-    std::fs::create_dir_all(&index_dir).map_err(|e| format!("Failed to create index directory: {}", e))?;
+    std::fs::create_dir_all(&index_dir)
+        .map_err(|e| format!("Failed to create index directory: {}", e))?;
 
-    let iri = params.iri.unwrap_or_else(|| {
-        format!("iri://rag/{}", uuid::Uuid::new_v4())
-    });
+    let iri = params
+        .iri
+        .unwrap_or_else(|| format!("iri://rag/{}", uuid::Uuid::new_v4()));
 
     let doc = json!({
         "iri": iri,
@@ -145,12 +149,12 @@ pub fn execute_rag_chunk(input: &Value) -> Result<Value, String> {
     let mut start = 0;
     let content_chars: Vec<char> = content.chars().collect();
     let total_len = content_chars.len();
-    
+
     while start < total_len {
         let end = (start + chunk_size).min(total_len);
         let chunk: String = content_chars[start..end].iter().collect();
         chunks.push(chunk);
-        
+
         let next_start = end.saturating_sub(overlap);
         if next_start <= start || end >= total_len {
             break;

@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 
-
 use crate::engine::SearchHit;
 use crate::hnsw::IncrementalHNSW;
 use crate::hyper_vector::EmbeddingVector;
@@ -90,11 +89,7 @@ pub fn hybrid_search(
     }
 
     // Build score maps
-    let max_text_dist = text_results
-        .first()
-        .map(|r| r.1)
-        .unwrap_or(1.0)
-        .max(0.001);
+    let max_text_dist = text_results.first().map(|r| r.1).unwrap_or(1.0).max(0.001);
     let max_struct_dist = struct_results
         .first()
         .map(|r| r.1)
@@ -143,7 +138,7 @@ pub fn hybrid_search(
 mod tests {
     use super::*;
     use crate::hyper_vector::MetricKind;
-    use crate::metric::{metric_from_kind, CosineMetric};
+    use crate::metric::metric_from_kind;
 
     fn v(coords: Vec<f64>, kind: MetricKind) -> EmbeddingVector {
         EmbeddingVector::new_unchecked(coords, kind)
@@ -151,34 +146,34 @@ mod tests {
 
     #[test]
     fn test_hybrid_search_text_only() {
-        let mut idx = IncrementalHNSW::new(
-            metric_from_kind(MetricKind::Cosine),
-            Default::default(),
-        );
-        let mut idx_struct = IncrementalHNSW::new(
-            metric_from_kind(MetricKind::Poincare),
-            Default::default(),
-        );
+        let mut idx =
+            IncrementalHNSW::new(metric_from_kind(MetricKind::Cosine), Default::default());
+        let mut idx_struct =
+            IncrementalHNSW::new(metric_from_kind(MetricKind::Poincare), Default::default());
         let meta = JsonLdMetadataIndex::new();
 
         idx.insert(0, v(vec![1.0, 0.0, 0.0, 0.0], MetricKind::Cosine));
         idx.insert(1, v(vec![0.0, 1.0, 0.0, 0.0], MetricKind::Cosine));
 
         let text_q = v(vec![1.0, 0.0, 0.0, 0.0], MetricKind::Cosine);
-        let results = hybrid_search(&mut idx, &mut idx_struct, &meta, Some(&text_q), None, 5, 1.0);
+        let results = hybrid_search(
+            &mut idx,
+            &mut idx_struct,
+            &meta,
+            Some(&text_q),
+            None,
+            5,
+            1.0,
+        );
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_hybrid_search_both_empty() {
-        let mut idx = IncrementalHNSW::new(
-            metric_from_kind(MetricKind::Cosine),
-            Default::default(),
-        );
-        let mut idx_struct = IncrementalHNSW::new(
-            metric_from_kind(MetricKind::Poincare),
-            Default::default(),
-        );
+        let mut idx =
+            IncrementalHNSW::new(metric_from_kind(MetricKind::Cosine), Default::default());
+        let mut idx_struct =
+            IncrementalHNSW::new(metric_from_kind(MetricKind::Poincare), Default::default());
         let meta = JsonLdMetadataIndex::new();
 
         let results = hybrid_search(&mut idx, &mut idx_struct, &meta, None, None, 5, 0.5);

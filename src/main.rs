@@ -1,7 +1,7 @@
+use glidinghorse::api::grpc::server::seapp::se_kernel_service_server::SeKernelServiceServer;
 use glidinghorse::api::grpc::server::AgentOSService;
 use glidinghorse::config::settings::Settings;
 use glidinghorse::utils::init_logging;
-use glidinghorse::api::grpc::server::seapp::se_kernel_service_server::SeKernelServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,11 +21,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&settings.output.directory)?;
     std::fs::create_dir_all(&settings.memory.l0.path)?;
 
-    let addr = settings.api.grpc_addr.parse().unwrap_or_else(|_| {
-        "[::1]:50051".parse().expect("default addr parse")
-    });
-    let agent_os_service = AgentOSService::new(settings)
-        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+    let addr = settings
+        .api
+        .grpc_addr
+        .parse()
+        .unwrap_or_else(|_| "[::1]:50051".parse().expect("default addr parse"));
+    let agent_os_service =
+        AgentOSService::new(settings).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
     // async initialize BatchAgent system (register agents, start triggers)
     agent_os_service.init_batch_system().await;

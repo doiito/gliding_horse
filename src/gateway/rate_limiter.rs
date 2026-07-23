@@ -7,14 +7,14 @@ use tracing::debug;
 /// Token bucket rate limiter, per-model
 pub struct RateLimiter {
     buckets: RwLock<HashMap<String, TokenBucket>>,
-    default_rate: u64,   // tokens per second
-    default_burst: u64,  // max burst size
+    default_rate: u64,  // tokens per second
+    default_burst: u64, // max burst size
 }
 
 struct TokenBucket {
     tokens: f64,
     capacity: f64,
-    rate: f64,       // tokens per second
+    rate: f64, // tokens per second
     last_refill: Instant,
 }
 
@@ -89,7 +89,11 @@ impl RateLimiter {
             }
         }
         let allowed = self.check(model, count);
-        if allowed { None } else { Some(Duration::from_millis(100)) }
+        if allowed {
+            None
+        } else {
+            Some(Duration::from_millis(100))
+        }
     }
 
     /// Async version: wait until a request can be made without blocking the runtime
@@ -102,7 +106,11 @@ impl RateLimiter {
             tokio::time::sleep(dur).await;
         }
         let allowed = self.check(model, count);
-        if allowed { None } else { Some(Duration::from_millis(100)) }
+        if allowed {
+            None
+        } else {
+            Some(Duration::from_millis(100))
+        }
     }
 
     /// Configure rate for a specific model

@@ -5,6 +5,8 @@ gateway:
   timeout_seconds: 300
   max_retries: 3
   retry_base_ms: 500
+  # deepseek-v4-flash 走 Responses API (/v1/responses)，deepseek-v4-pro 继续走 chat completions
+  use_responses_api: true
   model_mapping:
     planning: "deepseek-v4-pro"
     execution: "deepseek-v4-flash"

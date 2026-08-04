@@ -1,8 +1,8 @@
 use serde_json::Value;
 
 use crate::llm::stream_types::{
-    ContentBlockDelta, ContentBlockDeltaEvent, MessageDeltaEvent, MessageStartEvent, StreamEvent,
-    Usage,
+    ContentBlock, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    MessageDeltaEvent, MessageStartEvent, StreamEvent, Usage,
 };
 
 #[derive(Debug, Default)]
@@ -120,6 +120,14 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, SseError> {
             return Ok(None);
         }
     };
+
+    // DeepSeek Responses API streams use semantic events (type: "response.*") and
+    // terminate with response.completed / response.incomplete / response.failed —
+    // they never emit a trailing `data: [DONE]` frame.
+    let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if event_type.starts_with("response.") {
+        return parse_responses_api_event(&json);
+    }
 
     parse_openai_stream_event(&json)
 }
@@ -241,6 +249,171 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
     }
 
     Ok(None)
+}
+
+/// Parse a single DeepSeek / OpenAI Responses API stream event.
+///
+/// Responses API streams are made of semantic events (`response.created`,
+/// `response.output_text.delta`, `response.function_call_arguments.delta`, …)
+/// and end with `response.completed` / `response.incomplete` / `response.failed`.
+/// They are translated into the same internal [`StreamEvent`] vocabulary used by
+/// the chat-completions path so downstream consumers need no knowledge of the
+/// wire format.
+fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseError> {
+    let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match event_type {
+        "response.created" => {
+            let response = json.get("response");
+            let id = response
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let model = response
+                .and_then(|r| r.get("model"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Ok(Some(StreamEvent::MessageStart(MessageStartEvent {
+                id,
+                model,
+                role: "assistant".to_string(),
+            })))
+        }
+        "response.output_item.added" => {
+            let item_type = json
+                .get("item")
+                .and_then(|i| i.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let index = json
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            match item_type {
+                "function_call" | "custom_tool_call" => {
+                    let id = json
+                        .get("item")
+                        .and_then(|i| i.get("call_id"))
+                        .or_else(|| json.get("item").and_then(|i| i.get("id")))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = json
+                        .get("item")
+                        .and_then(|i| i.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok(Some(StreamEvent::ContentBlockStart(
+                        ContentBlockStartEvent {
+                            index,
+                            content_block: ContentBlock::ToolUse { id, name },
+                        },
+                    )))
+                }
+                _ => Ok(None),
+            }
+        }
+        "response.output_text.delta" => {
+            let delta = json
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta.is_empty() {
+                return Ok(None);
+            }
+            let index = json
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Ok(Some(StreamEvent::ContentBlockDelta(
+                ContentBlockDeltaEvent {
+                    index,
+                    delta: ContentBlockDelta::TextDelta {
+                        text: delta.to_string(),
+                    },
+                },
+            )))
+        }
+        "response.reasoning_text.delta" => {
+            let delta = json
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(StreamEvent::ContentBlockDelta(
+                ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: delta.to_string(),
+                    },
+                },
+            )))
+        }
+        "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+            let delta = json
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta.is_empty() {
+                return Ok(None);
+            }
+            let index = json
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Ok(Some(StreamEvent::ContentBlockDelta(
+                ContentBlockDeltaEvent {
+                    index,
+                    delta: ContentBlockDelta::ToolCallDelta {
+                        id: None,
+                        name: None,
+                        arguments: Some(delta.to_string()),
+                    },
+                },
+            )))
+        }
+        "response.completed" | "response.incomplete" | "response.failed" => {
+            let response = json.get("response");
+            let status = response
+                .and_then(|r| r.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(event_type.trim_start_matches("response."));
+            let has_tool_calls = response
+                .and_then(|r| r.get("output"))
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item.get("type").and_then(|v| v.as_str()),
+                            Some("function_call") | Some("custom_tool_call")
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            let finish_reason = match status {
+                "completed" if has_tool_calls => "tool_calls".to_string(),
+                "completed" => "stop".to_string(),
+                "incomplete" => "length".to_string(),
+                _ => "error".to_string(),
+            };
+            let usage = response.and_then(|r| r.get("usage")).map(|u| Usage {
+                prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                completion_tokens: u
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            });
+            Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {
+                finish_reason: Some(finish_reason),
+                usage,
+            })))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -418,6 +591,7 @@ impl StreamingFieldParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::stream_types::StreamAccumulator;
 
     #[test]
     fn test_sse_parser_single_frame() {
@@ -503,5 +677,150 @@ mod tests {
         assert!(result.is_some());
         let json = result.unwrap();
         assert_eq!(json["key"], "value");
+    }
+
+    #[test]
+    fn test_responses_api_text_stream() {
+        let created = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"deepseek-v4-flash\",\"status\":\"in_progress\"},\"sequence_number\":0}\n\n"
+        );
+        let delta = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\",\"sequence_number\":1}\n\n"
+        );
+        let done = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}},\"sequence_number\":2}\n\n"
+        );
+
+        let mut parser = SseParser::new();
+        let mut events = parser.push(created.as_bytes()).unwrap();
+        events.extend(parser.push(delta.as_bytes()).unwrap());
+        events.extend(parser.push(done.as_bytes()).unwrap());
+
+        let mut acc = StreamAccumulator::new();
+        for e in &events {
+            acc.process_event(e);
+        }
+        assert_eq!(acc.get_text(), "Hello");
+        assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+        let usage = acc.usage.as_ref().expect("usage should be set");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn test_responses_api_no_done_terminator() {
+        // A response stream must not depend on data: [DONE]; response.completed is the terminator.
+        let frame = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+        );
+        let event = parse_frame(frame).expect("frame should parse");
+        assert!(matches!(
+            event,
+            Some(StreamEvent::MessageDelta(MessageDeltaEvent {
+                finish_reason: Some(ref r),
+                ..
+            })) if r == "stop"
+        ));
+    }
+
+    #[test]
+    fn test_responses_api_reasoning_delta() {
+        let frame = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Let me think...\",\"sequence_number\":1}\n\n"
+        );
+        let event = parse_frame(frame).expect("frame should parse");
+        if let Some(StreamEvent::ContentBlockDelta(e)) = event {
+            assert_eq!(
+                e.delta,
+                ContentBlockDelta::ThinkingDelta {
+                    thinking: "Let me think...".to_string()
+                }
+            );
+        } else {
+            panic!("Expected ThinkingDelta");
+        }
+    }
+
+    #[test]
+    fn test_responses_api_tool_call_stream() {
+        let added = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"file_read\",\"arguments\":\"\"},\"sequence_number\":2}\n\n"
+        );
+        let args_delta = concat!(
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"/tmp/a.txt\\\"}\",\"sequence_number\":3}\n\n"
+        );
+        let done = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"file_read\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/a.txt\\\"}\"}],\"usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}},\"sequence_number\":4}\n\n"
+        );
+
+        let mut parser = SseParser::new();
+        let mut events = parser.push(added.as_bytes()).unwrap();
+        events.extend(parser.push(args_delta.as_bytes()).unwrap());
+        events.extend(parser.push(done.as_bytes()).unwrap());
+
+        let mut acc = StreamAccumulator::new();
+        for e in &events {
+            acc.process_event(e);
+        }
+
+        let tool_calls = acc.get_tool_calls();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].0, "call_1");
+        assert_eq!(tool_calls[0].1, "file_read");
+        assert_eq!(tool_calls[0].2["path"], "/tmp/a.txt");
+        assert_eq!(acc.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn test_responses_api_custom_tool_call_delta() {
+        let added = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"input\":\"\"},\"sequence_number\":1}\n\n"
+        );
+        let input_delta = concat!(
+            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"ctc_1\",\"output_index\":0,\"delta\":\"[patch body]\",\"sequence_number\":2}\n\n"
+        );
+
+        let mut parser = SseParser::new();
+        let mut events = parser.push(added.as_bytes()).unwrap();
+        events.extend(parser.push(input_delta.as_bytes()).unwrap());
+
+        let mut acc = StreamAccumulator::new();
+        for e in &events {
+            acc.process_event(e);
+        }
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert_eq!(acc.tool_calls[0].name, "apply_patch");
+        assert_eq!(acc.tool_calls[0].arguments, "[patch body]");
+    }
+
+    #[test]
+    fn test_responses_api_incomplete_sets_length() {
+        let frame = concat!(
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":100,\"total_tokens\":105}}}\n\n"
+        );
+        let event = parse_frame(frame).expect("frame should parse");
+        assert!(matches!(
+            event,
+            Some(StreamEvent::MessageDelta(MessageDeltaEvent {
+                finish_reason: Some(ref r),
+                ..
+            })) if r == "length"
+        ));
+    }
+
+    #[test]
+    fn test_responses_api_failed_sets_error() {
+        let frame = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\"},\"output\":[],\"usage\":null}}\n\n"
+        );
+        let event = parse_frame(frame).expect("frame should parse");
+        assert!(matches!(
+            event,
+            Some(StreamEvent::MessageDelta(MessageDeltaEvent {
+                finish_reason: Some(ref r),
+                ..
+            })) if r == "error"
+        ));
     }
 }

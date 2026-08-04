@@ -73,6 +73,13 @@ impl CliConfig {
             model
         };
 
+        // Responses API only affects deepseek-v4-flash (the gateway falls back to
+        // chat completions for other models), so it is safe to enable by default.
+        let use_responses_api = std::env::var("USE_RESPONSES_API")
+            .or_else(|_| std::env::var("AGENT_OS_GATEWAY_USE_RESPONSES_API"))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
         let gateway = GatewaySettings {
             base_url,
             api_key,
@@ -80,6 +87,7 @@ impl CliConfig {
             timeout_seconds: 300,
             max_retries: 2,
             retry_base_ms: 500,
+            use_responses_api,
             model_mapping: HashMap::from([
                 ("planning".to_string(), model.clone()),
                 ("execution".to_string(), model.clone()),

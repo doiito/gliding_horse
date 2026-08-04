@@ -96,6 +96,10 @@ pub struct GatewaySettings {
     pub max_retries: u32,
     #[serde(default = "default_retry_base_ms")]
     pub retry_base_ms: u64,
+    /// Route deepseek-v4-flash requests through the Responses API (`/v1/responses`)
+    /// instead of chat completions. Other models keep using chat completions.
+    #[serde(default)]
+    pub use_responses_api: bool,
     pub model_mapping: std::collections::HashMap<String, String>,
 }
 
@@ -950,6 +954,7 @@ impl Default for Settings {
                 timeout_seconds: 30,
                 max_retries: 3,
                 retry_base_ms: 500,
+                use_responses_api: false,
                 model_mapping: std::collections::HashMap::from([
                     ("planning".to_string(), "deepseek-v4-pro".to_string()),
                     ("execution".to_string(), "deepseek-v4-pro".to_string()),

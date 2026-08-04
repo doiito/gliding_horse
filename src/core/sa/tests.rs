@@ -39,6 +39,7 @@ mod tests {
             timeout_seconds: 30,
             max_retries: 3,
             retry_base_ms: 500,
+            use_responses_api: false,
             model_mapping: HashMap::new(),
         };
         let gateway = Arc::new(UnifiedGateway::new(&settings).unwrap());

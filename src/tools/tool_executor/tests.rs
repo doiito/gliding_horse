@@ -83,6 +83,7 @@ mod tests {
                 timeout_seconds: 1,
                 max_retries: 0,
                 retry_base_ms: 1,
+                use_responses_api: false,
                 model_mapping: HashMap::new(),
             })
             .unwrap(),

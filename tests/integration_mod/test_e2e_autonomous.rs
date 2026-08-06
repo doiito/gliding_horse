@@ -73,6 +73,7 @@ fn build_autonomous_system(max_iterations: u32, model: &str) -> (SupervisorAgent
         timeout_seconds: 300,
         max_retries: 3,
         retry_base_ms: 500,
+        use_responses_api: false,
         model_mapping: Default::default(),
     };
 

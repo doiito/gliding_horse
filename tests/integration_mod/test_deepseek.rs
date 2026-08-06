@@ -18,6 +18,7 @@ fn get_gateway() -> Arc<UnifiedGateway> {
         timeout_seconds: 60,
         max_retries: 2,
         retry_base_ms: 500,
+        use_responses_api: false,
         model_mapping: Default::default(),
     };
 

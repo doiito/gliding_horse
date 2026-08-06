@@ -58,6 +58,7 @@ fn test_gateway_settings() -> GatewaySettings {
         timeout_seconds: 30,
         max_retries: 3,
         retry_base_ms: 500,
+        use_responses_api: false,
         model_mapping: Default::default(),
     }
 }

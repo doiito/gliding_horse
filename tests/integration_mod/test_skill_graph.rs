@@ -458,6 +458,7 @@ fn test_skill_creator_register_axure_to_vue2() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
+        use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -557,6 +558,7 @@ fn test_skill_creator_register_axure_vue2_refactor() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
+        use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -602,6 +604,7 @@ async fn test_skill_creator_two_skills_coexist() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
+        use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -741,6 +744,7 @@ fn test_skill_creator_json_ld_validity() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
+        use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -817,6 +821,7 @@ fn test_skill_creator_disclosure_levels() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
+        use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),

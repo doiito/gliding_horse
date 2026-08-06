@@ -153,6 +153,7 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
         timeout_seconds: 180,
         max_retries: 2,
         retry_base_ms: 500,
+        use_responses_api: false,
         model_mapping: Default::default(),
     };
 

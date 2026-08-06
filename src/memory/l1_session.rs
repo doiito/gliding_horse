@@ -628,7 +628,16 @@ impl L1Session {
         reloaded
     }
 
-    /// Set turn embedding (for semantic relevance computation)
+    /// Set turn embedding (for semantic relevance computation).
+    ///
+    /// DEPRECATED: turn embeddings are set directly at the call sites
+    /// (`execution.rs` ReAct loop and `utils.rs` tool path assign
+    /// `l1_turn.embedding = Some(emb)` right after `add_summary`), so this
+    /// method has no runtime callers. Kept as a public API for programmatic
+    /// use; do not route the execution paths through it.
+    #[deprecated(
+        note = "turn embeddings are assigned directly at add_summary call sites in agent_runner"
+    )]
     pub fn set_turn_embedding(&mut self, turn_idx: usize, embedding: Vec<f32>) {
         if let Some(turn) = self.turns.get_mut(turn_idx) {
             turn.embedding = Some(embedding);

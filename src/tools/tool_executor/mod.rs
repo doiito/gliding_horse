@@ -133,8 +133,10 @@ const MICRO_TOOL_PREFIXES: &[&str] = &[
 /// Keep this table explicit: an unknown tool must still fail closed.
 fn builtin_security_skill_iri(name: &str) -> Option<&'static str> {
     match name {
-        "tool_search" | "glob_search" | "grep_search" | "file_read" | "read_agent_output"
-        | "read_full_result" | "get_entity_details" | "expand_relation" => {
+        "tool_search" | "glob_search" | "grep_search" | "file_read" | "file_list"
+        | "workspace_status" | "rag_search" | "kg_search" | "codebase_search"
+        | "knowledge_list" | "knowledge_search" | "knowledge_extract_code"
+        | "read_agent_output" | "read_full_result" | "get_entity_details" | "expand_relation" => {
             Some("iri://skills/file_read")
         }
         "bash" | "file_write" | "file_edit" => Some("iri://skills/file_write"),

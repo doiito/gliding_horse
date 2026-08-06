@@ -73,6 +73,84 @@ mod tests {
     }
 
     #[test]
+    fn security_gate_allows_aa_ca_inspection_tools_with_whitelisted_file_read() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let registry = Arc::new(SkillRegistry::new());
+            let graph = Arc::new(SkillGraphStore::new());
+            // The CLI (apps/gliding_code/src/engine.rs) registers SystemBuiltin skills like
+            // file_read into the graph and wires SecurityEngine::with_whitelisted_skills using
+            // that same SystemBuiltin set as the allowlist. Replicate that setup here so the
+            // the gate resolves iri://skills/file_read and whitelist-approves it.
+            let meta = registry.get_skill("iri://skills/file_read").unwrap();
+            graph
+                .register_skill(crate::skill_graph::types::SkillGraphNode::from_skill_meta(
+                    &meta,
+                ))
+                .unwrap();
+            let whitelist = std::collections::HashSet::from([
+                "iri://skills/file_read".to_string(),
+            ]);
+            let security = Arc::new(
+                crate::skill_graph::security::SecurityEngine::with_whitelisted_skills(
+                    graph.clone(),
+                    whitelist.clone(),
+                ),
+            );
+            executor.set_shared_skill_registry(registry);
+            executor.set_shared_skill_graph(graph);
+            executor.set_security_engine(security.clone());
+
+            // The AA/CA default inspection tools (also registered read-only workspace/KG readers)
+            // must NOT be rejected as "no registered executable skill" — otherwise the
+            // verify-first CA/AA cannot inspect the workspace and cannot verify deliverables.
+            for tool in [
+                "file_list",
+                "workspace_status",
+                "rag_search",
+                "kg_search",
+                "knowledge_list",
+                "knowledge_search",
+                "knowledge_extract_code",
+            ] {
+                // Handler-level input validation may still Err (e.g. kg_search needs "query");
+                // what matters is that the security gate never denies the tool as unregistered.
+                let outcome = executor
+                    .execute_with_security_context(
+                        tool,
+                        json!({"path": "."}),
+                        crate::skill_graph::security::SecurityContext::new("agent:test", "AA")
+                            .with_task("iri://tasks/security-test"),
+                    )
+                    .await;
+                let err = match outcome {
+                    Ok(result) => result
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    Err(e) => e,
+                };
+                assert!(
+                    !err.contains("no registered executable skill"),
+                    "tool {} was denied by gate: {}",
+                    tool,
+                    err
+                );
+            }
+
+            let audit = security
+                .get_audit_log(Some("iri://skills/file_read"), Some("agent:test"), 50)
+                .await;
+            assert!(
+                audit.iter().any(|e| e.outcome
+                    == crate::skill_graph::types::AuditOutcome::Success),
+                "whitelisted read skill should produce allow audit entries"
+            );
+        });
+    }
+
+    #[test]
     fn skill_creator_gateway_is_executor_local_and_settable_after_builtin_registration() {
         let executor = ToolExecutor::new();
         let gateway = Arc::new(

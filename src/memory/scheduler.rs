@@ -121,9 +121,6 @@ impl MemoryScheduler {
 
     pub async fn on_task_complete(&self, task_iri: &str) -> Result<(), CoreError> {
         self.blackboard.flush_dirty_nodes(&self.l0_store)?;
-        if let Err(e) = self.consistency.on_l2_write(task_iri, task_iri, &[]).await {
-            tracing::warn!("Consistency on_l2_write failed: {}", e);
-        }
         self.blackboard.release_subtree(task_iri)?;
         self.memory_bus
             .publish("TASK_COMPLETED", task_iri, "{}")

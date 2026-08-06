@@ -21,7 +21,7 @@ pub struct ConsistencyEngine {
     l0_store: Arc<L0Store>,
     blackboard: Arc<Blackboard>,
     projection: Arc<ProjectionEngine>,
-    critical_tags: RwLock<HashSet<String>>,
+    critical_tags: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ConsistencyEngine {
@@ -31,19 +31,32 @@ impl ConsistencyEngine {
         blackboard: Arc<Blackboard>,
         projection: Arc<ProjectionEngine>,
     ) -> Self {
-        let critical_tags = RwLock::new(HashSet::from([
+        let critical_tags = Arc::new(RwLock::new(HashSet::from([
             "emphasis".to_string(),
             "user_intent".to_string(),
             "confirmed_fact".to_string(),
-        ]));
+        ])));
 
-        Self {
+        let result = Self {
             memory_bus,
             l0_store,
             blackboard,
             projection,
             critical_tags,
-        }
+        };
+        let hook_blackboard = result.blackboard.clone();
+        let hook_l0 = result.l0_store.clone();
+        let hook_critical = result.critical_tags.clone();
+        let hook_projection = result.projection.clone();
+        let closure_blackboard = hook_blackboard.clone();
+        hook_blackboard.set_write_hook(move |node_iri, tags| {
+            hook_projection.invalidate_by_node(node_iri);
+            let has_critical = tags.iter().any(|t| hook_critical.read().contains(t));
+            if has_critical {
+                let _ = closure_blackboard.persist_node(node_iri, &hook_l0);
+            }
+        });
+        result
     }
 
     #[instrument(skip(self, tags))]
@@ -134,6 +147,7 @@ mod tests {
     use crate::memory::l3_projection::ProjectionEngine;
     use crate::memory::memory_bus::MemoryBus;
     use crate::CoreConfig;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     fn setup() -> (
@@ -318,5 +332,66 @@ mod tests {
 
         let node = blackboard.read_node("iri://proj_test").unwrap().unwrap();
         assert_eq!(node.mesi_state, MesiState::Modified);
+    }
+
+    #[tokio::test]
+    async fn test_write_node_with_critical_tag_flushes_to_l0() {
+        let (_consistency, blackboard, l0_store, _bus) = setup();
+        let config = CoreConfig::default();
+        let json_ld = r#"{"@id":"iri://critical/1","tags":["emphasis"]}"#;
+        blackboard
+            .write_node("iri://critical/1", json_ld, &config)
+            .unwrap();
+        assert!(l0_store.retrieve("iri://critical/1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_write_node_without_critical_tag_stays_l2_only() {
+        let (_consistency, blackboard, l0_store, _bus) = setup();
+        let config = CoreConfig::default();
+        let json_ld = r#"{"@id":"iri://normal/1","tags":["ordinary"]}"#;
+        blackboard
+            .write_node("iri://normal/1", json_ld, &config)
+            .unwrap();
+        assert!(l0_store.retrieve("iri://normal/1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_node_invalidates_l3_projection_view() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("l0_test");
+        let l0_store = Arc::new(L0Store::new(path.to_str().unwrap()).unwrap());
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let projection = Arc::new(ProjectionEngine::new(blackboard.clone(), 1024));
+        let event_bus = Arc::new(EventBus::new(100));
+        let memory_bus = Arc::new(MemoryBus::new(event_bus));
+        let _consistency = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            l0_store.clone(),
+            blackboard.clone(),
+            projection.clone(),
+        ));
+
+        let config = CoreConfig::default();
+        let node_iri = "iri://task/inval_proj/node_1";
+        let json_ld = r#"{"@id":"iri://task/inval_proj/node_1","@type":"Artifact","status":"created"}"#;
+        blackboard
+            .write_node(node_iri, json_ld, &config)
+            .unwrap();
+
+        projection
+            .project("iri://task/inval_proj", "reference_only", HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(projection.cleanup_invalid(), 0);
+
+        blackboard
+            .write_node(node_iri, json_ld, &config)
+            .unwrap();
+        assert_eq!(
+            projection.cleanup_invalid(),
+            1,
+            "write hook 应使 L3 投影视图失效(回归:P0 删除 on_l2_write 后投影失效路径断裂)"
+        );
     }
 }

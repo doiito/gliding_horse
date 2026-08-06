@@ -74,6 +74,10 @@ pub struct Blackboard {
 
     /// Pending Oxigraph sync thread handles — joined on flush_oxigraph()
     pending_syncs: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+
+    /// Optional hook invoked after every write_node, with the node IRI and its tags.
+    /// Used by ConsistencyEngine to implement WriteThrough (immediate L0 flush for critical tags).
+    write_hook: parking_lot::RwLock<Option<Arc<dyn Fn(&str, &[String]) + Send + Sync>>>,
 }
 
 impl Blackboard {
@@ -94,6 +98,7 @@ impl Blackboard {
             agent_registry: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(Vec::new()),
             pending_syncs: std::sync::Mutex::new(Vec::new()),
+            write_hook: parking_lot::RwLock::new(None),
         })
     }
 
@@ -113,7 +118,16 @@ impl Blackboard {
             agent_registry: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(Vec::new()),
             pending_syncs: std::sync::Mutex::new(Vec::new()),
+            write_hook: parking_lot::RwLock::new(None),
         })
+    }
+
+    /// Register a callback invoked after each write_node, receiving the node IRI and tags.
+    pub fn set_write_hook<F>(&self, f: F)
+    where
+        F: Fn(&str, &[String]) + Send + Sync + 'static,
+    {
+        *self.write_hook.write() = Some(Arc::new(f));
     }
 
     #[instrument(skip(self, json_ld, config))]
@@ -156,6 +170,16 @@ impl Blackboard {
 
         let jsonld_types = extract_jsonld_types(&parsed);
 
+        let node_tags: Vec<String> = parsed
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let node = Node {
             iri: node_iri.to_string(),
             json_ld: json_ld.to_string(),
@@ -165,15 +189,7 @@ impl Blackboard {
                 .get("created_by")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            tags: parsed
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            tags: node_tags.clone(),
             node_type: jsonld_types.first().cloned(),
             dirty: is_update,
             mesi_state: if is_update {
@@ -203,6 +219,7 @@ impl Blackboard {
             }
         });
         self.pending_syncs.lock().unwrap().push(handle);
+        self.reap_finished_syncs();
 
         if let Some(task_iri) = &task_iri {
             let mut task_nodes = self.task_nodes.write();
@@ -270,6 +287,11 @@ impl Blackboard {
         self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
 
         debug!(node_iri = %node_iri, size = size, is_update = is_update, "Node written to blackboard (cache + oxigraph)");
+
+        if let Some(ref hook) = *self.write_hook.read() {
+            hook(node_iri, &node_tags);
+        }
+
         Ok(())
     }
 
@@ -469,33 +491,50 @@ impl Blackboard {
             .collect();
 
         for iri in dirty_iris {
-            if let Some(mut arc_node) = self.node_cache.get_mut(&iri) {
-                let entry = crate::memory::l0_store::L0Entry {
-                    iri: arc_node.iri.clone(),
-                    content: arc_node.json_ld.clone(),
-                    importance: 0.5,
-                    access_count: 0,
-                    created_at: arc_node.created_at,
-                    last_accessed: chrono::Utc::now(),
-                    tags: arc_node.tags.clone(),
-                    metadata: serde_json::Map::new(),
-                    mesi_state: crate::memory::l0_store::MesiState::Shared,
-                    content_hash: String::new(),
-                    named_graph: arc_node.named_graph.clone(),
-                    jsonld_context: None,
-                    jsonld_types: arc_node.jsonld_types.clone(),
-                    hyperspace_point_id: None,
-                };
-                l0_store.store_entry(&entry)?;
-                let mut node = (**arc_node).clone();
-                node.dirty = false;
-                node.mesi_state = MesiState::Shared;
-                *arc_node = Arc::new(node);
+            if self.flush_node_to_l0(&iri, l0_store)? {
                 flushed += 1;
             }
         }
 
         Ok(flushed)
+    }
+
+    fn flush_node_to_l0(
+        &self,
+        node_iri: &str,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<bool, CoreError> {
+        if let Some(mut arc_node) = self.node_cache.get_mut(node_iri) {
+            let entry = crate::memory::l0_store::L0Entry {
+                iri: arc_node.iri.clone(),
+                content: arc_node.json_ld.clone(),
+                importance: 0.5,
+                access_count: 0,
+                created_at: arc_node.created_at,
+                last_accessed: chrono::Utc::now(),
+                tags: arc_node.tags.clone(),
+                metadata: serde_json::Map::new(),
+                mesi_state: crate::memory::l0_store::MesiState::Shared,
+                content_hash: String::new(),
+                named_graph: arc_node.named_graph.clone(),
+                jsonld_context: None,
+                jsonld_types: arc_node.jsonld_types.clone(),
+                hyperspace_point_id: None,
+            };
+            l0_store.store_entry(&entry)?;
+            let mut node = (**arc_node).clone();
+            node.dirty = false;
+            node.mesi_state = MesiState::Shared;
+            *arc_node = Arc::new(node);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Immediately persist a single node to L0 (WriteThrough semantics), resetting its dirty/MESI state.
+    pub fn persist_node(&self, node_iri: &str, l0_store: &crate::memory::l0_store::L0Store) -> Result<bool, CoreError> {
+        self.flush_node_to_l0(node_iri, l0_store)
     }
 
     pub fn release_subtree(&self, task_iri: &str) -> Result<usize, CoreError> {
@@ -770,6 +809,7 @@ impl Blackboard {
     }
 
     pub fn clear(&self) {
+        self.flush_oxigraph();
         self.node_cache.clear();
         self.task_nodes.write().clear();
         self.task_tree.write().clear();
@@ -854,6 +894,7 @@ impl Blackboard {
             }
         });
         self.pending_syncs.lock().unwrap().push(handle);
+        self.reap_finished_syncs();
 
         if let Some(task_iri) = &task_iri {
             let mut task_nodes = self.task_nodes.write();
@@ -956,6 +997,22 @@ impl Blackboard {
         for h in handles {
             let _ = h.join();
         }
+    }
+
+    /// Reap already-finished background sync handles so `pending_syncs`
+    /// stays bounded to in-flight syncs instead of growing unboundedly
+    /// under write-heavy workloads. Called on each handle push.
+    fn reap_finished_syncs(&self) {
+        let mut handles = self.pending_syncs.lock().unwrap();
+        let mut active = Vec::new();
+        for h in std::mem::take(&mut *handles) {
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                active.push(h);
+            }
+        }
+        *handles = active;
     }
 
     pub fn query_graph(
@@ -2727,5 +2784,49 @@ mod tests {
             msgs_future.is_empty(),
             "Should not find messages after future timestamp"
         );
+    }
+
+    #[test]
+    fn test_reap_finished_syncs_prunes_completed_handles() {
+        let bb = Blackboard::new().unwrap();
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag = done.clone();
+        let finished_handle = std::thread::spawn(move || {
+            done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // Wait until the spawned thread has actually completed.
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let park_flag = parked.clone();
+        let in_flight_handle = std::thread::spawn(move || {
+            while !park_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+
+        {
+            let mut pending = bb.pending_syncs.lock().unwrap();
+            pending.push(finished_handle);
+            pending.push(in_flight_handle);
+        }
+
+        bb.reap_finished_syncs();
+
+        let remaining = bb.pending_syncs.lock().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "finished sync handle must be reaped, in-flight one retained"
+        );
+        drop(remaining);
+
+        // Release the parked thread and join so the test exits cleanly.
+        parked.store(true, std::sync::atomic::Ordering::SeqCst);
+        let in_flight = bb.pending_syncs.lock().unwrap().pop().unwrap();
+        let _ = in_flight.join();
     }
 }

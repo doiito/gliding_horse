@@ -149,6 +149,8 @@ pub struct AgentOsWorker {
     queue: WorkerQueue,
     sa: SupervisorAgent,
     approval_notifier: Option<Arc<ChannelApprovalNotifier>>,
+    prefetch_engine: Option<Arc<PrefetchEngine>>,
+    blackboard: Arc<Blackboard>,
     /// Event bus for cross-component communication
     pub event_bus: Arc<EventBus>,
 }
@@ -198,7 +200,10 @@ impl AgentOsWorker {
 
         let projection_engine = Arc::new(ProjectionEngine::new(blackboard.clone(), 500));
 
-        let memory_bus = Arc::new(MemoryBus::new(Arc::new(EventBus::new(100))));
+        // 主事件总线提前创建,让 memory_bus 与上层共享同一总线(修复独立总线导致预取/一致性事件无人消费的缺陷)
+        let event_bus = Arc::new(EventBus::new(config.event_bus_capacity));
+
+        let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
         let consistency = Arc::new(ConsistencyEngine::new(
             memory_bus.clone(),
             l0.clone(),
@@ -310,9 +315,8 @@ impl AgentOsWorker {
         // Capture the runner's perception store so it can be shared with the SA
         let runner_perception = runner.perception_store.clone();
 
-        let event_bus = Arc::new(EventBus::new(config.event_bus_capacity));
         let sa = SupervisorAgent::new(runner, templates_engine, skills, event_bus.clone(), 20)
-            .with_memory(Some(blackboard), Some(prefetch), Some(scheduler))
+            .with_memory(Some(blackboard.clone()), Some(prefetch.clone()), Some(scheduler))
             .with_perception_store(Arc::new(runner_perception))
             .with_execution_timeout(600);
 
@@ -321,6 +325,8 @@ impl AgentOsWorker {
             queue,
             sa,
             approval_notifier,
+            prefetch_engine: Some(prefetch),
+            blackboard,
             event_bus,
         })
     }
@@ -338,6 +344,10 @@ impl AgentOsWorker {
             approval_enabled = self.approval_notifier.is_some(),
             "Agent OS Worker started"
         );
+
+        if let Some(pf) = self.prefetch_engine.clone() {
+            pf.spawn_consumer(self.event_bus.clone(), self.blackboard.clone());
+        }
 
         loop {
             match self.queue.recv_task().await {

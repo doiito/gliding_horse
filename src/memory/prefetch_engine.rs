@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use crate::core::event_bus::EventBus;
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::memory_bus::MemoryBus;
@@ -51,6 +52,49 @@ impl PrefetchEngine {
             max_hops: 2,
             top_k: 5,
         }
+    }
+
+    /// Wire a PREFETCH_REQUEST / MEMORY_PREFETCH consumer that refreshes the
+    /// entity graph from the blackboard and drains the queue on each event.
+    pub fn spawn_consumer(self: &Arc<Self>, event_bus: Arc<EventBus>, blackboard: Arc<Blackboard>) {
+        let bb = blackboard.clone();
+        let pf = self.clone();
+        event_bus.spawn_consumer(
+            vec![
+                "MEMORY_PREFETCH".to_string(),
+                "PREFETCH_REQUEST".to_string(),
+            ],
+            move |event| {
+                let bb = bb.clone();
+                let pf = pf.clone();
+                async move {
+                    let entity_iri = serde_json::from_str::<serde_json::Value>(&event.payload)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("entity_iri")
+                                .and_then(|s| s.as_str())
+                                .map(String::from)
+                        })
+                        .unwrap_or_else(|| event.task_iri.clone());
+                    if let Ok(related) = bb.query_by_types(&["KnowledgeFragment".to_string()]) {
+                        let related_iris: Vec<String> = related
+                            .iter()
+                            .map(|n| n.iri.clone())
+                            .filter(|iri| *iri != entity_iri)
+                            .collect();
+                        pf.update_entity_graph(&entity_iri, &related_iris);
+                    }
+                    match pf.execute_prefetch().await {
+                        Ok(n) => {
+                            info!(entity_iri = %entity_iri, prefetched = n, "prefetch executed on demand");
+                        }
+                        Err(e) => {
+                            warn!(entity_iri = %entity_iri, error = %e, "prefetch execution failed");
+                        }
+                    }
+                }
+            },
+        );
     }
 
     pub async fn on_intent_change(&self, new_intent: &str, current_entities: &[String]) {
@@ -267,7 +311,7 @@ impl PrefetchEngine {
         let mut graph = self.entity_graph.write();
         graph.insert(entity_iri.to_string(), related.to_vec());
         for rel in related {
-            graph.entry(rel.clone()).or_insert_with(Vec::new);
+            graph.entry(rel.clone()).or_default();
             if let Some(neighbors) = graph.get_mut(rel) {
                 if !neighbors.contains(&entity_iri.to_string()) {
                     neighbors.push(entity_iri.to_string());
@@ -310,5 +354,122 @@ impl PrefetchEngine {
 
     pub fn queue_len(&self) -> usize {
         self.queue.read().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::l2_blackboard::Blackboard;
+    use crate::memory::l3_projection::ProjectionEngine;
+    use crate::memory::memory_bus::MemoryBus;
+    use crate::core::event_bus::EventBus;
+
+    fn build() -> (Arc<PrefetchEngine>, Arc<Blackboard>) {
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let proj = Arc::new(ProjectionEngine::new(blackboard.clone(), 500));
+        let bus = Arc::new(MemoryBus::new(Arc::new(EventBus::new(100))));
+        let engine = Arc::new(PrefetchEngine::new(bus, blackboard.clone(), proj));
+        (engine, blackboard)
+    }
+
+    #[test]
+    fn update_entity_graph_builds_bidirectional_edges() {
+        let (engine, _) = build();
+        engine.update_entity_graph(
+            "iri://entity/a",
+            &["iri://entity/b".to_string(), "iri://entity/c".to_string()],
+        );
+        // hop 1 衰减 = 0.5
+        let related = engine.get_related_entities("iri://entity/a", 1);
+        let iris: Vec<String> = related.iter().map(|(i, _)| i.clone()).collect();
+        assert!(iris.contains(&"iri://entity/b".to_string()));
+        assert!(iris.contains(&"iri://entity/c".to_string()));
+        assert!(
+            related.iter().all(|(_, s)| (s - 0.5).abs() < f64::EPSILON),
+            "all 1-hop neighbors decay to 0.5, got {:?}",
+            related
+        );
+    }
+
+    #[test]
+    fn get_related_entities_excludes_self_and_respects_hops() {
+        let (engine, _) = build();
+        engine.update_entity_graph(
+            "iri://entity/root",
+            &["iri://entity/hop1".to_string()],
+        );
+        engine.update_entity_graph(
+            "iri://entity/hop1",
+            &["iri://entity/hop2".to_string()],
+        );
+        let related = engine.get_related_entities("iri://entity/root", 2);
+        let map: HashMap<String, f64> = related.into_iter().collect();
+        assert!(!map.contains_key("iri://entity/root"), "self must be excluded");
+        assert!(
+            (map["iri://entity/hop1"] - 0.5).abs() < f64::EPSILON,
+            "hop1 must decay to 0.5"
+        );
+        assert!(
+            (map["iri://entity/hop2"] - 0.25).abs() < f64::EPSILON,
+            "hop2 must decay to 0.25"
+        );
+    }
+
+    #[test]
+    fn on_intent_change_enqueues_and_rejects_duplicates() {
+        let (engine, _) = build();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            engine.on_new_entity("iri://entity/a");
+            engine.on_intent_change("new intent", &["iri://entity/a".to_string()]).await;
+            assert_eq!(engine.queue_len(), 1, "single entity enqueued via on_new_entity");
+        });
+    }
+
+    #[test]
+    fn execute_prefetch_drains_empty_queue() {
+        let (engine, _) = build();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async { engine.execute_prefetch().await.unwrap() });
+        assert_eq!(result, 0, "empty queue returns 0");
+    }
+
+    #[test]
+    fn on_new_entity_enqueues_and_cascades() {
+        let (engine, _) = build();
+        engine.update_entity_graph("iri://entity/a", &["iri://entity/b".to_string()]);
+        engine.on_new_entity("iri://entity/a");
+        assert!(engine.queue_len() >= 2, "a self + cascade b, got {}", engine.queue_len());
+    }
+
+    #[test]
+    fn prefetch_consumer_drains_queue_on_event() {
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let proj = Arc::new(ProjectionEngine::new(blackboard.clone(), 500));
+        let event_bus: Arc<EventBus> = Arc::new(EventBus::new(16));
+        let bus = Arc::new(MemoryBus::new(event_bus.clone()));
+        let engine: Arc<PrefetchEngine> =
+            Arc::new(PrefetchEngine::new(bus, blackboard.clone(), proj));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            engine.spawn_consumer(event_bus.clone(), blackboard.clone());
+            engine.on_new_entity("iri://entity/a");
+            assert!(engine.queue_len() > 0, "entity enqueued before drain");
+            let bus = MemoryBus::new(event_bus.clone());
+            bus.emit_prefetch_request("iri://entity/a", "test").await;
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if engine.queue_len() == 0 {
+                    break;
+                }
+            }
+        });
+        assert_eq!(
+            engine.queue_len(),
+            0,
+            "consumer drains the queue after PREFETCH_REQUEST event"
+        );
     }
 }

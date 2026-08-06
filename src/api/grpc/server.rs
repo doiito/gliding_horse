@@ -94,6 +94,26 @@ fn unified_graph_path(settings: &Settings) -> PathBuf {
     PathBuf::from(&settings.memory.l0.path).join("unified-graph")
 }
 
+fn node_iri_from_invalidate_event(payload: &str, fallback: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("node_iri")
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Evict a clean L2 cache line so the next read reloads from L0 (MESI-style).
+/// Dirty lines are authoritative and must be retained until flushed.
+fn evict_stale_l2_line(blackboard: &Blackboard, node_iri: &str) -> bool {
+    match blackboard.read_node(node_iri) {
+        Ok(Some(node)) if !node.dirty => blackboard.delete_node(node_iri).unwrap_or(false),
+        _ => false,
+    }
+}
+
 async fn execute_batch_agent(
     manager: &mut BatchAgentManager,
     pipeline: &ExtractorPipeline,
@@ -316,7 +336,6 @@ impl AgentOSService {
         );
 
         let eb_invalidate = event_bus.clone();
-        let l0_inv = l0.clone();
         let bb_inv = blackboard.clone();
         eb_invalidate.spawn_consumer(
             vec![
@@ -325,39 +344,22 @@ impl AgentOSService {
             ],
             move |event| {
                 let bb = bb_inv.clone();
-                let l0 = l0_inv.clone();
                 async move {
-                    tracing::info!(
-                        event_type = %event.event_type,
-                        task_iri = %event.task_iri,
-                        "Cache invalidation event consumed"
-                    );
-                    let _ = (l0, bb);
+                    let node_iri =
+                        node_iri_from_invalidate_event(&event.payload, &event.task_iri);
+                    if evict_stale_l2_line(&bb, &node_iri) {
+                        tracing::debug!(
+                            node_iri = %node_iri,
+                            event_type = %event.event_type,
+                            "Evicted clean L2 cache line on invalidation"
+                        );
+                    }
                 }
             },
         );
 
         let eb_prefetch = event_bus.clone();
-        let bb_prefetch = blackboard.clone();
-        let proj_prefetch = projection.clone();
-        eb_prefetch.spawn_consumer(
-            vec![
-                "MEMORY_PREFETCH".to_string(),
-                "PREFETCH_REQUEST".to_string(),
-            ],
-            move |event| {
-                let bb = bb_prefetch.clone();
-                let proj = proj_prefetch.clone();
-                async move {
-                    tracing::info!(
-                        event_type = %event.event_type,
-                        task_iri = %event.task_iri,
-                        "Prefetch request event consumed"
-                    );
-                    let _ = (bb, proj);
-                }
-            },
-        );
+        prefetch.spawn_consumer(eb_prefetch, blackboard.clone());
 
         let eb_tasks = event_bus.clone();
         eb_tasks.spawn_consumer(
@@ -1415,6 +1417,47 @@ mod tests {
         assert_eq!(
             unified_graph_path(&settings),
             dir.path().join("l0/unified-graph")
+        );
+    }
+
+    #[test]
+    fn evict_stale_l2_line_evicts_clean_but_keeps_dirty() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let json_ld = r#"{"@id":"iri://test/1","@type":"Test"}"#;
+
+        // Clean line: first write leaves dirty=false → evictable.
+        bb.write_node("iri://test/clean", json_ld, &config)
+            .unwrap();
+        assert!(evict_stale_l2_line(&bb, "iri://test/clean"));
+        assert!(bb.read_node("iri://test/clean").unwrap().is_none());
+
+        // Dirty line: second write marks dirty=true → must be retained.
+        bb.write_node("iri://test/dirty", json_ld, &config)
+            .unwrap();
+        bb.write_node("iri://test/dirty", json_ld, &config)
+            .unwrap();
+        assert!(!evict_stale_l2_line(&bb, "iri://test/dirty"));
+        assert!(bb.read_node("iri://test/dirty").unwrap().is_some());
+
+        // Absent line: no-op, returns false.
+        assert!(!evict_stale_l2_line(&bb, "iri://test/absent"));
+    }
+
+    #[test]
+    fn cache_invalidate_payload_extracts_node_iri_with_fallback() {
+        let payload = r#"{"node_iri":"iri://node/42"}"#;
+        assert_eq!(
+            node_iri_from_invalidate_event(payload, "iri://task/fallback"),
+            "iri://node/42".to_string()
+        );
+        assert_eq!(
+            node_iri_from_invalidate_event("not-json", "iri://task/fallback"),
+            "iri://task/fallback".to_string()
+        );
+        assert_eq!(
+            node_iri_from_invalidate_event(r#"{"other":"x"}"#, "iri://task/fallback"),
+            "iri://task/fallback".to_string()
         );
     }
 }

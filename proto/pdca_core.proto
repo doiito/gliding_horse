@@ -25,6 +25,13 @@ option java_multiple_files = true;
 // Service Definition
 // ============================================================================
 
+// DEPRECATED — declared for contract documentation only; NOT implemented server-side.
+// No `impl PDCACoreService` exists in the workspace and no client calls these RPCs.
+// Actual memory/execution access is provided by:
+//   - SeKernelService (se_app.proto): execute_stage / chat_stream / execute_task_stream / ...
+//   - HTTP surface: /api/v1/nodes, /api/v1/projections, /api/v1/events, /api/v1/skills
+//   - In-process direct calls (AgentRunner / SupervisorAgent / gliding_code engine)
+// Clients must NOT generate code against this service until it is implemented.
 service PDCACoreService {
     // -------------------------------------------
     // 1. Task Lifecycle Management

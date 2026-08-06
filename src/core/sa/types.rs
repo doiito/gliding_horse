@@ -280,3 +280,25 @@ pub struct CycleState {
     pub task_completed: bool,
     pub experience_hints: Vec<String>,
 }
+
+/// Decide whether a verify-first AA verdict requires full execution.
+///
+/// The agent_runner's `finish` action hardcodes `status: "success"` regardless
+/// of what the verify-AA actually concluded, so the final status is meaningless
+/// for verify-first plans. This recovers the intent from the AA's summary text.
+/// Conservative by design: only an explicit completion confirmation avoids
+/// re-execution; any missing/ambiguous/negative verdict means full PDCA is needed.
+pub fn verify_aa_needs_execution(summary: &str) -> bool {
+    let s = summary.to_lowercase();
+    const COMPLETION_MARKERS: [&str; 8] = [
+        "verified-pass",
+        "verified pass",
+        "task already done",
+        "already done",
+        "already satisfies",
+        "already complete",
+        "no execution needed",
+        "no need to execute",
+    ];
+    !COMPLETION_MARKERS.iter().any(|m| s.contains(m))
+}

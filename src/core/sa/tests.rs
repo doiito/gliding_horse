@@ -113,4 +113,40 @@ mod tests {
         sa.cleanup_expired_cycles(3600);
         assert!(sa.active_cycles.is_empty());
     }
+
+    #[test]
+    fn test_verify_aa_needs_execution_parses_verdict() {
+        // Verify-first AA concluded full execution is needed (the regression:
+        // the agent_runner's finish action hardcodes status "success", so this
+        // verdict must be recovered from the summary to trigger fallback_steps).
+        assert!(
+            verify_aa_needs_execution(
+                "Final verdict: needs full execution. Existing workspace has no calculator.py — deliverable is absent."
+            ),
+            "explicit needs-execution verdict must require execution"
+        );
+        assert!(
+            verify_aa_needs_execution(
+                "The existing code does NOT satisfy the task requirements. Missing: calculator.py, test_calculator.py."
+            ),
+            "missing deliverables must require execution"
+        );
+        assert!(
+            verify_aa_needs_execution(""),
+            "empty verdict must conservatively require execution"
+        );
+        // Verify-first AA confirmed the task is already done — must NOT require execution.
+        assert!(
+            !verify_aa_needs_execution(
+                "Final verdict: task already done. Existing calculator.py passes all test cases."
+            ),
+            "task-already-done verdict must not require execution"
+        );
+        assert!(
+            !verify_aa_needs_execution(
+                "VERIFIED-PASS: existing code satisfies the task requirements."
+            ),
+            "VERIFIED-PASS must not require execution"
+        );
+    }
 }

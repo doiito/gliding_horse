@@ -398,7 +398,16 @@ impl SupervisorAgent {
                 )
                 .await?;
 
-            if result.status == "success" {
+            // Verify-first: the AA's finish action hardcodes status "success" even when it
+            // concluded full execution is needed, so that status is unusable here. Only treat
+            // a verify-first cycle as complete when the AA verdict explicitly confirms the
+            // task is already done; otherwise fall through to the retry loop which runs the
+            // stored fallback_steps (full PDCA) on the next cycle.
+            let needs_execution_after_verify = cycle_num == 0
+                && plan.verify_first
+                && verify_aa_needs_execution(&result.summary);
+
+            if result.status == "success" && !needs_execution_after_verify {
                 info!(task_iri = %task_iri, cycle_num = cycle_num + 1, "PDCA cycle passed");
                 self.emit_sa_thought(
                     task_iri,

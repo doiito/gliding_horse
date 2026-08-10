@@ -168,6 +168,9 @@ jobs:
           files: |
             glidingcode-${{ matrix.target }}.tar.gz
             glidingcode-${{ matrix.target }}.zip
+            CHANGELOG.md
+          # 矩阵各 target 都会上传同一个 CHANGELOG.md，需允许覆盖
+          overwrite_files: true
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

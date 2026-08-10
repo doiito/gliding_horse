@@ -849,6 +849,16 @@ impl Blackboard {
         let is_update = self.node_cache.contains_key(node_iri);
         let jsonld_types = extract_jsonld_types(&parsed);
 
+        let node_tags: Vec<String> = parsed
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let node = Node {
             iri: node_iri.to_string(),
             json_ld: json_ld.to_string(),
@@ -858,15 +868,7 @@ impl Blackboard {
                 .get("created_by")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            tags: parsed
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            tags: node_tags.clone(),
             node_type: jsonld_types.first().cloned(),
             dirty: is_update,
             mesi_state: if is_update {
@@ -957,6 +959,11 @@ impl Blackboard {
         self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
 
         debug!(node_iri = %node_iri, graph = %graph_name, size = size, "Node written to named graph");
+
+        if let Some(ref hook) = *self.write_hook.read() {
+            hook(node_iri, &node_tags);
+        }
+
         Ok(())
     }
 
@@ -2828,5 +2835,41 @@ mod tests {
         parked.store(true, std::sync::atomic::Ordering::SeqCst);
         let in_flight = bb.pending_syncs.lock().unwrap().pop().unwrap();
         let _ = in_flight.join();
+    }
+
+    #[test]
+    fn test_write_node_to_graph_fires_write_hook() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let call_count = calls.clone();
+        let seen_iri = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_iri = seen_iri.clone();
+        bb.set_write_hook(move |node_iri, tags| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(tags.contains(&"user_intent".to_string()));
+            *captured_iri.lock().unwrap() = node_iri.to_string();
+        });
+
+        let json_ld = r#"{"@id":"iri://workspace/file/main.rs","@type":["ws:File"],"tags":["user_intent","ws:File"],"ws:filePath":"main.rs"}"#;
+        bb.write_node_to_graph(
+            "iri://workspace/file/main.rs",
+            json_ld,
+            "http://agent-os.org/workspace",
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "write_node_to_graph must trigger the ConsistencyEngine write hook exactly once"
+        );
+        assert_eq!(
+            *seen_iri.lock().unwrap(),
+            "iri://workspace/file/main.rs",
+            "hook must receive the written node IRI"
+        );
     }
 }

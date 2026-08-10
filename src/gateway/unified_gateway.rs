@@ -1004,6 +1004,34 @@ mod tests {
         assert_eq!(converted[1]["type"], "web_search");
     }
 
+    // Live integration tests hit a real external provider. The provider's
+    // streaming connection can be dropped transiently (rate-limit, network
+    // blip) even when HTTP status is 2xx, which surfaces as a transport decode
+    // error mid-body. Retry a bounded number of times with backoff before
+    // failing so the suite stays deterministic; logic assertions are unchanged.
+    async fn collect_stream_retrying(
+        gateway: &UnifiedGateway,
+        model: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<crate::llm::StreamResponse, String> {
+        let mut last_err: Option<String> = None;
+        for attempt in 0..3 {
+            match gateway
+                .stream_chat_with_params(model, messages.clone(), None, None, None, None)
+                .await
+            {
+                Ok(mut stream) => match stream.collect_all().await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => last_err = Some(format!("stream decode: {e}")),
+                },
+                Err(e) => last_err = Some(format!("request: {e}")),
+            }
+            let backoff = Duration::from_millis(400 * (1 << attempt));
+            tokio::time::sleep(backoff).await;
+        }
+        Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
+    }
+
     fn live_gateway() -> Option<UnifiedGateway> {
         let api_key = std::env::var("DEEPSEEK_API_KEY").ok()?;
         let settings = GatewaySettings {
@@ -1043,7 +1071,10 @@ mod tests {
                 reasoning_content: None,
             },
         ];
-        let response = gateway.chat_with_model("deepseek-v4-flash", messages).await.unwrap();
+        let response = gateway
+            .chat_with_model("deepseek-v4-flash", messages)
+            .await
+            .unwrap();
         assert_eq!(
             response.choices[0].message.content.as_deref().map(str::trim),
             Some("PONG")
@@ -1066,11 +1097,9 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        let mut stream = gateway
-            .stream_chat_with_params("deepseek-v4-flash", messages, None, None, None, None)
+        let response = collect_stream_retrying(&gateway, "deepseek-v4-flash", messages)
             .await
-            .unwrap();
-        let response = stream.collect_all().await.unwrap();
+            .expect("live streaming should succeed within bounded retries");
         assert!(response.content.contains('1'));
         assert!(response.content.contains('3'));
         assert!(!response.content.is_empty());

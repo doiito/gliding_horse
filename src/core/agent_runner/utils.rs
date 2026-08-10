@@ -171,6 +171,28 @@ impl super::AgentRunner {
         content_clean.chars().take(200).collect()
     }
 
+    /// When the `finish` action hardcodes `success` even after an agent declared it blocked
+    /// (e.g. "no task spec; zero deliverables"), the SA PDCA retry loop short-circuits and the
+    /// CLI shows `✅ SUCCESS` with zero output. Recover the true verdict from the summary so
+    /// callers can react honestly. Conservative: only explicit blockers downgrade the verdict.
+    pub(super) fn detect_blocker_verdict(summary: &str) -> Option<&'static str> {
+        let s = summary.to_lowercase();
+        const BLOCKER_MARKERS: [&str; 8] = [
+            "blocked: no",
+            "no task spec",
+            "missing task spec",
+            "no spec found",
+            "zero deliverables",
+            "zero deliverable",
+            "cannot proceed",
+            "blocked, cannot",
+        ];
+        if BLOCKER_MARKERS.iter().any(|m| s.contains(m)) {
+            return Some("failed");
+        }
+        None
+    }
+
     pub(crate) fn try_extract_json_from_markdown(content: &str) -> Option<String> {
         let trimmed = content.trim();
 

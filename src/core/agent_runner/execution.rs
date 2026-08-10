@@ -1599,9 +1599,11 @@ Output the summary report directly, not in JSON format."#,
                     } else {
                         Some(node_iri.clone())
                     };
+                    let verdict = Self::detect_blocker_verdict(&final_summary)
+                        .unwrap_or("success");
                     return Ok(TaskResult {
                         task_iri: ctx.task_iri,
-                        status: "success".to_string(),
+                        status: verdict.to_string(),
                         summary: final_summary,
                         output: Some(output_value),
                         jsonld_output,

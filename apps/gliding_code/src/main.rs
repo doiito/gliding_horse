@@ -160,6 +160,14 @@ fn main() -> anyhow::Result<()> {
     let log_buffer = std::sync::Arc::new(code_cli::log_buffer::LogBuffer::new());
     let shared_log = code_cli::log_buffer::SharedLogBuffer(log_buffer.clone());
 
+    // In single-shot (--prompt) mode there is no TUI log panel, so mirror every
+    // log line to stderr in real time. Without this, long-running tasks hold all
+    // logs in the in-memory buffer until the task ends, making the agent appear
+    // frozen / "jam generated nothing" while it is actually making progress.
+    if cli.prompt.is_some() {
+        log_buffer.set_mirror_to_stderr(true);
+    }
+
     // tui-markdown 0.3 spams "Could not find syntax for code block: ''" on
     // every render when encountering fenced ``` or indented (4-space) code blocks.
     // Suppress its warnings to keep the log panel clean.
@@ -332,9 +340,15 @@ fn run_single_with_logs(
 
     let result = rt.block_on(engine.process_task(prompt));
 
+    // Mirror mode writes every log line to stderr in real time, so the final
+    // dump below only needs to run when mirroring is off (e.g. interactive).
+    let mirrored = log_buffer.mirrors_to_stderr();
     // Dump logs before result so they appear in chronological order
     let logs = log_buffer.drain();
-    if !logs.is_empty() {
+    if mirrored && !logs.is_empty() {
+        eprintln!("--- END LOG DUMP ---");
+    }
+    if !mirrored && !logs.is_empty() {
         eprintln!("--- LOG DUMP ({} lines) ---", logs.len());
         for line in logs {
             eprintln!("{}", line);

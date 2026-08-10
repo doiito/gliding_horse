@@ -598,7 +598,7 @@ impl CodeCliEngine {
                 db_path: Some(ws_db_path),
                 ..Default::default()
             };
-            match WorkspaceMonitor::initialize(ws_config, None, Some(event_bus.clone())) {
+            match WorkspaceMonitor::initialize(ws_config, Some(l2.clone()), Some(event_bus.clone())) {
                 Ok(ws) => {
                     ws.register_hooks(&runner.hook_manager);
                     info!(root = %config.workspace, "WorkspaceMonitor 已初始化");

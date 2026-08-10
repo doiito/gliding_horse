@@ -256,7 +256,7 @@ impl AgentOsWorker {
                 workspace_root: ws_root.clone(),
                 ..Default::default()
             };
-            match WorkspaceMonitor::initialize(ws_config, None, None) {
+            match WorkspaceMonitor::initialize(ws_config, Some(blackboard.clone()), None) {
                 Ok(ws) => {
                     ws.register_hooks(&hook_manager);
                     info!(root = %ws_root.display(), "WorkspaceMonitor initialized");

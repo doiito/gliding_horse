@@ -326,6 +326,26 @@ fn test_try_extract_json_from_markdown_multiple_json_objects() {
 }
 
 #[test]
+fn test_detect_blocker_verdict() {
+    // Explicit blocker verdicts must downgrade from the hardcoded `success`.
+    assert_eq!(
+        AgentRunner::detect_blocker_verdict("Blocked: no task spec; archive loop stopped"),
+        Some("failed")
+    );
+    assert_eq!(
+        AgentRunner::detect_blocker_verdict(
+            "Blocked: validated no-spec blocker; zero deliverables; terminate"
+        ),
+        Some("failed")
+    );
+    assert_eq!(
+        AgentRunner::detect_blocker_verdict("Task status: success, all requirements met"),
+        None
+    );
+    assert_eq!(AgentRunner::detect_blocker_verdict(""), None);
+}
+
+#[test]
 fn test_task_result_partial_success_status() {
     let result = TaskResult {
         task_iri: "iri://task/test".to_string(),

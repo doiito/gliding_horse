@@ -590,6 +590,27 @@ impl UnifiedGateway {
             }
         }
 
+        // DeepSeek's `max_output_tokens` is a shared budget for reasoning +
+        // final output. When reasoning consumes the entire budget, the response
+        // is marked incomplete with no `message` block at all — surface that
+        // explicitly instead of silently returning `content: None`, which
+        // downstream callers would misreport as a generic "No response content".
+        if text_parts.is_empty() && tool_calls.is_empty() {
+            let status = json.get("status").and_then(|v| v.as_str());
+            let reason = json
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str());
+            if status == Some("incomplete") && reason == Some("max_output_tokens") {
+                return Err(CoreError::Internal {
+                    message: format!(
+                        "Responses API response incomplete: max_output_tokens reached with \
+                         reasoning consuming the full budget; no final text was produced"
+                    ),
+                });
+            }
+        }
+
         let finish_reason = if tool_calls.is_empty() {
             "stop"
         } else {

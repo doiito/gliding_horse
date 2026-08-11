@@ -187,6 +187,12 @@ impl PerceptionStore {
                         entries.push(entry.clone());
                     }
                 }
+                // Reclaim the task key once every entry has been consumed;
+                // consumed entries are never read back, so retention would
+                // only grow the pending map unboundedly for long-running tasks.
+                if task_entries.iter().all(|e| e.consumed) {
+                    map.remove(task_iri);
+                }
             }
         }
 
@@ -625,6 +631,30 @@ mod tests {
         );
         let text_b = store.take_perception_text("iri://task/b");
         assert!(!text_b.is_empty(), "Task b should have perception");
+    }
+
+    #[test]
+    fn test_task_key_reclaimed_after_all_consumed() {
+        let store = PerceptionStore::new();
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::System, "msg1"),
+        );
+        store.store(
+            "iri://task/t",
+            PerceptionEntry::new(PerceptionSource::BatchAgent, "msg2"),
+        );
+
+        // When: all task-level entries are consumed by a take
+        let first = store.take_perception_text("iri://task/t");
+        assert!(!first.is_empty(), "First take should have content");
+
+        // Then: the task key is reclaimed from the pending map to bound memory
+        let map = store.pending.lock().expect("PerceptionStore lock poisoned");
+        assert!(
+            map.get("iri://task/t").is_none(),
+            "Fully-consumed task key must be reclaimed"
+        );
     }
 
     #[test]

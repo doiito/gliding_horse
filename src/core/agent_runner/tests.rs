@@ -365,3 +365,38 @@ fn test_task_result_partial_success_status() {
     assert!(!result.errors.is_empty());
     assert!(result.summary.contains("partially_completed"));
 }
+
+#[test]
+fn test_build_agent_md_da_renders_workspace_files_section() {
+    let runner = create_test_runner();
+    let mut context_data = std::collections::HashMap::new();
+    context_data.insert(
+        "workspace_files".to_string(),
+        "3 files in workspace:\n- /tmp/a.js (200 bytes, 50 lines)\n- /tmp/b.js (1000 bytes, 120 lines)".to_string(),
+    );
+    let md = runner.build_agent_md(
+        AgentRole::Do,
+        "objective",
+        &context_data,
+        "deepseek-v4-pro",
+    );
+    assert!(md.contains("## Workspace Files"), "DA prompt renders file manifest");
+    assert!(md.contains("/tmp/a.js"));
+    assert!(
+        md.contains("use file_read with offset/limit"),
+        "DA prompt guides reading strategy"
+    );
+}
+
+#[test]
+fn test_build_agent_md_no_workspace_files_key_omits_section() {
+    let runner = create_test_runner();
+    let context_data = std::collections::HashMap::new();
+    let md = runner.build_agent_md(
+        AgentRole::Check,
+        "objective",
+        &context_data,
+        "deepseek-v4-pro",
+    );
+    assert!(!md.contains("## Workspace Files"));
+}

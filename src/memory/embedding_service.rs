@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ pub struct OneApiEmbeddingService {
     api_key: String,
     model: String,
     dimension: usize,
+    failure_warned: AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +41,7 @@ impl OneApiEmbeddingService {
             api_key: api_key.to_string(),
             model: model.to_string(),
             dimension,
+            failure_warned: AtomicBool::new(false),
         }
     }
 }
@@ -59,14 +62,19 @@ impl EmbeddingService for OneApiEmbeddingService {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Embedding request failed: {}", e))?;
+            .map_err(|e| {
+                warn_once_on_first_failure(&self.failure_warned, &format!("{}: {}", self.model, e));
+                format!("Embedding request failed: {}", e)
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
+            let err = format!(
                 "Embedding API returned error: {} - {}",
                 status, body
-            ));
+            );
+            warn_once_on_first_failure(&self.failure_warned, &err);
+            return Err(err);
         }
         let result: EmbeddingResponse = resp
             .json()
@@ -138,6 +146,7 @@ pub struct OllamaEmbeddingService {
     base_url: String,
     model: String,
     dimension: usize,
+    failure_warned: AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +164,7 @@ impl OllamaEmbeddingService {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             dimension,
+            failure_warned: AtomicBool::new(false),
         }
     }
 }
@@ -174,15 +184,20 @@ impl EmbeddingService for OllamaEmbeddingService {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Ollama Embedding request failed: {}", e))?;
+            .map_err(|e| {
+                warn_once_on_first_failure(&self.failure_warned, &format!("{}: {}", self.model, e));
+                format!("Ollama Embedding request failed: {}", e)
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
+            let err = format!(
                 "Ollama Embedding API returned error: {} - {}",
                 status, body
-            ));
+            );
+            warn_once_on_first_failure(&self.failure_warned, &err);
+            return Err(err);
         }
 
         let result: OllamaEmbedResponse = resp
@@ -275,6 +290,24 @@ fn fnv_hash(s: &str) -> u64 {
     h
 }
 
+/// Emit an embedding-service failure warning exactly once per process.
+///
+/// Returns `true` when this call is the first failure (and the warning was
+/// emitted), `false` for every subsequent failure. Callers (Ollama/OneAPI
+/// `embed`) invoke this on the error path so a chronically unreachable
+/// embedding backend cannot spam the log on every search/upsert.
+fn warn_once_on_first_failure(failure_warned: &AtomicBool, detail: &str) -> bool {
+    if failure_warned
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        warn!("Embedding service unreachable — semantic index/search degraded: {}", detail);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,9 +336,16 @@ mod tests {
         assert!(v.iter().any(|x| *x > 0.0));
     }
 
-    #[test]
+#[test]
     fn test_fnv() {
         assert_eq!(fnv_hash("a"), fnv_hash("a"));
-        assert_ne!(fnv_hash("a"), fnv_hash("b"));
+    }
+
+    #[test]
+    fn warn_once_emits_only_on_first_failure() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_once_on_first_failure(&flag, "ollama down"));
+        assert!(!warn_once_on_first_failure(&flag, "ollama down"));
+        assert!(!warn_once_on_first_failure(&flag, "still down"));
     }
 }

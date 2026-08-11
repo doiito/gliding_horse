@@ -366,7 +366,7 @@ Output only JSON, no other content."#,
         match self
             .runner
             .gateway
-            .chat_with_params(&model, messages, Some(0.3), Some(500), None, None)
+            .chat_with_params(&model, messages, Some(0.3), Some(4096), None, None)
             .await
         {
             Ok(response) => {
@@ -719,7 +719,7 @@ Output only JSON, no other content."#,
         let response = self
             .runner
             .gateway
-            .chat_with_params(&model, messages, Some(0.3), Some(2000), None, None)
+            .chat_with_params(&model, messages, Some(0.3), Some(8192), None, None)
             .await?;
 
         let content = response
@@ -881,7 +881,7 @@ Complexity definitions:
         let response = self
             .runner
             .gateway
-            .chat_with_params(&model, messages, Some(0.3), Some(200), None, None)
+            .chat_with_params(&model, messages, Some(0.3), Some(4096), None, None)
             .await?;
 
         let content = response

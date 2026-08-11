@@ -1365,6 +1365,63 @@ impl super::AgentRunner {
                 summary::format_iri_message(tool_name, call_id, &truncated, result_str.len())
             }
 
+            RouteDecision::FileReadPreview {
+                call_id: p_call_id,
+                max_lines,
+                max_chars,
+            } => {
+                // Keep the JSON skeleton (path/total_lines/offset) and the first
+                // max_lines lines inline; the full content stays in the micro-tool.
+                let preview = match serde_json::from_str::<Value>(result_str) {
+                    Ok(Value::Object(mut obj)) => {
+                        obj.insert("preview".to_string(), Value::Bool(true));
+                        if let Some(lines) = obj.get_mut("lines").and_then(|l| l.as_array_mut()) {
+                            let keep = lines.len().min(max_lines);
+                            lines.truncate(keep);
+                            obj.insert("returned".to_string(), Value::from(keep));
+                        }
+                        obj.insert(
+                            "message".to_string(),
+                            Value::String(format!(
+                                "Preview of first {} lines shown. Call read_full_result_{} or file_read with offset/limit to view the rest.",
+                                max_lines, p_call_id
+                            )),
+                        );
+                        serde_json::to_string(&Value::Object(obj))
+                            .unwrap_or_else(|_| result_str.to_string())
+                    }
+                    _ => summary::smart_truncate(result_str, max_chars),
+                };
+
+                self.store_micro_tool_data_persistent(
+                    &iri,
+                    serde_json::json!({
+                        "content": result_str,
+                        "tool_name": tool_name,
+                    }),
+                );
+                let read_tool_name = format!("read_full_result_{}", p_call_id);
+                let ctx = MicroToolContext {
+                    call_id: p_call_id.to_string(),
+                    storage_key: iri.clone(),
+                    tool_name: tool_name.to_string(),
+                    entity_types: vec![],
+                    preview_size: settings.preview_size,
+                };
+                {
+                    let mut exe = self.tool_executor.write();
+                    exe.register_micro_tool(&read_tool_name, ctx);
+                    if tool_name == "file_read" {
+                        if let Ok(val) = serde_json::from_str::<Value>(result_str) {
+                            if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
+                                exe.mark_file_external_read(path);
+                            }
+                        }
+                    }
+                }
+                summary::format_iri_message(tool_name, call_id, &preview, result_str.len())
+            }
+
             RouteDecision::Graphify {
                 call_id: g_call_id,
                 graph_name,

@@ -64,7 +64,7 @@ impl ToolResultCompressor {
             .filter(|(_, entry)| {
                 !entry.is_compressed && entry.content.len() > self.max_summary_length
             })
-            .map(|(i, entry)| (i, self.summarize_content(&entry.content)))
+            .map(|(i, entry)| (i, self.summarize_content(entry)))
             .collect();
 
         for (i, summary) in summaries {
@@ -75,9 +75,50 @@ impl ToolResultCompressor {
         }
     }
 
-    fn summarize_content(&self, content: &str) -> String {
+    fn summarize_content(&self, entry: &ToolResultEntry) -> String {
+        let content = &entry.content;
         if content.len() <= self.max_summary_length {
-            return content.to_string();
+            return content.clone();
+        }
+
+        let full_result_hint = format!(
+            "\nFull result: call read_full_result_{} (or file_read with offset/limit).",
+            entry.tool_call_id
+        );
+
+        // file_read results are JSON with path/total_lines — keep that context so
+        // the LLM knows which file this was and how much remains.
+        if entry.tool_name == "file_read" {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                let path = val
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown path)");
+                let total = val
+                    .get("total_lines")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let lines = val
+                    .get("lines")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.len())
+                    .unwrap_or(0);
+                let preview: String = val
+                    .get("lines")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .take(3)
+                            .filter_map(|l| l.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                return format!(
+                    "[Summary: file {} — {} lines total, {} returned]\n{}{}",
+                    path, total, lines, preview, full_result_hint
+                );
+            }
         }
 
         let lines: Vec<&str> = content.lines().take(5).collect();
@@ -88,10 +129,11 @@ impl ToolResultCompressor {
         };
 
         format!(
-            "[Summary {} bytes] {}... (total {} chars)",
+            "[Summary {} bytes] {}... (total {} chars){}",
             self.max_summary_length,
             preview,
-            content.len()
+            content.len(),
+            full_result_hint
         )
     }
 
@@ -146,6 +188,31 @@ impl ToolResultCompressor {
     }
 }
 
+/// Approximate token count of a single text. Raw `len()/4` counts UTF-8
+/// bytes, undervaluing CJK characters (3 bytes each) at 0.75 tokens/char;
+/// real tokenizers cost them ~1 token/char. CJK chars get 1 token, all
+/// other bytes stay at the 4-bytes-per-token heuristic.
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut cjk_chars = 0usize;
+    let mut other_bytes = 0usize;
+    for ch in text.chars() {
+        if is_cjk_char(ch) {
+            cjk_chars += 1;
+        } else {
+            other_bytes += ch.len_utf8();
+        }
+    }
+    cjk_chars + other_bytes / 4
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x2E80..=0x9FFF   // CJK radicals, punctuation, kana, bopomofo, unified ideographs
+        | 0xAC00..=0xD7AF // Hangul syllables
+        | 0xF900..=0xFAFF // CJK compatibility ideographs
+    )
+}
+
 pub struct ContextWindowManager {
     max_messages: usize,
     max_tokens: usize,
@@ -168,17 +235,17 @@ impl ContextWindowManager {
         messages
             .iter()
             .map(|m| {
-                let mut total = m.content.len() / 4 + m.role.len() / 4;
+                let mut total = estimate_text_tokens(&m.content) + estimate_text_tokens(&m.role);
                 if let Some(ref calls) = m.tool_calls {
                     for call in calls {
-                        total += call.function.name.len() / 4;
-                        total += call.function.arguments.len() / 4;
+                        total += estimate_text_tokens(&call.function.name);
+                        total += estimate_text_tokens(&call.function.arguments);
                         // Include tool_call_id (~36 chars per UUID)
-                        total += call.id.len() / 4;
+                        total += estimate_text_tokens(&call.id);
                     }
                 }
                 if let Some(ref id) = m.tool_call_id {
-                    total += id.len() / 4;
+                    total += estimate_text_tokens(id);
                 }
                 total
             })
@@ -420,6 +487,59 @@ mod tests {
     }
 
     #[test]
+    fn test_summarize_file_read_keeps_path_and_lines() {
+        let mut compressor = ToolResultCompressor::new(&default_settings());
+        let file_content = serde_json::json!({
+            "path": "/tmp/game.js",
+            "total_lines": 800,
+            "offset": 0,
+            "lines": (0..800).map(|i| format!("line {:04}", i)).collect::<Vec<_>>(),
+            "returned": 800,
+        })
+        .to_string();
+        assert!(file_content.len() > 200);
+
+        compressor.add_result(1, "file_read", "call_f1", &file_content);
+        compressor.add_result(2, "file_read", "call_f2", &"y".repeat(500));
+        compressor.add_result(3, "file_read", "call_f3", &"z".repeat(500));
+        compressor.add_result(4, "file_read", "call_f4", &"w".repeat(500));
+        compressor.add_result(5, "file_read", "call_f5", &"v".repeat(500));
+
+        let results = compressor.get_results();
+        let first = &results[0];
+        assert!(first.is_compressed);
+        assert!(first.content.contains("/tmp/game.js"), "summary keeps path");
+        assert!(first.content.contains("800 lines total"), "summary keeps line count");
+        assert!(
+            first.content.contains("read_full_result_call_f1"),
+            "summary points to the matching micro-tool"
+        );
+    }
+
+    #[test]
+    fn test_summarize_plain_text_preserves_old_behavior() {
+        let mut compressor = ToolResultCompressor::new(&default_settings());
+        // body > 200 chars so compression triggers, but first 3 lines are unique text
+        let long_text = "alpha line\nbeta line\ngamma line\n".to_string()
+            + &"filler content to exceed the summary length threshold for compression".repeat(4);
+
+        compressor.add_result(1, "bash", "call_t1", &long_text);
+        compressor.add_result(2, "bash", "call_t2", &"a".repeat(500));
+        compressor.add_result(3, "bash", "call_t3", &"b".repeat(500));
+        compressor.add_result(4, "bash", "call_t4", &"c".repeat(500));
+        compressor.add_result(5, "bash", "call_t5", &"d".repeat(500));
+
+        let first = &compressor.get_results()[0];
+        assert!(first.is_compressed);
+        assert!(first.content.starts_with("[Summary"));
+        assert!(first.content.contains("alpha line"), "plain preview keeps text");
+        assert!(
+            first.content.contains("read_full_result_call_t1"),
+            "plain summary also points to the micro-tool"
+        );
+    }
+
+    #[test]
     fn test_compress_tool_messages_by_call_id() {
         let mut compressor = ToolResultCompressor::new(&default_settings());
 
@@ -485,5 +605,16 @@ mod tests {
 
         assert!(!manager.should_compress(10, &empty));
         assert!(manager.should_compress(20, &empty));
+    }
+
+    #[test]
+    fn test_estimate_text_tokens_cjk_weighting() {
+        // UTF-8 Chinese is 3 bytes/char; naive len()/4 undervalued it at
+        // 0.75 tokens/char. A 4-char phrase must cost ~4 tokens, one per char.
+        assert_eq!(estimate_text_tokens("你好世界"), 4);
+        // Plain ASCII still ~4 bytes per token.
+        assert_eq!(estimate_text_tokens("Hello, world!"), 3);
+        // Mixed content weights each part correctly.
+        assert_eq!(estimate_text_tokens("你好 world"), 3);
     }
 }

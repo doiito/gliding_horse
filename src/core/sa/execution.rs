@@ -1564,7 +1564,7 @@ Output only JSON."#,
             let response = self
                 .runner
                 .gateway
-                .chat_with_params(&model, messages, Some(0.3), Some(1000), None, None)
+                .chat_with_params(&model, messages, Some(0.3), Some(8192), None, None)
                 .await
                 .map_err(|e| CoreError::Internal {
                     message: format!("Recursive decomposition LLM call failed: {}", e),

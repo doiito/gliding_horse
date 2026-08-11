@@ -7,6 +7,26 @@ use crate::CoreError;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// Upper bound on distinct experience hints injected into the LLM prompt.
+/// Perception events plus skill discovery results can overlap; the cap keeps
+/// the prompt lean while retaining the first-seen (highest priority) hints.
+const MAX_ALL_HINTS: usize = 20;
+
+/// Deduplicate hints preserving first-seen order, then truncate to `cap`.
+fn dedup_hints(hints: Vec<String>, cap: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(cap.min(hints.len()));
+    let mut out = Vec::with_capacity(cap.min(hints.len()));
+    for h in hints {
+        if out.len() >= cap {
+            break;
+        }
+        if seen.insert(h.clone()) {
+            out.push(h);
+        }
+    }
+    out
+}
+
 impl SupervisorAgent {
     #[instrument(skip(self, user_input), fields(task_iri = %task_iri))]
     pub async fn process_task(
@@ -133,6 +153,7 @@ impl SupervisorAgent {
                 );
             }
         }
+        all_hints = dedup_hints(all_hints, MAX_ALL_HINTS);
 
         // Unified execution path: build ExecutionPlan from JSON-LD workflow or LLM
         let mut plan = if let Some(ref wf_jsonld) = ctx.workflow_jsonld {
@@ -491,5 +512,58 @@ impl SupervisorAgent {
             tracked_actions: Vec::new(),
             archive_iri: None,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dedup_hints_removes_duplicates_preserving_order() {
+        // Given: hints with interleaved duplicates from perception + skill discovery
+        let hints = vec![
+            "skill:calculator".to_string(),
+            "workspace_event:main.rs modified".to_string(),
+            "skill:calculator".to_string(),
+            "scenario:debug loop".to_string(),
+        ];
+        // When: deduplicated with generous cap
+        let deduped = dedup_hints(hints, 10);
+        // Then: first occurrences kept, order preserved, count reduced
+        assert_eq!(
+            deduped,
+            vec![
+                "skill:calculator".to_string(),
+                "workspace_event:main.rs modified".to_string(),
+                "scenario:debug loop".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dedup_hints_respects_cap() {
+        // Given: 5 distinct hints and a cap of 3
+        let hints = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+        // When: deduplicated with cap 3
+        let deduped = dedup_hints(hints, 3);
+        // Then: only the first 3 distinct hints remain
+        assert_eq!(deduped, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn test_dedup_hints_empty_input() {
+        // Given: empty hints
+        let hints: Vec<String> = Vec::new();
+        // When: deduplicated
+        let deduped = dedup_hints(hints, 5);
+        // Then: empty output
+        assert!(deduped.is_empty());
     }
 }

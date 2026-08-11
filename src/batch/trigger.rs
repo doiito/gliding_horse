@@ -175,11 +175,27 @@ impl TriggerSystem {
                                 event_type = %event.event_type,
                                 "TriggerSystem received custom event"
                             );
-                            // Wake up via a trigger on the window
-                            let win = window.write();
-                            // Add a synthetic entry so the window can detect it
-                            // Actual re-evaluation is triggered by the manager polling
-                            let _ = win;
+                            // Add a synthetic entry so the window can detect it.
+                            // Actual re-evaluation is triggered by the manager polling.
+                            let mut win = window.write();
+                            let entry = crate::batch::types::WindowEntry {
+                                message_id: event.event_id.clone(),
+                                role: "event".to_string(),
+                                content: event.payload.clone(),
+                                timestamp: event.timestamp,
+                                estimated_intent: None,
+                                metadata: std::collections::HashMap::from([
+                                    ("event_type".to_string(), event.event_type.clone()),
+                                    ("task_iri".to_string(), event.task_iri.clone()),
+                                    (
+                                        "source_agent_iri".to_string(),
+                                        event.source_agent_iri.clone(),
+                                    ),
+                                ]),
+                            };
+                            if let Err(error) = win.push(entry) {
+                                warn!(%error, "Failed to enqueue custom event into window");
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -247,5 +263,36 @@ mod tests {
         let base = Utc::now();
         assert!(parse_cron_next("", base).is_none());
         assert!(parse_cron_next("invalid", base).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_listen_to_enqueues_custom_event_into_window() {
+        let window = Arc::new(parking_lot::RwLock::new(SlidingWindow::new(
+            crate::batch::WindowConfig {
+                max_entries: 10,
+                min_entries: 1,
+                time_window_secs: 600,
+                intent_shift_threshold: 0.6,
+            },
+        )));
+        let mut system = TriggerSystem::new(vec![], window.clone());
+        let bus = crate::core::event_bus::EventBus::new(64);
+
+        system.listen_to(&bus, vec!["custom.alert".to_string()]);
+        bus.emit("iri://task/t1", "custom.alert", "iri://agent/a1", "payload-1")
+            .await;
+
+        // Give the spawned listener a moment to drain the broadcast channel.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let win = window.read();
+        assert_eq!(win.len(), 1, "custom event must be enqueued into the window");
+        let entry = win.entries().back().unwrap();
+        assert_eq!(entry.role, "event");
+        assert_eq!(entry.content, "payload-1");
+        assert_eq!(
+            entry.metadata.get("event_type").map(|s| s.as_str()),
+            Some("custom.alert")
+        );
     }
 }

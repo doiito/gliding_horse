@@ -60,6 +60,11 @@ pub struct CheckpointManager {
     counter: AtomicU64,
 }
 
+/// Upper bound on checkpoints retained per task. Older entries beyond this
+/// limit are evicted on the next create to keep L0 growth bounded for
+/// long-running multi-turn tasks.
+pub const MAX_CHECKPOINTS_PER_TASK: usize = 20;
+
 impl CheckpointManager {
     pub fn new() -> Self {
         Self {
@@ -134,6 +139,7 @@ impl CheckpointManager {
                 .or_insert_with(Vec::new)
                 .push(checkpoint_iri.clone());
         }
+        self.prune_oldest(task_iri);
 
         Ok(checkpoint)
     }
@@ -232,6 +238,7 @@ impl CheckpointManager {
                 .or_insert_with(Vec::new)
                 .push(checkpoint_iri.clone());
         }
+        self.prune_oldest(task_iri);
 
         Ok(checkpoint)
     }
@@ -354,6 +361,19 @@ impl CheckpointManager {
             .values()
             .map(|v| v.len() as u64)
             .sum()
+    }
+
+    fn prune_oldest(&self, task_iri: &str) {
+        let mut task_cps = self.task_checkpoints.write();
+        let Some(iris) = task_cps.get_mut(task_iri) else { return };
+        while iris.len() > MAX_CHECKPOINTS_PER_TASK {
+            if let Some(oldest) = iris.first().cloned() {
+                iris.remove(0);
+                if let Some(ref l0) = self.l0 {
+                    let _ = l0.delete(&oldest);
+                }
+            }
+        }
     }
 }
 
@@ -514,6 +534,46 @@ mod tests {
         let list = mgr2.list("iri://task/abc-123", 10);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "finish_DA");
+    }
+
+    #[test]
+    fn test_checkpoint_retention_prunes_oldest() {
+        use crate::memory::l0_store::L0Store;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mgr = CheckpointManager::with_persistence(l0.clone());
+
+        // Create enough checkpoints to exceed the per-task retention cap
+        let total = MAX_CHECKPOINTS_PER_TASK + 5;
+        for i in 0..total {
+            mgr.create(
+                "iri://task/retention",
+                &format!("turn_Plan_{}", i),
+                "[]",
+                r#"[{"role":"user","content":"hello"}]"#,
+                r#"{"turn":1}"#,
+                &["Plan".to_string()],
+            )
+            .unwrap();
+        }
+
+        // In-memory index is bounded
+        assert_eq!(mgr.checkpoint_count() as usize, MAX_CHECKPOINTS_PER_TASK);
+
+        // Oldest entry physically evicted from L0
+        let pruned_iri = "iri://checkpoint/task/retention/seq_0".to_string();
+        assert!(l0.retrieve(&pruned_iri).unwrap().is_none());
+
+        // Latest entry still present and restorable
+        let latest_iri = format!(
+            "iri://checkpoint/task/retention/seq_{}",
+            total - 1
+        );
+        assert!(l0.retrieve(&latest_iri).unwrap().is_some());
+        let cp = mgr.restore_latest("iri://task/retention").unwrap();
+        assert_eq!(cp.unwrap().name, format!("turn_Plan_{}", total - 1));
     }
 
     #[test]

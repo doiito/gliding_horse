@@ -27,18 +27,21 @@ impl ResultRouter {
 
         let size = result_str.len();
 
-        // file_read: multi-line ≤1000 lines passes through, single-line ≤32KB passes through
+        // file_read: small files (≤300 lines AND ≤4KB) pass through fully;
+        // larger files go to FileReadPreview (JSON skeleton + first 200 lines inline).
+        // Byte cap on multi-line files closes the gap where a 32KB file with <1000
+        // lines previously entered context in full (game.js pattern).
         if tool_name == "file_read" {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) {
                 if let Some(total_lines) = val.get("total_lines").and_then(|v| v.as_u64()) {
-                    let is_large = if total_lines > 1 {
-                        total_lines > 1000
-                    } else {
-                        size > 32768
-                    };
-                    if !is_large {
+                    if total_lines <= 300 && size <= 4096 {
                         return RouteDecision::PassThrough;
                     }
+                    return RouteDecision::FileReadPreview {
+                        call_id: call_id.to_string(),
+                        max_lines: 200,
+                        max_chars: 4096,
+                    };
                 }
             }
         }
@@ -226,5 +229,71 @@ mod tests {
         assert_eq!(meta.tool_name, "test_tool");
         assert_eq!(meta.call_id, "call_7");
         assert!(meta.is_json);
+    }
+
+    #[test]
+    fn test_file_read_small_passthrough() {
+        let router = ResultRouter::new(&default_settings());
+        let result = serde_json::json!({
+            "path": "/tmp/a.js",
+            "total_lines": 50,
+            "offset": 0,
+            "lines": (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>(),
+            "returned": 50,
+        })
+        .to_string();
+        assert!(result.len() <= 4096);
+        let decision = router.route(&result, "file_read", "call_r1");
+        assert_eq!(decision, RouteDecision::PassThrough);
+    }
+
+    #[test]
+    fn test_file_read_many_lines_preview() {
+        let router = ResultRouter::new(&default_settings());
+        let result = serde_json::json!({
+            "path": "/tmp/big.js",
+            "total_lines": 501,
+            "offset": 0,
+            "lines": (0..501).map(|i| format!("line {:04}", i)).collect::<Vec<_>>(),
+            "returned": 501,
+        })
+        .to_string();
+        let decision = router.route(&result, "file_read", "call_r2");
+        assert!(matches!(
+            decision,
+            RouteDecision::FileReadPreview {
+                max_lines: 200,
+                max_chars: 4096,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_file_read_large_bytes_preview() {
+        let router = ResultRouter::new(&default_settings());
+        let result = serde_json::json!({
+            "path": "/tmp/wide.log",
+            "total_lines": 10,
+            "offset": 0,
+            "lines": (0..10).map(|_| "x".repeat(2000)).collect::<Vec<_>>(),
+            "returned": 10,
+        })
+        .to_string();
+        assert!(result.len() > 4096);
+        let decision = router.route(&result, "file_read", "call_r3");
+        assert!(matches!(decision, RouteDecision::FileReadPreview { .. }));
+    }
+
+    #[test]
+    fn test_non_file_read_large_json_still_graphify() {
+        let router = ResultRouter::new(&default_settings());
+        let items: Vec<serde_json::Value> = (0..1200)
+            .map(|i| serde_json::json!({"id": i, "name": format!("item_{}", i), "value": i * 10}))
+            .collect();
+        let result = serde_json::to_string(&items).unwrap();
+        assert!(result.len() > 32768);
+        let decision = router.route(&result, "test_tool", "call_r4");
+        assert!(matches!(decision, RouteDecision::Graphify { .. }));
     }
 }

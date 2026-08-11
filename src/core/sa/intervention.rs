@@ -529,7 +529,7 @@ Notes:
         let response = self
             .runner
             .gateway
-            .chat_with_params(&model, messages, Some(0.1), Some(1000), None, None)
+            .chat_with_params(&model, messages, Some(0.1), Some(4096), None, None)
             .await?;
         let content = response
             .choices

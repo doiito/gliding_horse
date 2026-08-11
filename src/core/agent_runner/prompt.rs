@@ -60,6 +60,12 @@ impl super::AgentRunner {
             if let Some(pending) = context_data.get("pending_steps") {
                 sections.push(format!("## Pending Steps\n{}", pending));
             }
+            if let Some(files) = context_data.get("workspace_files") {
+                sections.push(format!(
+                    "## Workspace Files\n{}\n\nOnly read the files relevant to your task; use file_read with offset/limit for large files.",
+                    files
+                ));
+            }
             let has_w2h = context_data.contains_key("five_w2h_what");
             if has_w2h {
                 let mut w2h_lines = Vec::new();
@@ -305,7 +311,55 @@ impl super::AgentRunner {
             }
         }
 
+        // DA: inject the workspace file manifest so the executor does not need
+        // to discover the file list via file_list + per-file reads on turn one.
+        if role == AgentRole::Do {
+            let manifest = self.build_workspace_file_manifest();
+            if !manifest.is_empty() {
+                context_data.insert("workspace_files".to_string(), manifest);
+            }
+        }
+
         context_data
+    }
+
+    /// Render a workspace file manifest for the DA: path + size + line count
+    /// when the line count is known from the content cache.
+    fn build_workspace_file_manifest(&self) -> String {
+        let workspace_monitor = {
+            let executor = self.tool_executor.read();
+            executor.get_workspace_monitor()
+        };
+        let Some(wm) = workspace_monitor else {
+            return String::new();
+        };
+        let entries = wm.inventory.read().list_all();
+        if entries.is_empty() {
+            return String::new();
+        }
+
+        let mut files: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let line_count = wm
+                    .content()
+                    .try_get_cached(&e.path)
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                if line_count > 0 {
+                    format!(
+                        "- {} ({} bytes, {} lines)",
+                        e.path, e.file_size, line_count
+                    )
+                } else {
+                    format!("- {} ({} bytes)", e.path, e.file_size)
+                }
+            })
+            .collect();
+        files.sort();
+        let mut lines = vec![format!("{} files in workspace:", entries.len())];
+        lines.extend(files);
+        lines.join("\n")
     }
 
     pub(super) fn build_agent_md(
@@ -440,6 +494,12 @@ impl super::AgentRunner {
             }
             if let Some(pending) = context_data.get("pending_steps") {
                 sections.push(format!("## Pending Steps\n{}", pending));
+            }
+            if let Some(files) = context_data.get("workspace_files") {
+                sections.push(format!(
+                    "## Workspace Files\n{}\n\nOnly read the files relevant to your task; use file_read with offset/limit for large files.",
+                    files
+                ));
             }
             let has_w2h = context_data.contains_key("five_w2h_what");
             if has_w2h {

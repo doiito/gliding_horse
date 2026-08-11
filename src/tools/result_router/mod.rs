@@ -19,6 +19,12 @@ pub enum RouteDecision {
         call_id: String,
         preview_size: usize,
     },
+    /// file_read over the small-file exemption: inline JSON skeleton + first `max_lines` lines; full content via `read_full_result_{call_id}` micro-tool.
+    FileReadPreview {
+        call_id: String,
+        max_lines: usize,
+        max_chars: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

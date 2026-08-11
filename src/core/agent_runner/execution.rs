@@ -21,6 +21,34 @@ use super::{
     TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT,
 };
 
+/// Cap on (tool_name, result) pairs aggregated into the force-finish summary
+/// prompt — bounds prompt size for long tasks regardless of total tool calls.
+const MAX_AGGREGATE_TOOL_ENTRIES: usize = 20;
+
+/// Collect assistant→tool message pairs from the history, keeping only the
+/// most recent `max_entries` so the summary prompt stays bounded.
+fn collect_tool_entries(messages: &[ChatMessage], max_entries: usize) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = messages
+        .windows(2)
+        .filter_map(|w| {
+            if w[0].role == "assistant" && w[0].tool_calls.is_some() && w[1].role == "tool" {
+                let tool_names: Vec<&str> = w[0]
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().map(|tc| tc.function.name.as_str()).collect())
+                    .unwrap_or_default();
+                Some((tool_names.join(", "), w[1].content.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if entries.len() > max_entries {
+        entries = entries.split_off(entries.len() - max_entries);
+    }
+    entries
+}
+
 impl super::AgentRunner {
     pub async fn execute(
         &self,
@@ -372,21 +400,7 @@ impl super::AgentRunner {
         ctx: &TaskContext,
     ) -> Option<(String, String)> {
         // Extract assistant messages with tool_calls and corresponding tool results
-        let tool_entries: Vec<(String, String)> = messages
-            .windows(2)
-            .filter_map(|w| {
-                if w[0].role == "assistant" && w[0].tool_calls.is_some() && w[1].role == "tool" {
-                    let tool_names: Vec<&str> = w[0]
-                        .tool_calls
-                        .as_ref()
-                        .map(|calls| calls.iter().map(|tc| tc.function.name.as_str()).collect())
-                        .unwrap_or_default();
-                    Some((tool_names.join(", "), w[1].content.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let tool_entries = collect_tool_entries(messages, MAX_AGGREGATE_TOOL_ENTRIES);
 
         if tool_entries.is_empty() {
             return None;
@@ -2230,7 +2244,7 @@ Output the summary report directly, not in JSON format."#,
                     OPTIONAL { ?s rdfs:label ?label }\
                     OPTIONAL { ?s <http://schema.org/name> ?label }\
                 }}\
-            } ORDER BY DESC(?label) LIMIT 50\
+            } ORDER BY DESC(?label) LIMIT 500\
         ";
 
         use oxigraph::sparql::{QueryResults as Qr, QuerySolution, SparqlEvaluator};
@@ -2347,5 +2361,105 @@ mod kg_context_tests {
         let context = AgentRunner::build_kg_context(&store, "find alpha information");
         assert!(context.contains("Default Alpha"), "{context}");
         assert!(context.contains("Named Alpha"), "{context}");
+    }
+
+    #[test]
+    fn kg_context_includes_relevant_entity_beyond_top_50_by_label() {
+        let store = Store::new().unwrap();
+        let rdf_type = NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").unwrap();
+        let schema_name = NamedNode::new("http://schema.org/name").unwrap();
+        let entity_type = NamedNode::new("https://example.org/Type").unwrap();
+
+        // Insert 60 filler entities whose labels sort *after* the target under
+        // ORDER BY DESC(?label) ("Zebra..." > "Alpha..."), so the task-relevant
+        // entity falls outside a tight LIMIT 50 window and must still be injected.
+        for i in 0..60 {
+            let subject = NamedNode::new(format!("https://example.org/filler_{}", i)).unwrap();
+            store
+                .insert(&Quad::new(
+                    subject.clone(),
+                    rdf_type.clone(),
+                    entity_type.clone(),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+            store
+                .insert(&Quad::new(
+                    subject,
+                    schema_name.clone(),
+                    Literal::new_simple_literal(format!("Zebra Filler Entity {}", i)),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+        }
+
+        let target = NamedNode::new("https://example.org/target").unwrap();
+        store
+            .insert(&Quad::new(
+                target,
+                rdf_type,
+                entity_type,
+                GraphName::DefaultGraph,
+            ))
+            .unwrap();
+        store
+            .insert(&Quad::new(
+                NamedNode::new("https://example.org/target").unwrap(),
+                schema_name,
+                Literal::new_simple_literal("Alpha Relevant"),
+                GraphName::DefaultGraph,
+            ))
+            .unwrap();
+
+        let context = AgentRunner::build_kg_context(&store, "find alpha information");
+        assert!(
+            context.contains("Alpha Relevant"),
+            "task-relevant entity beyond label top-50 must be injected, got: {context}"
+        );
+    }
+
+    #[test]
+    fn collect_tool_entries_caps_at_max_keeping_most_recent() {
+        use crate::gateway::unified_gateway::{ChatMessage, ToolCallFunction, ToolCallPayload};
+
+        // Build 25 assistant→tool pairs; only the most recent MAX_AGGREGATE_TOOL_ENTRIES
+        // should survive so the force-finish summary prompt stays bounded.
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        for i in 0..25 {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                name: None,
+                tool_calls: Some(vec![ToolCallPayload {
+                    id: format!("call_{}", i),
+                    call_type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: "search".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            messages.push(ChatMessage {
+                role: "tool".to_string(),
+                content: format!("result_of_call_{}", i),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some(format!("call_{}", i)),
+                reasoning_content: None,
+            });
+        }
+
+        let entries = super::collect_tool_entries(&messages, super::MAX_AGGREGATE_TOOL_ENTRIES);
+        assert_eq!(entries.len(), 20, "entries must be capped");
+        assert!(
+            entries.iter().any(|(_, c)| c.contains("result_of_call_24")),
+            "most recent call must survive the cap"
+        );
+        assert!(
+            !entries.iter().any(|(_, c)| c.contains("result_of_call_0")),
+            "oldest call must be evicted by the cap"
+        );
     }
 }

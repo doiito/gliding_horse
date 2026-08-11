@@ -607,7 +607,16 @@ impl WorkspaceMonitor {
         }
 
         if !discovered.is_empty() {
-            parts.push(format!("{} new discovered files unread", discovered.len()));
+            let names: Vec<&str> = discovered.iter().take(10).map(|e| e.path.as_str()).collect();
+            parts.push(format!(
+                "{} new discovered files unread{}",
+                discovered.len(),
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", names.join(", "))
+                }
+            ));
         }
 
         let summary = format!("{} | {}", total, parts.join(" | "));
@@ -1316,6 +1325,35 @@ mod tests {
             "Should mention total file count: {}",
             t
         );
+    }
+
+    #[test]
+    fn test_generate_perception_text_lists_discovered_paths() {
+        let (ws, dir) = temp_ws_monitor();
+
+        let f1 = dir.path().join("new_a.js");
+        let f2 = dir.path().join("new_b.js");
+        let f3 = dir.path().join("new_c.js");
+        std::fs::write(&f1, "// a").unwrap();
+        std::fs::write(&f2, "// b").unwrap();
+        std::fs::write(&f3, "// c").unwrap();
+
+        // add_or_update leaves entries in Discovered state (never read)
+        {
+            let inv = ws.inventory.read();
+            inv.add_or_update(&f1.to_string_lossy()).unwrap();
+            inv.add_or_update(&f2.to_string_lossy()).unwrap();
+            inv.add_or_update(&f3.to_string_lossy()).unwrap();
+        }
+
+        let text = ws.generate_perception_text(None).expect("perception text");
+        assert!(
+            text.contains("3 new discovered files unread"),
+            "count with names: {}",
+            text
+        );
+        assert!(text.contains("new_a.js"), "lists first discovered path");
+        assert!(text.contains("new_c.js"), "lists discovered paths up to 10");
     }
 
     #[test]

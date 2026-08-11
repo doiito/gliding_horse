@@ -175,7 +175,7 @@ fn parse_openai_stream_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                for tc in tool_calls {
+                if let Some(tc) = tool_calls.first() {
                     let tc_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     let id = tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                     let function = tc.get("function");

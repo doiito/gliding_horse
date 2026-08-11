@@ -394,7 +394,7 @@ impl ProactiveEngine {
         }
 
         let experiences = self.query_relevant_experiences(user_input).await;
-        analysis.relevant_experience_hints = experiences
+        let experience_hints: Vec<String> = experiences
             .iter()
             .filter_map(|e| {
                 e.get("scenario")
@@ -403,6 +403,9 @@ impl ProactiveEngine {
             })
             .take(5)
             .collect();
+        // Merge (not overwrite): perception/workspace events pushed above must
+        // survive alongside semantic experience hints.
+        analysis.relevant_experience_hints.extend(experience_hints);
 
         let val = serde_json::to_value(&analysis).unwrap_or_default();
         self.cache.insert(key, (Utc::now(), val));
@@ -887,6 +890,31 @@ mod tests {
             .unwrap();
         assert_eq!(analysis.complexity, "simple");
         assert_eq!(analysis.estimated_steps, 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_events_survive_in_experience_hints_when_experiences_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let perception_store = Arc::new(PerceptionStore::new());
+        perception_store.store_global(PerceptionEntry::new(
+            PerceptionSource::WorkspaceMonitor,
+            "file changed: src/main.rs modified",
+        ));
+        let mut engine = ProactiveEngine::new(l0, test_event_bus())
+            .with_perception_store(perception_store);
+        let analysis = engine
+            .on_task_start("Write a hello world program", "iri://task/ws_events")
+            .await
+            .unwrap();
+        assert!(
+            analysis
+                .relevant_experience_hints
+                .iter()
+                .any(|h| h.contains("src/main.rs modified")),
+            "workspace events must be preserved in relevant_experience_hints, got: {:?}",
+            analysis.relevant_experience_hints
+        );
     }
 
     #[test]

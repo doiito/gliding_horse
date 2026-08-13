@@ -353,7 +353,7 @@ impl WorkspaceMonitor {
                         tracing::warn!("WorkspaceMonitor event consumer lagged by {} events", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        tracing::error!("WorkspaceMonitor event bus connection closed");
+                        debug!("WorkspaceMonitor event bus closed (shutdown)");
                         break;
                     }
                 }

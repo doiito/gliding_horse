@@ -1,12 +1,18 @@
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tracing::debug;
+use tracing::warn;
 
 use crate::core::constitution::{ActivationCondition, ConstitutionRegistry};
 use crate::methodology::{
     evolution::{EvolutionEngineHandle, ViolationReporter},
     MethodologyDefinition, MethodologyRegistry, MethodologyType, RedFlagEntry,
+};
+use crate::skill_graph::evolution::{
+    EvolutionApproval, EvolutionPatch, EvolutionSuggestion, EvolutionSuggestionType,
+    METHODOLOGY_IRI_PREFIX,
 };
 use crate::tools::hooks::{FunctionHook, HookContext, HookManager, HookPoint, HookResult};
 use crate::tools::tool_guard::ToolCategory;
@@ -68,6 +74,19 @@ pub struct ConstitutionMethodologyBinding {
     pub condition: ActivationCondition,
 }
 
+/// A settled usage window for a methodology activation — activation start
+/// is captured in [`ActivatedMethodology::activated_at`], outcome is recorded
+/// when the window closes (SkillAfter success, TaskError failure).
+#[derive(Debug, Clone)]
+pub struct MethodologyUsageRecord {
+    pub methodology_id: String,
+    pub task_iri: String,
+    pub agent_id: String,
+    pub success: bool,
+    pub duration_seconds: u64,
+    pub error_message: Option<String>,
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // MethodologyGate
 // ════════════════════════════════════════════════════════════════════════
@@ -83,6 +102,12 @@ pub struct MethodologyGate {
     bindings: Vec<ConstitutionMethodologyBinding>,
     /// Maximum number of concurrent active methodologies
     max_active: usize,
+    /// Settled usage windows (activation → outcome)
+    usage_history: Vec<MethodologyUsageRecord>,
+    /// IDs activated at the most recent SkillBefore, awaiting SkillAfter settlement
+    pending_skill_activation: Vec<String>,
+    /// Methodologies excluded from activation (cold-archived)
+    archived: HashSet<String>,
 }
 
 impl MethodologyGate {
@@ -95,6 +120,9 @@ impl MethodologyGate {
             active: Vec::new(),
             bindings: Vec::new(),
             max_active,
+            usage_history: Vec::new(),
+            pending_skill_activation: Vec::new(),
+            archived: HashSet::new(),
         }
     }
 
@@ -118,6 +146,9 @@ impl MethodologyGate {
         let mut newly_active = Vec::new();
 
         for (idx, methodology) in self.registry.all().iter().enumerate() {
+            if self.archived.contains(methodology.id) {
+                continue;
+            }
             if self.active.iter().any(|a| a.registry_index == idx) {
                 continue;
             }
@@ -151,6 +182,9 @@ impl MethodologyGate {
 
         for binding in &self.bindings {
             let mid = &binding.methodology_id;
+            if self.archived.contains(mid.as_str()) {
+                continue;
+            }
             if self.active.iter().any(|a| a.methodology_id == *mid) {
                 continue;
             }
@@ -199,6 +233,9 @@ impl MethodologyGate {
                     .get("tool_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if tool_name.is_empty() {
+                    return None;
+                }
                 if categories
                     .iter()
                     .any(|c| tool_name.contains(c) || category_matches_tool(c, tool_name))
@@ -256,6 +293,9 @@ impl MethodologyGate {
 
     /// Manually activate a methodology by ID.
     pub fn activate(&mut self, methodology_id: &str, source: TriggerSource) -> Option<usize> {
+        if self.archived.contains(methodology_id) {
+            return None;
+        }
         let idx = self
             .registry
             .all()
@@ -289,6 +329,43 @@ impl MethodologyGate {
         self.active.clear();
     }
 
+    /// Settle the pending SkillBefore activation window with an outcome.
+    ///
+    /// Closes the usage window for methodologies activated at the most recent
+    /// SkillBefore: computes duration from each activation timestamp and records
+    /// a [`MethodologyUsageRecord`]. Settled methodologies leave the active set so
+    /// the next qualifying tool call re-activates them.
+    pub fn settle_pending_skill_usage(
+        &mut self,
+        success: bool,
+        error_message: Option<&str>,
+        ctx: &HookContext,
+    ) -> Vec<MethodologyUsageRecord> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut settled = Vec::new();
+        self.active.retain(|a| {
+            if self.pending_skill_activation.contains(&a.methodology_id) {
+                settled.push(MethodologyUsageRecord {
+                    methodology_id: a.methodology_id.clone(),
+                    task_iri: ctx.task_iri.clone().unwrap_or_default(),
+                    agent_id: ctx.agent_id.clone(),
+                    success,
+                    duration_seconds: now.saturating_sub(a.activated_at),
+                    error_message: error_message.map(str::to_string),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_skill_activation.clear();
+        self.usage_history.extend(settled.clone());
+        settled
+    }
+
     /// Get the definition for an activated methodology.
     pub fn get_definition(
         &self,
@@ -314,6 +391,98 @@ impl MethodologyGate {
         self.active
             .iter()
             .any(|a| a.methodology_id == methodology_id)
+    }
+
+    /// All settled usage records, oldest first.
+    pub fn usage_history(&self) -> &[MethodologyUsageRecord] {
+        &self.usage_history
+    }
+
+    /// Number of settled usage records.
+    pub fn usage_count(&self) -> usize {
+        self.usage_history.len()
+    }
+
+    /// Generate governed evolution suggestions for methodologies whose settled
+    /// success rate is below `min_success_rate` with at least `min_samples`
+    /// records. Suggestions carry a `Methodology` patch targeting the
+    /// methodology's synthetic IRI, so they flow through the shared
+    /// `EvolutionProposalStore` approval/commit lifecycle unchanged.
+    pub fn suggest_methodology_adjustments(
+        &self,
+        min_samples: usize,
+        min_success_rate: f64,
+    ) -> Vec<EvolutionSuggestion> {
+        let mut samples: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for record in &self.usage_history {
+            let entry = samples.entry(record.methodology_id.as_str()).or_insert((0, 0));
+            entry.0 += 1;
+            if record.success {
+                entry.1 += 1;
+            }
+        }
+        let mut suggestions = Vec::new();
+        for (methodology_id, (total, successes)) in samples {
+            if total < min_samples {
+                continue;
+            }
+            let success_rate = successes as f64 / total as f64;
+            if success_rate >= min_success_rate {
+                continue;
+            }
+            suggestions.push(EvolutionSuggestion {
+                suggestion_type: EvolutionSuggestionType::Methodology,
+                skill_iri: format!("{METHODOLOGY_IRI_PREFIX}{methodology_id}"),
+                description: format!(
+                    "methodology {methodology_id} success rate {success_rate:.2} below threshold {min_success_rate:.2} over {total} uses; review activation conditions"
+                ),
+                confidence: (1.0 - success_rate) as f32,
+                patch: Some(EvolutionPatch::Methodology {
+                    methodology_id: methodology_id.to_string(),
+                }),
+                approval: EvolutionApproval::Pending,
+            });
+        }
+        suggestions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        suggestions
+    }
+
+    /// Mark methodologies as cold-archived; archived methodologies are
+    /// excluded from future activation until unarchived.
+    pub fn archive_methodologies(&mut self, methodology_ids: &[&str]) -> usize {
+        let before = self.archived.len();
+        for id in methodology_ids {
+            if self.registry.get(id).is_some() {
+                self.archived.insert((*id).to_string());
+            }
+        }
+        self.archived.len() - before
+    }
+
+    /// Remove the cold-archive mark, re-enabling activation.
+    pub fn unarchive_methodologies(&mut self, methodology_ids: &[&str]) -> usize {
+        let before = self.archived.len();
+        for id in methodology_ids {
+            self.archived.remove(*id);
+        }
+        before - self.archived.len()
+    }
+
+    /// Currently cold-archived methodology IDs.
+    pub fn archived_methodologies(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.archived.iter().map(|s| s.as_str()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Whether a methodology is cold-archived.
+    pub fn is_archived(&self, methodology_id: &str) -> bool {
+        self.archived.contains(methodology_id)
     }
 
     /// Get active methodologies for a specific domain.
@@ -460,6 +629,14 @@ impl MethodologyGate {
         for entry in constitution.all() {
             if let Some(bindings) = constitution.get_bindings(entry.id) {
                 for binding in bindings {
+                    if self.registry.get(&binding.methodology_id).is_none() {
+                        warn!(
+                            constitution_id = %entry.id,
+                            methodology_id = %binding.methodology_id,
+                            trigger = ?binding.trigger,
+                            "Constitution binding references a methodology not present in the registry; binding will never activate"
+                        );
+                    }
                     self.bind_constitution_to_methodology(
                         entry.id,
                         binding.methodology_id,
@@ -529,6 +706,26 @@ impl MethodologyGateHandle {
         self.evolution.clone()
     }
 
+    /// Archive methodologies not activated since `cutoff_unix_secs`.
+    ///
+    /// Recency is read from the evolution engine's activation metrics;
+    /// matching methodologies are marked archived in the gate so they stop
+    /// activating. Returns the IDs archived.
+    pub fn archive_cold_methodologies(&self, cutoff_unix_secs: u64) -> Vec<String> {
+        let Some(evolution) = self.evolution.as_ref() else {
+            return Vec::new();
+        };
+        let cold = {
+            let engine = evolution.inner();
+            let guard = engine.read();
+            guard.find_cold_methodologies(cutoff_unix_secs)
+        };
+        let ids: Vec<&str> = cold.iter().map(|s| s.as_str()).collect();
+        let mut gate = self.inner.write();
+        gate.archive_methodologies(&ids);
+        cold
+    }
+
     /// Register hooks into HookManager.
     ///
     /// This method registers FunctionHooks that call into the MethodologyGate
@@ -574,6 +771,9 @@ impl MethodologyGateHandle {
             move |ctx: &mut HookContext| {
                 let mut g = gate_error.write();
                 let context_clone = ctx.clone();
+                // The tool-call window opened at the last SkillBefore closed with
+                // failure — settle it before activating debugging methodologies.
+                g.settle_pending_skill_usage(false, ctx.error.as_deref(), &context_clone);
                 let activated = g.on_hook_trigger(HookPoint::TaskError, &context_clone);
                 if let Some(ref evo) = evo_error {
                     let inner = evo.inner();
@@ -618,11 +818,29 @@ impl MethodologyGateHandle {
             vec![HookPoint::SkillBefore],
             60,
             move |ctx: &mut HookContext| {
-                let g = gate_tool.read();
+                let mut g = gate_tool.write();
                 let tool_name = match ctx.data.get("tool_name").and_then(|v| v.as_str()) {
                     Some(name) => name,
                     None => return HookResult::Continue,
                 };
+
+                // SkillBefore is the only hook point carrying a tool_name, so it is
+                // the sole production-visible trigger for OnToolCategory conditions.
+                // Evaluate activation before the anti-pattern gate so newly activated
+                // methodologies can contribute their anti-patterns this turn.
+                let context_clone = ctx.clone();
+                let activated = g.on_hook_trigger(HookPoint::SkillBefore, &context_clone);
+                g.pending_skill_activation = activated
+                    .iter()
+                    .map(|a| a.methodology_id.clone())
+                    .collect();
+                if let Some(ref evo) = evo_tool {
+                    let inner = evo.inner();
+                    let mut e = inner.write();
+                    for a in &activated {
+                        e.record_activation(&a.methodology_id);
+                    }
+                }
 
                 let anti_patterns = g.check_anti_patterns_for_tool(tool_name);
                 let role = &ctx.agent_role;
@@ -680,6 +898,21 @@ impl MethodologyGateHandle {
             },
         );
         hook_manager.register_arc(std::sync::Arc::new(tool_hook));
+
+        // ── SkillAfter: Settle the SkillBefore window as success ──
+        let gate_after = gate.clone();
+        let after_hook = FunctionHook::new(
+            "methodology_gate::skill_after",
+            vec![HookPoint::SkillAfter],
+            60,
+            move |ctx: &mut HookContext| {
+                let mut g = gate_after.write();
+                let context_clone = ctx.clone();
+                g.settle_pending_skill_usage(true, None, &context_clone);
+                HookResult::Continue
+            },
+        );
+        hook_manager.register_arc(std::sync::Arc::new(after_hook));
     }
 }
 
@@ -756,6 +989,15 @@ fn tool_name_matches_gate(tool_name: &str, gate_before: &str) -> bool {
 fn category_matches_tool(category: &str, tool_name: &str) -> bool {
     let tl = tool_name.to_lowercase();
     let cat = category.to_lowercase();
+
+    // Empty tool name must never match any category. Without this guard the
+    // fallback `cat.contains(&tl) || tl.contains(&cat)` below evaluates
+    // `cat.contains("")` which is always true, causing OnToolCategory
+    // methodologies to spuriously activate at points without a tool context
+    // (e.g. AgentInit).
+    if tl.is_empty() {
+        return false;
+    }
 
     let mappings: &[(&str, &[&str])] = &[
         ("file_read", &["file_read", "file_list", "glob", "grep"]),
@@ -1378,5 +1620,204 @@ mod tests {
         gate.activate("methodology:index-priority", TriggerSource::Manual);
         gate.activate("methodology:index-priority", TriggerSource::Manual);
         assert_eq!(gate.active_count(), 1);
+    }
+
+    // ─── Usage Recording ───
+
+    fn activate_tool_window(gate: &mut MethodologyGate, tool: &str) -> HookContext {
+        let ctx = test_context(HookPoint::SkillBefore, "DA", Some(tool));
+        let activated = gate.on_hook_trigger(HookPoint::SkillBefore, &ctx);
+        gate.pending_skill_activation = activated.iter().map(|a| a.methodology_id.clone()).collect();
+        ctx
+    }
+
+    #[test]
+    fn test_settle_pending_skill_success() {
+        let mut gate = test_gate();
+        let ctx = activate_tool_window(&mut gate, "glob");
+
+        let settled = gate.settle_pending_skill_usage(true, None, &ctx);
+
+        assert!(!settled.is_empty());
+        for record in settled {
+            assert!(record.success);
+            assert_eq!(record.agent_id, "test_agent");
+            assert!(record.error_message.is_none());
+        }
+        assert_eq!(gate.usage_count(), gate.usage_history().len());
+        assert!(gate.active_methodologies().is_empty());
+    }
+
+    #[test]
+    fn test_settle_pending_skill_failure() {
+        let mut gate = test_gate();
+        let ctx = activate_tool_window(&mut gate, "glob");
+        let mut error_ctx = test_context(HookPoint::TaskError, "DA", Some("glob"));
+        error_ctx.error = Some("boom".to_string());
+
+        let settled = gate.settle_pending_skill_usage(false, error_ctx.error.as_deref(), &error_ctx);
+
+        assert!(!settled.is_empty());
+        assert!(settled.iter().all(|r| !r.success));
+        assert!(
+            settled.iter().all(|r| r.error_message.as_deref() == Some("boom")),
+            "failure settlement should carry the error message"
+        );
+    }
+
+    #[test]
+    fn test_settle_without_pending_records_nothing() {
+        let mut gate = test_gate();
+        let ctx = test_context(HookPoint::SkillAfter, "DA", Some("glob"));
+
+        let settled = gate.settle_pending_skill_usage(true, None, &ctx);
+
+        assert!(settled.is_empty());
+        assert_eq!(gate.usage_count(), 0);
+    }
+
+    #[test]
+    fn test_resettle_after_new_activation() {
+        let mut gate = test_gate();
+        let first_ctx = activate_tool_window(&mut gate, "glob");
+        let first = gate.settle_pending_skill_usage(true, None, &first_ctx);
+
+        let second_ctx = activate_tool_window(&mut gate, "glob");
+        let second = gate.settle_pending_skill_usage(true, None, &second_ctx);
+
+        assert_eq!(second.len(), first.len());
+        assert_eq!(gate.usage_count(), first.len() + second.len());
+    }
+
+    // ─── Governance Suggestions ───
+
+    #[test]
+    fn test_suggest_methodology_adjustments_on_low_success() {
+        let mut gate = test_gate();
+        // Three tool windows on "glob"; fail all three so the activated
+        // methodologies record 0% success.
+        for _ in 0..3 {
+            let ctx = activate_tool_window(&mut gate, "glob");
+            gate.settle_pending_skill_usage(false, Some("boom"), &ctx);
+        }
+
+        let suggestions = gate.suggest_methodology_adjustments(3, 0.5);
+
+        assert!(!suggestions.is_empty(), "low-success methodologies must yield suggestions");
+        for suggestion in &suggestions {
+            assert!(matches!(
+                suggestion.suggestion_type,
+                EvolutionSuggestionType::Methodology
+            ));
+            assert!(matches!(
+                suggestion.patch,
+                Some(EvolutionPatch::Methodology { .. })
+            ));
+            assert!(suggestion.skill_iri.starts_with(METHODOLOGY_IRI_PREFIX));
+            assert!(matches!(suggestion.approval, EvolutionApproval::Pending));
+        }
+        assert!(
+            suggestions
+                .iter()
+                .all(|s| s.skill_iri.starts_with(METHODOLOGY_IRI_PREFIX)),
+            "all suggestions must target synthetic methodology IRIs"
+        );
+    }
+
+    #[test]
+    fn test_suggest_methodology_adjustments_requires_min_samples() {
+        let mut gate = test_gate();
+        // Only one settled record — below the min_samples of 3.
+        let ctx = activate_tool_window(&mut gate, "glob");
+        gate.settle_pending_skill_usage(false, Some("boom"), &ctx);
+
+        assert!(gate.suggest_methodology_adjustments(3, 0.5).is_empty());
+    }
+
+    #[test]
+    fn test_suggest_methodology_adjustments_skips_healthy() {
+        let mut gate = test_gate();
+        for _ in 0..3 {
+            let ctx = activate_tool_window(&mut gate, "glob");
+            gate.settle_pending_skill_usage(true, None, &ctx);
+        }
+
+        assert!(
+            gate.suggest_methodology_adjustments(3, 0.5).is_empty(),
+            "all-success methodologies must not yield suggestions"
+        );
+    }
+
+    // ─── Cold Archive ───
+
+    #[test]
+    fn test_archive_methodologies_excludes_from_activation() {
+        let mut gate = test_gate();
+        let archived = gate.archive_methodologies(&["methodology:index-priority"]);
+        assert_eq!(archived, 1);
+        assert!(gate.is_archived("methodology:index-priority"));
+
+        let ctx = test_context(HookPoint::AgentInit, "SA", None);
+        let activated = gate.on_hook_trigger(HookPoint::AgentInit, &ctx);
+        assert!(
+            !activated
+                .iter()
+                .any(|a| a.methodology_id == "methodology:index-priority"),
+            "archived methodology must not activate"
+        );
+        assert_eq!(gate.activate("methodology:index-priority", TriggerSource::Manual), None);
+    }
+
+    #[test]
+    fn test_archive_methodologies_ignores_unknown_and_dedups() {
+        let mut gate = test_gate();
+        assert_eq!(gate.archive_methodologies(&["methodology:does-not-exist"]), 0);
+        gate.archive_methodologies(&["methodology:index-priority"]);
+        assert_eq!(gate.archive_methodologies(&["methodology:index-priority"]), 0);
+        assert_eq!(gate.archived_methodologies(), vec!["methodology:index-priority"]);
+    }
+
+    #[test]
+    fn test_unarchive_reenables_activation() {
+        let mut gate = test_gate();
+        gate.archive_methodologies(&["methodology:boundary-enforcement"]);
+        assert_eq!(
+            gate.unarchive_methodologies(&["methodology:boundary-enforcement"]),
+            1
+        );
+
+        let ctx = test_context(HookPoint::AgentInit, "SA", None);
+        let activated = gate.on_hook_trigger(HookPoint::AgentInit, &ctx);
+        assert!(
+            activated
+                .iter()
+                .any(|a| a.methodology_id == "methodology:boundary-enforcement"),
+            "unarchived methodology must activate again"
+        );
+    }
+
+    #[test]
+    fn test_archive_cold_methodologies_via_handle() {
+        let gate = test_gate();
+        let evolution = EvolutionEngineHandle::new(crate::methodology::evolution::EvolutionEngine::new());
+        let handle = MethodologyGateHandle::new(gate).with_evolution(evolution);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // A fresh engine has no activation records — nothing is cold yet.
+        assert!(handle.archive_cold_methodologies(now).is_empty());
+
+        // Record an activation, then archive with a far-future cutoff: the
+        // recently activated methodology is older than the cutoff → cold.
+        {
+            let engine = handle.evolution_handle().unwrap();
+            engine.inner().write().record_activation("methodology:index-priority");
+        }
+        let cold = handle.archive_cold_methodologies(now + 100_000);
+        assert!(cold.contains(&"methodology:index-priority".to_string()));
+        assert!(handle.inner().read().is_archived("methodology:index-priority"));
     }
 }

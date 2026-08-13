@@ -317,7 +317,8 @@ impl AgentRunner {
 
         // Initialize MethodologyGate with constitution bindings + EvolutionEngine
         let methodology_gate = {
-            let registry = MethodologyRegistry::new();
+            let mut registry = MethodologyRegistry::new();
+            registry.load_bundled_nodes();
             let mut gate = MethodologyGate::new(registry, agent_settings.max_active);
             gate.register_constitution_bindings(&ConstitutionRegistry::new());
             let evolution = EvolutionEngineHandle::new(EvolutionEngine::new());

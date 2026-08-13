@@ -40,6 +40,9 @@ pub struct CliConfig {
     pub max_l2_mb: u64,
     pub max_l3_mb: u64,
     pub data_dir: Option<String>,
+    /// External skill directory containing `skills/*/skill.jsonld` files to
+    /// load into the SkillRegistry at startup (optional).
+    pub skill_dir: Option<String>,
     /// JSON-LD 工作流文件路径（可选，替代 LLM 生成的 plan）
     pub workflow_path: Option<String>,
     /// MCP 服务器配置（名称→URL）
@@ -55,6 +58,7 @@ impl CliConfig {
         max_iterations: u32,
         max_pdca_cycles: u32,
         workflow_path: Option<String>,
+        skill_dir: Option<String>,
     ) -> Self {
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .or_else(|_| std::env::var("AGENT_OS_GATEWAY_API_KEY"))
@@ -114,13 +118,14 @@ impl CliConfig {
             workspace,
             max_iterations,
             max_pdca_cycles,
-            max_l1_mb,
-            max_l2_mb,
-            max_l3_mb,
-            data_dir,
-            workflow_path,
-            mcp_servers,
-            mcp_stdio_servers,
+max_l1_mb,
+        max_l2_mb,
+        max_l3_mb,
+        data_dir,
+        skill_dir,
+        workflow_path,
+        mcp_servers,
+        mcp_stdio_servers,
         }
     }
 
@@ -222,6 +227,7 @@ impl CliConfig {
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
             data_dir: self.data_dir.clone(),
+            skill_dir: self.skill_dir.clone(),
             workflow_path: self.workflow_path.clone(),
             mcp_servers: self.mcp_servers.clone(),
             mcp_stdio_servers: self.mcp_stdio_servers.clone(),
@@ -241,6 +247,7 @@ impl CliConfig {
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
             data_dir: self.data_dir.clone(),
+            skill_dir: self.skill_dir.clone(),
             workflow_path: self.workflow_path.clone(),
             mcp_servers: self.mcp_servers.clone(),
             mcp_stdio_servers: self.mcp_stdio_servers.clone(),
@@ -260,6 +267,7 @@ impl CliConfig {
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
             data_dir: self.data_dir.clone(),
+            skill_dir: self.skill_dir.clone(),
             workflow_path: self.workflow_path.clone(),
             mcp_servers: self.mcp_servers.clone(),
             mcp_stdio_servers: self.mcp_stdio_servers.clone(),

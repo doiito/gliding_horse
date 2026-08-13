@@ -1,0 +1,45 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/subagent-driven-development",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:subagent-driven-development",
+  "methodology:name": "Subagent-Driven Development",
+  "methodology:description": "When executing implementation plans with independent tasks in the current session, dispatch work to subagents",
+  "methodology:type": "Process",
+  "methodology:domain": "development",
+  "methodology:source": "superpowers-main/skills/subagent-driven-development/SKILL.md",
+  "methodology:activation": "OnAgentRole([Do])",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "doing independent tasks inline",
+      "methodology:severity": "Warning",
+      "methodology:rationalizationCheck": "\"I'll just do it myself\" — independent plan tasks belong in subagents"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "inline-serial-execution",
+      "methodology:antiPatternDescription": "Executing independent plan tasks inline in the main session instead of dispatching to subagents",
+      "methodology:gateBefore": "before executing an independent plan task",
+      "methodology:gateAsk": "Is this task independent enough to dispatch to a subagent?",
+      "methodology:gateAction": "STOP — dispatch the task to a subagent"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["authority", "commitment"],
+    "methodology:phrasingExamples": ["Dispatch independent tasks to subagents", "The main session orchestrates, subagents execute"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/dispatching-parallel-agents",
+      "methodology:id": "methodology:dispatching-parallel-agents"
+    },
+    {
+      "@id": "https://gliding.horse/methodology/methodology/executing-plans",
+      "methodology:id": "methodology:executing-plans"
+    }
+  ]
+}

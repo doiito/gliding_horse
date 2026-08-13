@@ -54,23 +54,27 @@ impl TemplateManager {
 
         if let Ok(entries) = std::fs::read_dir(&self.template_dir) {
             for entry in entries.flatten() {
+                // file_type() does not follow symlinks, so self-referential
+                // links in the template dir cannot cause unbounded recursion
+                let Ok(ft) = entry.file_type() else { continue };
+                if !ft.is_dir() {
+                    continue;
+                }
                 let path = entry.path();
-                if path.is_dir() {
-                    let dir_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
+                let dir_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
 
-                    match dir_name {
-                        "prompts" => {
-                            count += self.load_prompts_from_dir(&path)?;
-                        }
-                        "schemas" => {
-                            count += self.load_schemas_from_dir(&path)?;
-                        }
-                        _ => {
-                            count += self.load_prompts_from_dir(&path)?;
-                        }
+                match dir_name {
+                    "prompts" => {
+                        count += self.load_prompts_from_dir(&path)?;
+                    }
+                    "schemas" => {
+                        count += self.load_schemas_from_dir(&path)?;
+                    }
+                    _ => {
+                        count += self.load_prompts_from_dir(&path)?;
                     }
                 }
             }
@@ -85,10 +89,11 @@ impl TemplateManager {
 
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
                 let path = entry.path();
-                if path.is_dir() {
+                if ft.is_dir() {
                     count += self.load_prompts_from_dir(&path)?;
-                } else if path.extension().map_or(false, |e| e == "md") {
+                } else if ft.is_file() && path.extension().is_some_and(|e| e == "md") {
                     let relative = path.strip_prefix(&self.template_dir).unwrap_or(&path);
                     let template_name = relative
                         .to_string_lossy()
@@ -127,10 +132,11 @@ impl TemplateManager {
 
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else { continue };
                 let path = entry.path();
-                if path.is_dir() {
+                if ft.is_dir() {
                     count += self.load_schemas_from_dir(&path)?;
-                } else if path.extension().map_or(false, |e| e == "json") {
+                } else if ft.is_file() && path.extension().is_some_and(|e| e == "json") {
                     let relative = path.strip_prefix(&self.template_dir).unwrap_or(&path);
                     let schema_name = relative
                         .to_string_lossy()
@@ -570,5 +576,21 @@ mod tests {
             .unwrap();
         assert!(result.contains("Build a web app"));
         assert!(result.contains("file_read, http_request"));
+    }
+
+    #[test]
+    fn test_new_skips_symlink_loop() {
+        #[cfg(unix)]
+        {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("self")).unwrap();
+            let engine = TemplateManager::new(dir.path()).unwrap();
+            assert_eq!(engine.template_count(), 0);
+        }
+        #[cfg(not(unix))]
+        {
+            let engine = TemplateManager::new(Path::new("/nonexistent")).unwrap();
+            assert_eq!(engine.template_count(), 0);
+        }
     }
 }

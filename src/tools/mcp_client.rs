@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -466,10 +467,7 @@ impl McpClient {
     ) -> Result<Value, CoreError> {
         match self.send_rpc_http(url, request).await {
             Ok(response) => Self::handle_call_response(response),
-            Err(_) => Ok(json!({
-                "status": "simulated",
-                "note": "MCP HTTP transport unavailable, returning simulated result",
-            })),
+            Err(e) => Err(e),
         }
     }
 
@@ -486,19 +484,12 @@ impl McpClient {
             })?;
 
         if !process.is_alive() {
-            return Ok(json!({
-                "status": "simulated",
-                "note": "MCP Stdio process exited, returning simulated result",
-            }));
+            return Err(CoreError::Internal {
+                message: format!("MCP Stdio process for server '{}' has exited", server),
+            });
         }
 
-        match process.send_request(request).await {
-            Ok(response) => Self::handle_call_response(response),
-            Err(_) => Ok(json!({
-                "status": "simulated",
-                "note": "MCP Stdio communication failed, returning simulated result",
-            })),
-        }
+        process.send_request(request).await.and_then(Self::handle_call_response)
     }
 
     fn handle_call_response(response: JsonRpcResponse) -> Result<Value, CoreError> {
@@ -594,6 +585,49 @@ impl McpClient {
                 registry.register_skill(skill);
                 debug!(iri = %iri, "MCP tool registered in SkillRegistry");
             }
+        }
+    }
+
+    /// Register every connected tool of every server into the ToolExecutor.
+    pub fn register_tools_to_tool_executor(
+        &self,
+        executor: &mut crate::tools::tool_executor::ToolExecutor,
+        handle: Arc<tokio::sync::Mutex<Option<McpClient>>>,
+    ) {
+        for (server_name, tool) in self.all_tools() {
+            let server = server_name.clone();
+            let tool_name = tool.name.clone();
+            let handle = handle.clone();
+            let description = tool.description.clone().unwrap_or_default();
+            let input_schema = tool
+                .input_schema
+                .clone()
+                .unwrap_or(json!({"type":"object","properties":{}}));
+
+            let server_for_fn = server.clone();
+            let tool_name_for_fn = tool_name.clone();
+            executor.register(
+                &tool_name,
+                &description,
+                input_schema,
+                Arc::new(move |input: Value| {
+                    let handle = handle.clone();
+                    let server = server_for_fn.clone();
+                    let tool_name = tool_name_for_fn.clone();
+                    Box::pin(async move {
+                        let mut guard = handle.lock().await;
+                        let client = guard.as_mut().ok_or_else(|| {
+                            "MCP client not connected for tool dispatch".to_string()
+                        })?;
+                        client
+                            .call_tool(&server, &tool_name, &input)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+                &["Plan", "Do", "Check", "Act"],
+            );
+            debug!(server = %server, tool = %tool_name, "MCP tool registered in ToolExecutor");
         }
     }
 

@@ -1,7 +1,11 @@
 use axum::{routing::post, Json, Router};
+use glidinghorse::skill_graph::graph_store::SkillGraphStore;
+use glidinghorse::skill_graph::{MCPIntegration, MCPRegistry, MCPServerConfig, MCPToolInfo};
 use glidinghorse::tools::mcp_client::McpClient;
 use glidinghorse::tools::skill_registry::SkillRegistry;
+use glidinghorse::tools::ToolExecutor;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 
 // ── Mock MCP Server ──────────────────────────────────────────────
@@ -280,4 +284,88 @@ async fn test_mcp_client_tool_not_found_error() {
         .call_tool("chrome", "browser_navigate", &json!({}))
         .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_register_tools_to_tool_executor() {
+    let addr = start_mock_server(chrome_router()).await;
+    let url = format!("http://{}/mcp", addr);
+
+    let mut client = McpClient::new();
+    client.register_server("chrome", &url);
+    client.connect("chrome").await.unwrap();
+
+    let handle = Arc::new(tokio::sync::Mutex::new(Some(client)));
+    let mut executor = ToolExecutor::new();
+    {
+        let guard = handle.lock().await;
+        guard
+            .as_ref()
+            .unwrap()
+            .register_tools_to_tool_executor(&mut executor, handle.clone());
+    }
+
+    let result = executor
+        .execute("browser_navigate", json!({"url": "https://example.com"}))
+        .await;
+    assert!(result.is_ok());
+    let output = result.unwrap();
+    assert!(
+        output.to_string().contains("browser_navigate"),
+        "real dispatch should reach the MCP server, got: {}",
+        output
+    );
+    assert!(
+        !output.to_string().contains("simulated"),
+        "registered MCP tool must not return a simulated result"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_integration_invoke_tool_real_dispatch() {
+    let addr = start_mock_server(chrome_router()).await;
+    let url = format!("http://{}/mcp", addr);
+
+    let mut client = McpClient::new();
+    client.register_server("chrome", &url);
+    client.connect("chrome").await.unwrap();
+    let handle = Arc::new(tokio::sync::Mutex::new(Some(client)));
+
+    let registry = Arc::new(MCPRegistry::new());
+    let store = Arc::new(SkillGraphStore::new());
+    let integration = MCPIntegration::new(registry.clone(), store.clone()).with_client(handle);
+
+    let server_config = MCPServerConfig {
+        server_id: "chrome".to_string(),
+        server_name: "Chrome".to_string(),
+        endpoint: Some(url),
+        trust_level: glidinghorse::skill_graph::TrustLevel::High,
+        ..Default::default()
+    };
+    registry.register_server(server_config).await.unwrap();
+    registry
+        .register_tool(MCPToolInfo::new("chrome", "browser_navigate", "Navigate to a URL"))
+        .await
+        .unwrap();
+
+    let sync = integration.sync_tools_to_skills("chrome").await.unwrap();
+    assert_eq!(sync.tools_added, 1);
+
+    let result = integration
+        .invoke_tool(
+            "iri://skills/mcp/chrome-browser_navigate",
+            json!({"url": "https://example.com"}),
+        )
+        .await;
+    assert!(result.is_ok());
+    let output = result.unwrap();
+    assert!(
+        output.to_string().contains("browser_navigate"),
+        "invoke_tool should reach the real MCP server, got: {}",
+        output
+    );
+    assert!(
+        !output.to_string().contains("simulated"),
+        "invoke_tool must not return a simulated result"
+    );
 }

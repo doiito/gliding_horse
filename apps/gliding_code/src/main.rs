@@ -111,6 +111,12 @@ struct Cli {
     workflow: Option<String>,
 
     #[arg(
+        long = "skill-dir",
+        help = "Directory of external skill definitions (scans skills/*/skill.jsonld)"
+    )]
+    skill_dir: Option<String>,
+
+    #[arg(
         long = "daemon",
         help = "Run in daemon mode (Agent OS Worker — processes tasks from a Unix socket queue)"
     )]
@@ -213,6 +219,7 @@ fn main() -> anyhow::Result<()> {
         cli.max_iterations,
         cli.max_pdca_cycles,
         cli.workflow,
+        cli.skill_dir,
     );
 
     if cli.daemon {

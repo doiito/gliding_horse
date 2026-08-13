@@ -1,0 +1,45 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/finishing-a-development-branch",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:finishing-a-development-branch",
+  "methodology:name": "Finishing a Development Branch",
+  "methodology:description": "When implementation is complete and all tests pass, decide how to integrate the work: merge, PR, or cleanup",
+  "methodology:type": "Process",
+  "methodology:domain": "git",
+  "methodology:source": "superpowers-main/skills/finishing-a-development-branch/SKILL.md",
+  "methodology:activation": "OnPhaseEnd(\"ACT\")",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "merge without integration check",
+      "methodology:severity": "Critical",
+      "methodology:rationalizationCheck": "\"All tests pass, just merge it\" — integration requires deciding merge vs PR vs cleanup"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "automatic-merge",
+      "methodology:antiPatternDescription": "Merging without evaluating whether the work should be merged, PR'd, or cleaned up",
+      "methodology:gateBefore": "before merging a development branch",
+      "methodology:gateAsk": "Have you decided merge vs PR vs cleanup, and verified all tests pass?",
+      "methodology:gateAction": "STOP — present integration options and verify before merging"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["authority", "commitment"],
+    "methodology:phrasingExamples": ["Choose merge, PR, or cleanup deliberately", "Verify before integrating"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/verification-before-completion",
+      "methodology:id": "methodology:verification-before-completion"
+    },
+    {
+      "@id": "https://gliding.horse/methodology/methodology/requesting-code-review",
+      "methodology:id": "methodology:requesting-code-review"
+    }
+  ]
+}

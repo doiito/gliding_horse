@@ -1,0 +1,45 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/requesting-code-review",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:requesting-code-review",
+  "methodology:name": "Requesting Code Review",
+  "methodology:description": "When completing tasks, implementing major features, or before merging, verify work meets requirements and request review",
+  "methodology:type": "Guidance",
+  "methodology:domain": "review",
+  "methodology:source": "superpowers-main/skills/requesting-code-review/SKILL.md",
+  "methodology:activation": "OnAgentRole([Check])",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "review request without self-verification",
+      "methodology:severity": "Warning",
+      "methodology:rationalizationCheck": "\"The reviewer will catch issues\" — self-verify first, then request review"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "unverified-review-request",
+      "methodology:antiPatternDescription": "Requesting review before verifying your own work meets the requirements",
+      "methodology:gateBefore": "before requesting a code review",
+      "methodology:gateAsk": "Did you verify your work against the requirements and run the checks?",
+      "methodology:gateAction": "STOP — self-verify first, then request review"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["authority", "commitment"],
+    "methodology:phrasingExamples": ["Self-verify before requesting review", "Review requests follow verification"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/verification-before-completion",
+      "methodology:id": "methodology:verification-before-completion"
+    },
+    {
+      "@id": "https://gliding.horse/methodology/methodology/receiving-code-review",
+      "methodology:id": "methodology:receiving-code-review"
+    }
+  ]
+}

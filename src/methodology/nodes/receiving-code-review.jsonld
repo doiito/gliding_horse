@@ -1,0 +1,41 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/receiving-code-review",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:receiving-code-review",
+  "methodology:name": "Receiving Code Review",
+  "methodology:description": "When receiving code review feedback, evaluate suggestions technically before implementing; require rigor, not performative agreement",
+  "methodology:type": "Guidance",
+  "methodology:domain": "review",
+  "methodology:source": "superpowers-main/skills/receiving-code-review/SKILL.md",
+  "methodology:activation": "OnAgentRole([Check])",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "blind implementation of feedback",
+      "methodology:severity": "Warning",
+      "methodology:rationalizationCheck": "\"The reviewer said so, just do it\" — feedback must be verified for technical correctness"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "performative-agreement",
+      "methodology:antiPatternDescription": "Agreeing with and implementing all review feedback without verifying it is technically correct",
+      "methodology:gateBefore": "before implementing review feedback",
+      "methodology:gateAsk": "Is this feedback technically correct and consistent with the codebase?",
+      "methodology:gateAction": "STOP — verify feedback; implement only what is correct"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["authority", "commitment"],
+    "methodology:phrasingExamples": ["Verify review feedback before implementing", "Rigor over agreement"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/requesting-code-review",
+      "methodology:id": "methodology:requesting-code-review"
+    }
+  ]
+}

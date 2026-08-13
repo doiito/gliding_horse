@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::skill_graph::types::*;
+use crate::tools::mcp_client::McpClient;
 use crate::CoreError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +221,7 @@ impl Default for MCPRegistry {
 pub struct MCPIntegration {
     registry: Arc<MCPRegistry>,
     graph_store: Arc<SkillGraphStore>,
+    client: Option<Arc<tokio::sync::Mutex<Option<McpClient>>>>,
 }
 
 impl MCPIntegration {
@@ -227,7 +229,17 @@ impl MCPIntegration {
         Self {
             registry,
             graph_store,
+            client: None,
         }
+    }
+
+    /// Attach the shared MCP client handle so invoke_tool dispatches real tool calls.
+    pub fn with_client(
+        mut self,
+        client: Arc<tokio::sync::Mutex<Option<McpClient>>>,
+    ) -> Self {
+        self.client = Some(client);
+        self
     }
 
     pub async fn sync_tools_to_skills(
@@ -372,13 +384,19 @@ impl MCPIntegration {
             mapping.mcp_server_id, mapping.mcp_tool_name, mcp_params
         );
 
-        let result = serde_json::json!({
-            "tool": mapping.mcp_tool_name,
-            "server": mapping.mcp_server_id,
-            "params": mcp_params,
-            "status": "simulated",
-            "result": "MCP tool invocation simulated"
-        });
+        let handle = self.client.as_ref().ok_or_else(|| CoreError::ValidationFailed {
+            message: format!("No MCP client attached for skill: {}", skill_iri),
+        })?;
+        let mut guard = handle.lock().await;
+        let client = guard
+            .as_mut()
+            .ok_or_else(|| CoreError::ValidationFailed {
+                message: format!("MCP client not connected for skill: {}", skill_iri),
+            })?;
+
+        let result = client
+            .call_tool(&mapping.mcp_server_id, &mapping.mcp_tool_name, &mcp_params)
+            .await?;
 
         let transformed_result = self.transform_result(&mapping, result)?;
 

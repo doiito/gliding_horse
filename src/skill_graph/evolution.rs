@@ -130,6 +130,12 @@ pub enum EvolutionPatch {
         strength: LinkStrength,
         description: String,
     },
+    /// Governed record for a methodology adjustment recommendation. The
+    /// matching skill IRI is synthetic (`iri://methodology/<methodology_id>`)
+    /// and never requires a graph node.
+    Methodology {
+        methodology_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +147,17 @@ pub enum EvolutionSuggestionType {
     Deprecate,
     Merge,
     Split,
+    /// Adjustment recommendation for a methodology, persisted with a
+    /// synthetic skill IRI.
+    Methodology,
+}
+
+/// Prefix for synthetic skill IRIs representing methodologies in the
+/// proposal store. These IRIs never correspond to graph nodes.
+pub const METHODOLOGY_IRI_PREFIX: &str = "iri://methodology/";
+
+pub fn is_methodology_iri(iri: &str) -> bool {
+    iri.starts_with(METHODOLOGY_IRI_PREFIX)
 }
 
 /// Durable lifecycle of a governed proposal.  This is deliberately separate
@@ -229,6 +246,9 @@ impl EvolutionProposalStore {
         affected.dedup();
         let mut base_revisions = HashMap::new();
         for iri in affected {
+            if is_methodology_iri(&iri) {
+                continue;
+            }
             let skill = graph_store
                 .get_skill(&iri)
                 .ok_or_else(|| CoreError::SkillNotFound { iri })?;
@@ -470,6 +490,23 @@ impl EvolutionProposalStore {
                     description,
                 )?;
             }
+            Some(EvolutionPatch::Methodology { methodology_id }) => {
+                let expected_iri = format!("{METHODOLOGY_IRI_PREFIX}{methodology_id}");
+                if proposal.suggestion.skill_iri != expected_iri {
+                    return Err(CoreError::ValidationFailed {
+                        message: format!(
+                            "Methodology proposal skill IRI {} does not match methodology {}",
+                            proposal.suggestion.skill_iri, methodology_id
+                        ),
+                    });
+                }
+                if methodology_id.trim().is_empty() {
+                    return Err(CoreError::ValidationFailed {
+                        message: "Methodology proposal requires a non-empty methodology id"
+                            .to_string(),
+                    });
+                }
+            }
             None => {
                 return Err(CoreError::ValidationFailed {
                     message: "Proposal has no typed patch".to_string(),
@@ -511,6 +548,15 @@ impl EvolutionProposalStore {
                         .to_string(),
             });
         }
+        if matches!(
+            proposal.suggestion.patch,
+            Some(EvolutionPatch::Methodology { .. })
+        ) {
+            proposal.status = EvolutionProposalStatus::Committed;
+            proposal.updated_at = Utc::now();
+            self.save(&proposal)?;
+            return Ok(proposal);
+        }
         let (source_iri, target_iri, link_type, strength, description, is_removal) =
             match &proposal.suggestion.patch {
                 Some(EvolutionPatch::AddLink {
@@ -541,6 +587,11 @@ impl EvolutionProposalStore {
                     description.clone(),
                     true,
                 ),
+                Some(EvolutionPatch::Methodology { .. }) => {
+                    return Err(CoreError::ValidationFailed {
+                        message: "Methodology proposal has no link patch to commit".to_string(),
+                    })
+                }
                 None => {
                     return Err(CoreError::ValidationFailed {
                         message: "Proposal has no typed patch".to_string(),
@@ -641,6 +692,13 @@ impl EvolutionProposalStore {
             let source_iri = match &proposal.suggestion.patch {
                 Some(EvolutionPatch::AddLink { source_iri, .. })
                 | Some(EvolutionPatch::RemoveLink { source_iri, .. }) => source_iri,
+                Some(EvolutionPatch::Methodology { .. }) => {
+                    proposal.status = EvolutionProposalStatus::Committed;
+                    proposal.updated_at = Utc::now();
+                    self.save(&proposal)?;
+                    report.committed += 1;
+                    continue;
+                }
                 None => {
                     proposal.status = EvolutionProposalStatus::Failed;
                     proposal.updated_at = Utc::now();
@@ -690,6 +748,9 @@ impl EvolutionProposalStore {
         affected.dedup();
         let mut revisions = HashMap::new();
         for iri in affected {
+            if is_methodology_iri(&iri) {
+                continue;
+            }
             let skill = graph_store
                 .get_skill(&iri)
                 .ok_or_else(|| CoreError::SkillNotFound { iri })?;
@@ -782,11 +843,15 @@ impl EvolutionProposalStore {
                 target_iri,
                 ..
             } => vec![source_iri.clone(), target_iri.clone()],
+            EvolutionPatch::Methodology { .. } => Vec::new(),
         }
     }
 
     fn patch_is_applied(graph_store: &SkillGraphStore, patch: &EvolutionPatch) -> bool {
         let (source_iri, target_iri, link_type, strength, description, is_removal) = match patch {
+            EvolutionPatch::Methodology { .. } => {
+                return true;
+            }
             EvolutionPatch::AddLink {
                 source_iri,
                 target_iri,
@@ -1365,6 +1430,7 @@ impl SkillEvolutionEngine {
                 *strength,
                 description,
             ),
+            Some(EvolutionPatch::Methodology { .. }) => Ok(()),
             None => Err(CoreError::ValidationFailed {
                 message: "Suggestion has no typed patch; approval is required".to_string(),
             }),
@@ -2636,6 +2702,114 @@ mod tests {
             .unwrap()
             .links
             .is_empty());
+    }
+
+    #[test]
+    fn methodology_proposal_full_lifecycle_commits_record_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 =
+            Arc::new(crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let graph = Arc::new(SkillGraphStore::new().with_l0_store(l0.clone()));
+        let methodology_id = "methodology:writing-plans";
+        let synthetic_iri = format!("{METHODOLOGY_IRI_PREFIX}{methodology_id}");
+        let suggestion = EvolutionSuggestion {
+            suggestion_type: EvolutionSuggestionType::Methodology,
+            skill_iri: synthetic_iri.clone(),
+            description: "cold-archive writing-plans".into(),
+            confidence: 0.9,
+            patch: Some(EvolutionPatch::Methodology {
+                methodology_id: methodology_id.into(),
+            }),
+            approval: EvolutionApproval::Pending,
+        };
+        let proposals = EvolutionProposalStore::new(l0.clone());
+        let proposal = proposals
+            .create_or_get("methodology-record", suggestion, graph.as_ref())
+            .unwrap();
+        assert_eq!(proposal.status, EvolutionProposalStatus::PendingReview);
+        assert!(proposal.base_revisions.is_empty());
+        let approved = proposals
+            .approve(&proposal.proposal_id, "reviewer:test", None)
+            .unwrap();
+        assert_eq!(approved.status, EvolutionProposalStatus::Approved);
+        let validated = proposals
+            .validate_for_commit(&approved.proposal_id, graph.as_ref())
+            .unwrap();
+        assert_eq!(validated.status, EvolutionProposalStatus::Validated);
+        let committed = proposals
+            .commit_validated_link_patch(&validated.proposal_id, graph.as_ref())
+            .unwrap();
+        assert_eq!(committed.status, EvolutionProposalStatus::Committed);
+        assert!(graph.list_all_skills().is_empty());
+
+        let restored = EvolutionProposalStore::new(l0);
+        let hydrated = restored
+            .get(&proposal.proposal_id)
+            .unwrap()
+            .expect("proposal survives hydration");
+        assert_eq!(hydrated.status, EvolutionProposalStatus::Committed);
+        assert!(hydrated
+            .suggestion
+            .patch
+            .is_some_and(|p| matches!(p, EvolutionPatch::Methodology { .. })));
+    }
+
+    #[test]
+    fn methodology_proposal_rejects_mismatched_synthetic_iri() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 =
+            Arc::new(crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let graph = Arc::new(SkillGraphStore::new().with_l0_store(l0.clone()));
+        let suggestion = EvolutionSuggestion {
+            suggestion_type: EvolutionSuggestionType::Methodology,
+            skill_iri: format!("{METHODOLOGY_IRI_PREFIX}other"),
+            description: "mismatched iri".into(),
+            confidence: 0.9,
+            patch: Some(EvolutionPatch::Methodology {
+                methodology_id: "methodology:writing-plans".into(),
+            }),
+            approval: EvolutionApproval::Pending,
+        };
+        let proposals = EvolutionProposalStore::new(l0.clone());
+        let proposal = proposals
+            .create_or_get("methodology-mismatch", suggestion, graph.as_ref())
+            .unwrap();
+        proposals
+            .approve(&proposal.proposal_id, "reviewer:test", None)
+            .unwrap();
+        let error = proposals
+            .validate_for_commit(&proposal.proposal_id, graph.as_ref())
+            .unwrap_err();
+        assert!(matches!(error, CoreError::ValidationFailed { .. }));
+    }
+
+    #[test]
+    fn methodology_proposal_rejects_empty_methodology_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 =
+            Arc::new(crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let graph = Arc::new(SkillGraphStore::new().with_l0_store(l0.clone()));
+        let suggestion = EvolutionSuggestion {
+            suggestion_type: EvolutionSuggestionType::Methodology,
+            skill_iri: format!("{METHODOLOGY_IRI_PREFIX}"),
+            description: "empty id".into(),
+            confidence: 0.9,
+            patch: Some(EvolutionPatch::Methodology {
+                methodology_id: "  ".into(),
+            }),
+            approval: EvolutionApproval::Pending,
+        };
+        let proposals = EvolutionProposalStore::new(l0.clone());
+        let proposal = proposals
+            .create_or_get("methodology-empty-id", suggestion, graph.as_ref())
+            .unwrap();
+        proposals
+            .approve(&proposal.proposal_id, "reviewer:test", None)
+            .unwrap();
+        let error = proposals
+            .validate_for_commit(&proposal.proposal_id, graph.as_ref())
+            .unwrap_err();
+        assert!(matches!(error, CoreError::ValidationFailed { .. }));
     }
 
     #[test]

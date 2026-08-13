@@ -178,7 +178,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:index-priority",
             enforcement: "SyscallGate::validate_source(time_sensitive → realtime tool)",
-            trigger: ActivationCondition::OnHookPoint("PreToolCall"),
+            trigger: ActivationCondition::OnHookPoint("skill_before"),
         }],
     );
     m.insert(
@@ -212,7 +212,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:verification-before-completion",
             enforcement: "ToolGuard::PostValidation — re-run verification after fix",
-            trigger: ActivationCondition::OnHookPoint("PostToolCall"),
+            trigger: ActivationCondition::OnHookPoint("skill_after"),
         }],
     );
 
@@ -230,7 +230,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:boundary-enforcement",
             enforcement: "StageGate::HardBlock — risk assessment before side effects",
-            trigger: ActivationCondition::OnHookPoint("PreDestructiveAction"),
+            trigger: ActivationCondition::OnHookPoint("skill_before"),
         }],
     );
     m.insert(
@@ -330,7 +330,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:finishing-a-development-branch",
             enforcement: "HumanApprovalHook",
-            trigger: ActivationCondition::OnHookPoint("PreDestructiveAction"),
+            trigger: ActivationCondition::OnHookPoint("skill_before"),
         }],
     );
     m.insert(
@@ -390,7 +390,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:finishing-a-development-branch",
             enforcement: "decision tree conservative branch",
-            trigger: ActivationCondition::OnHookPoint("PreDestructiveAction"),
+            trigger: ActivationCondition::OnHookPoint("skill_before"),
         }],
     );
     m.insert(
@@ -424,7 +424,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:brainstorming",
             enforcement: "clarification template → SA→User follow-up",
-            trigger: ActivationCondition::OnHookPoint("PrePlanCreation"),
+            trigger: ActivationCondition::OnHookPoint("phase_start"),
         }],
     );
     m.insert(
@@ -472,7 +472,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:executing-plans",
             enforcement: "StageGate — Plan→Do human confirmation",
-            trigger: ActivationCondition::OnHookPoint("PrePlanExecution"),
+            trigger: ActivationCondition::OnHookPoint("phase_start"),
         }],
     );
     m.insert(
@@ -480,7 +480,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:dispatching-parallel-agents",
             enforcement: "EventBus progress broadcast",
-            trigger: ActivationCondition::OnHookPoint("TaskProgress"),
+            trigger: ActivationCondition::OnHookPoint("task_start"),
         }],
     );
     m.insert(
@@ -488,7 +488,7 @@ pub fn default_bindings() -> HashMap<&'static str, Vec<MethodologyBinding>> {
         vec![MethodologyBinding {
             methodology_id: "methodology:complexity-assessment",
             enforcement: "ResourceMonitor — overload warning",
-            trigger: ActivationCondition::OnHookPoint("PreTaskAssign"),
+            trigger: ActivationCondition::OnHookPoint("task_start"),
         }],
     );
     m.insert(

@@ -336,6 +336,25 @@ impl EvolutionEngine {
         self.metrics.values().collect()
     }
 
+    /// Find methodologies not activated since `cutoff_unix_secs`.
+    ///
+    /// Methodologies with no recorded activation are excluded — an unknown
+    /// methodology is not yet cold.
+    pub fn find_cold_methodologies(&self, cutoff_unix_secs: u64) -> Vec<String> {
+        let mut cold: Vec<String> = self
+            .metrics
+            .iter()
+            .filter(|(_, m)| {
+                m.last_activated
+                    .map(|activated| activated < cutoff_unix_secs)
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        cold.sort();
+        cold
+    }
+
     /// Get the top N violation patterns by frequency.
     pub fn top_patterns(&self, n: usize) -> Vec<LearnedPattern> {
         let mut patterns = self.learn_patterns();

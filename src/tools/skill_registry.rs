@@ -396,6 +396,37 @@ impl SkillRegistry {
         Ok(loaded)
     }
 
+    /// Load skills from a `skills/*/skill.jsonld` directory layout: each
+    /// immediate subdirectory may contain a `skill.jsonld` file whose
+    /// `skills` array is merged (existing IRIs replaced). Subdirectories
+    /// without a `skill.jsonld` are skipped.
+    pub fn load_from_jsonld_dir<P: AsRef<Path>>(&self, dir: P) -> Result<usize, CoreError> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            return Err(CoreError::Internal {
+                message: format!("Skill directory not found: {}", dir.display()),
+            });
+        }
+        let mut loaded = 0;
+        for entry in std::fs::read_dir(dir).map_err(|e| CoreError::Internal {
+            message: format!("Failed to read skill dir {}: {}", dir.display(), e),
+        })? {
+            let entry = entry.map_err(|e| CoreError::Internal {
+                message: format!("read_dir entry: {}", e),
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let def = path.join("skill.jsonld");
+            if def.is_file() {
+                loaded += self.load_from_jsonld(&def)?;
+            }
+        }
+        info!(count = loaded, path = %dir.display(), "Skills loaded from JSON-LD directory");
+        Ok(loaded)
+    }
+
     fn parse_skill_from_jsonld(&self, json: &serde_json::Value) -> Result<SkillMeta, CoreError> {
         let skill_iri = json
             .get("@id")
@@ -1499,5 +1530,59 @@ mod tests {
             skill.output_mapping.get("result"),
             Some(&"iri://schema/test/result".to_string())
         );
+    }
+
+    #[test]
+    fn load_from_jsonld_dir_merges_skill_jsonld_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        let skill_dir = skills_root.join("dir_test");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let file = skill_dir.join("skill.jsonld");
+        std::fs::write(
+            &file,
+            r#"{
+                "skills": [{
+                    "@id": "iri://skills/dir_test",
+                    "skill:name": "dir_test",
+                    "skill:description": "Loaded from directory",
+                    "skill:version": "1.0.0",
+                    "skill:category": "external",
+                    "skill:allowedRoles": ["DA"],
+                    "skill:inputSchema": {"type": "object"},
+                    "skill:outputSchema": {"type": "object"}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::new();
+        let loaded = registry.load_from_jsonld_dir(&skills_root).unwrap();
+        assert_eq!(loaded, 1);
+        let skill = registry.get_skill("iri://skills/dir_test").unwrap();
+        assert_eq!(skill.name, "dir_test");
+        assert_eq!(skill.category, "external");
+        assert!(registry
+            .list_all_skills()
+            .iter()
+            .any(|s| s.skill_iri == "iri://skills/dir_test"));
+    }
+
+    #[test]
+    fn load_from_jsonld_dir_skips_leaf_files_and_missing_dir_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        std::fs::create_dir_all(&skills_root).unwrap();
+        std::fs::write(skills_root.join("stray.jsonld"), "{}").unwrap();
+        let sub = skills_root.join("no_def");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let registry = SkillRegistry::new();
+        let loaded = registry.load_from_jsonld_dir(&skills_root).unwrap();
+        assert_eq!(loaded, 0);
+
+        assert!(registry
+            .load_from_jsonld_dir(dir.path().join("missing"))
+            .is_err());
     }
 }

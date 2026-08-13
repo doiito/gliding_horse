@@ -9,7 +9,11 @@ pub mod evolution;
 pub mod gate;
 pub mod integration;
 
+use std::path::{Path, PathBuf};
+use tracing::{debug, warn};
+
 use crate::core::constitution::{ActivationCondition, ConstitutionRole};
+use crate::CoreError;
 
 /// The nature of a methodology — determines how it's communicated to the agent
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +149,74 @@ impl MethodologyRegistry {
     pub fn count(&self) -> usize {
         self.entries.len()
     }
+
+    /// Load methodology definitions from all `*.jsonld` files in a directory.
+    ///
+    /// Entries replace same-ID builtins when present; unknown IDs are appended.
+    pub fn load_from_jsonld_dir<P: AsRef<Path>>(&mut self, dir: P) -> Result<usize, CoreError> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            return Err(CoreError::Internal {
+                message: format!("Methodology nodes directory not found: {}", dir.display()),
+            });
+        }
+        let mut loaded = 0;
+        for entry in std::fs::read_dir(dir).map_err(|e| CoreError::Internal {
+            message: format!("Failed to read methodology nodes dir {}: {}", dir.display(), e),
+        })? {
+            let entry = entry.map_err(|e| CoreError::Internal {
+                message: format!("read_dir entry: {}", e),
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonld") {
+                continue;
+            }
+            loaded += self.load_from_jsonld_file(&path)?;
+        }
+        Ok(loaded)
+    }
+
+    /// Load a single methodology definition from a JSON-LD file, replacing the
+    /// builtin entry with the same ID if present.
+    pub fn load_from_jsonld_file<P: AsRef<Path>>(&mut self, path: P) -> Result<usize, CoreError> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(|e| CoreError::Internal {
+            message: format!("Failed to read methodology JSON-LD {}: {}", path.display(), e),
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| CoreError::InvalidJsonLd {
+            message: format!("Invalid JSON in {}: {}", path.display(), e),
+        })?;
+        let def = parse_methodology_from_jsonld(&json)?;
+        if let Some(existing) = self.entries.iter_mut().find(|m| m.id == def.id) {
+            *existing = def;
+        } else {
+            self.entries.push(def);
+        }
+        Ok(1)
+    }
+
+    /// Best-effort load of the bundled `nodes/` definitions. Falls back to the
+    /// hardcoded builtins (no-op) when the directory is absent, logging a warning.
+    pub fn load_bundled_nodes(&mut self) {
+        let candidates: [PathBuf; 2] = [
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/methodology/nodes"),
+            PathBuf::from("src/methodology/nodes"),
+        ];
+        for dir in &candidates {
+            if dir.is_dir() {
+                match self.load_from_jsonld_dir(dir) {
+                    Ok(n) => {
+                        debug!(count = n, path = %dir.display(), "Methodologies loaded from JSON-LD nodes");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(path = %dir.display(), error = %e, "Failed to load methodology nodes, falling back to builtins");
+                    }
+                }
+            }
+        }
+        warn!("Methodology nodes/ dir not found; using builtin fallback");
+    }
 }
 
 impl Default for MethodologyRegistry {
@@ -158,6 +230,231 @@ pub fn global_registry() -> &'static MethodologyRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<MethodologyRegistry> = OnceLock::new();
     REGISTRY.get_or_init(MethodologyRegistry::new)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// JSON-LD Parsing
+// ════════════════════════════════════════════════════════════════════════
+
+fn get_json_str<'a>(json: &'a serde_json::Value, key: &str) -> Result<&'a str, CoreError> {
+    json.get(key).and_then(|v| v.as_str()).ok_or_else(|| CoreError::InvalidJsonLd {
+        message: format!("Missing string field `{}` in methodology node", key),
+    })
+}
+
+fn leak_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+fn parse_methodology_type_str(s: &str) -> Result<MethodologyType, CoreError> {
+    match s {
+        "Discipline" => Ok(MethodologyType::Discipline),
+        "Guidance" => Ok(MethodologyType::Guidance),
+        "Reference" => Ok(MethodologyType::Reference),
+        "Process" => Ok(MethodologyType::Process),
+        other => Err(CoreError::InvalidJsonLd {
+            message: format!("Unknown methodology type `{}`", other),
+        }),
+    }
+}
+
+fn parse_severity_str(s: &str) -> Result<RedFlagSeverity, CoreError> {
+    match s {
+        "Critical" => Ok(RedFlagSeverity::Critical),
+        "Warning" => Ok(RedFlagSeverity::Warning),
+        "Info" => Ok(RedFlagSeverity::Info),
+        other => Err(CoreError::InvalidJsonLd {
+            message: format!("Unknown red flag severity `{}`", other),
+        }),
+    }
+}
+
+fn parse_role_str(s: &str) -> Result<ConstitutionRole, CoreError> {
+    match s.trim() {
+        "Universal" => Ok(ConstitutionRole::Universal),
+        "Supervisor" => Ok(ConstitutionRole::Supervisor),
+        "Plan" => Ok(ConstitutionRole::Plan),
+        "Do" => Ok(ConstitutionRole::Do),
+        "Check" => Ok(ConstitutionRole::Check),
+        "Act" => Ok(ConstitutionRole::Act),
+        other => Err(CoreError::InvalidJsonLd {
+            message: format!("Unknown constitution role `{}`", other),
+        }),
+    }
+}
+
+/// Parse a Debug-formatted list such as `["a", "b"]` or `[Universal, Supervisor]`.
+fn parse_dbg_list(inner: &str, quoted_items: bool) -> Result<Vec<String>, CoreError> {
+    let t = inner.trim();
+    let list = t
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| CoreError::InvalidJsonLd {
+            message: format!("Malformed list in activation condition: `{}`", inner),
+        })?;
+    if list.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    list.split(',')
+        .map(|item| {
+            let item = item.trim();
+            if quoted_items {
+                Ok(item.trim_matches('"').to_string())
+            } else {
+                Ok(item.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Parse the Debug-string serialization of [`ActivationCondition`] produced by
+/// [`MethodologyDefinition::to_json_ld`] (which uses `format!("{:?}")`).
+fn parse_activation_str(raw: &str) -> Result<ActivationCondition, CoreError> {
+    let t = raw.trim();
+    match t {
+        "Always" => return Ok(ActivationCondition::Always),
+        "OnTaskError" => return Ok(ActivationCondition::OnTaskError),
+        _ => {}
+    }
+
+    if let Some(inner) = t.strip_prefix("OnHookPoint(").and_then(|s| s.strip_suffix(')')) {
+        let hook = inner.trim().trim_matches('"');
+        if hook.is_empty() {
+            return Err(CoreError::InvalidJsonLd {
+                message: "OnHookPoint with empty hook point".into(),
+            });
+        }
+        return Ok(ActivationCondition::OnHookPoint(leak_str(hook.to_string())));
+    }
+
+    if let Some(inner) = t.strip_prefix("OnPhaseEnd(").and_then(|s| s.strip_suffix(')')) {
+        let phase = inner.trim().trim_matches('"');
+        if phase.is_empty() {
+            return Err(CoreError::InvalidJsonLd {
+                message: "OnPhaseEnd with empty phase".into(),
+            });
+        }
+        return Ok(ActivationCondition::OnPhaseEnd(leak_str(phase.to_string())));
+    }
+
+    if let Some(inner) = t.strip_prefix("OnToolCategory(").and_then(|s| s.strip_suffix(')')) {
+        let items = parse_dbg_list(inner, true)?;
+        let leaked: &'static [&'static str] =
+            Box::leak(items.into_iter().map(leak_str).collect::<Vec<_>>().into_boxed_slice());
+        return Ok(ActivationCondition::OnToolCategory(leaked));
+    }
+
+    if let Some(inner) = t.strip_prefix("OnAgentRole(").and_then(|s| s.strip_suffix(')')) {
+        let items = parse_dbg_list(inner, false)?;
+        let mut roles = Vec::with_capacity(items.len());
+        for item in items {
+            roles.push(parse_role_str(&item)?);
+        }
+        let leaked: &'static [ConstitutionRole] = Box::leak(roles.into_boxed_slice());
+        return Ok(ActivationCondition::OnAgentRole(leaked));
+    }
+
+    Err(CoreError::InvalidJsonLd {
+        message: format!("Unrecognized activation condition: `{}`", raw),
+    })
+}
+
+/// Parse a single methodology definition from a JSON-LD node in the format
+/// produced by [`MethodologyDefinition::to_json_ld`].
+///
+/// All returned string fields are leaked to `'static` to match
+/// [`MethodologyDefinition`]'s interned representation.
+pub fn parse_methodology_from_jsonld(
+    json: &serde_json::Value,
+) -> Result<MethodologyDefinition, CoreError> {
+    let id = leak_str(get_json_str(json, "methodology:id")?.to_string());
+    let name = leak_str(get_json_str(json, "methodology:name")?.to_string());
+    let description = leak_str(get_json_str(json, "methodology:description")?.to_string());
+    let methodology_type = parse_methodology_type_str(get_json_str(json, "methodology:type")?)?;
+    let domain = leak_str(get_json_str(json, "methodology:domain")?.to_string());
+    let source = leak_str(get_json_str(json, "methodology:source")?.to_string());
+    let activation = parse_activation_str(get_json_str(json, "methodology:activation")?)?;
+
+    // Red flags
+    let mut red_flags: Vec<RedFlagEntry> = Vec::new();
+    if let Some(arr) = json.get("methodology:redFlags").and_then(|v| v.as_array()) {
+        for f in arr {
+            let pattern = leak_str(get_json_str(f, "methodology:pattern")?.to_string());
+            let severity = parse_severity_str(get_json_str(f, "methodology:severity")?)?;
+            let rationalization_check = f
+                .get("methodology:rationalizationCheck")
+                .and_then(|v| v.as_str())
+                .map(|s| leak_str(s.to_string()));
+            red_flags.push(RedFlagEntry {
+                pattern,
+                severity,
+                rationalization_check,
+            });
+        }
+    }
+
+    // Anti-patterns
+    let mut anti_patterns: Vec<AntiPatternEntry> = Vec::new();
+    if let Some(arr) = json.get("methodology:antiPatterns").and_then(|v| v.as_array()) {
+        for ap in arr {
+            anti_patterns.push(AntiPatternEntry {
+                name: leak_str(get_json_str(ap, "methodology:antiPatternName")?.to_string()),
+                description: leak_str(
+                    get_json_str(ap, "methodology:antiPatternDescription")?.to_string(),
+                ),
+                gate_before: leak_str(get_json_str(ap, "methodology:gateBefore")?.to_string()),
+                gate_ask: leak_str(get_json_str(ap, "methodology:gateAsk")?.to_string()),
+                gate_action: leak_str(get_json_str(ap, "methodology:gateAction")?.to_string()),
+            });
+        }
+    }
+
+    // Persuasion
+    let mut principles: Vec<&'static str> = Vec::new();
+    let mut phrasing_examples: Vec<&'static str> = Vec::new();
+    if let Some(p) = json.get("methodology:persuasion") {
+        if let Some(arr) = p.get("methodology:principles").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    principles.push(leak_str(s.to_string()));
+                }
+            }
+        }
+        if let Some(arr) = p.get("methodology:phrasingExamples").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    phrasing_examples.push(leak_str(s.to_string()));
+                }
+            }
+        }
+    }
+
+    // Related
+    let mut related: Vec<&'static str> = Vec::new();
+    if let Some(arr) = json.get("methodology:related").and_then(|v| v.as_array()) {
+        for r in arr {
+            if let Some(s) = r.get("methodology:id").and_then(|v| v.as_str()) {
+                related.push(leak_str(s.to_string()));
+            }
+        }
+    }
+
+    Ok(MethodologyDefinition {
+        id,
+        name,
+        description,
+        methodology_type,
+        domain,
+        source,
+        red_flags: Box::leak(red_flags.into_boxed_slice()),
+        anti_patterns: Box::leak(anti_patterns.into_boxed_slice()),
+        persuasion: PersuasionProfile {
+            principles: Box::leak(principles.into_boxed_slice()),
+            phrasing_examples: Box::leak(phrasing_examples.into_boxed_slice()),
+        },
+        activation,
+        related: Box::leak(related.into_boxed_slice()),
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -252,7 +549,7 @@ pub fn builtin_methodologies() -> Vec<MethodologyDefinition> {
                 principles: &["authority", "social_proof"],
                 phrasing_examples: &["YOU MUST control token usage", "Always prefer the lowest-cost path"],
             },
-            activation: ActivationCondition::OnHookPoint("PreToolCall"),
+            activation: ActivationCondition::OnHookPoint("skill_before"),
             related: &["methodology:index-priority", "methodology:verification-before-completion"],
         },
 
@@ -439,7 +736,7 @@ pub fn builtin_methodologies() -> Vec<MethodologyDefinition> {
                 principles: &["unity", "commitment"],
                 phrasing_examples: &["Let's explore before building", "We are colleagues working together"],
             },
-            activation: ActivationCondition::OnHookPoint("PrePlanCreation"),
+            activation: ActivationCondition::OnHookPoint("phase_start"),
             related: &["methodology:writing-plans", "methodology:complexity-assessment"],
         },
 
@@ -555,6 +852,230 @@ pub fn builtin_methodologies() -> Vec<MethodologyDefinition> {
             activation: ActivationCondition::OnPhaseEnd("ACT"),
             related: &["methodology:test-driven-development"],
         },
+
+        // ── 11. Writing Plans ──
+        MethodologyDefinition {
+            id: "methodology:writing-plans",
+            name: "Writing Plans",
+            description: "When you have a spec or requirements for a multi-step task, write an implementation plan before touching code",
+            methodology_type: MethodologyType::Process,
+            domain: "planning",
+            source: "superpowers-main/skills/writing-plans/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "implementing before planning",
+                    severity: RedFlagSeverity::Critical,
+                    rationalization_check: Some("\"The task is simple enough to start immediately\" — multi-step tasks need a written plan"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "code-before-plan",
+                    description: "Jumping straight into implementation without a written plan for a multi-step task",
+                    gate_before: "before implementing a multi-step task",
+                    gate_ask: "Do you have a written plan covering all steps and checkpoints?",
+                    gate_action: "STOP — write the plan first, then implement",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["commitment", "authority"],
+                phrasing_examples: &["Plan before you code", "A written plan is a commitment to the outcome"],
+            },
+            activation: ActivationCondition::OnHookPoint("phase_start"),
+            related: &["methodology:brainstorming", "methodology:executing-plans"],
+        },
+
+        // ── 12. Dispatching Parallel Agents ──
+        MethodologyDefinition {
+            id: "methodology:dispatching-parallel-agents",
+            name: "Dispatching Parallel Agents",
+            description: "When facing 2+ independent tasks that can be worked on without shared state or sequential dependencies, dispatch them in parallel",
+            methodology_type: MethodologyType::Process,
+            domain: "general",
+            source: "superpowers-main/skills/dispatching-parallel-agents/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "serializing independent tasks",
+                    severity: RedFlagSeverity::Warning,
+                    rationalization_check: Some("\"I can do them one by one\" — independent tasks should run in parallel"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "sequential-only-execution",
+                    description: "Executing independent tasks one after another instead of dispatching parallel agents",
+                    gate_before: "before executing a sequence of independent tasks",
+                    gate_ask: "Are there 2+ independent tasks that could run in parallel without shared state?",
+                    gate_action: "STOP — dispatch independent tasks to parallel agents",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["authority", "commitment"],
+                phrasing_examples: &["Parallelize independent work", "Independent tasks go to parallel agents"],
+            },
+            activation: ActivationCondition::OnAgentRole(&[ConstitutionRole::Supervisor]),
+            related: &["methodology:subagent-driven-development", "methodology:executing-plans"],
+        },
+
+        // ── 13. Executing Plans ──
+        MethodologyDefinition {
+            id: "methodology:executing-plans",
+            name: "Executing Plans",
+            description: "When you have a written implementation plan to execute in a separate session with review checkpoints",
+            methodology_type: MethodologyType::Process,
+            domain: "planning",
+            source: "superpowers-main/skills/executing-plans/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "plan deviation",
+                    severity: RedFlagSeverity::Warning,
+                    rationalization_check: Some("\"I found a better way mid-flight\" — deviations from the plan need explicit justification"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "unplanned-deviation",
+                    description: "Executing plan steps without following the written plan's checkpoints",
+                    gate_before: "before each plan step",
+                    gate_ask: "Does this step match the written plan? Were previous steps verified?",
+                    gate_action: "STOP — follow the plan; record deviations explicitly",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["commitment", "authority"],
+                phrasing_examples: &["Follow the plan step by step", "Verify each checkpoint before moving on"],
+            },
+            activation: ActivationCondition::OnHookPoint("phase_start"),
+            related: &["methodology:writing-plans", "methodology:subagent-driven-development"],
+        },
+
+        // ── 14. Finishing a Development Branch ──
+        MethodologyDefinition {
+            id: "methodology:finishing-a-development-branch",
+            name: "Finishing a Development Branch",
+            description: "When implementation is complete and all tests pass, decide how to integrate the work: merge, PR, or cleanup",
+            methodology_type: MethodologyType::Process,
+            domain: "git",
+            source: "superpowers-main/skills/finishing-a-development-branch/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "merge without integration check",
+                    severity: RedFlagSeverity::Critical,
+                    rationalization_check: Some("\"All tests pass, just merge it\" — integration requires deciding merge vs PR vs cleanup"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "automatic-merge",
+                    description: "Merging without evaluating whether the work should be merged, PR'd, or cleaned up",
+                    gate_before: "before merging a development branch",
+                    gate_ask: "Have you decided merge vs PR vs cleanup, and verified all tests pass?",
+                    gate_action: "STOP — present integration options and verify before merging",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["authority", "commitment"],
+                phrasing_examples: &["Choose merge, PR, or cleanup deliberately", "Verify before integrating"],
+            },
+            activation: ActivationCondition::OnPhaseEnd("ACT"),
+            related: &["methodology:verification-before-completion", "methodology:requesting-code-review"],
+        },
+
+        // ── 15. Receiving Code Review ──
+        MethodologyDefinition {
+            id: "methodology:receiving-code-review",
+            name: "Receiving Code Review",
+            description: "When receiving code review feedback, evaluate suggestions technically before implementing; require rigor, not performative agreement",
+            methodology_type: MethodologyType::Guidance,
+            domain: "review",
+            source: "superpowers-main/skills/receiving-code-review/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "blind implementation of feedback",
+                    severity: RedFlagSeverity::Warning,
+                    rationalization_check: Some("\"The reviewer said so, just do it\" — feedback must be verified for technical correctness"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "performative-agreement",
+                    description: "Agreeing with and implementing all review feedback without verifying it is technically correct",
+                    gate_before: "before implementing review feedback",
+                    gate_ask: "Is this feedback technically correct and consistent with the codebase?",
+                    gate_action: "STOP — verify feedback; implement only what is correct",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["authority", "commitment"],
+                phrasing_examples: &["Verify review feedback before implementing", "Rigor over agreement"],
+            },
+            activation: ActivationCondition::OnAgentRole(&[ConstitutionRole::Check]),
+            related: &["methodology:requesting-code-review"],
+        },
+
+        // ── 16. Requesting Code Review ──
+        MethodologyDefinition {
+            id: "methodology:requesting-code-review",
+            name: "Requesting Code Review",
+            description: "When completing tasks, implementing major features, or before merging, verify work meets requirements and request review",
+            methodology_type: MethodologyType::Guidance,
+            domain: "review",
+            source: "superpowers-main/skills/requesting-code-review/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "review request without self-verification",
+                    severity: RedFlagSeverity::Warning,
+                    rationalization_check: Some("\"The reviewer will catch issues\" — self-verify first, then request review"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "unverified-review-request",
+                    description: "Requesting review before verifying your own work meets the requirements",
+                    gate_before: "before requesting a code review",
+                    gate_ask: "Did you verify your work against the requirements and run the checks?",
+                    gate_action: "STOP — self-verify first, then request review",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["authority", "commitment"],
+                phrasing_examples: &["Self-verify before requesting review", "Review requests follow verification"],
+            },
+            activation: ActivationCondition::OnAgentRole(&[ConstitutionRole::Check]),
+            related: &["methodology:verification-before-completion", "methodology:receiving-code-review"],
+        },
+
+        // ── 17. Subagent-Driven Development ──
+        MethodologyDefinition {
+            id: "methodology:subagent-driven-development",
+            name: "Subagent-Driven Development",
+            description: "When executing implementation plans with independent tasks in the current session, dispatch work to subagents",
+            methodology_type: MethodologyType::Process,
+            domain: "development",
+            source: "superpowers-main/skills/subagent-driven-development/SKILL.md",
+            red_flags: &[
+                RedFlagEntry {
+                    pattern: "doing independent tasks inline",
+                    severity: RedFlagSeverity::Warning,
+                    rationalization_check: Some("\"I'll just do it myself\" — independent plan tasks belong in subagents"),
+                },
+            ],
+            anti_patterns: &[
+                AntiPatternEntry {
+                    name: "inline-serial-execution",
+                    description: "Executing independent plan tasks inline in the main session instead of dispatching to subagents",
+                    gate_before: "before executing an independent plan task",
+                    gate_ask: "Is this task independent enough to dispatch to a subagent?",
+                    gate_action: "STOP — dispatch the task to a subagent",
+                },
+            ],
+            persuasion: PersuasionProfile {
+                principles: &["authority", "commitment"],
+                phrasing_examples: &["Dispatch independent tasks to subagents", "The main session orchestrates, subagents execute"],
+            },
+            activation: ActivationCondition::OnAgentRole(&[ConstitutionRole::Do]),
+            related: &["methodology:dispatching-parallel-agents", "methodology:executing-plans"],
+        },
     ]
 }
 
@@ -633,5 +1154,131 @@ mod tests {
     #[test]
     fn test_constitutions_for_methodology() {
         // MethodologyResolver removed as unused (P9)
+    }
+
+    #[test]
+    fn test_jsonld_roundtrip_preserves_definition() {
+        let registry = MethodologyRegistry::new();
+        for m in registry.all() {
+            let json = m.to_json_ld();
+            let parsed = parse_methodology_from_jsonld(&json).expect("round-trip parse");
+            assert_eq!(parsed.id, m.id, "id mismatch for {}", m.id);
+            assert_eq!(parsed.name, m.name);
+            assert_eq!(parsed.description, m.description);
+            assert_eq!(parsed.methodology_type, m.methodology_type);
+            assert_eq!(parsed.domain, m.domain);
+            assert_eq!(parsed.source, m.source);
+            assert_eq!(format!("{:?}", parsed.activation), format!("{:?}", m.activation));
+            assert_eq!(parsed.red_flags.len(), m.red_flags.len());
+            for (p, orig) in parsed.red_flags.iter().zip(m.red_flags.iter()) {
+                assert_eq!(p.pattern, orig.pattern);
+                assert_eq!(p.severity, orig.severity);
+                assert_eq!(p.rationalization_check, orig.rationalization_check);
+            }
+            assert_eq!(parsed.anti_patterns.len(), m.anti_patterns.len());
+            for (p, orig) in parsed.anti_patterns.iter().zip(m.anti_patterns.iter()) {
+                assert_eq!(p.name, orig.name);
+                assert_eq!(p.gate_action, orig.gate_action);
+            }
+            assert_eq!(
+                parsed.persuasion.principles.as_ref(),
+                m.persuasion.principles.as_ref()
+            );
+            assert_eq!(
+                parsed.persuasion.phrasing_examples.as_ref(),
+                m.persuasion.phrasing_examples.as_ref()
+            );
+            assert_eq!(parsed.related.as_ref(), m.related.as_ref());
+        }
+    }
+
+    #[test]
+    fn test_load_bundled_nodes_resolves_all() {
+        let mut registry = MethodologyRegistry::new();
+        registry.load_bundled_nodes();
+        assert_eq!(registry.count(), 17);
+        for id in [
+            "methodology:index-priority",
+            "methodology:cost-awareness",
+            "methodology:least-privilege",
+            "methodology:complexity-assessment",
+            "methodology:boundary-enforcement",
+            "methodology:using-superpowers",
+            "methodology:brainstorming",
+            "methodology:test-driven-development",
+            "methodology:systematic-debugging",
+            "methodology:verification-before-completion",
+            "methodology:writing-plans",
+            "methodology:dispatching-parallel-agents",
+            "methodology:executing-plans",
+            "methodology:finishing-a-development-branch",
+            "methodology:receiving-code-review",
+            "methodology:requesting-code-review",
+            "methodology:subagent-driven-development",
+        ] {
+            assert!(
+                registry.get(id).is_some(),
+                "{} must resolve after load_bundled_nodes",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_bundled_nodes_overrides_builtin() {
+        let mut registry = MethodologyRegistry::new();
+        registry.load_bundled_nodes();
+        let wp = registry.get("methodology:writing-plans").unwrap();
+        assert_eq!(wp.source, "superpowers-main/skills/writing-plans/SKILL.md");
+        assert_eq!(wp.domain, "planning");
+    }
+
+    #[test]
+    fn test_load_jsonld_missing_dir_is_err() {
+        let mut registry = MethodologyRegistry::new();
+        let res = registry.load_from_jsonld_dir("/nonexistent/methodology/nodes");
+        assert!(res.is_err(), "missing dir must error, not silently pass");
+    }
+
+    #[test]
+    fn test_parse_activation_variants() {
+        use crate::core::constitution::ConstitutionRole;
+        let cases: Vec<(ActivationCondition, &str)> = vec![
+            (ActivationCondition::Always, "Always"),
+            (ActivationCondition::OnTaskError, "OnTaskError"),
+            (
+                ActivationCondition::OnHookPoint("skill_before"),
+                "OnHookPoint(\"skill_before\")",
+            ),
+            (ActivationCondition::OnPhaseEnd("ACT"), "OnPhaseEnd(\"ACT\")"),
+            (
+                ActivationCondition::OnToolCategory(&["file_search", "shell"]),
+                "OnToolCategory([\"file_search\", \"shell\"])",
+            ),
+            (
+                ActivationCondition::OnAgentRole(&[
+                    ConstitutionRole::Supervisor,
+                    ConstitutionRole::Plan,
+                ]),
+                "OnAgentRole([Supervisor, Plan])",
+            ),
+        ];
+        for (condition, raw) in cases {
+            let parsed = parse_activation_str(raw).unwrap_or_else(|e| panic!("parse {}: {}", raw, e));
+            assert_eq!(
+                format!("{:?}", parsed),
+                format!("{:?}", condition),
+                "parsed {:?} must equal {:?}",
+                parsed,
+                condition
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_activation_rejects_garbage() {
+        assert!(parse_activation_str("OnBogus([x])").is_err());
+        assert!(parse_activation_str("").is_err());
+        assert!(parse_activation_str("OnHookPoint(\"\")").is_err());
     }
 }

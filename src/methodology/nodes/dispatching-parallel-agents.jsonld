@@ -1,0 +1,45 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/dispatching-parallel-agents",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:dispatching-parallel-agents",
+  "methodology:name": "Dispatching Parallel Agents",
+  "methodology:description": "When facing 2+ independent tasks that can be worked on without shared state or sequential dependencies, dispatch them in parallel",
+  "methodology:type": "Process",
+  "methodology:domain": "general",
+  "methodology:source": "superpowers-main/skills/dispatching-parallel-agents/SKILL.md",
+  "methodology:activation": "OnAgentRole([Supervisor])",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "serializing independent tasks",
+      "methodology:severity": "Warning",
+      "methodology:rationalizationCheck": "\"I can do them one by one\" — independent tasks should run in parallel"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "sequential-only-execution",
+      "methodology:antiPatternDescription": "Executing independent tasks one after another instead of dispatching parallel agents",
+      "methodology:gateBefore": "before executing a sequence of independent tasks",
+      "methodology:gateAsk": "Are there 2+ independent tasks that could run in parallel without shared state?",
+      "methodology:gateAction": "STOP — dispatch independent tasks to parallel agents"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["authority", "commitment"],
+    "methodology:phrasingExamples": ["Parallelize independent work", "Independent tasks go to parallel agents"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/subagent-driven-development",
+      "methodology:id": "methodology:subagent-driven-development"
+    },
+    {
+      "@id": "https://gliding.horse/methodology/methodology/executing-plans",
+      "methodology:id": "methodology:executing-plans"
+    }
+  ]
+}

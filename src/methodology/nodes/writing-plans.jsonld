@@ -1,0 +1,45 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/writing-plans",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:writing-plans",
+  "methodology:name": "Writing Plans",
+  "methodology:description": "When you have a spec or requirements for a multi-step task, write an implementation plan before touching code",
+  "methodology:type": "Process",
+  "methodology:domain": "planning",
+  "methodology:source": "superpowers-main/skills/writing-plans/SKILL.md",
+  "methodology:activation": "OnHookPoint(\"phase_start\")",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "implementing before planning",
+      "methodology:severity": "Critical",
+      "methodology:rationalizationCheck": "\"The task is simple enough to start immediately\" — multi-step tasks need a written plan"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "code-before-plan",
+      "methodology:antiPatternDescription": "Jumping straight into implementation without a written plan for a multi-step task",
+      "methodology:gateBefore": "before implementing a multi-step task",
+      "methodology:gateAsk": "Do you have a written plan covering all steps and checkpoints?",
+      "methodology:gateAction": "STOP — write the plan first, then implement"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["commitment", "authority"],
+    "methodology:phrasingExamples": ["Plan before you code", "A written plan is a commitment to the outcome"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/brainstorming",
+      "methodology:id": "methodology:brainstorming"
+    },
+    {
+      "@id": "https://gliding.horse/methodology/methodology/executing-plans",
+      "methodology:id": "methodology:executing-plans"
+    }
+  ]
+}

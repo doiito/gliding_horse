@@ -1,0 +1,45 @@
+{
+  "@context": {
+    "schema": "https://schema.org/",
+    "methodology": "https://gliding.horse/ontology/methodology#"
+  },
+  "@id": "https://gliding.horse/methodology/methodology/executing-plans",
+  "@type": "methodology:Methodology",
+  "methodology:id": "methodology:executing-plans",
+  "methodology:name": "Executing Plans",
+  "methodology:description": "When you have a written implementation plan to execute in a separate session with review checkpoints",
+  "methodology:type": "Process",
+  "methodology:domain": "planning",
+  "methodology:source": "superpowers-main/skills/executing-plans/SKILL.md",
+  "methodology:activation": "OnHookPoint(\"phase_start\")",
+  "methodology:redFlags": [
+    {
+      "methodology:pattern": "plan deviation",
+      "methodology:severity": "Warning",
+      "methodology:rationalizationCheck": "\"I found a better way mid-flight\" — deviations from the plan need explicit justification"
+    }
+  ],
+  "methodology:antiPatterns": [
+    {
+      "methodology:antiPatternName": "unplanned-deviation",
+      "methodology:antiPatternDescription": "Executing plan steps without following the written plan's checkpoints",
+      "methodology:gateBefore": "before each plan step",
+      "methodology:gateAsk": "Does this step match the written plan? Were previous steps verified?",
+      "methodology:gateAction": "STOP — follow the plan; record deviations explicitly"
+    }
+  ],
+  "methodology:persuasion": {
+    "methodology:principles": ["commitment", "authority"],
+    "methodology:phrasingExamples": ["Follow the plan step by step", "Verify each checkpoint before moving on"]
+  },
+  "methodology:related": [
+    {
+      "@id": "https://gliding.horse/methodology/methodology/writing-plans",
+      "methodology:id": "methodology:writing-plans"
+    },
+    {
+      "@id": "https://gliding.horse/methodology/methodology/subagent-driven-development",
+      "methodology:id": "methodology:subagent-driven-development"
+    }
+  ]
+}

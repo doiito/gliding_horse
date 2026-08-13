@@ -21,6 +21,7 @@ use crate::skill_graph::discovery::SkillDiscoveryEngine;
 use crate::templates::template_engine::TemplateEngine;
 use crate::tools::sharing::SharingProtocol;
 use crate::tools::skill_registry::SkillRegistry;
+use crate::tools::tool_executor::ToolExecutor;
 
 use super::types::CycleState;
 
@@ -201,5 +202,11 @@ impl SupervisorAgent {
 
     pub fn blackboard(&self) -> Option<&Arc<Blackboard>> {
         self.blackboard.as_ref()
+    }
+
+    /// Access to the runner's ToolExecutor for runtime tool registration
+    /// (e.g. MCP tools discovered after a lazy connection).
+    pub fn tool_executor(&self) -> Arc<parking_lot::RwLock<ToolExecutor>> {
+        self.runner.tool_executor.clone()
     }
 }

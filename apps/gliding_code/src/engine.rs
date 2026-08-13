@@ -68,7 +68,7 @@ pub struct CodeCliEngine {
     last_completion_tokens: Arc<AtomicU64>,
     context_limit: u64,
     skills: Arc<SkillRegistry>,
-    mcp_client: Option<McpClient>,
+    mcp_client: Option<Arc<tokio::sync::Mutex<Option<McpClient>>>>,
     workspace_monitor: Option<Arc<WorkspaceMonitor>>,
     /// Skill Graph Store — cognitive network
     skill_graph: Arc<SkillGraphStore>,
@@ -410,6 +410,15 @@ impl CodeCliEngine {
         let skills = Arc::new(SkillRegistry::new());
         let skills_for_engine = skills.clone();
 
+        // Load external skills from --skill-dir (skills/*/skill.jsonld)
+        // before the bootstrap loop so they join the skill graph at startup.
+        if let Some(skill_dir) = config.skill_dir.as_deref() {
+            match skills.load_from_jsonld_dir(skill_dir) {
+                Ok(count) => info!(count, path = %skill_dir, "Loaded external skills from --skill-dir"),
+                Err(error) => warn!(path = %skill_dir, %error, "Failed to load skills from --skill-dir"),
+            }
+        }
+
         let workspace_root = std::path::PathBuf::from(&config.workspace);
         let code_scan_exclude_patterns =
             load_code_scan_exclusions(&workspace_root, &settings.workspace.exclude_patterns);
@@ -696,7 +705,7 @@ impl CodeCliEngine {
                 info!(name = %name, command = %entry.command, "注册 MCP 服务器 (Stdio)");
                 client.register_from_config(name, &cfg);
             }
-            Some(client)
+            Some(Arc::new(tokio::sync::Mutex::new(Some(client))))
         } else {
             None
         };
@@ -1430,23 +1439,29 @@ impl CodeCliEngine {
         // code graph for a TUI/resume task.
         self.scan_workspace_code()?;
         // Lazy MCP connect — connect to registered servers on first task
-        if let Some(ref mut client) = self.mcp_client {
-            let needs_connect: Vec<String> = client
-                .list_servers()
-                .iter()
-                .filter(|s| s.status == "registered")
-                .map(|s| s.name.clone())
-                .collect();
+        if let Some(ref handle) = self.mcp_client {
+            let mut guard = handle.lock().await;
+            if let Some(client) = guard.as_mut() {
+                let needs_connect: Vec<String> = client
+                    .list_servers()
+                    .iter()
+                    .filter(|s| s.status == "registered")
+                    .map(|s| s.name.clone())
+                    .collect();
 
-            for name in &needs_connect {
-                info!(server = %name, "连接 MCP 服务器");
-                if let Err(e) = client.connect(name).await {
-                    warn!("MCP 服务器 '{}' 连接失败: {}", name, e);
+                for name in &needs_connect {
+                    info!(server = %name, "连接 MCP 服务器");
+                    if let Err(e) = client.connect(name).await {
+                        warn!("MCP 服务器 '{}' 连接失败: {}", name, e);
+                    }
                 }
-            }
 
-            if !needs_connect.is_empty() {
-                client.register_tools_to_skill_registry(&self.skills);
+                if !needs_connect.is_empty() {
+                    client.register_tools_to_skill_registry(&self.skills);
+                    let tool_executor = self.sa.tool_executor();
+                    let mut executor = tool_executor.write();
+                    client.register_tools_to_tool_executor(&mut executor, handle.clone());
+                }
             }
         }
 

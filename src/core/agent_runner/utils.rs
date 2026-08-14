@@ -5,21 +5,14 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
-use crate::core::system_prompt::{
-    build_constitution_prompt, build_time_awareness_text, SystemPromptBuilder, SystemPromptRegion,
-};
 use crate::gateway::unified_gateway::ChatMessage;
 use crate::jsonld::{generate_iri, validate_jsonld_node, JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
-use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
-use super::{
-    LlmParsedResponse, TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT,
-    LLM_RESPONSE_FORMAT_WITH_THOUGHT,
-};
+use super::{LlmParsedResponse, TaskContext, TaskResult};
 
 impl super::AgentRunner {
     /// Utility: extract summary from agent output.
@@ -610,113 +603,7 @@ impl super::AgentRunner {
         let context_data = self.gather_context_data_async(agent.role, &ctx).await;
         let agent_md = self.build_agent_md(agent.role, &ctx.objective, &context_data, &model);
 
-        let mut prompt_builder = SystemPromptBuilder::new();
-        prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.clone());
-
-        // Region 2: Time awareness — current time and session context
-        {
-            let session_start = session
-                .created_at()
-                .format("%Y-%m-%d %H:%M:%S UTC")
-                .to_string();
-            let time_text = build_time_awareness_text(Some(&session_start));
-            prompt_builder.set_region(SystemPromptRegion::TimeAwareness, time_text);
-        }
-
-        // Region 3: Workspace environment info
-        if let Some(ref ws_root) = self.workspace_root {
-            let env_info = format!(
-                "## Workspace\n\n- Workspace path: {}\n\
-                 - All your file operations (read, write, search, command execution) are limited to the workspace\n\
-                 - Files outside the workspace are not relevant to the current task and should not be accessed\n\
-                 - The workspace root may contain other directories and files unrelated to the current task — please distinguish carefully",
-                ws_root.display()
-            );
-            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
-        }
-
-        // Region 2: Code of conduct (constitution + methodology)
-        {
-            let mut policy_text = build_constitution_prompt(agent.role);
-
-            policy_text.push_str("\n\n### 🔴 Task Focus Principle (Must Follow)\n");
-            policy_text.push_str("- Your only task is the currently assigned \"Current Task\". Other directories/files in the workspace are not relevant to your task\n");
-            policy_text.push_str("- For unrelated files or directories (e.g., other projects, test outputs, irrelevant codebases), you must ignore them directly — do not explore or process them\n");
-            policy_text.push_str("- When using glob_search, file_list, or similar tools, if results contain irrelevant content, you must automatically filter it out — do not let it distract you\n");
-            policy_text.push_str("- If you encounter any files/directories that do not belong to the current task, skip them and continue executing the current task — do not change direction due to irrelevant content\n");
-            policy_text.push_str("- Check Agent (CA) special note: Your audit report may only contain content related to the current task. If you discover irrelevant files, ignore them and do not include them in the report\n");
-            policy_text.push_str("- Decision Agent (AA) special note: Do not actively explore files. Your decisions must be based solely on CA audit results — ignore any irrelevant content in the audit results\n");
-
-            // Inject methodology discipline (PA/CA/AA specific)
-            if let Some(methodology_addendum) =
-                MethodologyPromptInjector::build_for_role(agent.role)
-            {
-                policy_text.push_str(&methodology_addendum);
-            }
-            // Inject persuasive directives for active methodologies
-            if let Some(ref gate) = self.methodology_gate {
-                let directives = gate.inner().read().persuasive_directives();
-                if !directives.is_empty() {
-                    policy_text.push_str("\n\n### Methodology Execution Requirements\n");
-                    for d in &directives {
-                        policy_text.push_str(&format!("- {}\n", d));
-                    }
-                }
-            }
-            // AA-specific: inject methodology evolution briefing
-            if agent.role == AgentRole::Act {
-                if let Some(ref gate) = self.methodology_gate {
-                    if let Some(ref evo) = gate.evolution_handle() {
-                        let briefing = evo.inner().read().aa_evolution_briefing();
-                        if !briefing.is_empty() {
-                            policy_text.push_str("\n\n");
-                            policy_text.push_str(&briefing);
-                        }
-                    }
-                }
-            }
-            prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
-        }
-
-        let emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
-        if !emphasis_items.is_empty() {
-            let emphasis_content = emphasis_items
-                .iter()
-                .map(|e| format!("- {}", e))
-                .collect::<Vec<_>>()
-                .join("\n");
-            prompt_builder.set_region(SystemPromptRegion::EmphasizedConstraints, emphasis_content);
-        }
-
-        let format_constraint = if supports_reasoning {
-            LLM_RESPONSE_FORMAT_NO_THOUGHT.to_string()
-        } else {
-            LLM_RESPONSE_FORMAT_WITH_THOUGHT.to_string()
-        };
-        prompt_builder.set_region(SystemPromptRegion::OutputFormat, format_constraint);
-
-        // Region: Output management area
-        prompt_builder.set_region(
-            SystemPromptRegion::OutputManagement,
-            crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
-        );
-
-        let tool_menu = self.build_readable_tool_menu(&agent.role);
-        if !tool_menu.is_empty() {
-            prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
-        }
-
-        // Region: Extraction prompt area (loaded from config)
-        if let Some(ref config) = self.emphasis_config {
-            if config.enabled {
-                prompt_builder.set_region(
-                    SystemPromptRegion::ExtractionPrompt,
-                    config.extraction_prompt.clone(),
-                );
-            }
-        }
-
-        let system_content = prompt_builder.build();
+        let system_content = self.build_system_prompt(agent, &ctx, &session, &agent_md).await;
 
         let summary_chain = session.get_summary_chain();
         let summary_text = summary_chain
@@ -1056,7 +943,14 @@ impl super::AgentRunner {
 
                             // Cross-turn aging: compress old tool results by staleness
                             if let Some(ref aging) = self.tool_result_aging {
-                                aging.age_tool_results(&mut running_messages, &self.tool_executor);
+                                let (aged, freed) = aging
+                                    .age_tool_results(&mut running_messages, &self.tool_executor);
+                                if aged > 0 {
+                                    info!(
+                                        "[turn {}] ToolResultAging aged {} results, freed {} bytes",
+                                        turn, aged, freed
+                                    );
+                                }
                             }
 
                             running_messages.push(ChatMessage {

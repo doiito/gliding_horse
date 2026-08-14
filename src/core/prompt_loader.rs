@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde_json::Value;
+use tracing::debug;
 
 use crate::templates::template_engine::TemplateEngine;
 
@@ -82,19 +83,28 @@ impl PromptLoader {
                 .join("prompts")
                 .join(&fname);
             if let Some(content) = self.read_cached(&path) {
+                debug!(role = %role, template = %template, source = "user", "prompt template hit");
                 return self.post_process(role, &Self::render_string(&content, vars));
             }
         }
 
         let proj_path = PathBuf::from(".gliding_horse").join("prompts").join(&fname);
         if let Some(content) = self.read_cached(&proj_path) {
+            debug!(role = %role, template = %template, source = "project", "prompt template hit");
             return self.post_process(role, &Self::render_string(&content, vars));
         }
 
         if let Ok(content) = self.engine.render_prompt(role, template, vars, false, None) {
+            debug!(role = %role, template = %template, source = "engine", "prompt template hit");
             return self.post_process(role, &content);
         }
 
+        debug!(
+            role = %role,
+            template = %template,
+            "no prompt template found for {}/{}.md, using builtin fallback",
+            role, template
+        );
         let fallback = builtin_fallback(role);
         self.post_process(role, &Self::render_string(fallback, vars))
     }

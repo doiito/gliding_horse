@@ -3,7 +3,11 @@ use tracing::debug;
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::core::sa::PlanStep;
+use crate::core::system_prompt::{
+    build_constitution_prompt, build_time_awareness_text, SystemPromptBuilder, SystemPromptRegion,
+};
 use crate::memory::l1_session::L1Session;
+use crate::methodology::integration::MethodologyPromptInjector;
 
 use super::{TaskContext, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
 
@@ -434,7 +438,13 @@ impl super::AgentRunner {
             let result = loader.load(&role_lower, "skeleton", &vars);
             if !result.is_empty() {
                 let md = format!("# {} Agent.md\n\n{}", role_name, result);
-                debug!(role = %role_name, "=== agent.md (from PromptLoader) ===\n{}", md);
+                debug!(
+                    role = %role_name,
+                    source = "PromptLoader",
+                    chars = md.chars().count(),
+                    preview = %Self::preview_text(&md, 200),
+                    "agent.md built"
+                );
                 return md;
             }
         }
@@ -444,7 +454,14 @@ impl super::AgentRunner {
                 .render_prompt(&role_lower, "skeleton", &vars, false, None)
         {
             let md = format!("# {} Agent.md\n\n{}\n", role_name, rendered,);
-            debug!(role = %role_name, supports_reasoning = supports_reasoning, "=== agent.md (from template) ===\n{}", md);
+            debug!(
+                role = %role_name,
+                source = "template",
+                supports_reasoning = supports_reasoning,
+                chars = md.chars().count(),
+                preview = %Self::preview_text(&md, 200),
+                "agent.md built"
+            );
             return md;
         }
 
@@ -542,8 +559,142 @@ impl super::AgentRunner {
             "# {} Agent.md\n\nRole: {}\nTask: {}\nWork Mode: {}\n\n{}\n\nImportant: After fulfilling your responsibility, directly output the final result without calling additional tools. Your response should include the complete conclusion or result.",
             role_name, role_name, objective, role_prompt, context_section
         );
-        debug!(role = %role_name, "=== agent.md (fallback) ===\n{}", md);
+        debug!(
+            role = %role_name,
+            source = "fallback",
+            chars = md.chars().count(),
+            preview = %Self::preview_text(&md, 200),
+            "agent.md built"
+        );
         md
+    }
+
+    fn preview_text(text: &str, max_chars: usize) -> String {
+        let mut preview: String = text.chars().take(max_chars).collect();
+        if text.chars().count() > max_chars {
+            preview.push_str("...");
+        }
+        preview.replace('\n', "\\n")
+    }
+
+    /// Single source of truth for the agent system prompt (all regions except
+    /// the dynamic perception/KG messages). Shared by `exec()` and the streaming path.
+    pub(super) async fn build_system_prompt(
+        &self,
+        agent: &AgentInstance,
+        ctx: &TaskContext,
+        sess: &L1Session,
+        agent_md: &str,
+    ) -> String {
+        let model = self
+            .gateway
+            .get_model(&agent.role.to_string().to_lowercase());
+        let supports_reasoning = self.gateway.supports_native_reasoning(&model);
+
+        let mut prompt_builder = SystemPromptBuilder::new();
+        prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.to_string());
+
+        let session_start = sess
+            .created_at()
+            .format("%Y-%m-%d %H:%M:%S UTC")
+            .to_string();
+        prompt_builder.set_region(
+            SystemPromptRegion::TimeAwareness,
+            build_time_awareness_text(Some(&session_start)),
+        );
+
+        if let Some(ref ws_root) = self.workspace_root {
+            let env_info = format!(
+                "## Workspace\n\n- Workspace path: {}\n\
+                 - All file operations (read, write, search, command execution) must stay within the workspace\n\
+                 - Files outside the workspace are unrelated to the current task and must not be accessed\n\
+                 - The workspace root may contain other directories and files unrelated to the current task — distinguish carefully",
+                ws_root.display()
+            );
+            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
+        }
+
+        {
+            let mut policy_text = build_constitution_prompt(agent.role);
+
+            policy_text.push_str("\n\n### 🔴 Task Focus Principles (Mandatory)\n");
+            policy_text.push_str("- Your only task is the designated 'Current Task'. All other directories/files in the workspace are unrelated to your task\n");
+            policy_text.push_str("- Irrelevant files or directories (e.g. other projects, test artifacts, unrelated codebases) must be directly ignored — do not explore or process them\n");
+            policy_text.push_str("- When using glob_search, file_list or similar tools, if results contain irrelevant content, automatically filter it out — do not get distracted\n");
+            policy_text.push_str("- If you encounter files/directories not belonging to the current task, skip them and continue executing the current task — do not change direction due to irrelevant content\n");
+            policy_text.push_str("- Check Agent (CA) special note: your audit report may only contain content related to the current task. Irrelevant files found must be ignored and not written into the report\n");
+            policy_text.push_str("- Decision Agent (AA) special note: do NOT proactively explore files. Your decisions must be based solely on CA audit results, ignoring any irrelevant content in the audit\n");
+            policy_text.push_str("\n### 📖 File Reading Efficiency Principles (Mandatory)\n");
+            policy_text.push_str("- Only read files relevant to the current task. Files that have been 'written but not re-read' are output from other agents — only read them when you need to reference their content\n");
+            policy_text.push_str("- Do not re-read the same file. If file_read returns from_cache=true, the content is unchanged and was already provided — skip re-reading and continue with what you have\n");
+            policy_text.push_str("- Do NOT try mode:force_refresh just because file_read returns from_cache=true — this only wastes tokens reading unchanged content\n");
+            policy_text.push_str("- For files already read, their content is already in your context. No need to re-confirm or re-verify\n");
+
+            if let Some(methodology_addendum) =
+                MethodologyPromptInjector::build_for_role(agent.role)
+            {
+                policy_text.push_str(&methodology_addendum);
+            }
+            if let Some(ref gate) = self.methodology_gate {
+                let directives = gate.inner().read().persuasive_directives();
+                if !directives.is_empty() {
+                    policy_text.push_str("\n\n### Methodology Execution Requirements\n");
+                    for d in &directives {
+                        policy_text.push_str(&format!("- {}\n", d));
+                    }
+                }
+            }
+            if agent.role == AgentRole::Act {
+                if let Some(ref gate) = self.methodology_gate {
+                    if let Some(ref evo) = gate.evolution_handle() {
+                        let briefing = evo.inner().read().aa_evolution_briefing();
+                        if !briefing.is_empty() {
+                            policy_text.push_str("\n\n");
+                            policy_text.push_str(&briefing);
+                        }
+                    }
+                }
+            }
+            prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
+        }
+
+        let emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
+        if !emphasis_items.is_empty() {
+            let emphasis_content = emphasis_items
+                .iter()
+                .map(|e| format!("- {}", e))
+                .collect::<Vec<_>>()
+                .join("\n");
+            prompt_builder.set_region(SystemPromptRegion::EmphasizedConstraints, emphasis_content);
+        }
+
+        let format_constraint = if supports_reasoning {
+            LLM_RESPONSE_FORMAT_NO_THOUGHT.to_string()
+        } else {
+            LLM_RESPONSE_FORMAT_WITH_THOUGHT.to_string()
+        };
+        prompt_builder.set_region(SystemPromptRegion::OutputFormat, format_constraint);
+
+        prompt_builder.set_region(
+            SystemPromptRegion::OutputManagement,
+            crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
+        );
+
+        let tool_menu = self.build_readable_tool_menu(&agent.role);
+        if !tool_menu.is_empty() {
+            prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
+        }
+
+        if let Some(ref config) = self.emphasis_config {
+            if config.enabled {
+                prompt_builder.set_region(
+                    SystemPromptRegion::ExtractionPrompt,
+                    config.extraction_prompt.clone(),
+                );
+            }
+        }
+
+        prompt_builder.build()
     }
 
     pub(super) fn build_readable_tool_menu(&self, role: &AgentRole) -> String {

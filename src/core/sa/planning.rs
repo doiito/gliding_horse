@@ -644,7 +644,7 @@ Output only JSON, no other content."#,
             use crate::core::constitution::{ConstitutionRegistry, ConstitutionRole};
             let registry = ConstitutionRegistry::new();
             let constitution_text =
-                registry.build_prompt_for_role_exact(ConstitutionRole::Supervisor);
+                registry.build_prompt_for_role(ConstitutionRole::Supervisor);
             // Inject methodology layer discipline (includes auto-trigger protocol, always-active methodology)
             let methodology_text =
                 crate::methodology::integration::MethodologyPromptInjector::build_for_sa();

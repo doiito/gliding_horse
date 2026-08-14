@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::knowledge_graph::store::KnowledgeGraphStore;
 use crate::memory::hyperspace_store::HyperspaceStore;
@@ -994,6 +994,12 @@ impl ToolExecutor {
         allowed_roles: &[&str],
     ) {
         let roles: Vec<String> = allowed_roles.iter().map(|s| s.to_string()).collect();
+        if self.tools.contains_key(name) && !Self::is_micro_tool_name(name) {
+            warn!(
+                tool = name,
+                "tool registration overwrites existing handler with same name"
+            );
+        }
         self.tools.insert(name.to_string(), handler);
 
         if let Some(existing) = self.tool_descriptions.iter_mut().find(|td| td.name == name) {
@@ -1371,9 +1377,16 @@ impl ToolExecutor {
         }))
     }
 
-    /// List all tools
-    pub fn list_tools(&self, _role: &str) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+    /// List tool names visible to the given role (role-filtered definitions).
+    pub fn list_tools(&self, role: &str) -> Vec<String> {
+        self.tool_definitions_for_role(role)
+            .into_iter()
+            .filter_map(|td| {
+                td["function"]["name"]
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
+            .collect()
     }
 
     /// Return all tool definitions (LLM autonomously selects based on role description in agent.md)
@@ -1432,7 +1445,7 @@ impl ToolExecutor {
             .iter()
             .filter(|td| {
                 if !td.allowed_roles.is_empty() {
-                    return td.allowed_roles.iter().any(|r| r == role);
+                    return td.allowed_roles.iter().any(|r| r == role || r == role_name);
                 }
                 default_tools.contains(&td.name) || on_demand_tools.contains(&td.name)
             })

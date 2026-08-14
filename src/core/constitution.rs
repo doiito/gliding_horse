@@ -776,14 +776,6 @@ impl ConstitutionRegistry {
         self.build_prompt_for_entries(&self.for_role(role))
     }
 
-    /// Build prompt text for only the exact role's rules (no universal).
-    /// Used by SA prompt which manages its own universal rules separately.
-    pub fn build_prompt_for_role_exact(&self, role: ConstitutionRole) -> String {
-        let rules: Vec<&ConstitutionEntry> =
-            self.entries.iter().filter(|e| e.role == role).collect();
-        self.build_prompt_for_entries(&rules)
-    }
-
     fn build_prompt_for_entries(&self, rules: &[&ConstitutionEntry]) -> String {
         let mut lines = Vec::new();
         let mut last_cat: Option<ConstitutionCategory> = None;

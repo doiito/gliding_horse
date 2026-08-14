@@ -343,4 +343,44 @@ mod tests {
         assert!(description.contains("does not create an executable"));
         assert!(!description.contains("available for use"));
     }
+
+    /// Regression test: MCP tools are registered with long-form role names
+    /// ("Plan"/"Do"/"Check"/"Act", see McpClient::register_tools_to_tool_executor),
+    /// while consumers call tool_definitions_for_role with short-form names
+    /// ("PA"/"DA"/"CA"/"AA", see AgentRole::Display). Both conventions must match.
+    #[test]
+    fn test_long_form_allowed_roles_match_short_form_agent_roles() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.register(
+                "mcp_server_browse",
+                "MCP-registered browsing tool",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(|input: Value| {
+                    Box::pin(async move { Ok(json!({"ok": input})) })
+                }),
+                &["Plan", "Do", "Check", "Act"],
+            );
+
+            for role in ["PA", "DA", "CA", "AA"] {
+                let defs = executor.tool_definitions_for_role(role);
+                let names: Vec<String> = defs
+                    .iter()
+                    .map(|d| {
+                        d["function"]["name"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+                assert!(
+                    names.contains(&"mcp_server_browse".to_string()),
+                    "role {} should see the MCP-registered tool, got {} tools: {:?}",
+                    role,
+                    names.len(),
+                    &names[..names.len().min(15)]
+                );
+            }
+        });
+    }
 }

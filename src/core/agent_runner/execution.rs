@@ -6,20 +6,14 @@ use tracing::{debug, info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
-use crate::core::system_prompt::{
-    build_constitution_prompt, build_time_awareness_text, SystemPromptBuilder, SystemPromptRegion,
-};
 use crate::gateway::unified_gateway::ChatMessage;
 use crate::jsonld::{JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
-use crate::methodology::integration::MethodologyPromptInjector;
 use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
-use super::{
-    TaskContext, TaskResult, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT,
-};
+use super::{TaskContext, TaskResult};
 
 /// Cap on (tool_name, result) pairs aggregated into the force-finish summary
 /// prompt — bounds prompt size for long tasks regardless of total tool calls.
@@ -493,125 +487,8 @@ Output the summary report directly, not in JSON format."#,
         let context_data = self.gather_context_data_async(agent.role, &ctx).await;
         let agent_md = self.build_agent_md(agent.role, &ctx.objective, &context_data, &model);
 
-        // Build system prompt using SystemPromptBuilder
-        let mut prompt_builder = SystemPromptBuilder::new();
-
-        // Region 1: Role definition area
-        prompt_builder.set_region(SystemPromptRegion::RoleDefinition, agent_md.clone());
-
-        // Region 2: Time awareness — current time and session context
-        {
-            let session_start = sess
-                .created_at()
-                .format("%Y-%m-%d %H:%M:%S UTC")
-                .to_string();
-            let time_text = build_time_awareness_text(Some(&session_start));
-            prompt_builder.set_region(SystemPromptRegion::TimeAwareness, time_text);
-        }
-
-        // Region 3: Workspace environment info area (let Agent know its workspace boundaries)
-        if let Some(ref ws_root) = self.workspace_root {
-            let env_info = format!(
-                "## Workspace\n\n- Workspace path: {}\n\
-                 - All file operations (read, write, search, command execution) must stay within the workspace\n\
-                 - Files outside the workspace are unrelated to the current task and must not be accessed\n\
-                 - The workspace root may contain other directories and files unrelated to the current task — distinguish carefully",
-                ws_root.display()
-            );
-            prompt_builder.set_region(SystemPromptRegion::EnvironmentInfo, env_info);
-        }
-
-        // Region 2: Behavioral policy area (constitution layer + methodology layer)
-        {
-            let mut policy_text = build_constitution_prompt(agent.role);
-
-            policy_text.push_str("\n\n### 🔴 Task Focus Principles (Mandatory)\n");
-            policy_text.push_str("- Your only task is the designated 'Current Task'. All other directories/files in the workspace are unrelated to your task\n");
-            policy_text.push_str("- Irrelevant files or directories (e.g. other projects, test artifacts, unrelated codebases) must be directly ignored — do not explore or process them\n");
-            policy_text.push_str("- When using glob_search, file_list or similar tools, if results contain irrelevant content, automatically filter it out — do not get distracted\n");
-            policy_text.push_str("- If you encounter files/directories not belonging to the current task, skip them and continue executing the current task — do not change direction due to irrelevant content\n");
-            policy_text.push_str("- Check Agent (CA) special note: your audit report may only contain content related to the current task. Irrelevant files found must be ignored and not written into the report\n");
-            policy_text.push_str("- Decision Agent (AA) special note: do NOT proactively explore files. Your decisions must be based solely on CA audit results, ignoring any irrelevant content in the audit\n");
-            policy_text.push_str("\n### 📖 File Reading Efficiency Principles (Mandatory)\n");
-            policy_text.push_str("- Only read files relevant to the current task. Files that have been 'written but not re-read' are output from other agents — only read them when you need to reference their content\n");
-            policy_text.push_str("- Do not re-read the same file. If file_read returns from_cache=true, the content is unchanged and was already provided — skip re-reading and continue with what you have\n");
-            policy_text.push_str("- Do NOT try mode:force_refresh just because file_read returns from_cache=true — this only wastes tokens reading unchanged content\n");
-            policy_text.push_str("- For files already read, their content is already in your context. No need to re-confirm or re-verify\n");
-
-            // Inject methodology discipline (PA/CA/AA specific)
-            if let Some(methodology_addendum) =
-                MethodologyPromptInjector::build_for_role(agent.role)
-            {
-                policy_text.push_str(&methodology_addendum);
-            }
-            // Inject active methodology persuasive directives
-            if let Some(ref gate) = self.methodology_gate {
-                let directives = gate.inner().read().persuasive_directives();
-                if !directives.is_empty() {
-                    policy_text.push_str("\n\n### Methodology Execution Requirements\n");
-                    for d in &directives {
-                        policy_text.push_str(&format!("- {}\n", d));
-                    }
-                }
-            }
-            // AA specific: inject methodology evolution briefing
-            if agent.role == AgentRole::Act {
-                if let Some(ref gate) = self.methodology_gate {
-                    if let Some(ref evo) = gate.evolution_handle() {
-                        let briefing = evo.inner().read().aa_evolution_briefing();
-                        if !briefing.is_empty() {
-                            policy_text.push_str("\n\n");
-                            policy_text.push_str(&briefing);
-                        }
-                    }
-                }
-            }
-            prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
-        }
-
-        // Region 3: Emphasized constraints area (loaded from L0)
-        let emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
-        if !emphasis_items.is_empty() {
-            let emphasis_content = emphasis_items
-                .iter()
-                .map(|e| format!("- {}", e))
-                .collect::<Vec<_>>()
-                .join("\n");
-            prompt_builder.set_region(SystemPromptRegion::EmphasizedConstraints, emphasis_content);
-        }
-
-        // Region 3: Output format area
-        let format_constraint = if supports_reasoning {
-            LLM_RESPONSE_FORMAT_NO_THOUGHT.to_string()
-        } else {
-            LLM_RESPONSE_FORMAT_WITH_THOUGHT.to_string()
-        };
-        prompt_builder.set_region(SystemPromptRegion::OutputFormat, format_constraint);
-
-        // Region 4: Output management area
-        prompt_builder.set_region(
-            SystemPromptRegion::OutputManagement,
-            crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
-        );
-
-        // Region 5: Tools area (built-in tools + dynamic tools)
-        let tool_menu = self.build_readable_tool_menu(&agent.role);
-        if !tool_menu.is_empty() {
-            prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
-        }
-
-        // Region 5: Extraction prompt area (loaded from config)
-        if let Some(ref config) = self.emphasis_config {
-            if config.enabled {
-                prompt_builder.set_region(
-                    SystemPromptRegion::ExtractionPrompt,
-                    config.extraction_prompt.clone(),
-                );
-            }
-        }
-
         // Build system prompt (relatively static, placed in system role)
-        let system_content = prompt_builder.build();
+        let system_content = self.build_system_prompt(agent, &ctx, sess, &agent_md).await;
 
         // Build context message (dynamic, placed in the final user role)
         let summary_iris = sess.get_summary_chain_with_iris(20, 100);
@@ -1137,72 +1014,6 @@ Output the summary report directly, not in JSON format."#,
 
             if let Some(compressed) = context_window_compressed {
                 messages = compressed;
-            } else if messages.len() > 30 {
-                // Fallback: hard truncation (only triggered when CWM is unavailable or misconfigured)
-                let system_msg = messages.first().cloned();
-                let kept_recent = messages.len().saturating_sub(15);
-
-                let mut recent: Vec<_> = messages.drain(kept_recent..).collect();
-
-                while !recent.is_empty() {
-                    let first = &recent[0];
-                    if first.role == "tool" {
-                        recent.remove(0);
-                        continue;
-                    }
-                    if first.role == "assistant" {
-                        if let Some(ref tool_calls) = first.tool_calls {
-                            let expected_tool_results = tool_calls.len();
-                            let actual_tool_results = recent
-                                .iter()
-                                .skip(1)
-                                .take_while(|m| m.role == "tool")
-                                .count();
-                            if actual_tool_results < expected_tool_results {
-                                recent.remove(0);
-                                continue;
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                messages.clear();
-                if let Some(sys) = system_msg {
-                    messages.push(sys);
-                }
-
-                let summary_iris = sess.get_summary_chain_with_iris(10, 100);
-                let summary_text = if summary_iris.is_empty() {
-                    format!(
-                        "[History Summary] Previously executed {} turns with {} tool calls. Here is the recent conversation:",
-                        turn - 1, tc
-                    )
-                } else {
-                    format!(
-                        "[History Summary] Executed {} turns. Key records:\n{}\n\nFor details, use kg_search / knowledge_query with the IRI.",
-                        turn - 1,
-                        summary_iris.join("\n")
-                    )
-                };
-
-                let summary_note = ChatMessage {
-                    role: "user".to_string(),
-                    content: summary_text,
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                };
-                messages.push(summary_note);
-                messages.extend(recent);
-
-                info!(
-                    "[turn {}] message history truncated: kept {} (original {} messages)",
-                    turn,
-                    messages.len(),
-                    kept_recent + 17
-                );
             }
 
             if !guard_pending_pre_injections.is_empty() {
@@ -1940,7 +1751,14 @@ Output the summary report directly, not in JSON format."#,
 
                             // Cross-turn aging: compress old tool results by staleness
                             if let Some(ref aging) = self.tool_result_aging {
-                                aging.age_tool_results(&mut messages, &self.tool_executor);
+                                let (aged, freed) =
+                                    aging.age_tool_results(&mut messages, &self.tool_executor);
+                                if aged > 0 {
+                                    info!(
+                                        "[turn {}] ToolResultAging aged {} results, freed {} bytes",
+                                        turn, aged, freed
+                                    );
+                                }
                             }
 
                             if let Some(err) = result.get("error") {

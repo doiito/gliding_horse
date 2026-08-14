@@ -67,6 +67,102 @@ fn create_test_runner() -> AgentRunner {
 }
 
 #[test]
+fn test_token_optimization_settings_wired() {
+    use crate::config::settings::{
+        ContextWindowSettings, TokenOptimizationSettings, ToolResultAgingSettings,
+        ToolResultCompressorSettings,
+    };
+
+    // Historical default: compressors are enabled by default (matching the
+    // pre-config hardcoded behavior), so a default runner has them attached.
+    let runner = create_test_runner();
+    assert!(runner.tool_result_compressor.is_some());
+    assert!(runner.tool_result_aging.is_some());
+    assert!(runner.context_window_manager.is_some());
+
+    // Disabled settings → with_token_optimization must detach all compressors.
+    let disabled = TokenOptimizationSettings {
+        enabled: false,
+        tool_groups: Default::default(),
+        tool_result_compressor: ToolResultCompressorSettings {
+            enabled: false,
+            max_full_results: 2,
+            max_summary_length: 200,
+            compression_trigger: 5,
+            compress_tool_result_threshold: 500,
+        },
+        context_window: ContextWindowSettings {
+            max_messages: 0,
+            max_tokens: 16000,
+            compression_ratio: 0.3,
+            preserve_recent: 4,
+            model_aware: false,
+        },
+        tool_result_aging: ToolResultAgingSettings {
+            enabled: false,
+            keep_full: 3,
+            try_microtool: 5,
+            compress_threshold: 500,
+        },
+        prompt_optimization: Default::default(),
+    };
+    let runner = runner.with_token_optimization(disabled);
+    assert!(runner.tool_result_compressor.is_none());
+    assert!(runner.tool_result_aging.is_none());
+    assert!(runner.context_window_manager.is_none());
+
+    // Enabled with distinct values → each compressor must exist and reflect the settings.
+    let trc = ToolResultCompressorSettings {
+        enabled: true,
+        max_full_results: 3,
+        max_summary_length: 99,
+        compression_trigger: 5,
+        compress_tool_result_threshold: 500,
+    };
+    let aging = ToolResultAgingSettings {
+        enabled: true,
+        keep_full: 4,
+        try_microtool: 8,
+        compress_threshold: 600,
+    };
+    let cwm = ContextWindowSettings {
+        max_messages: 12,
+        max_tokens: 8888,
+        compression_ratio: 0.3,
+        preserve_recent: 4,
+        model_aware: false,
+    };
+    let to = TokenOptimizationSettings {
+        enabled: true,
+        tool_groups: Default::default(),
+        tool_result_compressor: trc.clone(),
+        context_window: cwm.clone(),
+        tool_result_aging: aging.clone(),
+        prompt_optimization: Default::default(),
+    };
+    let runner = runner.with_token_optimization(to);
+
+    let compressor = runner
+        .tool_result_compressor
+        .as_ref()
+        .expect("compressor should be created");
+    let compressor = compressor.lock().unwrap();
+    assert_eq!(compressor.max_full_results(), 3);
+    assert_eq!(compressor.max_summary_length(), 99);
+
+    let aging = runner.tool_result_aging.as_ref().expect("aging created");
+    assert_eq!(aging.keep_full(), 4);
+    assert_eq!(aging.try_microtool(), 8);
+
+    let cwm = runner
+        .context_window_manager
+        .as_ref()
+        .expect("cwm created");
+    let cwm = cwm.lock().unwrap();
+    assert_eq!(cwm.max_tokens(), 8888);
+}
+
+#[test]
 fn test_parse_jsonld_response_valid() {
     let runner = create_test_runner();
     let response = json!({
@@ -399,4 +495,176 @@ fn test_build_agent_md_no_workspace_files_key_omits_section() {
         "deepseek-v4-pro",
     );
     assert!(!md.contains("## Workspace Files"));
+}
+
+#[test]
+fn test_available_skills_injects_role_skills() {
+    use crate::tools::skill_registry::SkillMeta;
+
+    let runner = create_test_runner();
+    runner.skills.register_skill(SkillMeta {
+        skill_iri: "iri://skills/da-analyze".to_string(),
+        name: "analyze_output".to_string(),
+        description: "Deep analysis of execution results".to_string(),
+        version: "1.0.0".to_string(),
+        category: "analysis".to_string(),
+        security_level: "L0".to_string(),
+        allowed_roles: vec!["DA".to_string()],
+        input_schema: serde_json::json!({}),
+        output_schema: serde_json::json!({}),
+        compiled_template: "template".to_string(),
+        signature: None,
+        signature_algorithm: None,
+        input_mapping: std::collections::HashMap::new(),
+        output_mapping: std::collections::HashMap::new(),
+        skill_types: vec![],
+    });
+
+    let tools = vec!["file_read".to_string(), "file_write".to_string()];
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA");
+    assert!(
+        skills_text.contains("analyze_output: Deep analysis of execution results"),
+        "role-visible skill should be injected, got: {}",
+        skills_text
+    );
+    assert!(skills_text.starts_with("file_read, file_write"));
+}
+
+#[test]
+fn test_agent_md_fallback_includes_injected_skills() {
+    use crate::tools::skill_registry::SkillMeta;
+
+    let runner = create_test_runner();
+    runner.skills.register_skill(SkillMeta {
+        skill_iri: "iri://skills/da-analyze".to_string(),
+        name: "analyze_output".to_string(),
+        description: "Deep analysis of execution results".to_string(),
+        version: "1.0.0".to_string(),
+        category: "analysis".to_string(),
+        security_level: "L0".to_string(),
+        allowed_roles: vec!["DA".to_string()],
+        input_schema: serde_json::json!({}),
+        output_schema: serde_json::json!({}),
+        compiled_template: "template".to_string(),
+        signature: None,
+        signature_algorithm: None,
+        input_mapping: std::collections::HashMap::new(),
+        output_mapping: std::collections::HashMap::new(),
+        skill_types: vec![],
+    });
+
+    let context_data = std::collections::HashMap::new();
+    let md = runner.build_agent_md(AgentRole::Do, "objective", &context_data, "deepseek-v4-pro");
+    assert!(
+        md.contains("## Available Skills") && md.contains("analyze_output"),
+        "fallback agent.md must include injected skills, got: {}",
+        md
+    );
+}
+
+#[test]
+fn test_available_skills_dedupes_tool_names() {
+    use crate::tools::skill_registry::SkillMeta;
+
+    let runner = create_test_runner();
+    // A skill whose name collides with an actual tool must not be injected twice.
+    runner.skills.register_skill(SkillMeta {
+        skill_iri: "iri://skills/dup".to_string(),
+        name: "file_read".to_string(),
+        description: "duplicate".to_string(),
+        version: "1.0.0".to_string(),
+        category: "misc".to_string(),
+        security_level: "L0".to_string(),
+        allowed_roles: vec!["DA".to_string()],
+        input_schema: serde_json::json!({}),
+        output_schema: serde_json::json!({}),
+        compiled_template: "template".to_string(),
+        signature: None,
+        signature_algorithm: None,
+        input_mapping: std::collections::HashMap::new(),
+        output_mapping: std::collections::HashMap::new(),
+        skill_types: vec![],
+    });
+
+    let tools = vec!["file_read".to_string()];
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA");
+    let occurrences = skills_text.matches("file_read").count();
+    assert_eq!(
+        occurrences, 1,
+        "tool-named skill must be deduped against the tool list, found {} occurrences: {}",
+        occurrences, skills_text
+    );
+}
+
+#[test]
+fn test_available_skills_skips_other_roles() {
+    use crate::tools::skill_registry::SkillMeta;
+
+    let runner = create_test_runner();
+    runner.skills.register_skill(SkillMeta {
+        skill_iri: "iri://skills/pa-only".to_string(),
+        name: "plan_strategy".to_string(),
+        description: "planning expertise".to_string(),
+        version: "1.0.0".to_string(),
+        category: "planning".to_string(),
+        security_level: "L0".to_string(),
+        allowed_roles: vec!["PA".to_string()],
+        input_schema: serde_json::json!({}),
+        output_schema: serde_json::json!({}),
+        compiled_template: "template".to_string(),
+        signature: None,
+        signature_algorithm: None,
+        input_mapping: std::collections::HashMap::new(),
+        output_mapping: std::collections::HashMap::new(),
+        skill_types: vec![],
+    });
+
+    let tools = vec!["file_read".to_string()];
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA");
+    assert!(
+        !skills_text.contains("plan_strategy"),
+        "PA-only skill must not appear for DA, got: {}",
+        skills_text
+    );
+}
+#[test]
+fn test_agent_md_prompt_loader_fallback_injects_skills() {
+    use crate::core::prompt_loader::{PromptConfig, PromptLoader};
+    use crate::templates::template_engine::TemplateEngine;
+    use crate::tools::skill_registry::SkillMeta;
+    use std::path::Path;
+
+    let runner = create_test_runner();
+    // A loader backed by an empty template dir exercises the builtin-fallback
+    // branch of PromptLoader::load, which ignores the `available_skills` var.
+    let empty_dir = std::env::temp_dir().join(format!("gh-pl-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let tmpl = Arc::new(TemplateEngine::new(Path::new(&empty_dir)).unwrap());
+    let runner = runner.with_prompt_loader(PromptLoader::new(PromptConfig::default(), tmpl));
+
+    runner.skills.register_skill(SkillMeta {
+        skill_iri: "iri://skills/da-analyze".to_string(),
+        name: "analyze_output".to_string(),
+        description: "Deep analysis of execution results".to_string(),
+        version: "1.0.0".to_string(),
+        category: "analysis".to_string(),
+        security_level: "L0".to_string(),
+        allowed_roles: vec!["DA".to_string()],
+        input_schema: serde_json::json!({}),
+        output_schema: serde_json::json!({}),
+        compiled_template: "template".to_string(),
+        signature: None,
+        signature_algorithm: None,
+        input_mapping: std::collections::HashMap::new(),
+        output_mapping: std::collections::HashMap::new(),
+        skill_types: vec![],
+    });
+
+    let context_data = std::collections::HashMap::new();
+    let md = runner.build_agent_md(AgentRole::Do, "objective", &context_data, "deepseek-v4-pro");
+    assert!(
+        md.contains("## Available Skills") && md.contains("analyze_output"),
+        "PromptLoader builtin-fallback agent.md must include injected skills, got: {}",
+        md
+    );
 }

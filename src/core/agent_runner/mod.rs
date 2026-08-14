@@ -260,6 +260,9 @@ pub struct AgentRunner {
     pub templates: Arc<TemplateEngine>,
     pub tool_executor: Arc<parking_lot::RwLock<ToolExecutor>>,
     pub agent_settings: AgentSettings,
+    /// Token-optimization settings (compressor/aging/context-window tuning).
+    /// Defaults match the historical hardcoded values when not provided.
+    pub token_optimization: crate::config::settings::TokenOptimizationSettings,
     pub hook_manager: Arc<HookManager>,
     pub projection: Arc<ProjectionEngine>,
     pub sharing: Arc<SharingProtocol>,
@@ -347,6 +350,7 @@ impl AgentRunner {
                 Arc::new(parking_lot::RwLock::new(exe))
             },
             agent_settings,
+            token_optimization: crate::config::settings::TokenOptimizationSettings::default(),
             hook_manager,
             projection,
             sharing,
@@ -379,23 +383,23 @@ impl AgentRunner {
     }
 
     fn init_context_compressors(&mut self) {
-        use crate::config::settings::{
-            ContextWindowSettings, ToolResultAgingSettings, ToolResultCompressorSettings,
-        };
-        let trc_settings = ToolResultCompressorSettings::default();
+        self.tool_result_compressor = None;
+        self.tool_result_aging = None;
+        self.context_window_manager = None;
+        let trc_settings = &self.token_optimization.tool_result_compressor;
         if trc_settings.enabled {
             self.tool_result_compressor = Some(Arc::new(std::sync::Mutex::new(
-                ToolResultCompressor::new(&trc_settings),
+                ToolResultCompressor::new(trc_settings),
             )));
         }
-        let aging_settings = ToolResultAgingSettings::default();
+        let aging_settings = &self.token_optimization.tool_result_aging;
         if aging_settings.enabled {
-            self.tool_result_aging = Some(crate::core::ToolResultAging::new(&aging_settings));
+            self.tool_result_aging = Some(crate::core::ToolResultAging::new(aging_settings));
         }
-        let cwm_settings = ContextWindowSettings::default();
+        let cwm_settings = &self.token_optimization.context_window;
         if cwm_settings.max_messages > 0 {
             self.context_window_manager = Some(Arc::new(std::sync::Mutex::new(
-                ContextWindowManager::new(&cwm_settings),
+                ContextWindowManager::new(cwm_settings),
             )));
         }
     }
@@ -405,7 +409,15 @@ impl AgentRunner {
         self
     }
 
-    pub fn with_prefetch_engine(mut self, prefetch_engine: Arc<PrefetchEngine>) -> Self {
+    /// Attach token-optimization settings; re-initializes the three compressors.
+    pub fn with_token_optimization(
+        mut self,
+        token_optimization: crate::config::settings::TokenOptimizationSettings,
+    ) -> Self {
+        self.token_optimization = token_optimization;
+        self.init_context_compressors();
+        self
+    }    pub fn with_prefetch_engine(mut self, prefetch_engine: Arc<PrefetchEngine>) -> Self {
         self.prefetch_engine = Some(prefetch_engine);
         self
     }

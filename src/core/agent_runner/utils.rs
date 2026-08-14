@@ -970,7 +970,14 @@ impl super::AgentRunner {
                             self.context_window_manager
                         {
                             if let Ok(cwm) = cwm_lock.lock() {
-                                if cwm.should_compress(running_messages.len(), &running_messages) {
+                                let model = self
+                                    .gateway
+                                    .get_model(&agent.role.to_string().to_lowercase());
+                                if cwm.should_compress_for_model(
+                                    running_messages.len(),
+                                    &running_messages,
+                                    &model,
+                                ) {
                                     let (compressed, _summary) =
                                         cwm.compress_messages(&running_messages);
                                     let orig_count = running_messages.len();

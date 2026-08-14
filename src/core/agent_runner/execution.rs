@@ -993,7 +993,10 @@ Output the summary report directly, not in JSON format."#,
             let context_window_compressed = if let Some(ref cwm_lock) = self.context_window_manager
             {
                 let cwm = cwm_lock.lock().expect("cwm_lock Mutex poisoned");
-                if cwm.should_compress(messages.len(), &messages) {
+                let model = self
+                    .gateway
+                    .get_model(&agent.role.to_string().to_lowercase());
+                if cwm.should_compress_for_model(messages.len(), &messages, &model) {
                     let (compressed, summary_text) = cwm.compress_messages(&messages);
                     if !summary_text.is_empty() {
                         sess.add_summary("system", &summary_text, None);

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
@@ -8,8 +9,13 @@ use crate::core::system_prompt::{
 };
 use crate::memory::l1_session::L1Session;
 use crate::methodology::integration::MethodologyPromptInjector;
+use crate::tools::skill_registry::SkillRegistry;
 
 use super::{TaskContext, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
+
+/// Maximum number of role-visible skills injected into the `available_skills`
+/// template variable, mirroring MAX_ALL_HINTS to prevent prompt bloat.
+const MAX_INJECTED_SKILLS: usize = 10;
 
 impl super::AgentRunner {
     pub(super) fn build_agent_md_from_step(
@@ -366,6 +372,38 @@ impl super::AgentRunner {
         lines.join("\n")
     }
 
+    /// Compose the `available_skills` template variable: the tool list followed
+    /// by role-visible skill summaries (name + description), deduplicated against
+    /// the tool list and capped to avoid prompt bloat.
+    pub(super) fn build_available_skills(
+        tools_list: &[String],
+        skills: &Arc<SkillRegistry>,
+        role_name: &str,
+    ) -> String {
+        let mut output = tools_list.join(", ");
+        let tool_names: std::collections::HashSet<&str> =
+            tools_list.iter().map(|s| s.as_str()).collect();
+        let role_skills = skills.list_skills_for_role(role_name);
+        let mut injected = 0usize;
+        for skill in role_skills {
+            if injected >= MAX_INJECTED_SKILLS {
+                break;
+            }
+            if tool_names.contains(skill.name.as_str()) {
+                continue;
+            }
+            let summary = if skill.description.is_empty() {
+                skill.name.clone()
+            } else {
+                format!("{}: {}", skill.name, skill.description)
+            };
+            output.push_str("\n- ");
+            output.push_str(&summary);
+            injected += 1;
+        }
+        output
+    }
+
     pub(super) fn build_agent_md(
         &self,
         role: AgentRole,
@@ -391,7 +429,11 @@ impl super::AgentRunner {
         );
         vars.insert(
             "available_skills".to_string(),
-            serde_json::Value::String(tools_list.join(", ")),
+            serde_json::Value::String(Self::build_available_skills(
+                &tools_list,
+                &self.skills,
+                &role_name,
+            )),
         );
         vars.insert(
             "context_summary".to_string(),
@@ -437,7 +479,14 @@ impl super::AgentRunner {
         if let Some(ref loader) = self.prompt_loader {
             let result = loader.load(&role_lower, "skeleton", &vars);
             if !result.is_empty() {
-                let md = format!("# {} Agent.md\n\n{}", role_name, result);
+                // PromptLoader's template/builtin fallback may not consume the
+                // `available_skills` var, so append the role skills explicitly
+                // when the rendered result does not already contain them.
+                let skills_text = Self::build_available_skills(&tools_list, &self.skills, &role_name);
+                let mut md = format!("# {} Agent.md\n\n{}", role_name, result);
+                if !skills_text.trim().is_empty() && !md.contains(&skills_text) {
+                    md.push_str(&format!("\n\n## Available Skills\n{}", skills_text));
+                }
                 debug!(
                     role = %role_name,
                     source = "PromptLoader",
@@ -555,9 +604,16 @@ impl super::AgentRunner {
             sections.join("\n\n")
         };
 
+        let skills_text = Self::build_available_skills(&tools_list, &self.skills, &role_name);
+        let skills_section = if skills_text.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## Available Skills\n{}", skills_text)
+        };
+
         let md = format!(
-            "# {} Agent.md\n\nRole: {}\nTask: {}\nWork Mode: {}\n\n{}\n\nImportant: After fulfilling your responsibility, directly output the final result without calling additional tools. Your response should include the complete conclusion or result.",
-            role_name, role_name, objective, role_prompt, context_section
+            "# {} Agent.md\n\nRole: {}\nTask: {}\nWork Mode: {}\n\n{}{}\n\nImportant: After fulfilling your responsibility, directly output the final result without calling additional tools. Your response should include the complete conclusion or result.",
+            role_name, role_name, objective, role_prompt, context_section, skills_section
         );
         debug!(
             role = %role_name,

@@ -548,7 +548,8 @@ impl CodeCliEngine {
             Default::default(),
             tmpl.clone(),
         ))
-        .with_workspace_root(workspace_root.clone());
+        .with_workspace_root(workspace_root.clone())
+        .with_token_optimization(settings.token_optimization.clone());
 
         // Create FusedRootCauseEngine backed by the shared unified Oxigraph store
         let unified_kg_store = unified.store();

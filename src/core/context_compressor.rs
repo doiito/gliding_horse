@@ -183,6 +183,14 @@ impl ToolResultCompressor {
         self.enabled
     }
 
+    pub fn max_full_results(&self) -> usize {
+        self.max_full_results
+    }
+
+    pub fn max_summary_length(&self) -> usize {
+        self.max_summary_length
+    }
+
     pub fn compress_tool_result_threshold(&self) -> usize {
         self.compress_tool_result_threshold
     }
@@ -213,11 +221,42 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
+/// Context-window sizes (in tokens) for known model families.
+/// Keys are lowercase substrings matched against the active model name.
+const MODEL_CONTEXT_WINDOWS: &[(&str, usize)] = &[
+    ("deepseek", 128_000),
+    ("gpt-4o", 128_000),
+    ("gpt-4", 32_000),
+    ("gpt-3.5", 16_000),
+    ("claude", 200_000),
+    ("gemini", 1_000_000),
+    ("llama-3", 128_000),
+    ("qwen", 128_000),
+    ("glm", 128_000),
+    ("mistral", 32_000),
+    ("command-r", 128_000),
+];
+
+/// Fraction of the model context window used as the compression budget.
+const MODEL_AWARE_BUDGET_RATIO: f32 = 0.8;
+
+/// Best-effort context-window lookup for a model name (lowercased substring match).
+pub fn model_context_window(model: &str) -> usize {
+    let model_lower = model.to_lowercase();
+    for (key, window) in MODEL_CONTEXT_WINDOWS {
+        if model_lower.contains(key) {
+            return *window;
+        }
+    }
+    64_000
+}
+
 pub struct ContextWindowManager {
     max_messages: usize,
     max_tokens: usize,
     compression_ratio: f32,
     preserve_recent: usize,
+    model_aware: bool,
 }
 
 impl ContextWindowManager {
@@ -227,7 +266,23 @@ impl ContextWindowManager {
             max_tokens: settings.max_tokens,
             compression_ratio: settings.compression_ratio,
             preserve_recent: settings.preserve_recent,
+            model_aware: settings.model_aware,
         }
+    }
+
+    /// Effective compression budget for the given model.
+    /// With `model_aware` enabled the budget scales with the model's context
+    /// window; otherwise the configured `max_tokens` is used.
+    pub fn budget_for_model(&self, model: &str) -> usize {
+        if self.model_aware() {
+            ((model_context_window(model) as f32) * MODEL_AWARE_BUDGET_RATIO) as usize
+        } else {
+            self.max_tokens
+        }
+    }
+
+    pub fn model_aware(&self) -> bool {
+        self.model_aware
     }
 
     /// Estimate token consumption of a message list (4 chars ≈ 1 token, mixed CJK/Latin estimation)
@@ -258,6 +313,23 @@ impl ContextWindowManager {
             return true;
         }
         if Self::estimate_tokens(messages) > self.max_tokens {
+            return true;
+        }
+        false
+    }
+
+    /// Model-aware variant: the token budget follows the active model's context
+    /// window when `model_aware` is enabled.
+    pub fn should_compress_for_model(
+        &self,
+        message_count: usize,
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> bool {
+        if message_count > self.max_messages {
+            return true;
+        }
+        if Self::estimate_tokens(messages) > self.budget_for_model(model) {
             return true;
         }
         false
@@ -459,6 +531,7 @@ mod tests {
             max_tokens: 16000,
             compression_ratio: 0.3,
             preserve_recent: 4,
+            model_aware: false,
         }
     }
 
@@ -605,6 +678,62 @@ mod tests {
 
         assert!(!manager.should_compress(10, &empty));
         assert!(manager.should_compress(20, &empty));
+    }
+
+    #[test]
+    fn test_model_context_window_lookup() {
+        assert_eq!(model_context_window("deepseek-v4-flash"), 128_000);
+        assert_eq!(model_context_window("DeepSeek-V3"), 128_000);
+        assert_eq!(model_context_window("gpt-4o-mini"), 128_000);
+        assert_eq!(model_context_window("claude-sonnet-4"), 200_000);
+        assert_eq!(model_context_window("llama-3.1-70b"), 128_000);
+        assert_eq!(model_context_window("unknown-model"), 64_000);
+    }
+
+    #[test]
+    fn test_model_aware_budget() {
+        let mut settings = default_context_settings();
+        settings.model_aware = true;
+        let manager = ContextWindowManager::new(&settings);
+
+        // 128K model → 0.8 * 128K budget
+        assert_eq!(manager.budget_for_model("deepseek-v4-flash"), 102_400);
+        // Unknown model → 0.8 * 64K fallback
+        assert_eq!(manager.budget_for_model("mystery-model"), 51_200);
+    }
+
+    #[test]
+    fn test_model_aware_compression_trigger() {
+        // max_messages raised so the token budget is the only trigger criterion.
+        let mut settings = default_context_settings();
+        settings.model_aware = true;
+        settings.max_messages = 5000;
+        let manager = ContextWindowManager::new(&settings);
+
+        // Build a message payload that exceeds the 16K static budget but stays
+        // well under the 102K model-aware budget: must NOT compress on a 128K
+        // model, while a legacy non-model-aware manager WOULD compress.
+        let mut msgs = Vec::new();
+        // 2000 x 100-char ASCII messages ≈ 50K tokens: above the 16K static
+        // budget yet below the 102K model-aware budget.
+        for _ in 0..2000 {
+            msgs.push(ChatMessage {
+                role: "user".to_string(),
+                content: "X".repeat(100),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
+        assert!(ContextWindowManager::estimate_tokens(&msgs) > 16_000);
+        assert!(!manager.should_compress_for_model(msgs.len(), &msgs, "deepseek-v4-flash"));
+
+        // Same payload on a legacy manager (model_aware=false) triggers compression.
+        let mut legacy_settings = default_context_settings();
+        legacy_settings.max_messages = 5000;
+        let legacy = ContextWindowManager::new(&legacy_settings);
+        assert!(legacy.should_compress_for_model(msgs.len(), &msgs, "deepseek-v4-flash"));
     }
 
     #[test]

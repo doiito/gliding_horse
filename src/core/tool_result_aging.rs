@@ -31,6 +31,14 @@ impl ToolResultAging {
         }
     }
 
+    pub fn keep_full(&self) -> usize {
+        self.keep_full
+    }
+
+    pub fn try_microtool(&self) -> usize {
+        self.try_microtool
+    }
+
     /// Auto-degrade and compress tool messages in messages by staleness.
     ///
     /// Returns (aged_count, freed_bytes)

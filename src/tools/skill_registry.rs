@@ -480,6 +480,15 @@ impl SkillRegistry {
                     .filter_map(|r| r.as_str().map(String::from))
                     .collect()
             })
+            .or_else(|| {
+                json.get("skill:who")
+                    .and_then(|who| {
+                        who.get("skill:roleName")
+                            .or_else(|| who.get("skill:requiredRole"))
+                    })
+                    .and_then(|v| v.as_str())
+                    .map(|r| vec![r.to_string()])
+            })
             .unwrap_or_default();
 
         let input_schema_raw = json

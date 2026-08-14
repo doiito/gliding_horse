@@ -725,6 +725,14 @@ pub struct ContextWindowSettings {
     pub compression_ratio: f32,
     #[serde(default = "default_preserve_recent")]
     pub preserve_recent: usize,
+    /// When true, the compression budget is derived from the active model's
+    /// context window (proportional), overriding `max_tokens`.
+    #[serde(default = "default_false")]
+    pub model_aware: bool,
+}
+
+fn default_false() -> bool {
+    false
 }
 
 fn default_max_messages() -> usize {
@@ -747,6 +755,7 @@ impl Default for ContextWindowSettings {
             max_tokens: default_max_tokens(),
             compression_ratio: default_compression_ratio(),
             preserve_recent: default_preserve_recent(),
+            model_aware: false,
         }
     }
 }

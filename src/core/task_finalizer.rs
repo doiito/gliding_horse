@@ -100,6 +100,7 @@ mod tests {
             tool_call_count: 0,
             five_w2h_updates: None,
             tracked_actions: vec![],
+            verdict: None,
             archive_iri: None,
         };
 

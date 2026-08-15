@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::core::agent_instance::AgentRole;
+use crate::core::agent_runner::{TaskResult, TaskVerdict};
 use crate::CoreError;
 
 /// 5 categories, 16 predefined intervention actions
@@ -185,7 +186,7 @@ pub(super) struct SupplementaryLlmDecision {
     pub(super) reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TaskComplexity {
     Instant,
     Simple,
@@ -226,6 +227,14 @@ pub struct PlanStep {
     pub dependencies: Vec<String>,
     pub tools_allowed: Vec<String>,
     pub success_criteria: String,
+    #[serde(default)]
+    pub branch_on_failure: bool,
+    #[serde(default)]
+    pub branch_fallback: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub retry_delay_secs: u64,
 }
 
 /// Execution result of a human approval node
@@ -268,6 +277,20 @@ pub enum CyclePhase {
     Completed,
 }
 
+/// Mutable intervention state carried on a cycle, written by SA intervention
+/// handlers (actions.rs) and consumed at dispatch time (execution.rs).
+#[derive(Debug, Clone, Default)]
+pub struct InterventionState {
+    /// IncreaseRetry/DecreaseRetry effect: added to `max_iterations` at dispatch.
+    pub max_iterations_delta: i32,
+    /// IncreaseTimeout/DecreaseTimeout effect: added to dispatch timeout seconds.
+    pub timeout_delta_secs: i64,
+    /// RestrictTools effect: only these tools are offered to the agent.
+    pub tool_allowlist_override: Option<Vec<String>>,
+    /// ContinueWithMonitor effect: monitor the cycle for anomalies.
+    pub monitor: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CycleState {
     pub cycle_id: String,
@@ -279,17 +302,28 @@ pub struct CycleState {
     pub phase_history: Vec<String>,
     pub task_completed: bool,
     pub experience_hints: Vec<String>,
+    /// Accumulated SA intervention state, applied at dispatch time.
+    pub intervention: InterventionState,
 }
 
 /// Decide whether a verify-first AA verdict requires full execution.
 ///
 /// The agent_runner's `finish` action hardcodes `status: "success"` regardless
 /// of what the verify-AA actually concluded, so the final status is meaningless
-/// for verify-first plans. This recovers the intent from the AA's summary text.
-/// Conservative by design: only an explicit completion confirmation avoids
-/// re-execution; any missing/ambiguous/negative verdict means full PDCA is needed.
-pub fn verify_aa_needs_execution(summary: &str) -> bool {
-    let s = summary.to_lowercase();
+/// for verify-first plans. The structured `verdict` takes priority: blocked,
+/// failed, and timeout verdicts always require execution; success and partial
+/// success fall through to a summary double-check. Summary text matching is the
+/// fallback for results without a structured verdict. Conservative by design:
+/// only an explicit completion confirmation avoids re-execution; any
+/// missing/ambiguous/negative verdict means full PDCA is needed.
+pub fn verify_aa_needs_execution(result: &TaskResult) -> bool {
+    if let Some(verdict) = result.verdict {
+        match verdict {
+            TaskVerdict::Blocked | TaskVerdict::Failed | TaskVerdict::Timeout => return true,
+            TaskVerdict::Success | TaskVerdict::PartialSuccess => {}
+        }
+    }
+    let s = result.summary.to_lowercase();
     const COMPLETION_MARKERS: [&str; 8] = [
         "verified-pass",
         "verified pass",

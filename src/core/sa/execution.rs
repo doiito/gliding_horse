@@ -4,12 +4,40 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
-use crate::core::agent_runner::{TaskContext, TaskResult};
+use crate::core::agent_runner::{TaskContext, TaskResult, TaskVerdict};
 use crate::memory::l2_blackboard::QueryFilter;
 use crate::CoreError;
 
 use super::agent::SupervisorAgent;
 use super::types::*;
+
+/// Code-level fan-out cap for recursive sub-task decomposition.
+/// Matches the "Maximum of 3 sub-tasks" constraint in the decomposition prompt.
+const MAX_RECURSIVE_SUB_TASKS: usize = 3;
+
+/// Re-dispatch on failure up to `retry_count` times, sleeping `retry_delay_secs`
+/// between attempts. Returns the final result after retries are exhausted.
+pub(super) async fn dispatch_with_retry<F, Fut>(
+    retry_count: u32,
+    retry_delay_secs: u64,
+    dispatch: F,
+) -> Result<TaskResult, CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<TaskResult, CoreError>>,
+{
+    let mut remaining = retry_count;
+    let mut dispatch = dispatch;
+    let mut result = dispatch().await?;
+    while result.status == "failed" && remaining > 0 {
+        remaining -= 1;
+        if retry_delay_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
+        }
+        result = dispatch().await?;
+    }
+    Ok(result)
+}
 
 impl SupervisorAgent {
     fn create_agent(&self, role: AgentRole, cycle_id: &str) -> AgentInstance {
@@ -20,6 +48,31 @@ impl SupervisorAgent {
             uuid::Uuid::new_v4().hyphenated()
         );
         AgentInstance::new(agent_id, role)
+    }
+
+    /// Per-cycle max iterations after SA intervention deltas (floor ≥ 1).
+    pub(super) fn effective_max_iterations(&self, cycle_id: &str) -> u32 {
+        let delta = self
+            .active_cycles
+            .get(cycle_id)
+            .map(|c| c.intervention.max_iterations_delta)
+            .unwrap_or(0);
+        (self.max_iterations as i64 + delta as i64).max(1) as u32
+    }
+
+    /// Per-cycle dispatch timeout seconds after SA intervention deltas.
+    /// base == 0 keeps the "no timeout" semantics (dispatch_agent only applies
+    /// timeout when timeout_secs > 0); a positive base is floored at 1.
+    pub(super) fn effective_timeout_secs(&self, cycle_id: &str, base: u64) -> u64 {
+        if base == 0 {
+            return 0;
+        }
+        let delta = self
+            .active_cycles
+            .get(cycle_id)
+            .map(|c| c.intervention.timeout_delta_secs)
+            .unwrap_or(0);
+        (base as i64 + delta).max(1) as u64
     }
 
     async fn dispatch_agent(
@@ -139,6 +192,7 @@ impl SupervisorAgent {
                         tool_call_count: 0,
                         five_w2h_updates: None,
                         tracked_actions: vec![],
+                        verdict: Some(TaskVerdict::Timeout),
                         archive_iri: None,
                     });
                 }
@@ -187,6 +241,7 @@ impl SupervisorAgent {
         cycle_id: &str,
         max_iterations: u32,
         timeout_secs: u64,
+        tools_allowed: &[String],
     ) -> Result<Vec<TaskResult>, CoreError> {
         let _ = self
             .event_bus
@@ -208,7 +263,12 @@ impl SupervisorAgent {
 
         for i in 0..count {
             let objective = format!("[{}-{}] {}", role, i + 1, base_objective);
-            let ctx = TaskContext::new(task_iri, &objective, max_iterations);
+            let ctx = if tools_allowed.is_empty() {
+                TaskContext::new(task_iri, &objective, max_iterations)
+            } else {
+                TaskContext::new(task_iri, &objective, max_iterations)
+                    .with_allowed_tools(tools_allowed.to_vec())
+            };
             let tid = cycle_id.to_string();
             let runner_clone = runner.clone();
 
@@ -239,6 +299,7 @@ impl SupervisorAgent {
                             tool_call_count: 0,
                             five_w2h_updates: None,
                             tracked_actions: vec![],
+                            verdict: Some(TaskVerdict::Timeout),
                             archive_iri: None,
                         }),
                     }
@@ -550,6 +611,7 @@ impl SupervisorAgent {
                         tool_call_count: 0,
                         five_w2h_updates: None,
                         tracked_actions: vec![],
+                        verdict: None,
                         archive_iri: None,
                     };
                     prev_summary = Some(format!("## Human Approval Result\n{}", summary));
@@ -615,7 +677,7 @@ impl SupervisorAgent {
                             if intervention.should_interrupt {
                                 let _ = tokio::time::timeout(
                                     std::time::Duration::from_secs(self.execution_timeout_secs),
-                                    self.execute_intervention(intervention, task_iri),
+                                    self.execute_intervention_for_cycle(intervention, task_iri),
                                 )
                                 .await;
                             }
@@ -683,8 +745,9 @@ impl SupervisorAgent {
                             &step.objective,
                             task_iri,
                             &cycle_id,
-                            self.max_iterations,
-                            nd.timeout_secs,
+                            self.effective_max_iterations(&cycle_id),
+                            self.effective_timeout_secs(&cycle_id, nd.timeout_secs),
+                            &step.tools_allowed,
                         )
                         .await?;
 
@@ -703,6 +766,7 @@ impl SupervisorAgent {
                             tool_call_count: results.iter().map(|r| r.tool_call_count).sum(),
                             five_w2h_updates: None,
                             tracked_actions: Vec::new(),
+                            verdict: Some(TaskVerdict::Failed),
                             archive_iri: None,
                         });
                     }
@@ -768,8 +832,12 @@ impl SupervisorAgent {
                 };
 
                 // ── Build context ──
-                let mut context = TaskContext::new(task_iri, &objective, self.max_iterations)
-                    .with_original_task(user_input)
+                let mut context = TaskContext::new(
+                    task_iri,
+                    &objective,
+                    self.effective_max_iterations(&cycle_id),
+                )
+                .with_original_task(user_input)
                     .with_step_info(&step.expected_output, &step.success_criteria)
                     .with_cycle_id(&cycle_id);
                 context = context.with_five_w2h(five_w2h_iri, five_w2h.clone());
@@ -819,7 +887,7 @@ impl SupervisorAgent {
                     ni,
                     step,
                     ctx: context,
-                    timeout_secs: nd.timeout_secs,
+                    timeout_secs: self.effective_timeout_secs(&cycle_id, nd.timeout_secs),
                 });
             }
 
@@ -839,12 +907,21 @@ impl SupervisorAgent {
                     let cid = cycle_id.to_string();
                     let wi = wt.wi;
                     let to = wt.timeout_secs;
+                    let retry_count = wt.step.retry_count;
+                    let retry_delay = wt.step.retry_delay_secs;
                     futs.push(async move {
                         (
                             wi,
-                            self_ref
-                                .dispatch_agent(role, ctx, &cid, Some(step), to)
-                                .await,
+                            dispatch_with_retry(retry_count, retry_delay, || {
+                                self_ref.dispatch_agent(
+                                    role,
+                                    ctx.clone(),
+                                    &cid,
+                                    Some(step.clone()),
+                                    to,
+                                )
+                            })
+                            .await,
                         )
                     });
                 }
@@ -871,6 +948,7 @@ impl SupervisorAgent {
                                 tool_call_count: 0,
                                 five_w2h_updates: None,
                                 tracked_actions: vec![],
+                                verdict: None,
                                 archive_iri: None,
                             });
                         }
@@ -901,15 +979,20 @@ impl SupervisorAgent {
                 }
             } else if num_tasks == 1 {
                 let wt = agent_tasks.into_iter().next().unwrap();
-                let result = self
-                    .dispatch_agent(
-                        wt.step.role,
-                        wt.ctx,
-                        &cycle_id,
-                        Some(wt.step.clone()),
-                        wt.timeout_secs,
-                    )
-                    .await?;
+                let result = dispatch_with_retry(
+                    wt.step.retry_count,
+                    wt.step.retry_delay_secs,
+                    || {
+                        self.dispatch_agent(
+                            wt.step.role,
+                            wt.ctx.clone(),
+                            &cycle_id,
+                            Some(wt.step.clone()),
+                            wt.timeout_secs,
+                        )
+                    },
+                )
+                .await?;
                 if let Some(failed_task) = self
                     .handle_step_result(
                         result,
@@ -973,9 +1056,13 @@ impl SupervisorAgent {
                 &ca_text[..ca_text.len().min(4000)]
             );
 
-            let da_ctx = TaskContext::new(task_iri, &da_corrective_objective, self.max_iterations)
-                .with_original_task(user_input)
-                .with_cycle_id(&cycle_id);
+            let da_ctx = TaskContext::new(
+                task_iri,
+                &da_corrective_objective,
+                self.effective_max_iterations(&cycle_id),
+            )
+            .with_original_task(user_input)
+            .with_cycle_id(&cycle_id);
 
             match self
                 .dispatch_agent(AgentRole::Do, da_ctx, &cycle_id, None, 0)
@@ -989,9 +1076,13 @@ impl SupervisorAgent {
                         correction_count, da_result.summary
                     );
 
-                    let ca_ctx = TaskContext::new(task_iri, &ca_objective, self.max_iterations)
-                        .with_original_task(user_input)
-                        .with_cycle_id(&cycle_id);
+                    let ca_ctx = TaskContext::new(
+                        task_iri,
+                        &ca_objective,
+                        self.effective_max_iterations(&cycle_id),
+                    )
+                    .with_original_task(user_input)
+                    .with_cycle_id(&cycle_id);
 
                     match self
                         .dispatch_agent(AgentRole::Check, ca_ctx, &cycle_id, None, 0)
@@ -1061,8 +1152,40 @@ impl SupervisorAgent {
             tool_call_count: 0,
             five_w2h_updates: None,
             tracked_actions: Vec::new(),
+            verdict: None,
             archive_iri: None,
         }))
+    }
+
+    fn build_failed_step_result(
+        &self,
+        task_iri: &str,
+        step: &PlanStep,
+        result: &TaskResult,
+    ) -> TaskResult {
+        let error_detail = result
+            .errors
+            .first()
+            .map(|e| format!("\n\n**Error details**: {}", e))
+            .unwrap_or_default();
+        TaskResult {
+            task_iri: task_iri.to_string(),
+            status: "failed".to_string(),
+            summary: format!(
+                "Agent {:?} failed at step {}{}",
+                step.role, step.step_id, error_detail
+            ),
+            output: None,
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: result.errors.clone(),
+            turn_count: result.turn_count,
+            tool_call_count: result.tool_call_count,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            verdict: None,
+            archive_iri: None,
+        }
     }
 
     /// Process a single DAG node's execution result — handles failure, 5W2H, perception,
@@ -1070,7 +1193,7 @@ impl SupervisorAgent {
     /// Returns `Ok(Some(TaskResult))` if the caller should terminate (node failure),
     /// `Ok(None)` to continue normally.
     #[allow(clippy::too_many_arguments)]
-    async fn handle_step_result(
+    pub(super) async fn handle_step_result(
         &self,
         mut result: TaskResult,
         step: PlanStep,
@@ -1098,29 +1221,44 @@ impl SupervisorAgent {
 
         // Early return on agent failure
         if result.status == "failed" {
-            warn!(role = ?step.role, step_id = %step.step_id, "Agent failed, aborting plan");
-            let error_detail = result
-                .errors
-                .first()
-                .map(|e| format!("\n\n**Error details**: {}", e))
-                .unwrap_or_default();
-            return Ok(Some(TaskResult {
-                task_iri: task_iri.to_string(),
-                status: "failed".to_string(),
-                summary: format!(
-                    "Agent {:?} failed at step {}{}",
-                    step.role, step.step_id, error_detail
-                ),
-                output: None,
-                jsonld_output: None,
-                artifacts: Vec::new(),
-                errors: result.errors,
-                turn_count: result.turn_count,
-                tool_call_count: result.tool_call_count,
-                five_w2h_updates: None,
-                tracked_actions: Vec::new(),
-                archive_iri: None,
-            }));
+            // branch_on_failure: skip intermediates up to branch_fallback, then continue
+            if step.branch_on_failure {
+                if let Some(ref target) = step.branch_fallback {
+                    let mut found = false;
+                    for node_idx in order.iter().skip(i + 1) {
+                        let sid = dag.graph[*node_idx].def.id.clone();
+                        if sid == *target {
+                            found = true;
+                            break;
+                        }
+                        skip_nodes.insert(sid);
+                    }
+                    if found {
+                        warn!(role = ?step.role, step_id = %step.step_id, target = %target, "Agent failed, branching to fallback step");
+                    } else {
+                        warn!(role = ?step.role, step_id = %step.step_id, target = %target, "Agent failed, branch target not in remaining order, aborting plan");
+                        return Ok(Some(self.build_failed_step_result(
+                            task_iri,
+                            &step,
+                            &result,
+                        )));
+                    }
+                } else {
+                    warn!(role = ?step.role, step_id = %step.step_id, "Agent failed, no branch fallback target, aborting plan");
+                    return Ok(Some(self.build_failed_step_result(
+                        task_iri,
+                        &step,
+                        &result,
+                    )));
+                }
+            } else {
+                warn!(role = ?step.role, step_id = %step.step_id, "Agent failed, aborting plan");
+                return Ok(Some(self.build_failed_step_result(
+                    task_iri,
+                    &step,
+                    &result,
+                )));
+            }
         }
 
         // Propagate 5W2H updates
@@ -1637,14 +1775,17 @@ Output only JSON."#,
 
             let mut sub_summaries = Vec::new();
 
-            for (idx, sub_def) in parsed.sub_tasks.iter().enumerate() {
+            for (idx, sub_def) in parsed.sub_tasks.iter().take(MAX_RECURSIVE_SUB_TASKS).enumerate() {
                 let sub_objective =
                     format!("[recursive depth={}] {}", current_depth, sub_def.objective);
                 info!(sub_idx = idx, objective = %sub_def.objective, "Executing recursive sub-task");
 
-                let mut sub_ctx =
-                    TaskContext::new(task_iri, &sub_objective, self.max_iterations.min(8))
-                        .with_original_task(&sub_def.objective);
+                let mut sub_ctx = TaskContext::new(
+                    task_iri,
+                    &sub_objective,
+                    self.effective_max_iterations(cycle_id).min(8),
+                )
+                .with_original_task(&sub_def.objective);
 
                 sub_ctx = sub_ctx.with_five_w2h(five_w2h_iri, five_w2h.clone());
 
@@ -1676,6 +1817,10 @@ Output only JSON."#,
                     dependencies: vec![parent_step_id.to_string()],
                     tools_allowed: vec![],
                     success_criteria: sub_def.success_criteria.clone(),
+                    branch_on_failure: false,
+                    branch_fallback: None,
+                    retry_count: 0,
+                    retry_delay_secs: 0,
                 };
 
                 let total = parsed.sub_tasks.len();

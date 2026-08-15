@@ -134,6 +134,7 @@ impl BizAgent {
                 tool_call_count: 0,
                 five_w2h_updates: None,
                 tracked_actions: Vec::new(),
+                verdict: None,
                 archive_iri: None,
             },
         }
@@ -222,6 +223,7 @@ impl BizAgent {
                             tool_call_count: 0,
                             five_w2h_updates: None,
                             tracked_actions: Vec::new(),
+                            verdict: None,
                             archive_iri: None,
                         });
                     }
@@ -540,6 +542,7 @@ Output only the JSON, no other content."#,
                     tool_call_count: fallback.tool_call_count,
                     five_w2h_updates: None,
                     tracked_actions: Vec::new(),
+                    verdict: None,
                     archive_iri: None,
                 }
             }
@@ -589,6 +592,7 @@ Output only the JSON, no other content."#,
             tool_call_count: 0,
             five_w2h_updates: None,
             tracked_actions: Vec::new(),
+            verdict: None,
             archive_iri: None,
         }
     }

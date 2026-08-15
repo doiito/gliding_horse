@@ -1264,7 +1264,13 @@ impl ToolExecutor {
         name: &str,
         input: Value,
         context: SecurityContext,
+        allowed_tools: Option<&[String]>,
     ) -> Result<Value, String> {
+        if let Some(ref allowed) = allowed_tools {
+            if !allowed.iter().any(|t| t == name) {
+                return Ok(json!({"error": format!("Tool not allowed: {}", name), "tool": name}));
+            }
+        }
         let security_engine = { self.security_engine.read().clone() };
         if let Some(engine) = security_engine {
             let skill_iri = {
@@ -1478,6 +1484,30 @@ impl ToolExecutor {
         );
 
         result
+    }
+
+    /// Role-filtered tool definitions intersected with an explicit allowlist.
+    /// `None`/empty keeps the full role-filtered set; non-empty keeps only
+    /// definitions whose name appears in the list (SA `RestrictTools` override).
+    pub fn tool_definitions_for_role_with_allowlist(
+        &self,
+        role: &str,
+        allowlist: Option<&[String]>,
+    ) -> Vec<Value> {
+        let result = self.tool_definitions_for_role(role);
+        let Some(allowed) = allowlist.filter(|l| !l.is_empty()) else {
+            return result;
+        };
+        let allowed: HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
+        result
+            .into_iter()
+            .filter(|td| {
+                td["function"]["name"]
+                    .as_str()
+                    .map(|n| allowed.contains(n))
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
     pub fn pa_readonly_tools() -> &'static [&'static str] {

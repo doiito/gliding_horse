@@ -218,6 +218,10 @@ impl SupervisorAgent {
                 tools_allowed: vec![],
                 success_criteria: "Clear pass/fail verdict with evidence from workspace"
                     .to_string(),
+                branch_on_failure: false,
+                branch_fallback: None,
+                retry_count: 0,
+                retry_delay_secs: 0,
             };
             let verify_aa = PlanStep {
                 step_id: "verify_aa".to_string(),
@@ -227,6 +231,10 @@ impl SupervisorAgent {
                 dependencies: vec!["verify_ca".to_string()],
                 tools_allowed: vec![],
                 success_criteria: "Decision clear with justification".to_string(),
+                branch_on_failure: false,
+                branch_fallback: None,
+                retry_count: 0,
+                retry_delay_secs: 0,
             };
             // Store original description, prepend verify steps
             let original_desc = plan.description.clone();
@@ -339,7 +347,7 @@ impl SupervisorAgent {
         for plan in pending_interventions {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(self.execution_timeout_secs),
-                self.execute_intervention(plan, task_iri),
+                self.execute_intervention_for_cycle(plan, task_iri),
             )
             .await;
         }
@@ -426,7 +434,7 @@ impl SupervisorAgent {
             // stored fallback_steps (full PDCA) on the next cycle.
             let needs_execution_after_verify = cycle_num == 0
                 && plan.verify_first
-                && verify_aa_needs_execution(&result.summary);
+                && verify_aa_needs_execution(&result);
 
             if result.status == "success" && !needs_execution_after_verify {
                 info!(task_iri = %task_iri, cycle_num = cycle_num + 1, "PDCA cycle passed");
@@ -510,6 +518,7 @@ impl SupervisorAgent {
             tool_call_count: 0,
             five_w2h_updates: None,
             tracked_actions: Vec::new(),
+            verdict: None,
             archive_iri: None,
         }))
     }

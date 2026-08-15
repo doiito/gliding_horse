@@ -10,6 +10,10 @@ use super::actions::parse_or_repair_json;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+/// Single source of truth for the LLM plan step limit.
+/// The planning prompt advertises this exact cap; parse_llm_plan truncates to it.
+pub const MAX_PLAN_STEPS: usize = 6;
+
 impl SupervisorAgent {
     pub async fn start_cycle(
         &mut self,
@@ -37,6 +41,7 @@ impl SupervisorAgent {
             phase_history: vec!["Created".to_string()],
             task_completed: false,
             experience_hints: perception_result.relevant_experience_hints.clone(),
+            intervention: InterventionState::default(),
         };
 
         self.active_cycles.insert(cycle_id.clone(), cycle);
@@ -59,101 +64,13 @@ impl SupervisorAgent {
         Ok(cycle_id)
     }
 
+    /// Classify the task and build the matching complexity-based execution plan.
     pub fn analyze_task(&self, user_input: &str) -> ExecutionPlan {
         let complexity = self.classify_complexity(user_input);
-
-        let (agent_sequence, parallel_groups, description) = match &complexity {
-            TaskComplexity::Instant => (
-                vec![AgentRole::Do],
-                vec![],
-                "Instant query: single DA agent".to_string(),
-            ),
-            TaskComplexity::Simple => (
-                vec![AgentRole::Do],
-                vec![],
-                "Simple query: single DA agent".to_string(),
-            ),
-            TaskComplexity::Standard => (
-                vec![
-                    AgentRole::Plan,
-                    AgentRole::Do,
-                    AgentRole::Check,
-                    AgentRole::Act,
-                ],
-                vec![],
-                "Standard task: PA → DA → CA → AA".to_string(),
-            ),
-            TaskComplexity::Complex => (
-                vec![
-                    AgentRole::Plan,
-                    AgentRole::Do,
-                    AgentRole::Check,
-                    AgentRole::Act,
-                ],
-                vec![],
-                "Complex task: PA → DA → CA → AA with full validation".to_string(),
-            ),
-            TaskComplexity::Exploratory => (
-                vec![
-                    AgentRole::Plan,
-                    AgentRole::Do,
-                    AgentRole::Do,
-                    AgentRole::Do,
-                    AgentRole::Check,
-                    AgentRole::Act,
-                ],
-                vec![vec![AgentRole::Do, AgentRole::Do, AgentRole::Do]],
-                "Exploratory: PA → [DA1, DA2, DA3] → CA → AA".to_string(),
-            ),
-            TaskComplexity::Emergency => (
-                vec![AgentRole::Do, AgentRole::Check, AgentRole::Act],
-                vec![],
-                "Emergency: DA → CA → AA (skip PA)".to_string(),
-            ),
-            TaskComplexity::Recursive => {
-                // Recursive: only 1 round of SA-level PDCA.
-                // DA internally executes micro-recursion via execute_recursive_sub_cycle
-                // Sub-task decomposition, no SA-level multi-round replay needed.
-                let seq = vec![
-                    AgentRole::Plan,
-                    AgentRole::Do,
-                    AgentRole::Check,
-                    AgentRole::Act,
-                ];
-                (
-                    seq,
-                    vec![],
-                    "Recursive: 1 PDCA with DA-internal sub-cycles".to_string(),
-                )
-            }
-        };
-
-        let steps = self.generate_default_steps(&agent_sequence);
-
-        let max_recursion_depth = match &complexity {
-            TaskComplexity::Recursive => self.max_pdca_cycles,
-            TaskComplexity::Complex => 2,
-            _ => 0,
-        };
-
-        ExecutionPlan {
-            plan_id: format!("plan_{}", uuid::Uuid::new_v4().hyphenated()),
-            agent_sequence,
-            parallel_groups,
-            task_complexity: complexity,
-            description,
-            steps,
-            context_requirements: HashMap::new(),
-            success_metrics: vec!["Task completed".to_string()],
-            max_recursion_depth,
-            sub_tasks: vec![],
-            dag_jsonld: None,
-            verify_first: false,
-            fallback_steps: vec![],
-        }
+        self.build_plan_from_complexity(complexity)
     }
 
-    fn build_plan_from_complexity(&self, complexity: TaskComplexity) -> ExecutionPlan {
+    pub(super) fn build_plan_from_complexity(&self, complexity: TaskComplexity) -> ExecutionPlan {
         let (agent_sequence, parallel_groups, description) = match &complexity {
             TaskComplexity::Instant => (
                 vec![AgentRole::Do],
@@ -223,7 +140,7 @@ impl SupervisorAgent {
         let steps = self.generate_default_steps(&agent_sequence);
 
         let max_recursion_depth = match &complexity {
-            TaskComplexity::Recursive => self.max_pdca_cycles,
+            TaskComplexity::Recursive => 3,
             TaskComplexity::Complex => 2,
             _ => 0,
         };
@@ -313,6 +230,10 @@ impl SupervisorAgent {
                     },
                     tools_allowed: vec![],
                     success_criteria,
+                    branch_on_failure: false,
+                    branch_fallback: None,
+                    retry_count: 0,
+                    retry_delay_secs: 0,
                 }
             })
             .collect()
@@ -507,12 +428,9 @@ Output only JSON, no other content."#,
         five_w2h: &crate::core::five_w2h::Task5W2H,
         experience_hints: &[String],
     ) -> ExecutionPlan {
-        // First detect recursive/complex tasks via keyword classifier (keyword path captures Recursive more reliably than LLM)
+        // Keyword verdict takes precedence over the priority mapping for structural
+        // complexity (Recursive/Exploratory/Emergency); the LLM refines the plan.
         let keyword_complexity = self.classify_complexity(user_input);
-        if keyword_complexity == TaskComplexity::Recursive {
-            info!("Keyword classification: Recursive, skipping LLM plan generation, using keyword path for cyclic plan");
-            return self.build_plan_from_complexity(TaskComplexity::Recursive);
-        }
 
         let enhanced_input = if experience_hints.is_empty() {
             user_input.to_string()
@@ -528,17 +446,15 @@ Output only JSON, no other content."#,
             )
         };
 
-        let complexity = match five_w2h.why.priority {
-            crate::core::five_w2h::Priority::High => {
-                // Use Complex if keyword classifier says Complex, otherwise High→Complex
-                if keyword_complexity == TaskComplexity::Complex {
-                    TaskComplexity::Complex
-                } else {
-                    TaskComplexity::Complex
-                }
-            }
-            crate::core::five_w2h::Priority::Medium => TaskComplexity::Standard,
-            crate::core::five_w2h::Priority::Low => TaskComplexity::Simple,
+        let complexity = match keyword_complexity {
+            TaskComplexity::Recursive
+            | TaskComplexity::Exploratory
+            | TaskComplexity::Emergency => keyword_complexity,
+            _ => match five_w2h.why.priority {
+                crate::core::five_w2h::Priority::High => TaskComplexity::Complex,
+                crate::core::five_w2h::Priority::Medium => TaskComplexity::Standard,
+                crate::core::five_w2h::Priority::Low => TaskComplexity::Simple,
+            },
         };
 
         match self
@@ -547,12 +463,19 @@ Output only JSON, no other content."#,
         {
             Ok(mut plan) => {
                 info!(plan_id = %plan.plan_id, steps = plan.steps.len(), "LLM generated detailed plan successfully");
-                // If keyword classifier says Complex but LLM returned wrong complexity, fix it
-                if keyword_complexity == TaskComplexity::Complex
-                    && plan.task_complexity != TaskComplexity::Complex
-                {
-                    plan.task_complexity = TaskComplexity::Complex;
-                    plan.max_recursion_depth = 2;
+                // Keyword verdict wins for Recursive/Complex: force the LLM
+                // plan's complexity when it disagrees.
+                let forced = match keyword_complexity {
+                    TaskComplexity::Complex | TaskComplexity::Recursive => keyword_complexity,
+                    _ => plan.task_complexity,
+                };
+                if forced != plan.task_complexity {
+                    plan.task_complexity = forced;
+                    plan.max_recursion_depth = match forced {
+                        TaskComplexity::Recursive => 3,
+                        TaskComplexity::Complex => 2,
+                        _ => 0,
+                    };
                 }
                 return plan;
             }
@@ -692,7 +615,7 @@ Output the plan in JSON format with the following fields:
 - **emergency**: Emergency fix, skip PA, DA→CA→AA
 
 ## Important Constraints
-1. **Step count limit**: Total steps not to exceed 6 (including PA and CA/AA)
+1. **Step count limit**: Total steps not to exceed {} (including PA and CA/AA)
 2. **DA step merging**: Merge multiple related operations into one DA step. For example, creating multiple files should be done in one DA step, not one step per file
 3. **Recommended pattern**: PA(1step) → DA(1-3steps) → CA(1step) → AA(1step)
 4. Each DA step's objective should describe a group of related operations to complete, not a single atomic operation
@@ -703,7 +626,7 @@ As the Supervisor Agent, you must follow these guidelines:
 {}
 
 Output only JSON, no other content."#,
-            user_input, w2h_block, sa_constitution_prompt
+            user_input, w2h_block, sa_constitution_prompt, MAX_PLAN_STEPS
         );
 
         let model = self.runner.gateway.get_model("default");
@@ -733,7 +656,7 @@ Output only JSON, no other content."#,
         self.parse_llm_plan(&content)
     }
 
-    fn parse_llm_plan(&self, content: &str) -> Result<ExecutionPlan, CoreError> {
+    pub(super) fn parse_llm_plan(&self, content: &str) -> Result<ExecutionPlan, CoreError> {
         let trimmed = content.trim();
         let json_str = if trimmed.starts_with('{') {
             trimmed.to_string()
@@ -764,7 +687,6 @@ Output only JSON, no other content."#,
             objective: String,
             expected_output: String,
             dependencies: Vec<String>,
-            tools_allowed: Vec<String>,
             success_criteria: String,
         }
 
@@ -799,13 +721,17 @@ Output only JSON, no other content."#,
                     objective: s.objective,
                     expected_output: s.expected_output,
                     dependencies: s.dependencies,
-                    tools_allowed: s.tools_allowed,
+                    tools_allowed: vec![],
                     success_criteria: s.success_criteria,
+                    branch_on_failure: false,
+                    branch_fallback: None,
+                    retry_count: 0,
+                    retry_delay_secs: 0,
                 }
             })
             .collect();
 
-        let max_plan_steps = 8;
+        let max_plan_steps = MAX_PLAN_STEPS;
         let steps = if steps.len() > max_plan_steps {
             warn!(
                 "Plan step count {} exceeds limit {}, truncating to first {} steps",
@@ -820,6 +746,19 @@ Output only JSON, no other content."#,
 
         let agent_sequence: Vec<AgentRole> = steps.iter().map(|s| s.role).collect();
 
+        // Exploratory plans express parallelism as multiple Do steps; expose
+        // them as a parallel group so execute_plan dispatches them concurrently.
+        let parallel_groups = if complexity == TaskComplexity::Exploratory {
+            let do_count = steps.iter().filter(|s| s.role == AgentRole::Do).count();
+            if do_count > 1 {
+                vec![vec![AgentRole::Do; do_count]]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
         let max_recursion_depth = match &complexity {
             TaskComplexity::Recursive => 3,
             TaskComplexity::Complex => 2,
@@ -829,7 +768,7 @@ Output only JSON, no other content."#,
         Ok(ExecutionPlan {
             plan_id: format!("plan_{}", uuid::Uuid::new_v4().hyphenated()),
             agent_sequence,
-            parallel_groups: vec![],
+            parallel_groups,
             task_complexity: complexity,
             description: parsed.description,
             steps,
@@ -928,12 +867,19 @@ Complexity definitions:
             return TaskComplexity::Instant;
         }
 
-        // Emergency: emergency fix category
-        let emergency_keywords = [
-            "fix", "bug", "error", "crash", "urgent", "broken", "repair", "repair", "urgent",
-            "crash", "fault",
-        ];
-        if emergency_keywords.iter().any(|k| lower.contains(k)) {
+        // Emergency: emergency fix category. Strong verbs (fix/bug/urgent/repair)
+        // always qualify; weak symptoms (error/crash/broken/fault) only qualify
+        // when reinforced by urgency cues or a short input — long pasted logs
+        // containing "error" must not be misclassified as emergency.
+        let emergency_strong = ["fix", "bug", "urgent", "repair"];
+        let emergency_weak = ["error", "crash", "broken", "fault"];
+        let emergency_reinforced =
+            ["critical", "security", "production", "immediately", "outage"];
+        let has_strong = emergency_strong.iter().any(|k| lower.contains(k));
+        let has_weak = emergency_weak.iter().any(|k| lower.contains(k));
+        let reinforced = user_input.len() < 200
+            || emergency_reinforced.iter().any(|k| lower.contains(k));
+        if has_strong || (has_weak && reinforced) {
             return TaskComplexity::Emergency;
         }
 
@@ -966,7 +912,7 @@ Complexity definitions:
         }
 
         // Exploratory task → Exploratory (prioritized over research_patterns)
-        let exploratory_keywords = ["research", "explore", "investigate"];
+        let exploratory_keywords = ["explore", "investigate"];
         if exploratory_keywords.iter().any(|k| lower.contains(k)) {
             return TaskComplexity::Exploratory;
         }
@@ -981,7 +927,7 @@ Complexity definitions:
         }
 
         // Research/analysis questions → Standard or Complex
-        let research_patterns: [&str; 0] = [];
+        let research_patterns = ["research", "analysis", "survey", "study"];
         if research_patterns.iter().any(|p| lower.contains(p)) {
             let deep_patterns = [
                 "deep",
@@ -997,7 +943,7 @@ Complexity definitions:
         }
 
         // Simple: simple fact query, answerable in one sentence
-        let simple_query_patterns: [&str; 0] = [];
+        let simple_query_patterns = ["what is", "who is", "how to", "explain", "define"];
         let is_simple_query = user_input.len() < 50
             && simple_query_patterns.iter().any(|p| lower.contains(p))
             && !lower.contains("application")

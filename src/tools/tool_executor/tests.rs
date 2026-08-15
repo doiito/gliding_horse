@@ -34,6 +34,58 @@ mod tests {
     }
 
     #[test]
+    fn tools_allowed_denies_unlisted_tool() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let input = json!({"command": "ls"});
+            let result = executor
+                .execute_with_security_context(
+                    "bash",
+                    input,
+                    crate::skill_graph::security::SecurityContext::new(
+                        "agent:test",
+                        "DA",
+                    )
+                    .with_task("iri://tasks/allowlist-test"),
+                    Some(&["file_read".to_string()]),
+                )
+                .await
+                .unwrap();
+            assert!(result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("Tool not allowed: bash"));
+        });
+    }
+
+    #[test]
+    fn tools_allowed_passes_listed_tool_through() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let input = json!({"query": "search test"});
+            let result = executor
+                .execute_with_security_context(
+                    "tool_search",
+                    input,
+                    crate::skill_graph::security::SecurityContext::new(
+                        "agent:test",
+                        "DA",
+                    )
+                    .with_task("iri://tasks/allowlist-test"),
+                    Some(&["tool_search".to_string()]),
+                )
+                .await
+                .unwrap();
+            assert!(!result
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("Tool not allowed: tool_search"));
+        });
+    }
+
+    #[test]
     fn security_context_denies_high_risk_registered_tool_and_audits_it() {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
@@ -60,6 +112,7 @@ mod tests {
                     json!({"path": target, "content": "blocked"}),
                     crate::skill_graph::security::SecurityContext::new("agent:test", "DA")
                         .with_task("iri://tasks/security-test"),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -121,6 +174,7 @@ mod tests {
                         json!({"path": "."}),
                         crate::skill_graph::security::SecurityContext::new("agent:test", "AA")
                             .with_task("iri://tasks/security-test"),
+                        None,
                     )
                     .await;
                 let err = match outcome {
@@ -382,5 +436,47 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn test_tool_definitions_for_role_with_allowlist_intersection() {
+        let executor = ToolExecutor::new();
+        let full = executor.tool_definitions_for_role("DA");
+        assert!(!full.is_empty(), "DA role should expose builtin tools");
+        let full_names: Vec<String> = full
+            .iter()
+            .filter_map(|td| td["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        // None/empty allowlist → full role-filtered set unchanged
+        assert_eq!(
+            executor
+                .tool_definitions_for_role_with_allowlist("DA", None)
+                .len(),
+            full.len()
+        );
+        let empty: Vec<String> = vec![];
+        assert_eq!(
+            executor
+                .tool_definitions_for_role_with_allowlist("DA", Some(&empty))
+                .len(),
+            full.len()
+        );
+
+        // Single-tool allowlist → intersection keeps only that tool
+        let one = vec![full_names[0].clone()];
+        let filtered =
+            executor.tool_definitions_for_role_with_allowlist("DA", Some(&one));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered[0]["function"]["name"].as_str().unwrap(),
+            full_names[0]
+        );
+
+        // Allowlist with no overlap → empty intersection
+        let disjoint = vec!["no_such_tool".to_string()];
+        assert!(executor
+            .tool_definitions_for_role_with_allowlist("DA", Some(&disjoint))
+            .is_empty());
     }
 }

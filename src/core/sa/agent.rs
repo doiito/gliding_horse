@@ -54,6 +54,8 @@ pub struct SupervisorAgent {
     pub(super) relevance_tracker: RelevanceTracker,
     /// Timeout for intervention/LLM execution (seconds)
     pub(super) execution_timeout_secs: u64,
+    /// Human approval wait window (seconds) before falling back to the default
+    pub(super) approval_wait_secs: u64,
     /// Skill discovery engine for semantic skill search during planning
     pub(super) discovery_engine: Option<Arc<SkillDiscoveryEngine>>,
 }
@@ -117,12 +119,18 @@ impl SupervisorAgent {
             embedder: None,
             relevance_tracker: RelevanceTracker::new(0.6),
             execution_timeout_secs: 30,
+            approval_wait_secs: 5,
             discovery_engine: None,
         }
     }
 
     pub fn with_execution_timeout(mut self, secs: u64) -> Self {
         self.execution_timeout_secs = secs;
+        self
+    }
+
+    pub fn with_approval_wait_secs(mut self, secs: u64) -> Self {
+        self.approval_wait_secs = secs;
         self
     }
 

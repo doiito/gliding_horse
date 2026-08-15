@@ -95,6 +95,8 @@ pub struct TaskContext {
     /// Summary of workspace file inventory (set by CodeCliEngine before passing to SA).
     /// Used by SA to decide verification-first routing when workspace has existing files.
     pub workspace_file_summary: Option<String>,
+    /// Tool allowlist for this execution (None = all tools allowed)
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl TaskContext {
@@ -120,6 +122,7 @@ impl TaskContext {
             success_criteria: String::new(),
             cycle_id: String::new(),
             workspace_file_summary: None,
+            allowed_tools: None,
         }
     }
 
@@ -194,6 +197,11 @@ impl TaskContext {
         self.workspace_file_summary = Some(summary.to_string());
         self
     }
+
+    pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
+        self.allowed_tools = if tools.is_empty() { None } else { Some(tools) };
+        self
+    }
 }
 
 impl Default for TaskContext {
@@ -219,6 +227,33 @@ impl Default for TaskContext {
             success_criteria: String::new(),
             cycle_id: String::new(),
             workspace_file_summary: None,
+            allowed_tools: None,
+        }
+    }
+}
+
+/// Structured task outcome verdict — decoupled from the human-readable status string.
+/// The `finish` action historically flattened a verdict into `status: "success"`,
+/// losing blocked/failed intent; this enum preserves it so consumers (e.g. SA
+/// verify-first logic) can react honestly instead of re-parsing summary text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskVerdict {
+    Success,
+    PartialSuccess,
+    Failed,
+    Timeout,
+    Blocked,
+}
+
+impl TaskVerdict {
+    /// Maps back to the legacy status string so existing consumers keep working.
+    pub fn to_status_str(self) -> &'static str {
+        match self {
+            TaskVerdict::Success => "success",
+            TaskVerdict::PartialSuccess => "partial_success",
+            TaskVerdict::Failed => "failed",
+            TaskVerdict::Timeout => "timeout",
+            TaskVerdict::Blocked => "failed",
         }
     }
 }
@@ -227,6 +262,7 @@ impl Default for TaskContext {
 pub struct TaskResult {
     pub task_iri: String,
     pub status: String,
+    pub verdict: Option<TaskVerdict>,
     pub summary: String,
     pub output: Option<Value>,
     pub jsonld_output: Option<Value>,

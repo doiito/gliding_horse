@@ -13,7 +13,7 @@ use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
-use super::{TaskContext, TaskResult};
+use super::{TaskContext, TaskResult, TaskVerdict};
 
 /// Cap on (tool_name, result) pairs aggregated into the force-finish summary
 /// prompt — bounds prompt size for long tasks regardless of total tool calls.
@@ -90,6 +90,7 @@ impl super::AgentRunner {
                     tool_call_count: 0,
                     five_w2h_updates: None,
                     tracked_actions: Vec::new(),
+                    verdict: None,
                     archive_iri: None,
                 });
             }
@@ -120,6 +121,7 @@ impl super::AgentRunner {
                 tool_call_count: 0,
                 five_w2h_updates: None,
                 tracked_actions: Vec::new(),
+                verdict: None,
                 archive_iri: None,
             });
         }
@@ -246,6 +248,16 @@ impl super::AgentRunner {
     ) -> Result<TaskResult, CoreError> {
         use crate::core::biz_agent::{AgentConfig, BizAgent};
 
+        let ctx = if let Some(ref step) = plan_step {
+            if step.tools_allowed.is_empty() {
+                ctx
+            } else {
+                ctx.with_allowed_tools(step.tools_allowed.clone())
+            }
+        } else {
+            ctx
+        };
+
         // AgentInit hook
         {
             let mut hook_ctx = HookContext::new(
@@ -312,6 +324,7 @@ impl super::AgentRunner {
                     tool_call_count: 0,
                     five_w2h_updates: None,
                     tracked_actions: Vec::new(),
+                    verdict: None,
                     archive_iri: None,
                 });
             }
@@ -341,6 +354,7 @@ impl super::AgentRunner {
                 tool_call_count: 0,
                 five_w2h_updates: None,
                 tracked_actions: Vec::new(),
+                verdict: None,
                 archive_iri: None,
             });
         }
@@ -858,6 +872,7 @@ Output the summary report directly, not in JSON format."#,
                         tool_call_count: tc,
                         five_w2h_updates: None,
                         tracked_actions: action_tracker.actions,
+                        verdict: None,
                         archive_iri: force_archive,
                     });
                 }
@@ -1427,11 +1442,14 @@ Output the summary report directly, not in JSON format."#,
                     } else {
                         Some(node_iri.clone())
                     };
-                    let verdict = Self::detect_blocker_verdict(&final_summary)
-                        .unwrap_or("success");
+                    let task_verdict = if Self::detect_blocker_verdict(&final_summary).is_some() {
+                        TaskVerdict::Blocked
+                    } else {
+                        TaskVerdict::Success
+                    };
                     return Ok(TaskResult {
                         task_iri: ctx.task_iri,
-                        status: verdict.to_string(),
+                        status: task_verdict.to_status_str().to_string(),
                         summary: final_summary,
                         output: Some(output_value),
                         jsonld_output,
@@ -1441,6 +1459,7 @@ Output the summary report directly, not in JSON format."#,
                         tool_call_count: tc,
                         five_w2h_updates: None,
                         tracked_actions: action_tracker.actions,
+                        verdict: Some(task_verdict),
                         archive_iri,
                     });
                 }
@@ -1482,18 +1501,18 @@ Output the summary report directly, not in JSON format."#,
                         } else {
                             None
                         };
-                        let force_status = if soft_limit_force_finish
+                        let force_verdict = if soft_limit_force_finish
                             && errs
                                 .iter()
                                 .any(|e| e.contains("max turns") || e.contains("force-finish"))
                         {
-                            "partial_success"
+                            TaskVerdict::PartialSuccess
                         } else {
-                            "success"
+                            TaskVerdict::Success
                         };
                         return Ok(TaskResult {
                             task_iri: ctx.task_iri,
-                            status: force_status.to_string(),
+                            status: force_verdict.to_status_str().to_string(),
                             summary: final_summary,
                             output: Some(output_value),
                             jsonld_output,
@@ -1503,6 +1522,7 @@ Output the summary report directly, not in JSON format."#,
                             tool_call_count: tc,
                             five_w2h_updates: None,
                             tracked_actions: action_tracker.actions,
+                            verdict: Some(force_verdict),
                             archive_iri: intercept_archive,
                         });
                     }
@@ -1586,6 +1606,7 @@ Output the summary report directly, not in JSON format."#,
                                     tool_call_count: tc,
                                     five_w2h_updates: None,
                                     tracked_actions: Vec::new(),
+                                    verdict: None,
                                     archive_iri: pa_archive_iri,
                                 });
                             }
@@ -1695,6 +1716,7 @@ Output the summary report directly, not in JSON format."#,
                                         &agent.role.to_string(),
                                     )
                                     .with_task(&ctx.task_iri),
+                                    ctx.allowed_tools.as_deref(),
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));
@@ -2036,6 +2058,7 @@ Output the summary report directly, not in JSON format."#,
             tool_call_count: tc,
             five_w2h_updates: None,
             tracked_actions: Vec::new(),
+            verdict: None,
             archive_iri: unfinished_archive,
         })
     }

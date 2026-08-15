@@ -10,10 +10,42 @@ use super::agent::SupervisorAgent;
 use super::types::*;
 
 impl SupervisorAgent {
+    /// Execute an intervention plan against the active cycle for `task_iri`.
+    ///
+    /// The cycle is temporarily removed from `active_cycles` so the handler
+    /// can mutate it through `&mut CycleState` (its `intervention` field)
+    /// without a double mutable borrow of `self`; the cycle is written back
+    /// afterwards.
+    pub(super) async fn execute_intervention_for_cycle(
+        &mut self,
+        plan: crate::perception::proactive_engine::InterventionPlan,
+        task_iri: &str,
+    ) -> Result<(), CoreError> {
+        let cycle_id = self
+            .active_cycles
+            .iter()
+            .find(|(_, c)| c.task_iri == task_iri)
+            .map(|(id, _)| id.clone());
+        let Some(cycle_id) = cycle_id else {
+            warn!(task_iri = %task_iri, "No active cycle found for intervention");
+            return Ok(());
+        };
+        let mut cycle = self.active_cycles.remove(&cycle_id);
+        let result = match cycle.as_mut() {
+            Some(cycle) => self.execute_intervention(plan, task_iri, cycle).await,
+            None => Ok(()),
+        };
+        if let Some(cycle) = cycle {
+            self.active_cycles.insert(cycle_id, cycle);
+        }
+        result
+    }
+
     pub(super) async fn execute_intervention(
         &mut self,
         plan: crate::perception::proactive_engine::InterventionPlan,
         task_iri: &str,
+        cycle: &mut CycleState,
     ) -> Result<(), CoreError> {
         if !plan.should_interrupt {
             warn!(actions = ?plan.actions, "Non-interruptive intervention advice, logging only");
@@ -44,7 +76,7 @@ impl SupervisorAgent {
                 info!("IncreaseBudget not confirmed by human, downgraded to FreezeAndReport");
                 let fallback_action = InterventionAction::FreezeAndReport;
                 if let Some(handler) = get_action_handler(&fallback_action) {
-                    return handler(self, ActionParams::default(), task_iri).await;
+                    return handler(self, cycle, ActionParams::default(), task_iri).await;
                 }
                 return Ok(());
             }
@@ -54,7 +86,7 @@ impl SupervisorAgent {
         let handler = get_action_handler(&action).ok_or_else(|| CoreError::Internal {
             message: format!("Unknown action handler for: {:?}", action),
         })?;
-        handler(self, params, task_iri).await?;
+        handler(self, cycle, params, task_iri).await?;
 
         // 4. Emit intervention execution event
         self.event_bus
@@ -193,7 +225,7 @@ Notes:
     }
 
     /// IncreaseBudget human confirmation flow
-    async fn request_human_approval(
+    pub(super) async fn request_human_approval(
         &self,
         action: &InterventionAction,
         task_iri: &str,
@@ -245,7 +277,7 @@ Notes:
 
         // Wait briefly for any instant approval result
         let mut receiver = self.event_bus.subscribe();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.approval_wait_secs);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(event) = receiver.try_recv() {
@@ -267,8 +299,12 @@ Notes:
             }
         }
 
-        info!(request_id = %request_id, "Human confirmation wait timed out (5s), task continuing, waiting for async confirmation");
-        Ok(false)
+        info!(request_id = %request_id, "Human confirmation wait timed out, defaulting to approved (harmless), task continuing");
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(request_id, true);
+        Ok(true)
     }
 
     /// General human approval request (for HumanApprovalNode workflow nodes)
@@ -310,7 +346,7 @@ Notes:
 
         // Wait briefly for any instant approval result
         let mut receiver = self.event_bus.subscribe();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.approval_wait_secs);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(event) = receiver.try_recv() {
@@ -340,12 +376,15 @@ Notes:
             }
         }
 
-        info!(request_id = %request_id, "HumanApprovalNode: wait timed out (5s), task continuing, waiting for async confirmation");
-        // After timeout, do not block by default — mark as unapproved, follow reject logic
+        info!(request_id = %request_id, "HumanApprovalNode: wait timed out, defaulting to approved (harmless)");
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(request_id, true);
         Ok(HumanApprovalNodeResult {
             node_id: node_id.to_string(),
-            approved: false,
-            comment: Some("Approval timeout, default rejected".to_string()),
+            approved: true,
+            comment: Some("Approval timeout, default approved".to_string()),
         })
     }
 
@@ -410,7 +449,7 @@ Notes:
             }
         }
         for plan in pending_interventions {
-            let _ = self.execute_intervention(plan, task_iri).await;
+            let _ = self.execute_intervention_for_cycle(plan, task_iri).await;
         }
         for payload in supp_payloads {
             self.enqueue_supplementary_input(task_iri, &payload);

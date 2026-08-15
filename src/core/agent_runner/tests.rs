@@ -344,6 +344,7 @@ fn test_task_result_jsonld_output() {
         tool_call_count: 3,
         five_w2h_updates: None,
         tracked_actions: Vec::new(),
+        verdict: None,
         archive_iri: None,
     };
 
@@ -455,6 +456,7 @@ fn test_task_result_partial_success_status() {
         tool_call_count: 5,
         five_w2h_updates: None,
         tracked_actions: Vec::new(),
+        verdict: None,
         archive_iri: None,
     };
     assert_eq!(result.status, "partial_success");

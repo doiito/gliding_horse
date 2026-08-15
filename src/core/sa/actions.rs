@@ -5,82 +5,96 @@ use tracing::{info, warn};
 
 use crate::core::event_bus::EventPriority;
 use crate::core::sa::{
-    ActionParams, InterventionAction, SupervisorAgent, SupplementaryInputAction,
+    ActionParams, CycleState, InterventionAction, SupervisorAgent, SupplementaryInputAction,
 };
 use crate::CoreError;
 
 type ActionHandler = Box<
     dyn for<'a> Fn(
             &'a mut SupervisorAgent,
+            &'a mut CycleState,
             ActionParams,
             &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send + 'a>>
         + Send,
 >;
 
-/// Intervention action registry: look up handler by action type
+/// Intervention action registry: look up handler by action type.
+///
+/// Handlers receive `&mut CycleState` so effective actions can write back
+/// into `cycle.intervention`.
 pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHandler> {
     match action {
-        InterventionAction::Continue => Some(Box::new(|_sa, _params, _task_iri| {
+        InterventionAction::Continue => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
             Box::pin(async move {
                 info!("Intervention: continue execution");
                 Ok(())
             })
         })),
-        InterventionAction::ContinueWithMonitor => Some(Box::new(|_sa, _params, _task_iri| {
+        InterventionAction::ContinueWithMonitor => Some(Box::new(|_sa, cycle, _params, _task_iri| {
             Box::pin(async move {
+                cycle.intervention.monitor = true;
                 warn!("Intervention: continue with monitoring");
                 Ok(())
             })
         })),
-        InterventionAction::IncreaseRetry { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::IncreaseRetry { .. } => Some(Box::new(|_sa, cycle, params, _task_iri| {
             Box::pin(async move {
                 let retries = params.additional_retries.unwrap_or(3);
-                info!("Intervention: increase retries to {}", retries);
+                cycle.intervention.max_iterations_delta += retries as i32;
+                info!(
+                    "Intervention: increase retries by {} (max_iterations_delta={})",
+                    retries, cycle.intervention.max_iterations_delta
+                );
                 Ok(())
             })
         })),
-        InterventionAction::IncreaseTimeout { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::IncreaseTimeout { .. } => Some(Box::new(|_sa, cycle, params, _task_iri| {
             Box::pin(async move {
                 let secs = params.additional_seconds.unwrap_or(60);
-                info!("Intervention: increase timeout to {}s", secs);
+                cycle.intervention.timeout_delta_secs += secs as i64;
+                info!(
+                    "Intervention: increase timeout by {}s (timeout_delta_secs={})",
+                    secs, cycle.intervention.timeout_delta_secs
+                );
                 Ok(())
             })
         })),
-        InterventionAction::ReduceComplexity => Some(Box::new(|_sa, _params, _task_iri| {
+        InterventionAction::ReduceComplexity => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
             Box::pin(async move {
                 info!("Intervention: reduce complexity expectation");
                 Ok(())
             })
         })),
-        InterventionAction::RestrictTools { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::RestrictTools { .. } => Some(Box::new(|_sa, cycle, params, _task_iri| {
             Box::pin(async move {
                 let tools = params.allowed_tools.clone().unwrap_or_default();
+                cycle.intervention.tool_allowlist_override = Some(tools.clone());
                 info!("Intervention: restrict tools to {:?}", tools);
                 Ok(())
             })
         })),
-        InterventionAction::SkipStep { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::SkipStep { .. } => Some(Box::new(|_sa, _cycle, params, _task_iri| {
             Box::pin(async move {
                 let step = params.step_id.as_deref().unwrap_or("unknown");
                 info!("Intervention: skip step {}", step);
                 Ok(())
             })
         })),
-        InterventionAction::RetryStep { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::RetryStep { .. } => Some(Box::new(|_sa, _cycle, params, _task_iri| {
             Box::pin(async move {
                 let step = params.step_id.as_deref().unwrap_or("unknown");
                 info!("Intervention: retry step {}", step);
                 Ok(())
             })
         })),
-        InterventionAction::Parallelize => Some(Box::new(|_sa, _params, _task_iri| {
+        InterventionAction::Parallelize => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
             Box::pin(async move {
                 info!("Intervention: parallelize execution");
                 Ok(())
             })
         })),
-        InterventionAction::SplitStep { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::SplitStep { .. } => Some(Box::new(|_sa, _cycle, params, _task_iri| {
             Box::pin(async move {
                 let step = params.step_id.as_deref().unwrap_or("unknown");
                 let sub_steps = params.sub_steps.clone().unwrap_or_default();
@@ -92,26 +106,28 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
                 Ok(())
             })
         })),
-        InterventionAction::InsertExtraStep { .. } => Some(Box::new(|_sa, params, _task_iri| {
-            Box::pin(async move {
-                let desc = params.description.as_deref().unwrap_or("unknown");
-                info!("Intervention: insert extra step: {}", desc);
-                Ok(())
-            })
-        })),
-        InterventionAction::FallbackToShallow => Some(Box::new(|_sa, _params, _task_iri| {
+        InterventionAction::InsertExtraStep { .. } => {
+            Some(Box::new(|_sa, _cycle, params, _task_iri| {
+                Box::pin(async move {
+                    let desc = params.description.as_deref().unwrap_or("unknown");
+                    info!("Intervention: insert extra step: {}", desc);
+                    Ok(())
+                })
+            }))
+        }
+        InterventionAction::FallbackToShallow => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
             Box::pin(async move {
                 info!("Intervention: fall back to shallow mode");
                 Ok(())
             })
         })),
-        InterventionAction::EmergencyMode => Some(Box::new(|_sa, _params, _task_iri| {
+        InterventionAction::EmergencyMode => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
             Box::pin(async move {
                 warn!("Intervention: entering emergency mode");
                 Ok(())
             })
         })),
-        InterventionAction::IncreaseBudget { .. } => Some(Box::new(|_sa, params, _task_iri| {
+        InterventionAction::IncreaseBudget { .. } => Some(Box::new(|_sa, _cycle, params, _task_iri| {
             Box::pin(async move {
                 let tokens = params.additional_tokens.unwrap_or(1000);
                 let secs = params.additional_time_secs.unwrap_or(120);
@@ -123,7 +139,7 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
             })
         })),
         InterventionAction::FreezeAndReport => {
-            Some(Box::new(|sa, _params, task_iri| {
+            Some(Box::new(|sa, _cycle, _params, task_iri| {
                 Box::pin(async move {
                     info!("Intervention: freeze state and generate report");
                     let _ = sa.event_bus.emit(task_iri, "TASK_FROZEN", "SA",
@@ -132,7 +148,7 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
                 })
             }))
         }
-        InterventionAction::AbortTask { .. } => Some(Box::new(|sa, params, task_iri| {
+        InterventionAction::AbortTask { .. } => Some(Box::new(|sa, _cycle, params, task_iri| {
             Box::pin(async move {
                 let reason = params.reason.as_deref().unwrap_or("no specific reason");
                 warn!("Intervention: abort task, reason: {}", reason);
@@ -148,7 +164,7 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
                 Ok(())
             })
         })),
-        InterventionAction::NotifyHuman { .. } => Some(Box::new(|sa, params, task_iri| {
+        InterventionAction::NotifyHuman { .. } => Some(Box::new(|sa, _cycle, params, task_iri| {
             Box::pin(async move {
                 let msg = params
                     .message

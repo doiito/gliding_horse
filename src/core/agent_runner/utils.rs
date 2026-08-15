@@ -851,6 +851,7 @@ impl super::AgentRunner {
                                         &agent.role.to_string(),
                                     )
                                     .with_task(&ctx.task_iri),
+                                    ctx.allowed_tools.as_deref(),
                                 )
                                 .await
                                 .unwrap_or_else(|e| json!({"error": e}));
@@ -1157,6 +1158,7 @@ impl super::AgentRunner {
                 tool_call_count: tc,
                 five_w2h_updates: None,
                 tracked_actions: Vec::new(),
+                verdict: None,
                 archive_iri: None,
             }),
             session,

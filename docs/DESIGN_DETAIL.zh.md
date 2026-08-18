@@ -210,7 +210,7 @@ graph LR
 ```json
 {
   "@context": {
-    "skill": "https://agent-harness.os/skill#",
+    "skill": "https://agent-os.org/ontology/skill#",
     "skill:inputMapping": {
       "file_path": { "@id": "skill:sourceDataURI" },
       "source_url": { "@id": "skill:sourceDataURI" },
@@ -340,7 +340,7 @@ L3 投影引擎使用 **Frame 文档**声明所需的输出形状：
 
 ```json
 {
-  "@context": { "exec": "https://agent-harness.os/exec#" },
+  "@context": { "exec": "https://agent-os.org/ontology/exec#" },
   "@type": "task:AnalysisTask",
   "task:subTasks": {
     "@embed": "@always",           // 完全展开
@@ -676,7 +676,7 @@ CA 不只说"通过/不通过"。它**独立审计每个 5W2H 维度**：
 L0 存储所有已完成的任务作为冻结的 `task:CompletedTaskSnapshot`。SA 的模式识别器官查询类似经验：
 
 ```sparql
-PREFIX task: <https://agent-harness.os/task#>
+PREFIX task: <https://agent-os.org/ontology/task#>
 
 SELECT ?pastTask ?whySimilarity ?howSimilarity
 WHERE {

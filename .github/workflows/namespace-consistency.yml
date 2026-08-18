@@ -1,0 +1,16 @@
+name: Namespace Consistency
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Check ontology namespaces
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check namespace consistency
+        run: bash scripts/check_namespace.sh

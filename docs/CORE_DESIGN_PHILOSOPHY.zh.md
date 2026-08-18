@@ -345,7 +345,7 @@ graph TB
 
 #### 步骤 2：技能发现（SPARQL 查询）
 ```sparql
-PREFIX skill: <https://agent-harness.os/skill#>
+PREFIX skill: <https://agent-os.org/ontology/skill#>
 SELECT ?skill WHERE {
   GRAPH system:skills {
     ?skill a skill:AtomicSkill ;

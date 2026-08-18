@@ -319,6 +319,7 @@ cargo build -p code_cli --release
 
 - **Design Detail** → [`docs/DESIGN_DETAIL.md`](docs/DESIGN_DETAIL.md) · [`docs/DESIGN_DETAIL.zh.md`](docs/DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
+- **Ontology Namespace Migration** → [`docs/16-ONTOLOGY_NAMESPACE_MIGRATION.md`](docs/16-ONTOLOGY_NAMESPACE_MIGRATION.md)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
 
 ---

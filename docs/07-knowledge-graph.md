@@ -93,8 +93,8 @@ graph LR
 
 **属性 key IRI 转换规则**：
 - 含 `/`、`#`、`:` 的 key → 直接使用（已是完整 IRI）
-- 其他 key → 自动加前缀 `https://agentos.ontology/meta/`
-- 例如：`contentHash` → `https://agentos.ontology/meta/contentHash`
+- 其他 key → 自动加前缀 `https://agent-os.org/ontology/meta/`
+- 例如：`contentHash` → `https://agent-os.org/ontology/meta/contentHash`
 
 ### CodeAstExtractor — 代码 AST 提取
 

@@ -1,239 +1,240 @@
 {
   "@context": {
-    "@vocab": "https://pdca-agent.org/vocab#",
+    "@vocab": "https://agent-os.org/ontology/core/",
     "xsd": "http://www.w3.org/2001/XMLSchema#",
     "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
 
-    "agent": "https://pdca-agent.org/ontology/agent#",
-    "task": "https://pdca-agent.org/ontology/task#",
-    "skill": "https://pdca-agent.org/ontology/skill#",
-    "mem": "https://pdca-agent.org/ontology/memory#",
-    "sec": "https://pdca-agent.org/ontology/security#",
-    "mon": "https://pdca-agent.org/ontology/monitoring#",
-    "tmpl": "https://pdca-agent.org/ontology/template#",
-    "exp": "https://pdca-agent.org/ontology/experience#",
-    "adv": "https://pdca-agent.org/ontology/advisory#",
-    "node": "https://pdca-agent.org/ontology/node#",
+    "core": "https://agent-os.org/ontology/core/",
+    "agent": "https://agent-os.org/ontology/agent#",
+    "task": "https://agent-os.org/ontology/task#",
+    "skill": "https://agent-os.org/ontology/skill#",
+    "mem": "https://agent-os.org/ontology/memory#",
+    "sec": "https://agent-os.org/ontology/security#",
+    "mon": "https://agent-os.org/ontology/monitoring#",
+    "tmpl": "https://agent-os.org/ontology/template#",
+    "exp": "https://agent-os.org/ontology/experience#",
+    "adv": "https://agent-os.org/ontology/advisory#",
+    "node": "https://agent-os.org/ontology/node#",
 
-    "Task": "pdca:Task",
-    "Agent": "pdca:Agent",
-    "PlanNode": "pdca:PlanNode",
-    "ExecutionResult": "pdca:ExecutionResult",
-    "CheckResult": "pdca:CheckResult",
-    "Decision": "pdca:Decision",
-    "EmphasisContent": "pdca:EmphasisContent",
+    "Task": "core:Task",
+    "Agent": "core:Agent",
+    "PlanNode": "core:PlanNode",
+    "ExecutionResult": "core:ExecutionResult",
+    "CheckResult": "core:CheckResult",
+    "Decision": "core:Decision",
+    "EmphasisContent": "core:EmphasisContent",
 
     "task_iri": {
-      "@id": "pdca:taskIri",
+      "@id": "core:taskIri",
       "@type": "@id"
     },
     "agent_id": {
-      "@id": "pdca:agentId",
+      "@id": "core:agentId",
       "@type": "xsd:string"
     },
     "role": {
-      "@id": "pdca:role",
+      "@id": "core:role",
       "@type": "@vocab"
     },
     "status": {
-      "@id": "pdca:status",
+      "@id": "core:status",
       "@type": "xsd:string"
     },
     "summary": {
-      "@id": "pdca:summary",
+      "@id": "core:summary",
       "@type": "xsd:string"
     },
     "objective": {
-      "@id": "pdca:objective",
+      "@id": "core:objective",
       "@type": "xsd:string"
     },
     "content": {
-      "@id": "pdca:content",
+      "@id": "core:content",
       "@type": "xsd:string"
     },
     "thought": {
-      "@id": "pdca:thought",
+      "@id": "core:thought",
       "@type": "xsd:string"
     },
     "emphasis": {
-      "@id": "pdca:emphasis",
+      "@id": "core:emphasis",
       "@type": "xsd:string"
     },
     "timestamp": {
-      "@id": "pdca:timestamp",
+      "@id": "core:timestamp",
       "@type": "xsd:dateTime"
     },
     "permanent": {
-      "@id": "pdca:permanent",
+      "@id": "core:permanent",
       "@type": "xsd:boolean"
     },
     "confidence": {
-      "@id": "pdca:confidence",
+      "@id": "core:confidence",
       "@type": "xsd:float"
     },
     "turn_count": {
-      "@id": "pdca:turnCount",
+      "@id": "core:turnCount",
       "@type": "xsd:integer"
     },
     "tool_call_count": {
-      "@id": "pdca:toolCallCount",
+      "@id": "core:toolCallCount",
       "@type": "xsd:integer"
     },
     "dependencies": {
-      "@id": "pdca:dependsOn",
+      "@id": "core:dependsOn",
       "@type": "@id"
     },
     "created_by": {
-      "@id": "pdca:createdBy",
+      "@id": "core:createdBy",
       "@type": "@id"
     },
     "parent_task": {
-      "@id": "pdca:parentTask",
+      "@id": "core:parentTask",
       "@type": "@id"
     },
     "subtasks": {
-      "@id": "pdca:hasSubtask",
+      "@id": "core:hasSubtask",
       "@type": "@id"
     },
     "artifacts": {
-      "@id": "pdca:hasArtifact",
+      "@id": "core:hasArtifact",
       "@type": "@id"
     },
     "errors": {
-      "@id": "pdca:hasError",
+      "@id": "core:hasError",
       "@type": "xsd:string"
     },
     "tags": {
-      "@id": "pdca:hasTag",
+      "@id": "core:hasTag",
       "@type": "xsd:string"
     },
 
     "created_at": {
-      "@id": "pdca:createdAt",
+      "@id": "core:createdAt",
       "@type": "xsd:dateTime"
     },
     "updated_at": {
-      "@id": "pdca:updatedAt",
+      "@id": "core:updatedAt",
       "@type": "xsd:dateTime"
     },
     "priority": {
-      "@id": "pdca:priority",
+      "@id": "core:priority",
       "@type": "xsd:string"
     },
     "assignee": {
-      "@id": "pdca:assignee",
+      "@id": "core:assignee",
       "@type": "@id"
     },
     "what": {
-      "@id": "pdca:what",
+      "@id": "core:what",
       "@type": "xsd:string"
     },
     "why": {
-      "@id": "pdca:why",
+      "@id": "core:why",
       "@type": "xsd:string"
     },
     "who": {
-      "@id": "pdca:who",
+      "@id": "core:who",
       "@type": "xsd:string"
     },
     "when": {
-      "@id": "pdca:when",
+      "@id": "core:when",
       "@type": "xsd:string"
     },
     "where": {
-      "@id": "pdca:where",
+      "@id": "core:where",
       "@type": "xsd:string"
     },
     "how": {
-      "@id": "pdca:how",
+      "@id": "core:how",
       "@type": "xsd:string"
     },
     "how_much": {
-      "@id": "pdca:howMuch",
+      "@id": "core:howMuch",
       "@type": "xsd:string"
     },
     "success_criteria": {
-      "@id": "pdca:successCriteria",
+      "@id": "core:successCriteria",
       "@type": "xsd:string"
     },
     "description": {
-      "@id": "pdca:description",
+      "@id": "core:description",
       "@type": "xsd:string"
     },
     "deadline": {
-      "@id": "pdca:deadline",
+      "@id": "core:deadline",
       "@type": "xsd:dateTime"
     },
     "data_sources": {
-      "@id": "pdca:dataSources",
+      "@id": "core:dataSources",
       "@type": "@id"
     },
     "execution_environment": {
-      "@id": "pdca:executionEnvironment",
+      "@id": "core:executionEnvironment",
       "@type": "xsd:string"
     },
     "plan_iri": {
-      "@id": "pdca:planIRI",
+      "@id": "core:planIRI",
       "@type": "@id"
     },
     "preferred_skills": {
-      "@id": "pdca:preferredSkills",
+      "@id": "core:preferredSkills",
       "@type": "@id"
     },
     "forbidden_tools": {
-      "@id": "pdca:forbiddenTools",
+      "@id": "core:forbiddenTools",
       "@type": "xsd:string"
     },
     "required_steps": {
-      "@id": "pdca:requiredSteps",
+      "@id": "core:requiredSteps",
       "@type": "xsd:string"
     },
     "token_budget": {
-      "@id": "pdca:tokenBudget",
+      "@id": "core:tokenBudget",
       "@type": "xsd:integer"
     },
     "max_pdca_cycles": {
-      "@id": "pdca:maxPDCACycles",
+      "@id": "core:maxPDCACycles",
       "@type": "xsd:integer"
     },
     "actual_cost": {
-      "@id": "pdca:actualCost",
+      "@id": "core:actualCost",
       "@type": "xsd:integer"
     },
     "requestor": {
-      "@id": "pdca:requestor",
+      "@id": "core:requestor",
       "@type": "@id"
     },
     "required_role": {
-      "@id": "pdca:requiredRole",
+      "@id": "core:requiredRole",
       "@type": "xsd:string"
     },
     "access_level": {
-      "@id": "pdca:accessLevel",
+      "@id": "core:accessLevel",
       "@type": "xsd:string"
     },
     "agent_status": {
-      "@id": "pdca:agentStatus",
+      "@id": "core:agentStatus",
       "@type": "xsd:string"
     },
     "agent_role": {
-      "@id": "pdca:agentRole",
+      "@id": "core:agentRole",
       "@type": "xsd:string"
     },
     "skill_name": {
-      "@id": "pdca:skillName",
+      "@id": "core:skillName",
       "@type": "xsd:string"
     },
     "skill_version": {
-      "@id": "pdca:skillVersion",
+      "@id": "core:skillVersion",
       "@type": "xsd:string"
     },
     "memory_key": {
-      "@id": "pdca:memoryKey",
+      "@id": "core:memoryKey",
       "@type": "xsd:string"
     },
     "memory_value": {
-      "@id": "pdca:memoryValue",
+      "@id": "core:memoryValue",
       "@type": "xsd:string"
     }
   }

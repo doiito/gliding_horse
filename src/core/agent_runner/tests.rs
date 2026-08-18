@@ -166,7 +166,7 @@ fn test_token_optimization_settings_wired() {
 fn test_parse_jsonld_response_valid() {
     let runner = create_test_runner();
     let response = json!({
-        "@context": "https://pdca-agent.org/context/task",
+        "@context": "https://agent-os.org/context/task",
         "@id": "iri://task/test123",
         "@type": "TaskNode",
         "summary": "Test task",

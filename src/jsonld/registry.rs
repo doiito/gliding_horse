@@ -161,7 +161,7 @@ impl IriRegistry {
         let sparql = format!(
             "SELECT ?iri WHERE {{
                 GRAPH <{}> {{
-                    ?iri <https://pdca-agent.org/vocab#namespace> \"{}\" .
+                    ?iri <https://agent-os.org/ontology/core/namespace> \"{}\" .
                 }}
             }}",
             self.registry_graph,
@@ -203,7 +203,7 @@ impl IriRegistry {
         let sparql = format!(
             "SELECT ?iri WHERE {{
                 GRAPH <{}> {{
-                    ?iri <https://pdca-agent.org/vocab#entityType> \"{}\" .
+                    ?iri <https://agent-os.org/ontology/core/entityType> \"{}\" .
                 }}
             }}",
             self.registry_graph,
@@ -243,7 +243,7 @@ impl IriRegistry {
     pub fn find_duplicates(&self) -> Vec<IriConflict> {
         let sparql = format!(
             "SELECT ?iri (COUNT(DISTINCT ?namedGraph) AS ?graphCount) WHERE {{
-                GRAPH <{}> {{ ?iri <https://pdca-agent.org/vocab#namedGraph> ?namedGraph . }}
+                GRAPH <{}> {{ ?iri <https://agent-os.org/ontology/core/namedGraph> ?namedGraph . }}
             }} GROUP BY ?iri HAVING (?graphCount > 1)",
             self.registry_graph
         );
@@ -281,12 +281,12 @@ impl IriRegistry {
         let sparql = format!(
             "INSERT DATA {{
                 GRAPH <{}> {{
-                    <{}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://pdca-agent.org/vocab#RegisteredEntity> ;
-                        <https://pdca-agent.org/vocab#namespace> \"{}\" ;
-                        <https://pdca-agent.org/vocab#storageLayer> \"{}\" ;
-                        <https://pdca-agent.org/vocab#namedGraph> \"{}\" ;
-                        <https://pdca-agent.org/vocab#entityType> \"{}\" ;
-                        <https://pdca-agent.org/vocab#createdAt> \"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+                    <{}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://agent-os.org/ontology/core/RegisteredEntity> ;
+                        <https://agent-os.org/ontology/core/namespace> \"{}\" ;
+                        <https://agent-os.org/ontology/core/storageLayer> \"{}\" ;
+                        <https://agent-os.org/ontology/core/namedGraph> \"{}\" ;
+                        <https://agent-os.org/ontology/core/entityType> \"{}\" ;
+                        <https://agent-os.org/ontology/core/createdAt> \"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
                 }}
             }}",
             self.registry_graph,
@@ -307,11 +307,11 @@ impl IriRegistry {
     fn query_store(&self, iri: &str) -> Result<Vec<EntityLocation>, String> {
         let sparql = format!(
             "SELECT ?namespace ?namedGraph ?storageLayer ?entityType ?createdAt WHERE {{
-                GRAPH <{}> {{ <{}> <https://pdca-agent.org/vocab#namespace> ?namespace ;
-                    <https://pdca-agent.org/vocab#storageLayer> ?storageLayer .
-                OPTIONAL {{ <{}> <https://pdca-agent.org/vocab#namedGraph> ?namedGraph . }}
-                OPTIONAL {{ <{}> <https://pdca-agent.org/vocab#entityType> ?entityType . }}
-                OPTIONAL {{ <{}> <https://pdca-agent.org/vocab#createdAt> ?createdAt . }}
+                GRAPH <{}> {{ <{}> <https://agent-os.org/ontology/core/namespace> ?namespace ;
+                    <https://agent-os.org/ontology/core/storageLayer> ?storageLayer .
+                OPTIONAL {{ <{}> <https://agent-os.org/ontology/core/namedGraph> ?namedGraph . }}
+                OPTIONAL {{ <{}> <https://agent-os.org/ontology/core/entityType> ?entityType . }}
+                OPTIONAL {{ <{}> <https://agent-os.org/ontology/core/createdAt> ?createdAt . }}
                 }}
             }}",
             self.registry_graph, iri, iri, iri, iri

@@ -97,7 +97,7 @@ impl RdfMapper {
                     let predicate = if key.contains('/') || key.contains('#') || key.contains(':') {
                         key.clone()
                     } else {
-                        format!("https://agentos.ontology/meta/{}", key)
+                        format!("https://agent-os.org/ontology/meta/{}", key)
                     };
                     quads.push(RdfQuad {
                         subject: iri.clone(),
@@ -286,7 +286,7 @@ mod tests {
 
         let age_quad = quads
             .iter()
-            .find(|q| q.predicate == "https://agentos.ontology/meta/age")
+            .find(|q| q.predicate == "https://agent-os.org/ontology/meta/age")
             .unwrap();
         assert_eq!(
             age_quad.object,
@@ -298,7 +298,7 @@ mod tests {
 
         let active_quad = quads
             .iter()
-            .find(|q| q.predicate == "https://agentos.ontology/meta/active")
+            .find(|q| q.predicate == "https://agent-os.org/ontology/meta/active")
             .unwrap();
         assert_eq!(
             active_quad.object,

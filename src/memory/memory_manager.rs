@@ -242,7 +242,7 @@ impl MemoryManager {
         // Use task-prefixed IRI so extract_task_iri maps this node to the correct task
         let node_iri = format!("{}/session/{}", task_iri, summary.session_id);
         let json_ld = serde_json::json!({
-            "@context": "https://pdca-agent.org/context/memory",
+            "@context": "https://agent-os.org/context/memory",
             "@id": &node_iri,
             "@type": "SessionSummary",
             "session_id": summary.session_id,
@@ -272,13 +272,13 @@ impl MemoryManager {
             for fc in &a.files_created {
                 produces.push(serde_json::json!({
                     "@id": format!("iri://file/{}", fc.path.replace('/', "_")),
-                    "@type": "https://agentos.ontology/core/File",
-                    "https://agentos.ontology/core/filePath": fc.path,
+                    "@type": "https://agent-os.org/ontology/core/File",
+                    "https://agent-os.org/ontology/core/filePath": fc.path,
                 }));
             }
         }
         let json_ld = serde_json::json!({
-            "@context": {"aos": "https://agentos.ontology/core/"},
+            "@context": {"aos": "https://agent-os.org/ontology/core/"},
             "@id": task_id,
             "@type": "aos:Task",
             "aos:hasStatus": "completed",
@@ -364,7 +364,7 @@ impl MemoryManager {
                     .map(|f| f.name.clone())
                     .collect();
                 let result = serde_json::json!({
-                    "@context": "https://pdca-agent.org/context/projection",
+                    "@context": "https://agent-os.org/context/projection",
                     "note": "Async runtime not available, returning frame list",
                     "available_frames": frames,
                 })

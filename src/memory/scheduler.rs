@@ -169,7 +169,7 @@ impl MemoryScheduler {
         let config = crate::CoreConfig::default();
 
         let json_ld = serde_json::json!({
-            "@context": "https://pdca-agent.org/context/memory",
+            "@context": "https://agent-os.org/context/memory",
             "@id": format!("iri://memory/{}", uuid::Uuid::new_v4().hyphenated()),
             "@type": "SessionSummary",
             "session_id": summary.session_id,

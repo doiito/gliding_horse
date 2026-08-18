@@ -4,16 +4,16 @@ use std::sync::OnceLock;
 static BUILT_IN_ONTOLOGY: OnceLock<Vec<OntologyTerm>> = OnceLock::new();
 
 fn core(s: &str) -> String {
-    format!("https://agentos.ontology/core/{}", s)
+    format!("https://agent-os.org/ontology/core/{}", s)
 }
 fn eng(s: &str) -> String {
-    format!("https://agentos.ontology/eng/{}", s)
+    format!("https://agent-os.org/ontology/eng/{}", s)
 }
 fn code(s: &str) -> String {
-    format!("https://agentos.ontology/code/{}", s)
+    format!("https://agent-os.org/ontology/code/{}", s)
 }
 fn biz(s: &str) -> String {
-    format!("https://agentos.ontology/biz/{}", s)
+    format!("https://agent-os.org/ontology/biz/{}", s)
 }
 
 pub struct OntologyManager {

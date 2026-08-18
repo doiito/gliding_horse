@@ -1809,7 +1809,7 @@ pub(super) async fn execute_ontology_register(
         }
         quads.push(RdfQuad {
             subject: iri,
-            predicate: "https://agentos.ontology/meta/termType".to_string(),
+            predicate: "https://agent-os.org/ontology/meta/termType".to_string(),
             object: RdfValue::Literal(term_type),
             graph: Some(graph.to_string()),
         });

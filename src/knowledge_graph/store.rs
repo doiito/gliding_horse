@@ -73,7 +73,7 @@ impl KnowledgeGraphStore {
             .map_err(|e| format!("SPARQL DELETE failed: {}", e))?;
 
         let related_delete = format!(
-            "DELETE WHERE {{ GRAPH <{}> {{ ?s <https://agentos.ontology/code/contains> <{}> . }} }}",
+            "DELETE WHERE {{ GRAPH <{}> {{ ?s <https://agent-os.org/ontology/code/contains> <{}> . }} }}",
             graph, subject_iri
         );
         let _ = self.store.update(&related_delete);
@@ -125,7 +125,7 @@ impl KnowledgeGraphStore {
     /// an incremental re-extraction.
     #[allow(deprecated)]
     pub fn delete_code_file_subgraph(&self, file_iri: &str, graph: &str) -> Result<usize, String> {
-        let contains = "https://agentos.ontology/code/contains";
+        let contains = "https://agent-os.org/ontology/code/contains";
         let query = format!(
             "SELECT DISTINCT ?node WHERE {{ GRAPH <{}> {{ <{}> <{}> ?node . }} }}",
             graph, file_iri, contains
@@ -248,7 +248,7 @@ impl KnowledgeGraphStore {
                 let type_iri = if t.contains("://") {
                     t.to_string()
                 } else {
-                    format!("http://agent-os.org/ontology/{}", t)
+                    format!("https://agent-os.org/ontology/core/{}", t)
                 };
                 format!(
                     "?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{}> .",

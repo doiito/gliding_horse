@@ -79,7 +79,7 @@ impl UnifiedGraphStore {
         info!("Initializing Unified Oxigraph Store (memory)");
         Ok(Self {
             store: Arc::new(Store::new()?),
-            default_graph: "http://agent-os.org/graph/default".to_string(),
+            default_graph: "https://agent-os.org/graph/default".to_string(),
         })
     }
 
@@ -87,7 +87,7 @@ impl UnifiedGraphStore {
         info!(path = %path.as_ref().display(), "Initializing persistent Unified Oxigraph Store");
         Ok(Self {
             store: Arc::new(Store::open(path)?),
-            default_graph: "http://agent-os.org/graph/default".to_string(),
+            default_graph: "https://agent-os.org/graph/default".to_string(),
         })
     }
 
@@ -103,7 +103,7 @@ impl UnifiedGraphStore {
     pub fn with_shared_store(store: Arc<Store>) -> Self {
         Self {
             store,
-            default_graph: "http://agent-os.org/graph/default".to_string(),
+            default_graph: "https://agent-os.org/graph/default".to_string(),
         }
     }
 

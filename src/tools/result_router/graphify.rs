@@ -108,7 +108,7 @@ impl GraphifyEngine {
                                     let child_id = format!("{}_{}", id, key);
                                     let child_label = Self::extract_label(child, &child_id);
                                     let child_type = format!(
-                                        "https://agentos.ontology/tool-result/{}_{}",
+                                        "https://agent-os.org/ontology/tool-result/{}_{}",
                                         Self::to_iri_short(&node_type),
                                         key
                                     );
@@ -148,7 +148,7 @@ impl GraphifyEngine {
                                                 &arr_item_id,
                                             );
                                             let arr_item_type = format!(
-                                                "https://agentos.ontology/tool-result/{}_{}_item",
+                                                "https://agent-os.org/ontology/tool-result/{}_{}_item",
                                                 Self::to_iri_short(&node_type),
                                                 key
                                             );
@@ -200,7 +200,7 @@ impl GraphifyEngine {
                         let id = format!("{}_{}", call_id, idx);
                         nodes.push(NodeDef {
                             id: id.clone(),
-                            node_type: "https://agentos.ontology/tool-result/ScalarItem"
+                            node_type: "https://agent-os.org/ontology/tool-result/ScalarItem"
                                 .to_string(),
                             label: format!("Item {}", idx),
                             description: None,
@@ -216,7 +216,7 @@ impl GraphifyEngine {
             Value::Object(obj) => {
                 let id = format!("{}_root", call_id);
                 let label = Self::extract_label(obj, &id);
-                let node_type = "https://agentos.ontology/tool-result/RootObject".to_string();
+                let node_type = "https://agent-os.org/ontology/tool-result/RootObject".to_string();
 
                 let mut properties = HashMap::new();
                 let mut child_edges = Vec::new();
@@ -228,7 +228,7 @@ impl GraphifyEngine {
                                 let child_id = format!("{}_{}", id, key);
                                 let child_label = Self::extract_label(child, &child_id);
                                 let child_type =
-                                    format!("https://agentos.ontology/tool-result/Child_{}", key);
+                                    format!("https://agent-os.org/ontology/tool-result/Child_{}", key);
 
                                 let mut child_props = HashMap::new();
                                 for (ck, cv) in child {
@@ -262,7 +262,7 @@ impl GraphifyEngine {
                                     let arr_item_label =
                                         Self::extract_label(child_obj, &arr_item_id);
                                     let arr_item_type = format!(
-                                        "https://agentos.ontology/tool-result/{}_item",
+                                        "https://agent-os.org/ontology/tool-result/{}_item",
                                         key
                                     );
 
@@ -310,7 +310,7 @@ impl GraphifyEngine {
             _ => {
                 nodes.push(NodeDef {
                     id: format!("{}_value", call_id),
-                    node_type: "https://agentos.ontology/tool-result/ScalarValue".to_string(),
+                    node_type: "https://agent-os.org/ontology/tool-result/ScalarValue".to_string(),
                     label: "Value".to_string(),
                     description: None,
                     properties: {
@@ -352,14 +352,14 @@ impl GraphifyEngine {
                 return Self::to_iri(s);
             }
         }
-        "https://agentos.ontology/tool-result/Entity".to_string()
+        "https://agent-os.org/ontology/tool-result/Entity".to_string()
     }
 
     fn to_iri(s: &str) -> String {
         if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("iri://") {
             s.to_string()
         } else {
-            format!("https://agentos.ontology/tool-result/{}", s)
+            format!("https://agent-os.org/ontology/tool-result/{}", s)
         }
     }
 
@@ -377,7 +377,7 @@ impl GraphifyEngine {
                 {
                     key
                 } else {
-                    format!("https://agentos.ontology/property/{}", key)
+                    format!("https://agent-os.org/ontology/property/{}", key)
                 };
                 normalized.insert(iri_key, value);
             }
@@ -389,7 +389,7 @@ impl GraphifyEngine {
                 && !edge.relation.starts_with("https://")
                 && !edge.relation.starts_with("iri://")
             {
-                edge.relation = format!("https://agentos.ontology/relation/{}", edge.relation);
+                edge.relation = format!("https://agent-os.org/ontology/relation/{}", edge.relation);
             }
         }
     }

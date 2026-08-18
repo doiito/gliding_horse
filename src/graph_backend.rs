@@ -246,7 +246,7 @@ impl GraphBackend for SparqlBackend {
                     .map(|s| s.to_string())
                     .filter(|s| {
                         !s.starts_with("http://www.w3.org/")
-                            && !s.starts_with("https://agentos.ontology")
+                            && !s.starts_with("https://agent-os.org/ontology/")
                     })
                     .collect();
                 nodes.sort();
@@ -866,7 +866,7 @@ impl FeatureGraph for SparqlFeatureGraph {
         .iter()
         .filter_map(|r| r.get("?s").and_then(|v| v.as_str()))
         .filter(|s| {
-            !s.starts_with("http://www.w3.org/") && !s.starts_with("https://agentos.ontology")
+            !s.starts_with("http://www.w3.org/") && !s.starts_with("https://agent-os.org/ontology/")
         })
         .map(|s| s.to_string())
         .collect()

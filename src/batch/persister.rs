@@ -116,7 +116,7 @@ impl KnowledgePersister {
                 subject: entity_iri.clone(),
                 predicate: "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into(),
                 object: RdfValue::Iri(format!(
-                    "https://agentos.ontology/batch/{}",
+                    "https://agent-os.org/ontology/batch/{}",
                     entity.entity_type
                 )),
                 graph: Some(graph.into()),
@@ -133,7 +133,7 @@ impl KnowledgePersister {
             // confidence
             quads.push(RdfQuad {
                 subject: entity_iri.clone(),
-                predicate: "https://agentos.ontology/core/confidence".into(),
+                predicate: "https://agent-os.org/ontology/core/confidence".into(),
                 object: RdfValue::TypedLiteral(
                     entity.confidence.to_string(),
                     "http://www.w3.org/2001/XMLSchema#float".into(),
@@ -154,7 +154,7 @@ impl KnowledgePersister {
             // Source batch
             quads.push(RdfQuad {
                 subject: entity_iri.clone(),
-                predicate: "https://agentos.ontology/core/source".into(),
+                predicate: "https://agent-os.org/ontology/core/source".into(),
                 object: RdfValue::Iri(format!("batch://source/{}", domain)),
                 graph: Some(graph.into()),
             });
@@ -185,7 +185,7 @@ impl KnowledgePersister {
         for relation in relations {
             let from_iri = entity_iri(domain, &relation.from);
             let to_iri = entity_iri(domain, &relation.to);
-            let rel_iri = format!("https://agentos.ontology/relation/{}", relation.relation);
+            let rel_iri = format!("https://agent-os.org/ontology/relation/{}", relation.relation);
 
             quads.push(RdfQuad {
                 subject: from_iri,

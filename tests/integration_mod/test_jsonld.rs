@@ -449,8 +449,8 @@ fn test_sparql_query_on_jsonld_nodes() {
 
     let sparql = r#"
         SELECT ?s ?status WHERE {
-        ?s a <http://agent-os.org/ontology/Task> .
-        ?s <http://agent-os.org/ontology/status> ?status .
+        ?s a <https://agent-os.org/ontology/core/Task> .
+        ?s <https://agent-os.org/ontology/core/status> ?status .
         }
     "#;
 
@@ -624,7 +624,7 @@ fn test_performance_sparql_query() {
     }
 
     let start = Instant::now();
-    let sparql = "SELECT ?s WHERE { ?s a <http://agent-os.org/ontology/TypeA> }";
+    let sparql = "SELECT ?s WHERE { ?s a <https://agent-os.org/ontology/core/TypeA> }";
     let results = blackboard.query(sparql).unwrap();
     let query_time = start.elapsed().as_millis();
 
@@ -699,7 +699,7 @@ fn test_bug3_type_namespace_fix() {
     blackboard.flush_oxigraph();
 
     let sparql_ontology = r#"
-        PREFIX ex: <http://agent-os.org/ontology/>
+        PREFIX ex: <https://agent-os.org/ontology/core/>
         SELECT ?s ?summary WHERE {
             ?s a ex:Task .
             ?s ex:summary ?summary .
@@ -709,7 +709,7 @@ fn test_bug3_type_namespace_fix() {
     assert!(
         !results.is_empty(),
         "Bug 3 FAIL: SPARQL query with ex:Task (ontology/) returned 0 results. \
-         write_node with @type='Task' should store as <http://agent-os.org/ontology/Task>"
+         write_node with @type='Task' should store as <https://agent-os.org/ontology/core/Task>"
     );
     println!(
         "[Bug 3] ontology/ SPARQL returned {} result(s)",
@@ -718,7 +718,7 @@ fn test_bug3_type_namespace_fix() {
     println!("[Bug 3] First result: {:?}", results[0]);
 
     // Step 3: Negative test — type/ should NOT exist
-    let sparql_type = "SELECT ?s WHERE { ?s a <http://agent-os.org/type/Task> } LIMIT 1";
+    let sparql_type = "SELECT ?s WHERE { ?s a <https://agent-os.org/type/Task> } LIMIT 1";
     let old_results = blackboard.query(sparql_type).unwrap();
     assert!(
         old_results.is_empty(),
@@ -798,7 +798,7 @@ fn test_bug1_skill_iri_fix() {
 
     // Step 4: Verify the data via SELECT (data is in named graph system:test_graph)
     use oxigraph::sparql::QueryResults;
-    let verify_sparql = "PREFIX skill: <https://agent-harness.os/skill#>
+    let verify_sparql = "PREFIX skill: <https://agent-os.org/ontology/skill#>
         SELECT ?s WHERE { GRAPH <system:test_graph> { ?s a skill:CognitiveSkill } }";
     let query_results = store.query(verify_sparql).unwrap();
     let solutions: Vec<_> = match query_results {
@@ -815,7 +815,7 @@ fn test_bug1_skill_iri_fix() {
     );
 
     // Step 5: Verify linked usageCount and successRate data
-    let detail_sparql = "PREFIX skill: <https://agent-harness.os/skill#>
+    let detail_sparql = "PREFIX skill: <https://agent-os.org/ontology/skill#>
         SELECT ?usage ?rate WHERE { GRAPH <system:test_graph> { ?s skill:usageCount ?usage ; skill:successRate ?rate } }";
     let detail_results = store.query(detail_sparql).unwrap();
     let detail_solutions: Vec<_> = match detail_results {
@@ -830,7 +830,7 @@ fn test_bug1_skill_iri_fix() {
     println!("[Bug 1] Skill detail data (usageCount, successRate) also confirmed");
 
     // Step 6: Cross-graph query — default graph should NOT have the data
-    let default_sparql = "PREFIX skill: <https://agent-harness.os/skill#>
+    let default_sparql = "PREFIX skill: <https://agent-os.org/ontology/skill#>
         SELECT ?s WHERE { ?s a skill:CognitiveSkill }";
     let default_results = store.query(default_sparql).unwrap();
     let default_solutions: Vec<_> = match default_results {
@@ -854,9 +854,9 @@ fn test_bug2_kg_search_entity_type_fix() {
     let store = KnowledgeGraphStore::new().unwrap();
 
     // Step 1: Insert a quad with type in ontology/ namespace via inner store
-    let insert_sparql = "PREFIX ex: <http://agent-os.org/ontology/>
+    let insert_sparql = "PREFIX ex: <https://agent-os.org/ontology/core/>
         INSERT DATA {
-            GRAPH <http://agent-os.org/graph/test_graph> {
+            GRAPH <https://agent-os.org/graph/test_graph> {
                 <iri://entity/test_entity> a ex:TestEntity .
                 <iri://entity/test_entity> <http://www.w3.org/2000/01/rdf-schema#label> \"Test Entity Label\" .
             }
@@ -878,7 +878,10 @@ fn test_bug2_kg_search_entity_type_fix() {
 
     // Step 3: Search with full IRI still works
     let results_full = store
-        .search_entities("Test", Some("http://agent-os.org/ontology/TestEntity"))
+        .search_entities(
+            "Test",
+            Some("https://agent-os.org/ontology/core/TestEntity"),
+        )
         .unwrap();
     assert!(
         !results_full.is_empty(),
@@ -924,7 +927,7 @@ fn test_bug3_edge_cases() {
         .unwrap();
     blackboard.flush_oxigraph();
 
-    let sparql = r#"PREFIX ex: <http://agent-os.org/ontology/>
+    let sparql = r#"PREFIX ex: <https://agent-os.org/ontology/core/>
         SELECT ?s WHERE { ?s a ex:Urgent }"#;
     let results = blackboard.query(sparql).unwrap();
     assert_eq!(results.len(), 1, "Multi-type: ex:Urgent should match");
@@ -971,7 +974,7 @@ fn test_bug3_edge_cases() {
     }
     blackboard.flush_oxigraph();
 
-    let sparql_bulk = r#"PREFIX ex: <http://agent-os.org/ontology/>
+    let sparql_bulk = r#"PREFIX ex: <https://agent-os.org/ontology/core/>
         SELECT (COUNT(?s) AS ?cnt) WHERE { ?s a ex:BulkNode }"#;
     let bulk_results = blackboard.query(sparql_bulk).unwrap();
     println!("[R2 Bug3-E3] Bulk type query: {:?}", bulk_results);
@@ -1045,7 +1048,7 @@ fn test_bug1_edge_cases() {
     for (link_type, target_iri) in &all_link_types {
         let link_name = format!("{:?}", link_type); // e.g., "Prerequisite"
         let verify = format!(
-            "PREFIX skill: <https://agent-harness.os/skill#>
+            "PREFIX skill: <https://agent-os.org/ontology/skill#>
              SELECT ?s WHERE {{ GRAPH <system:edge_graph> {{ ?s skill:{} <{}> }} }}",
             link_name, target_iri
         );
@@ -1068,7 +1071,7 @@ fn test_bug1_edge_cases() {
     let store2 = oxigraph::store::Store::new().unwrap();
     store2.update(&sparql_special).unwrap();
 
-    let verify_special = r#"PREFIX skill: <https://agent-harness.os/skill#>
+    let verify_special = r#"PREFIX skill: <https://agent-os.org/ontology/skill#>
         SELECT ?name ?desc WHERE { GRAPH <system:special_graph> { ?s skill:name ?name ; skill:description ?desc } }"#;
     let qr = store2.query(verify_special).unwrap();
     let sols: Vec<_> = match qr {
@@ -1104,7 +1107,7 @@ fn test_bug1_edge_cases() {
     let store3 = oxigraph::store::Store::new().unwrap();
     store3.update(&sparql_empty).unwrap();
 
-    let verify_empty = r#"PREFIX skill: <https://agent-harness.os/skill#>
+    let verify_empty = r#"PREFIX skill: <https://agent-os.org/ontology/skill#>
         SELECT ?s WHERE { GRAPH <system:empty_graph> { ?s a skill:CognitiveSkill } }"#;
     let qr = store3.query(verify_empty).unwrap();
     let sols: Vec<_> = match qr {
@@ -1132,10 +1135,10 @@ fn test_bug2_edge_cases() {
         let type_iri = if type_name.contains("://") {
             format!("<{}>", type_name)
         } else {
-            format!("<http://agent-os.org/ontology/{}>", type_name)
+            format!("<https://agent-os.org/ontology/core/{}>", type_name)
         };
         let sparql = format!(
-            "INSERT DATA {{ GRAPH <http://agent-os.org/graph/kg_search> {{ <iri://entity/{}> a {} . \
+            "INSERT DATA {{ GRAPH <https://agent-os.org/graph/kg_search> {{ <iri://entity/{}> a {} . \
              <iri://entity/{}> <http://www.w3.org/2000/01/rdf-schema#label> \"{}\" . }} }}",
             id, type_iri, id, label
         );
@@ -1225,13 +1228,13 @@ fn test_all_bugfixes_stress() {
     blackboard.flush_oxigraph();
 
     // Verify all EvenType nodes via ontology/ namespace
-    let sparql = r#"PREFIX ex: <http://agent-os.org/ontology/>
+    let sparql = r#"PREFIX ex: <https://agent-os.org/ontology/core/>
         SELECT (COUNT(?s) AS ?cnt) WHERE { ?s a ex:EvenType }"#;
     let results = blackboard.query(sparql).unwrap();
     println!("[Stress] EvenType count via SPARQL: {:?}", results);
 
     // Verify all OddType nodes
-    let sparql_odd = r#"PREFIX ex: <http://agent-os.org/ontology/>
+    let sparql_odd = r#"PREFIX ex: <https://agent-os.org/ontology/core/>
         SELECT (COUNT(?s) AS ?cnt) WHERE { ?s a ex:OddType }"#;
     let results_odd = blackboard.query(sparql_odd).unwrap();
     println!("[Stress] OddType count via SPARQL: {:?}", results_odd);
@@ -1268,7 +1271,7 @@ fn test_all_bugfixes_stress() {
     // type/ namespace must be completely empty
     for type_name in &["EvenType", "OddType"] {
         let sparql_old = format!(
-            "SELECT ?s WHERE {{ ?s a <http://agent-os.org/type/{}> }} LIMIT 1",
+            "SELECT ?s WHERE {{ ?s a <https://agent-os.org/type/{}> }} LIMIT 1",
             type_name
         );
         let old_results = blackboard.query(&sparql_old).unwrap();

@@ -149,6 +149,25 @@ impl SupervisorAgent {
             prev_agent_summary.clone()
         };
 
+        // Activate the MemoryScheduler context path: when the blackboard
+        // yields no role-filtered context, recall via the scheduler instead of
+        // silently falling back to prev_agent_summary.
+        let prev_summary = if prev_summary.is_none() {
+            if let Some(ref sched) = self.scheduler {
+                match sched
+                    .context_request_with_decay(role, &context.task_iri, 0.5)
+                    .await
+                {
+                    Ok(recalled) if !recalled.trim().is_empty() => Some(recalled),
+                    _ => prev_summary,
+                }
+            } else {
+                prev_summary
+            }
+        } else {
+            prev_summary
+        };
+
         let context = if let Some(ref summary) = prev_summary {
             context.with_prev_summary(summary)
         } else {

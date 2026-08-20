@@ -62,6 +62,7 @@ pub struct App {
     event_bus: Arc<EventBus>,
     log_buffer: Arc<LogBuffer>,
     model_name: String,
+    embedding_provider: &'static str,
     workspace_path: String,
     max_iter: u32,
     input: String,
@@ -625,7 +626,13 @@ impl App {
         let max_l1_mb = config.max_l1_mb;
         let max_l2_mb = config.max_l2_mb;
         let max_l3_mb = config.max_l3_mb;
-        let engine = super::engine::CodeCliEngine::new(config)?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let engine = {
+            // Construct the engine inside the runtime context so subsystems
+            // that capture a tokio Handle at init (e.g. WatchEngine) work.
+            let _rt_guard = rt.enter();
+            super::engine::CodeCliEngine::new(config)?
+        };
         let l0 = engine.l0();
         let l2_bb = engine.l2_bb();
         let proj = engine.proj();
@@ -634,6 +641,7 @@ impl App {
             engine.token_arcs();
         let event_bus = engine.event_bus();
         let model_name = engine.model().to_string();
+        let embedding_provider = engine.embedding_provider();
         let workspace_path = std::path::Path::new(engine.workspace())
             .canonicalize()
             .map(|p| p.to_string_lossy().to_string())
@@ -649,12 +657,12 @@ impl App {
         let causal_engine = engine.causal_engine();
         let timeline = engine.timeline();
 
-        let rt = tokio::runtime::Runtime::new()?;
         let mut app = Self {
             engine: Arc::new(tokio::sync::Mutex::new(engine)),
             event_bus,
             log_buffer,
             model_name,
+            embedding_provider,
             workspace_path,
             max_iter,
             input: String::new(),
@@ -1946,7 +1954,8 @@ impl App {
             " Ready "
         }
         .width();
-        let prefix_w = 1 + 1 + status_w + 1 + 8 + self.model_name.width() + 2 + 8 + 6 + 2 + 12;
+        let emb_w = 5 + self.embedding_provider.width() + 1;
+        let prefix_w = 1 + 1 + status_w + 1 + 8 + self.model_name.width() + 2 + emb_w + 2 + 8 + 6 + 2 + 12;
         let max_path_w = (area.width as usize).saturating_sub(prefix_w);
         let workspace_display = width_truncate(&self.workspace_path, max_path_w);
 
@@ -1969,6 +1978,18 @@ impl App {
                     &self.model_name,
                     Style::default()
                         .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" |", Style::default().fg(Color::DarkGray)),
+                Span::raw(" Emb: "),
+                Span::styled(
+                    self.embedding_provider,
+                    Style::default()
+                        .fg(if self.embedding_provider == "fallback" {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        })
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" |", Style::default().fg(Color::DarkGray)),

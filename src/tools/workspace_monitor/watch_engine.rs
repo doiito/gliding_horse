@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::RecursiveMode;
@@ -100,7 +100,7 @@ impl WatchConfig {
 /// Events are debounced and forwarded to the EventBus as `WorkspaceFile*` events.
 /// Falls back to polling when native watching is unavailable.
 pub struct WatchEngine {
-    debouncer: Option<Debouncer<notify::RecommendedWatcher>>,
+    debouncer: Option<Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>>>,
     polling_handle: Option<tokio::task::AbortHandle>,
     /// Configuration.
     #[allow(dead_code)]
@@ -184,10 +184,11 @@ impl WatchEngine {
         config: &WatchConfig,
         event_bus: Arc<EventBus>,
         inventory: Option<Arc<RwLock<FileInventory>>>,
-    ) -> Result<Debouncer<notify::RecommendedWatcher>, String> {
+    ) -> Result<Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>>, String> {
         let debounce = Duration::from_millis(config.debounce_ms);
         let root_owned = root.to_string();
         let exclude = config.exclude_patterns.clone();
+        let watch_exclude = config.exclude_patterns.clone();
         let rt_handle = tokio::runtime::Handle::try_current().ok();
 
         // Per-path cooldown prevents feedback loops: when the app's own output
@@ -196,9 +197,18 @@ impl WatchEngine {
         // Silently skipping the same path within the window breaks the cycle.
         let last_emit = std::sync::Mutex::new(std::collections::HashMap::<String, std::time::Instant>::new());
 
+        // Shared handle so the event callback can install watches on newly
+        // created directories (NonRecursive watches do not auto-follow).
+        // The callback holds a Weak ref: the strong ref lives in WatchEngine,
+        // so dropping the engine drops the Debouncer (which sends Shutdown).
+        // A strong ref here would cycle: thread -> closure -> Arc -> Debouncer.
+        let shared_debouncer: Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>> =
+            Arc::new(Mutex::new(None));
+        let shared_for_callback = Arc::downgrade(&shared_debouncer);
+
         let mut debouncer = new_debouncer(debounce, move |result: DebounceEventResult| {
             let now = std::time::Instant::now();
-            let approved: Vec<notify_debouncer_mini::DebouncedEvent> = match &result {
+            let mut approved: Vec<notify_debouncer_mini::DebouncedEvent> = match &result {
                 Ok(events) => {
                     let mut last = last_emit.lock().unwrap();
                     let mut out = Vec::new();
@@ -218,6 +228,62 @@ impl WatchEngine {
                 }
                 Err(_) => Vec::new(),
             };
+            // A directory creation event means future writes inside it would
+            // be invisible (NonRecursive watches do not follow new children).
+            // Install a watch on the new directory and its existing children
+            // so subsequent events keep flowing; deeper nesting is picked up
+            // by the same mechanism as more directories appear.
+            let mut catch_up: Vec<notify_debouncer_mini::DebouncedEvent> = Vec::new();
+            if let Some(shared) = shared_for_callback.upgrade() {
+                if let Some(ref mut debouncer) = *shared.lock().unwrap() {
+                    for event in &approved {
+                        let path = &event.path;
+                        if path.is_dir() && !Self::is_path_excluded(&path.to_string_lossy(), &exclude)
+                        {
+                            // Watch the new directory itself, then any of its
+                            // immediate subdirectories, so writes at every level
+                            // below the parent watch keep producing events.
+                            let _ = debouncer
+                                .watcher()
+                                .watch(path, RecursiveMode::NonRecursive);
+                            for dir in walkdir::WalkDir::new(path)
+                                .min_depth(1)
+                                .max_depth(1)
+                                .into_iter()
+                                .filter_map(|e| e.ok())
+                                .filter(|e| e.file_type().is_dir())
+                            {
+                                let _ = debouncer
+                                    .watcher()
+                                    .watch(dir.path(), RecursiveMode::NonRecursive);
+                            }
+                            // Files already present were written before this
+                            // directory was watched, so no event fired for them.
+                            // Emit catch-up events so the inventory still learns
+                            // about them.
+                            for entry in walkdir::WalkDir::new(path)
+                                .into_iter()
+                                .filter_entry(|e| {
+                                    e.depth() == 0
+                                        || !Self::is_path_excluded(
+                                            &e.path().to_string_lossy(),
+                                            &exclude,
+                                        )
+                                })
+                                .filter_map(|e| e.ok())
+                            {
+                                if entry.file_type().is_file() {
+                                    catch_up.push(notify_debouncer_mini::DebouncedEvent {
+                                        path: entry.path().to_path_buf(),
+                                        kind: notify_debouncer_mini::DebouncedEventKind::Any,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            approved.extend(catch_up);
             if let Some(ref inv) = inventory {
                 for event in &approved {
                     if let Some(path) = event.path.to_str() {
@@ -258,12 +324,47 @@ impl WatchEngine {
         })
         .map_err(|e| format!("Failed to create debouncer: {}", e))?;
 
-        debouncer
-            .watcher()
-            .watch(Path::new(&root_owned), RecursiveMode::Recursive)
+        // Watch each directory individually (NonRecursive) instead of one
+        // Recursive watch on the root: notify's recursive watch enumerates the
+        // whole tree at startup (no filter support), which blocks start() for
+        // minutes on repositories with large build directories (e.g. target/).
+        // Pre-enumerating with filter_entry keeps excluded dirs out of inotify.
+        let watcher = debouncer.watcher();
+        for entry in walkdir::WalkDir::new(&root_owned)
+            .min_depth(1)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 1
+                    || !Self::is_path_excluded(
+                        &entry.path().to_string_lossy(),
+                        &watch_exclude,
+                    )
+            })
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            watcher
+                .watch(entry.path(), RecursiveMode::NonRecursive)
+                .map_err(|e| {
+                    format!(
+                        "Failed to watch directory {}: {}",
+                        entry.path().display(),
+                        e
+                    )
+                })?;
+        }
+        // Watch the root itself so creations directly under it (the entry
+        // point for the dynamic watch extension) are always observed.
+        watcher
+            .watch(Path::new(&root_owned), RecursiveMode::NonRecursive)
             .map_err(|e| format!("Failed to watch directory: {}", e))?;
-
-        Ok(debouncer)
+        // Publish the debouncer so the callback can watch newly created
+        // directories that appear after startup. It stays in the shared slot
+        // for the callback's lifetime; the returned Arc is held by WatchEngine.
+        *shared_debouncer.lock().unwrap() = Some(debouncer);
+        Ok(shared_debouncer)
     }
 
     fn is_path_excluded(path: &str, exclude_patterns: &[String]) -> bool {
@@ -499,5 +600,24 @@ mod tests {
         last_emit.insert("/tmp/ws/a.txt".to_string(), t0);
 
         assert!(!WatchEngine::within_cooldown(&mut last_emit, "/tmp/ws/b.txt", t0));
+    }
+
+    #[test]
+    fn test_is_path_excluded_matches_nested_build_dirs() {
+        let patterns = vec!["target/".to_string(), "node_modules/".to_string()];
+        assert!(WatchEngine::is_path_excluded(
+            "/repo/apps/gliding_code/target",
+            &patterns
+        ));
+        assert!(WatchEngine::is_path_excluded(
+            "/repo/target/debug/foo.rs",
+            &patterns
+        ));
+        assert!(WatchEngine::is_path_excluded(
+            "/repo/node_modules/pkg/index.js",
+            &patterns
+        ));
+        assert!(!WatchEngine::is_path_excluded("/repo/src/main.rs", &patterns));
+        assert!(!WatchEngine::is_path_excluded("/repo/targeted.rs", &patterns));
     }
 }

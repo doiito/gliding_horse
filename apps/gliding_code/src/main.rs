@@ -290,7 +290,12 @@ fn main() -> anyhow::Result<()> {
 fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
+    let mut engine = {
+        // Construct the engine inside the runtime context so subsystems
+        // that capture a tokio Handle at init (e.g. WatchEngine) work.
+        let _rt_guard = rt.enter();
+        code_cli::engine::CodeCliEngine::new(config)?
+    };
     println!("Code CLI - Agent OS");
     println!(
         "Model: {} | Workspace: {}",
@@ -336,7 +341,12 @@ fn run_single_with_logs(
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    let mut engine = code_cli::engine::CodeCliEngine::new(config)?;
+    let mut engine = {
+        // Construct the engine inside the runtime context so subsystems
+        // that capture a tokio Handle at init (e.g. WatchEngine) work.
+        let _rt_guard = rt.enter();
+        code_cli::engine::CodeCliEngine::new(config)?
+    };
     println!("Code CLI - Agent OS");
     println!(
         "Model: {} | Workspace: {}",
@@ -390,7 +400,12 @@ fn run_single_with_logs(
 
 fn list_checkpoints(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let engine = code_cli::engine::CodeCliEngine::new(config.clone())?;
+    let engine = {
+        // Construct the engine inside the runtime context so subsystems
+        // that capture a tokio Handle at init (e.g. WatchEngine) work.
+        let _rt_guard = rt.enter();
+        code_cli::engine::CodeCliEngine::new(config.clone())?
+    };
 
     let checkpoints = rt.block_on(engine.list_checkpoints())?;
     if checkpoints.is_empty() {

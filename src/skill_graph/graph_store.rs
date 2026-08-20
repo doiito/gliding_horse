@@ -176,7 +176,6 @@ impl SkillGraphStore {
 
                 jsonld_context: None,
                 jsonld_types: vec!["skill:Skill".to_string()],
-                hyperspace_point_id: None,
             };
             l0_store.store_entry(&entry)?;
             debug!("Skill written to L0 store: {}", iri);
@@ -218,7 +217,6 @@ impl SkillGraphStore {
                     named_graph: Some(SKILL_GRAPH_NAMED_GRAPH.to_string()),
                     jsonld_context: None,
                     jsonld_types: vec!["skill:Skill".to_string()],
-                    hyperspace_point_id: None,
                 })?;
             }
             self.emit_mutation(GraphMutation::SkillUpdated { old, new: skill });
@@ -824,7 +822,6 @@ impl SkillGraphStore {
                     ),
                     jsonld_context: None,
                     jsonld_types: vec!["skill:Skill".to_string()],
-                    hyperspace_point_id: None,
                 };
                 let json = serde_json::to_string(&entry).map_err(|e| CoreError::Internal {
                     message: format!("Serialization error during archive: {e}"),
@@ -1081,17 +1078,21 @@ impl SkillGraphStore {
         engine: Option<&SkillDiscoveryEngine>,
     ) -> Vec<(String, SkillLinkType, f32)> {
         // Build query from skill metadata (drop lock before potential await)
-        let query = {
+        let query: Option<(String, Vec<String>)> = {
             let skills = self.skills.read();
             skills.get(skill_iri).map(|s| {
                 let tags = s.tags.join(" ");
-                format!("{} {} {}", s.name, s.description, tags)
+                (
+                    format!("{} {} {}", s.name, s.description, tags),
+                    s.tags.clone(),
+                )
             })
         };
 
-        if let Some(ref q) = query {
+        if let Some((q, tags)) = query {
             if let Some(engine) = engine {
-                if let Ok(matches) = engine.semantic_search(q, 10).await {
+                // Hybrid: semantic + tag-structure boost via the source tags.
+                if let Ok(matches) = engine.hybrid_search(&q, &tags, 10).await {
                     if !matches.is_empty() {
                         return matches
                             .into_iter()

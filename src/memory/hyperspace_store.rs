@@ -42,11 +42,31 @@ impl HybridSearchFilter {
         self
     }
 
+    /// Add tags that boost ranking when present (non-exclusive).
+    ///
+    /// Unlike `with_must_tags`, entries are not excluded when a should-tag is
+    /// absent — the tag only contributes to the match score.
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HybridSearchFilter;
+    ///
+    /// let filter = HybridSearchFilter::new()
+    ///     .with_must_tags(vec!["experience".into()])
+    ///     .with_should_tags(vec!["urgent".into(), "critical".into()]);
+    /// ```
     pub fn with_should_tags(mut self, tags: Vec<String>) -> Self {
         self.should_tags = tags;
         self
     }
 
+    /// Exclude entries carrying any of these tags.
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HybridSearchFilter;
+    ///
+    /// let filter = HybridSearchFilter::new()
+    ///     .with_must_not_tags(vec!["archived".into()]);
+    /// ```
     pub fn with_must_not_tags(mut self, tags: Vec<String>) -> Self {
         self.must_not_tags = tags;
         self
@@ -62,6 +82,15 @@ impl HybridSearchFilter {
         self
     }
 
+    /// Restrict the search to a single named graph (knowledge-graph scoping).
+    ///
+    /// Entries outside `graph` are excluded entirely.
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HybridSearchFilter;
+    ///
+    /// let filter = HybridSearchFilter::new().with_named_graph("skill_graph".into());
+    /// ```
     pub fn with_named_graph(mut self, graph: String) -> Self {
         self.named_graph = Some(graph);
         self
@@ -137,6 +166,16 @@ impl HyperspaceStore {
             engine: Arc::new(engine),
             embed,
         })
+    }
+
+    /// Stable provider identifier of the backing embedding service
+    /// ("oneapi" | "ollama" | "fallback" | "unknown").
+    ///
+    /// Vector recall is only meaningful when the embedding backend is a real
+    /// provider; the hash-based fallback produces vectors that cannot be
+    /// compared semantically across entries.
+    pub fn embedding_provider(&self) -> &'static str {
+        self.embed.provider()
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -420,6 +459,17 @@ impl HyperspaceStore {
     }
 
     /// Search by tag match (uses combined tag string as query).
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HyperspaceStore;
+    ///
+    /// # async fn example(store: &HyperspaceStore) {
+    /// let entries = store
+    ///     .search_by_tags(&["experience".into(), "planning".into()], 5)
+    ///     .await
+    ///     .expect("tag search failed");
+    /// # }
+    /// ```
     pub async fn search_by_tags(
         &self,
         tags: &[String],
@@ -463,6 +513,14 @@ impl HyperspaceStore {
     }
 
     /// Total number of indexed entries.
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HyperspaceStore;
+    ///
+    /// # async fn example(store: &HyperspaceStore) {
+    /// let n = store.count().await.expect("count failed");
+    /// # }
+    /// ```
     pub async fn count(&self) -> Result<u64, CoreError> {
         self.engine.count().await.map_err(|e| CoreError::Internal {
             message: format!("Hyperspace count: {e}"),
@@ -470,6 +528,16 @@ impl HyperspaceStore {
     }
 
     /// Resolve an IRI to its numeric point ID (if indexed).
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HyperspaceStore;
+    ///
+    /// # async fn example(store: &HyperspaceStore) {
+    /// if let Some(id) = store.resolve_iri("task:abc").await.expect("resolve failed") {
+    ///     // `id` can be passed to lookup_id for the reverse mapping.
+    /// }
+    /// # }
+    /// ```
     pub async fn resolve_iri(&self, iri: &str) -> Result<Option<u32>, CoreError> {
         self.engine
             .resolve_iri(iri)
@@ -480,6 +548,14 @@ impl HyperspaceStore {
     }
 
     /// Look up the IRI for a numeric point ID (reverse of resolve_iri).
+    ///
+    /// ```
+    /// use glidinghorse::memory::hyperspace_store::HyperspaceStore;
+    ///
+    /// # async fn example(store: &HyperspaceStore) {
+    /// let iri = store.lookup_id(42).await.expect("lookup failed");
+    /// # }
+    /// ```
     pub async fn lookup_id(&self, id: u32) -> Result<Option<String>, CoreError> {
         self.engine
             .lookup_id(id)
@@ -487,6 +563,22 @@ impl HyperspaceStore {
             .map_err(|e| CoreError::Internal {
                 message: format!("Hyperspace lookup_id: {e}"),
             })
+    }
+
+    /// Persist a snapshot and rotate/clean the WAL so it cannot grow unbounded.
+    ///
+    /// Call periodically (or after tasks) to bound WAL replay time on restart.
+    pub async fn checkpoint(&self) -> Result<(), CoreError> {
+        self.engine.checkpoint().await.map_err(|e| CoreError::Internal {
+            message: format!("Hyperspace checkpoint: {e}"),
+        })
+    }
+
+    /// Reclaim metadata index space for tombstoned/deleted entries.
+    pub async fn vacuum(&self) -> Result<(), CoreError> {
+        self.engine.vacuum().await.map_err(|e| CoreError::Internal {
+            message: format!("Hyperspace vacuum: {e}"),
+        })
     }
 }
 
@@ -756,5 +848,36 @@ mod tests {
         let filters = store.to_jsonld_filters(&filter);
         // Expect 3 top-level filters: Must, Should, MustNot
         assert_eq!(filters.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_persists_snapshot_recoverable_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let embed = Arc::new(FallbackEmbeddingService::new());
+        {
+            let store = HyperspaceStore::open(dir.path(), embed.clone()).unwrap();
+            store
+                .upsert("ck:1", "checkpoint me", &["persist".into()])
+                .await
+                .unwrap();
+            store.checkpoint().await.unwrap();
+        }
+        // Drop the first store so the WAL flock is released before reopening.
+        let reopened = HyperspaceStore::open(dir.path(), embed).unwrap();
+        let results = reopened.search("checkpoint", 10).await.unwrap();
+        assert!(
+            results.iter().any(|r| r.iri == "ck:1"),
+            "checkpointed entry must survive reopen, got: {:?}",
+            results.iter().map(|r| r.iri.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_idempotent_on_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let embed = Arc::new(FallbackEmbeddingService::new());
+        let store = HyperspaceStore::open(dir.path(), embed).unwrap();
+        store.checkpoint().await.unwrap();
+        store.vacuum().await.unwrap();
     }
 }

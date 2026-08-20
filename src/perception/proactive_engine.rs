@@ -11,7 +11,7 @@ use crate::core::perception_store::{PerceptionEntry, PerceptionSource, Perceptio
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l0_store::{L0Entry, L0Store, MesiState};
 #[cfg(feature = "ontology")]
-use crate::ontology_bridge::OntologyBridgeManager;
+use crate::ontology_bridge::{OntologyBridgeManager, OntologyEmbedStore};
 use crate::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +294,24 @@ impl ProactiveEngine {
                     if !experiences.is_empty() {
                         return experiences;
                     }
+                    // Text recall yielded no retrievable payload: expand via
+                    // the top hit's structural vector (cross_search guards
+                    // against invalid cross-space projection).
+                    if let Some(seed) = hits.first() {
+                        if let Ok(struct_hits) =
+                            ontology.embed_store().cross_search(&seed.iri, 5).await
+                        {
+                            let struct_experiences: Vec<serde_json::Value> = struct_hits
+                                .iter()
+                                .filter_map(|hit| self.l0.retrieve(&hit.iri).ok().flatten())
+                                .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+                                .take(5)
+                                .collect();
+                            if !struct_experiences.is_empty() {
+                                return struct_experiences;
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     debug!(%error, "Ontology text recall unavailable; falling back to L0")
@@ -564,7 +582,6 @@ impl ProactiveEngine {
                     named_graph: None,
                     jsonld_context: None,
                     jsonld_types: Vec::new(),
-                    hyperspace_point_id: None,
                 };
                 if let Err(error) = self.l0.store_entry(&entry) {
                     warn!(experience_iri = %iri, %error, "failed to persist experience to L0; skipping vector indexes");

@@ -369,13 +369,15 @@ impl SkillDiscoveryEngine {
         limit: u64,
     ) -> Result<Vec<SkillMatch>, CoreError> {
         if let Some(ref vector_store) = self.vector_store {
-            let results =
-                vector_store
-                    .search(query, limit)
-                    .await
-                    .map_err(|e| CoreError::Internal {
-                        message: format!("Vector search failed: {}", e),
-                    })?;
+            // Scope retrieval to skill entries only (indexed with skill:Skill type).
+            let filter = crate::memory::hyperspace_store::HybridSearchFilter::new()
+                .with_jsonld_types(vec!["skill:Skill".to_string()]);
+            let results = vector_store
+                .search_with_filter(query, &filter, limit)
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("Vector search failed: {}", e),
+                })?;
 
             let mut matches = Vec::new();
             for result in results {
@@ -393,6 +395,40 @@ impl SkillDiscoveryEngine {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    /// Hybrid retrieval: free-text search plus tag-structure boost.
+    ///
+    /// `should_tags` rank entries carrying those tags higher without excluding
+    /// untagged entries — combining semantic similarity with tag overlap.
+    pub async fn hybrid_search(
+        &self,
+        query: &str,
+        should_tags: &[String],
+        limit: u64,
+    ) -> Result<Vec<SkillMatch>, CoreError> {
+        let Some(ref vector_store) = self.vector_store else {
+            return Ok(Vec::new());
+        };
+        let results = vector_store
+            .hybrid_search(query, &[], should_tags, None, limit)
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Vector search failed: {}", e),
+            })?;
+
+        let mut matches = Vec::new();
+        for result in results {
+            if let Some(skill) = self.graph_store.get_skill(&result.iri) {
+                matches.push(SkillMatch {
+                    skill,
+                    relevance_score: result.score,
+                    match_reasons: vec!["hybrid match".to_string()],
+                    required_dependencies: self.graph_store.resolve_dependencies(&result.iri),
+                });
+            }
+        }
+        Ok(matches)
     }
 
     pub fn get_recommended_skills(&self, skill_iri: &str) -> Vec<(String, String)> {

@@ -93,7 +93,6 @@ impl BatchEventJournal {
             named_graph: Some("system:batch-journal".into()),
             jsonld_context: None,
             jsonld_types: vec!["batch:EventEnvelope".into()],
-            hyperspace_point_id: None,
         })?;
         Ok(true)
     }

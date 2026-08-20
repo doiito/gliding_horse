@@ -47,8 +47,6 @@ pub struct L0Entry {
     pub jsonld_context: Option<String>,
     #[serde(default)]
     pub jsonld_types: Vec<String>,
-    #[serde(default)]
-    pub hyperspace_point_id: Option<u32>,
 }
 
 /// L0 search result
@@ -275,7 +273,6 @@ impl L0Store {
 
                 jsonld_context: None,
                 jsonld_types: Vec::new(),
-                hyperspace_point_id: None,
             };
             Self::merge_entries(&existing, &new_entry)
         } else {
@@ -294,7 +291,6 @@ impl L0Store {
 
                 jsonld_context: None,
                 jsonld_types: Vec::new(),
-                hyperspace_point_id: None,
             }
         };
 
@@ -387,7 +383,6 @@ impl L0Store {
                 .clone()
                 .or(existing.jsonld_context.clone()),
             jsonld_types: merged_types,
-            hyperspace_point_id: existing.hyperspace_point_id.or(new.hyperspace_point_id),
         }
     }
 
@@ -1139,7 +1134,6 @@ impl L0Store {
 
                 jsonld_context: jsonld_context.or(existing.jsonld_context.clone()),
                 jsonld_types: merged_types,
-                hyperspace_point_id: existing.hyperspace_point_id,
             }
         } else {
             let mut metadata = serde_json::Map::new();
@@ -1164,7 +1158,6 @@ impl L0Store {
 
                 jsonld_context,
                 jsonld_types,
-                hyperspace_point_id: None,
             }
         };
 
@@ -1271,7 +1264,6 @@ impl MemoryCompressor {
             named_graph: Some(format!("session:{}", session_id)),
             jsonld_context: None,
             jsonld_types: vec!["Memory".to_string()],
-            hyperspace_point_id: None,
         }
     }
 
@@ -1341,7 +1333,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: Vec::new(),
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry).unwrap();
 
@@ -1369,7 +1360,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: Vec::new(),
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry).unwrap();
         store.delete("iri://test/del").unwrap();
@@ -1421,7 +1411,6 @@ mod tests {
             named_graph: None,
             jsonld_context: Some(r#"{"@vocab": "http://example.org/"}"#.to_string()),
             jsonld_types: vec!["Person".to_string()],
-            hyperspace_point_id: None,
         };
         entry1
             .metadata
@@ -1443,7 +1432,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: vec!["Employee".to_string()],
-            hyperspace_point_id: None,
         };
         entry2
             .metadata
@@ -1482,7 +1470,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: vec!["Person".to_string()],
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry1).unwrap();
 
@@ -1500,7 +1487,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: vec!["Person".to_string(), "Employee".to_string()],
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry2).unwrap();
 
@@ -1518,7 +1504,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: vec!["Organization".to_string()],
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry3).unwrap();
 
@@ -1552,7 +1537,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: vec!["Person".to_string()],
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry1).unwrap();
 
@@ -1570,7 +1554,6 @@ mod tests {
             named_graph: None,
             jsonld_context: None,
             jsonld_types: vec!["Organization".to_string()],
-            hyperspace_point_id: None,
         };
         store.store_entry(&entry2).unwrap();
 

@@ -108,7 +108,6 @@ impl TimelineStore {
             named_graph: Some("system:timeline".to_string()),
             jsonld_context: None,
             jsonld_types: vec!["timeline:GraphMutation".to_string()],
-            hyperspace_point_id: None,
         };
         if let Err(error) = l0_store.store_entry(&entry) {
             tracing::warn!(%error, sequence = record.sequence, "Failed to persist timeline mutation");
@@ -141,7 +140,6 @@ impl TimelineStore {
             named_graph: Some("system:timeline".to_string()),
             jsonld_context: None,
             jsonld_types: vec!["timeline:GraphSnapshot".to_string()],
-            hyperspace_point_id: None,
         };
         if let Err(error) = l0_store.store_entry(&entry) {
             tracing::warn!(%error, "Failed to persist timeline snapshot");

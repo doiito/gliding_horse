@@ -14,6 +14,7 @@ use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend, SkillGraphSnaps
 use glidinghorse::graph_features::features::FeatureExtractor;
 use glidinghorse::knowledge_graph::code_ast::CodeAstExtractor;
 use glidinghorse::knowledge_graph::store::KnowledgeGraphStore;
+use glidinghorse::memory::consistency_engine::ConsistencyEngine;
 use glidinghorse::memory::embedding_service::{
     create_embedding_service_from_config, FallbackEmbeddingService,
 };
@@ -22,7 +23,9 @@ use glidinghorse::memory::l0_store::L0Store;
 use glidinghorse::memory::l1_session::EvictionConfig;
 use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
+use glidinghorse::memory::memory_bus::MemoryBus;
 use glidinghorse::memory::memory_manager::MemoryManager;
+use glidinghorse::memory::scheduler::MemoryScheduler;
 use glidinghorse::memory::unified_graph::UnifiedGraphStore;
 use glidinghorse::ontology_bridge::{
     FallbackStructuralEmbeddingService, LinearCrossSpaceProjection,
@@ -77,6 +80,15 @@ pub struct CodeCliEngine {
     /// Set after the persisted skill graph has been indexed into Hyperspace.
     /// Kept false after a failed attempt so the next task can retry.
     skill_vectors_ready: AtomicBool,
+    /// Persistent vector store; checkpointed after each task to bound WAL growth.
+    vector_store: Arc<HyperspaceStore>,
+    /// Embedding backend used by the vector store; kept for startup health probing
+    /// and to expose the active provider to status/health surfaces.
+    embedding: Arc<dyn glidinghorse::memory::embedding_service::EmbeddingService>,
+    /// True once the embedding backend has been probed for connectivity this run.
+    embedding_health_checked: AtomicBool,
+    /// Set when the startup probe failed; makes `embedding_status()` report degraded.
+    embedding_degraded: AtomicBool,
     /// Feature extractor (GNN topological features)
     feature_extractor: Arc<FeatureExtractor>,
     /// Causal engine (Bayesian inference on skill graph)
@@ -308,7 +320,7 @@ impl CodeCliEngine {
             .unwrap_or_else(|| dir.path().join("hyperspace").to_string_lossy().to_string());
         let _ = std::fs::create_dir_all(&hyperspace_path);
         let vector_store = Arc::new(
-            HyperspaceStore::open(std::path::Path::new(&hyperspace_path), embed)
+            HyperspaceStore::open(std::path::Path::new(&hyperspace_path), embed.clone())
                 .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
         );
 
@@ -387,11 +399,12 @@ impl CodeCliEngine {
                 }
             },
         };
-        let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::new(
+        let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::with_vector_store(
             l0.clone(),
             l2.clone(),
             proj.clone(),
             core_config.clone(),
+            Some(vector_store.clone()),
         )));
         // Attach OntologyBridge to MemoryManager for dual-space embedding access.
         {
@@ -586,6 +599,27 @@ impl CodeCliEngine {
 
         let event_bus = Arc::new(EventBus::new(100));
 
+        // ── MemoryScheduler with HyperspaceStore: activates context_request_with_decay ──
+        let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
+        let consistency_engine = Arc::new(ConsistencyEngine::new(
+            memory_bus.clone(),
+            l0.clone(),
+            l2.clone(),
+            proj.clone(),
+        ));
+        let scheduler = Arc::new(MemoryScheduler::with_hyperspace(
+            l0.clone(),
+            l2.clone(),
+            proj.clone(),
+            consistency_engine.clone(),
+            memory_bus.clone(),
+            Some(vector_store.clone()),
+        ));
+        {
+            let mut mm_lock = mm.blocking_lock();
+            mm_lock.set_scheduler(scheduler.clone());
+        }
+
         // TimelineStore EventBus subscription deferred — requires a Tokio runtime.
         // Subscribe via start_async_components() in process_task().
 
@@ -677,7 +711,7 @@ impl CodeCliEngine {
             config.max_iterations,
             config.max_pdca_cycles,
         )
-        .with_memory(Some(l2), None, None)
+        .with_memory(Some(l2), None, Some(scheduler))
         .with_execution_timeout(agent_settings.sa_execution_timeout_secs)
         .with_perception_hyperspace(vector_store.clone())
         .with_perception_store(Arc::new(runner_perception))
@@ -741,6 +775,10 @@ impl CodeCliEngine {
             skill_graph,
             discovery_engine,
             skill_vectors_ready: AtomicBool::new(false),
+            vector_store: vector_store.clone(),
+            embedding: embed,
+            embedding_health_checked: AtomicBool::new(false),
+            embedding_degraded: AtomicBool::new(false),
             feature_extractor,
             causal_engine,
             evolution_engine,
@@ -826,6 +864,26 @@ impl CodeCliEngine {
         }
     }
 
+    /// Probe the configured embedding backend exactly once per process so a
+    /// dead Ollama/OneAPI endpoint is surfaced loudly on the first task instead
+    /// of silently degrading every vector read to keyword hashing.
+    async fn ensure_embedding_healthy(&self) {
+        if self.embedding_health_checked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.embedding.provider() == "fallback" {
+            return;
+        }
+        if let Err(error) = self.embedding.health_check().await {
+            self.embedding_degraded.store(true, Ordering::Release);
+            warn!(
+                provider = self.embedding.provider(),
+                %error,
+                "语义检索已降级为关键词匹配: embedding 后端不可达"
+            );
+        }
+    }
+
     /// Incrementally refresh the shared code KG from workspace source files.
     /// Both one-shot CLI and TUI/resume call this method so entrypoint choice
     /// cannot decide whether a changed nested source file is represented.
@@ -864,6 +922,7 @@ impl CodeCliEngine {
     }
 
     pub async fn process_task(&mut self, user_input: &str) -> anyhow::Result<(String, TaskResult)> {
+        self.ensure_embedding_healthy().await;
         self.ensure_skill_vectors_indexed().await;
         // 首次进入 async 上下文时完成 WorkspaceMonitor 的异步初始化
         if let Some(ref wm) = self.workspace_monitor {
@@ -1213,6 +1272,10 @@ impl CodeCliEngine {
             }
         }
 
+        if let Err(error) = self.vector_store.checkpoint().await {
+            warn!(task_iri = %task_iri, error = %error, "Failed to checkpoint hyperspace store after task");
+        }
+
         Ok((task_iri, result))
     }
 
@@ -1339,6 +1402,26 @@ impl CodeCliEngine {
         (l1, l2, l3)
     }
 
+    /// Active embedding provider ("ollama" | "oneapi" | "fallback") for status surfaces.
+    pub fn embedding_provider(&self) -> &'static str {
+        self.embedding.provider()
+    }
+
+    /// Semantic-search health: degraded when the configured backend is a placeholder
+    /// or failed its startup connectivity probe.
+    pub fn embedding_status(&self) -> &'static str {
+        if self.embedding.provider() == "fallback"
+            || self.embedding_degraded.load(Ordering::Acquire)
+        {
+            return "degraded";
+        }
+        if self.embedding_health_checked.load(Ordering::Acquire) {
+            "healthy"
+        } else {
+            "unknown"
+        }
+    }
+
     pub async fn list_checkpoints(
         &self,
     ) -> anyhow::Result<Vec<glidinghorse::core::checkpoint::CheckpointData>> {
@@ -1434,6 +1517,7 @@ impl CodeCliEngine {
         task_iri: &str,
         resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
     ) -> anyhow::Result<TaskResult> {
+        self.ensure_embedding_healthy().await;
         self.ensure_skill_vectors_indexed().await;
         // Keep the code-KG precondition equivalent to the CLI task path.
         // Scan failure is surfaced rather than silently claiming an updated

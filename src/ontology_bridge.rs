@@ -38,6 +38,7 @@
 //! The `FallbackStructuralEmbeddingService` uses deterministic hash-based feature encoding
 //! and normalizes to the Poincaré ball.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -295,6 +296,20 @@ pub trait OntologyEmbedStore: Send + Sync {
         top_k: usize,
     ) -> Result<Vec<SearchHit>, EngineError>;
 
+    /// Hybrid search: run the text query in the text engine and the structural
+    /// query in the struct engine, then fuse the two result sets by IRI using
+    /// alpha-weighted score fusion (1.0 = pure text, 0.0 = pure struct).
+    ///
+    /// Fusing by IRI is required because the two engines keep independent ID
+    /// registries — the same entry has different numeric IDs in each engine.
+    async fn search_hybrid(
+        &self,
+        text_query: Option<&EmbeddingVector>,
+        struct_query: Option<&EmbeddingVector>,
+        top_k: usize,
+        alpha: f32,
+    ) -> Result<Vec<SearchHit>, EngineError>;
+
     /// Retrieve the text-space (Cosine) embedding vector for a given IRI.
     async fn get_text_vector(&self, iri: &str) -> Result<Option<EmbeddingVector>, EngineError>;
 
@@ -455,6 +470,61 @@ impl OntologyEmbedStore for HyperspaceEmbedStore {
         top_k: usize,
     ) -> Result<Vec<SearchHit>, EngineError> {
         self.struct_engine.search(query, top_k, &[]).await
+    }
+
+    async fn search_hybrid(
+        &self,
+        text_query: Option<&EmbeddingVector>,
+        struct_query: Option<&EmbeddingVector>,
+        top_k: usize,
+        alpha: f32,
+    ) -> Result<Vec<SearchHit>, EngineError> {
+        let text_results = match text_query {
+            Some(q) => self.text_engine.search(q, top_k * 3, &[]).await?,
+            None => Vec::new(),
+        };
+        let struct_results = match struct_query {
+            Some(q) => self.struct_engine.search(q, top_k * 3, &[]).await?,
+            None => Vec::new(),
+        };
+        if text_results.is_empty() {
+            return Ok(struct_results.into_iter().take(top_k).collect());
+        }
+        if struct_results.is_empty() {
+            return Ok(text_results.into_iter().take(top_k).collect());
+        }
+
+        let max_text = text_results.first().map(|r| r.score).unwrap_or(1.0).max(0.001);
+        let max_struct = struct_results
+            .first()
+            .map(|r| r.score)
+            .unwrap_or(1.0)
+            .max(0.001);
+
+        let mut fused: HashMap<String, f32> = HashMap::new();
+        let mut best: HashMap<String, SearchHit> = HashMap::new();
+        for hit in text_results {
+            let score = alpha * (hit.score / max_text);
+            let entry = fused.entry(hit.iri.clone()).or_insert(0.0);
+            *entry += score;
+            best.entry(hit.iri.clone()).or_insert(hit);
+        }
+        for hit in struct_results {
+            let score = (1.0 - alpha) * (hit.score / max_struct);
+            let entry = fused.entry(hit.iri.clone()).or_insert(0.0);
+            *entry += score;
+            best.entry(hit.iri.clone()).or_insert(hit);
+        }
+
+        let mut sorted: Vec<(String, f32)> = fused.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out = Vec::with_capacity(top_k);
+        for (iri, _score) in sorted.into_iter().take(top_k) {
+            if let Some(hit) = best.remove(&iri) {
+                out.push(hit);
+            }
+        }
+        Ok(out)
     }
 
     /// Cross-search: get the STRUCTURAL vector for `source_iri` and use it to
@@ -1013,6 +1083,69 @@ mod tests {
             "cross_search should return at least the source entry"
         );
         assert_eq!(results[0].iri, "onto:Dual");
+    }
+
+    #[tokio::test]
+    async fn test_search_hybrid_fuses_by_iri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HyperspaceEmbedStore::new(
+            Arc::new(text_engine(dir.path())),
+            Arc::new(struct_engine(dir.path())),
+        );
+
+        // Two entries: A is text-close to the query, B is struct-close.
+        store
+            .store_embedding(
+                "onto:A",
+                Some(&v_cos(vec![0.9, 0.1, 0.0, 0.0])),
+                Some(&v_poin(vec![0.05, 0.05, 0.0, 0.0])),
+                &json!({"label": "A"}),
+            )
+            .await
+            .unwrap();
+        store
+            .store_embedding(
+                "onto:B",
+                Some(&v_cos(vec![0.1, 0.9, 0.0, 0.0])),
+                Some(&v_poin(vec![0.4, 0.4, 0.0, 0.0])),
+                &json!({"label": "B"}),
+            )
+            .await
+            .unwrap();
+
+        // Pure text (alpha=1.0): only text score counts → A ranks first.
+        let text_only = store
+            .search_hybrid(Some(&v_cos(vec![0.9, 0.1, 0.0, 0.0])), None, 5, 1.0)
+            .await
+            .unwrap();
+        assert_eq!(text_only[0].iri, "onto:A");
+        assert_eq!(text_only.len(), 2);
+
+        // Pure struct (alpha=0.0): only struct score counts → B ranks first.
+        let struct_only = store
+            .search_hybrid(
+                None,
+                Some(&v_poin(vec![0.4, 0.4, 0.0, 0.0])),
+                5,
+                0.0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(struct_only[0].iri, "onto:B");
+        assert_eq!(struct_only.len(), 2);
+
+        // Balanced (alpha=0.5): both spaces contribute; both entries present,
+        // no ID misalignment (fusion keyed by IRI, not numeric ID).
+        let balanced = store
+            .search_hybrid(
+                Some(&v_cos(vec![0.9, 0.1, 0.0, 0.0])),
+                Some(&v_poin(vec![0.4, 0.4, 0.0, 0.0])),
+                5,
+                0.5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(balanced.len(), 2);
     }
 
     #[tokio::test]

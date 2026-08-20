@@ -12,6 +12,17 @@ const DEFAULT_VEC_SIZE: usize = 128;
 pub trait EmbeddingService: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
     fn dimension(&self) -> usize;
+
+    /// Stable provider identifier for health/status panels ("ollama" | "oneapi" | "fallback").
+    fn provider(&self) -> &'static str {
+        "unknown"
+    }
+
+    /// Lightweight connectivity probe. `Err` means the remote embedding backend is unreachable
+    /// and semantic search will silently degrade to the local fallback.
+    async fn health_check(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct OneApiEmbeddingService {
@@ -91,6 +102,26 @@ impl EmbeddingService for OneApiEmbeddingService {
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn provider(&self) -> &'static str {
+        "oneapi"
+    }
+
+    async fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/v1/models", self.api_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| format!("OneAPI health check failed: {}", e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("OneAPI health check returned status {}", resp.status()))
+        }
+    }
 }
 
 pub struct FallbackEmbeddingService {
@@ -138,6 +169,10 @@ impl EmbeddingService for FallbackEmbeddingService {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn provider(&self) -> &'static str {
+        "fallback"
     }
 }
 
@@ -215,6 +250,28 @@ impl EmbeddingService for OllamaEmbeddingService {
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn provider(&self) -> &'static str {
+        "ollama"
+    }
+
+    async fn health_check(&self) -> Result<(), String> {
+        let url = format!("{}/api/tags", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Ollama health check failed: {}", e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Ollama health check returned status {}",
+                resp.status()
+            ))
+        }
+    }
 }
 
 pub fn create_embedding_service_from_config(
@@ -264,7 +321,7 @@ pub fn create_embedding_service_from_config(
             ))
         }
         "fallback" | "" => {
-            info!("Using Fallback Embedding service");
+            warn!("Embedding provider explicitly set to fallback — semantic search is degraded to keyword hashing");
             Arc::new(FallbackEmbeddingService::with_dimension(
                 config.fallback.dimension,
             ))
@@ -347,5 +404,30 @@ mod tests {
         assert!(warn_once_on_first_failure(&flag, "ollama down"));
         assert!(!warn_once_on_first_failure(&flag, "ollama down"));
         assert!(!warn_once_on_first_failure(&flag, "still down"));
+    }
+
+    #[test]
+    fn fallback_provider_is_fallback() {
+        assert_eq!(FallbackEmbeddingService::new().provider(), "fallback");
+    }
+
+    #[tokio::test]
+    async fn fallback_health_check_ok() {
+        let svc = FallbackEmbeddingService::new();
+        assert!(svc.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ollama_health_check_fails_on_unreachable_endpoint() {
+        let svc = OllamaEmbeddingService::new("http://127.0.0.1:1", "nomic-embed-text", 128, 2);
+        assert_eq!(svc.provider(), "ollama");
+        assert!(svc.health_check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn oneapi_health_check_fails_on_unreachable_endpoint() {
+        let svc = OneApiEmbeddingService::new("http://127.0.0.1:1", "sk-none", "text-embedding", 128);
+        assert_eq!(svc.provider(), "oneapi");
+        assert!(svc.health_check().await.is_err());
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::core::agent_instance::AgentRole;
+use crate::core::timeline::TimeRange;
 use crate::memory::consistency_engine::ConsistencyEngine;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l0_store::L0Store;
@@ -98,6 +99,20 @@ impl MemoryScheduler {
             }
             let contents: Vec<String> = nodes.iter().map(|n| n.json_ld.clone()).collect();
             return Ok(contents.join("\n"));
+        }
+
+        // Healthy HyperspaceStore → time-windowed vector recall before the pure L0 scan
+        if let Some(ref hs) = self.hyperspace {
+            if hs.embedding_provider() != "fallback" {
+                let now = chrono::Utc::now();
+                let window = TimeRange::after(now - chrono::Duration::hours(24));
+                if let Ok(entries) = hs.search_by_time(task_iri, &window, 10).await {
+                    if !entries.is_empty() {
+                        let contents: Vec<String> = entries.iter().map(|r| r.text.clone()).collect();
+                        return Ok(contents.join("\n"));
+                    }
+                }
+            }
         }
 
         let results = self.l0_store.search(task_iri, 10)?;

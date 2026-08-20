@@ -408,7 +408,6 @@ fn test_sa_research_task_classification() {
 
     // English exploratory keywords reliably produce Exploratory
     for task in &[
-        "Research the latest advances in quantum computing",
         "Explore different methods for microservices",
         "Compare different database solutions for e-commerce",
     ] {
@@ -421,6 +420,12 @@ fn test_sa_research_task_classification() {
             plan.task_complexity
         );
     }
+
+    // Plain "research" without explore/investigate or deep qualifiers
+    // classifies as Standard (research moved out of exploratory keywords
+    // in effec5c; only deep research escalates to Complex).
+    let plan = sa.analyze_task("Research the latest advances in quantum computing");
+    assert_eq!(plan.task_complexity, TaskComplexity::Standard);
 
     // Chinese tasks — LLM classification may vary by model;
     // just verify they return a valid complexity without crashing

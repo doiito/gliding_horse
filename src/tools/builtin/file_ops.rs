@@ -449,13 +449,35 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
+/// Directories never traversed by grep_search. Mirrors the workspace
+/// exclude_patterns semantics (target/, node_modules/, .git/ in config.yaml)
+/// so a repository-scale grep does not scan build artifacts and vendored code.
+fn is_excluded_search_dir(path: &Path) -> bool {
+    const EXCLUDED: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "vendor",
+        ".venv",
+        "__pycache__",
+        ".next",
+    ];
+    let name = path.file_name().and_then(|name| name.to_str());
+    matches!(name, Some(name) if EXCLUDED.contains(&name))
+}
+
 fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
         return Ok(vec![base_path.to_path_buf()]);
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_excluded_search_dir(entry.path()))
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
@@ -624,8 +646,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        collect_search_files, edit_file, glob_search, grep_search, is_symlink_escape, read_file,
+        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -758,5 +780,44 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn grep_skips_build_and_vendored_dirs() {
+        let dir = temp_path("search-excludes");
+        std::fs::create_dir_all(&dir).expect("directory should be created");
+        std::fs::write(dir.join("src.rs"), "needle in source\n").expect("source should write");
+        for sub in ["target", "node_modules", ".git", "dist"] {
+            std::fs::create_dir_all(dir.join(sub)).expect("subdir should be created");
+            std::fs::write(dir.join(sub).join("junk.rs"), "needle in junk\n")
+                .expect("junk should write");
+        }
+
+        let files = collect_search_files(&dir).expect("collection should succeed");
+        let paths: Vec<String> = files
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths.len(), 1, "only source file should be collected: {paths:?}");
+        assert!(paths[0].ends_with("src.rs"));
+
+        let grep_output = grep_search(&GrepSearchInput {
+            pattern: String::from("needle"),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some(String::from("count")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(false),
+            case_insensitive: Some(false),
+            file_type: None,
+            head_limit: Some(10),
+            offset: Some(0),
+            multiline: Some(false),
+        })
+        .expect("grep should succeed");
+        assert_eq!(grep_output.num_files, 1);
     }
 }

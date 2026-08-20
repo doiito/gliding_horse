@@ -98,6 +98,9 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
 
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !is_build_or_vendored_dir(entry.path())
+        })
         .filter_map(|e| e.ok())
     {
         if !entry.file_type().is_file() {
@@ -257,6 +260,24 @@ fn match_glob(path: &str, pattern: &str) -> bool {
         return glob_matcher.matches(file_name);
     }
     file_name.contains(pattern.trim_start_matches('*'))
+}
+
+/// Directories excluded from recursive file scans so a repository-scale
+/// search does not traverse build artifacts and vendored dependencies.
+fn is_build_or_vendored_dir(path: &std::path::Path) -> bool {
+    const EXCLUDED: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "vendor",
+        ".venv",
+        "__pycache__",
+        ".next",
+    ];
+    let name = path.file_name().and_then(|n| n.to_str());
+    matches!(name, Some(name) if EXCLUDED.contains(&name))
 }
 
 pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
@@ -1955,6 +1976,30 @@ pub(super) async fn execute_knowledge_extract_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_build_or_vendored_dir() {
+        let cases = [
+            ("target", true),
+            ("node_modules", true),
+            (".git", true),
+            ("dist", true),
+            ("build", true),
+            ("vendor", true),
+            (".venv", true),
+            ("__pycache__", true),
+            (".next", true),
+            ("src", false),
+            ("crates", false),
+            ("docs", false),
+            ("target_arch", false),
+            ("mybuild", false),
+        ];
+        for (name, expected) in cases {
+            let path = std::path::Path::new(name);
+            assert_eq!(is_build_or_vendored_dir(path), expected, "case: {name}");
+        }
+    }
 
     #[test]
     fn test_parse_error_position_standard() {

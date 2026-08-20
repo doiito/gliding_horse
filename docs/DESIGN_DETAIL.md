@@ -210,7 +210,7 @@ Different developers write skills with different parameter names. JSON-LD `@cont
 ```json
 {
   "@context": {
-    "skill": "https://agent-harness.os/skill#",
+    "skill": "https://agent-os.org/ontology/skill#",
     "skill:inputMapping": {
       "file_path": { "@id": "skill:sourceDataURI" },
       "source_url": { "@id": "skill:sourceDataURI" },
@@ -340,7 +340,7 @@ L3 Projection Engine uses **Frame documents** to declare desired output shape:
 
 ```json
 {
-  "@context": { "exec": "https://agent-harness.os/exec#" },
+  "@context": { "exec": "https://agent-os.org/ontology/exec#" },
   "@type": "task:AnalysisTask",
   "task:subTasks": {
     "@embed": "@always",           // Expand fully
@@ -676,7 +676,7 @@ AA then makes dimension-aware decisions:
 L0 stores all completed tasks as frozen `task:CompletedTaskSnapshot`. SA's pattern recognition organ queries for similar experiences:
 
 ```sparql
-PREFIX task: <https://agent-harness.os/task#>
+PREFIX task: <https://agent-os.org/ontology/task#>
 
 SELECT ?pastTask ?whySimilarity ?howSimilarity
 WHERE {

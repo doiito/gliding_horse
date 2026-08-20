@@ -81,7 +81,7 @@ pub struct JsonLdNode {
 impl JsonLdNode {
     pub fn new(id: String, node_type: impl Into<Value>) -> Self {
         Self {
-            context: Value::String("https://pdca-agent.org/context/task".to_string()),
+            context: Value::String("https://agent-os.org/context/task".to_string()),
             id,
             node_type: node_type.into(),
             properties: HashMap::new(),
@@ -192,7 +192,7 @@ pub struct SummaryNode {
 impl SummaryNode {
     pub fn new(iri: String, node_type: String, summary: String) -> Self {
         Self {
-            context: "https://pdca-agent.org/context/task".to_string(),
+            context: "https://agent-os.org/context/task".to_string(),
             iri,
             node_type,
             summary,
@@ -238,7 +238,7 @@ pub struct FullNode {
 impl FullNode {
     pub fn new(iri: String, node_type: impl Into<Value>) -> Self {
         Self {
-            context: "https://pdca-agent.org/context/task".to_string(),
+            context: "https://agent-os.org/context/task".to_string(),
             iri,
             node_type: node_type.into(),
             properties: HashMap::new(),
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_jsonld_node_from_json() {
         let json = json!({
-            "@context": "https://pdca-agent.org/context/task",
+            "@context": "https://agent-os.org/context/task",
             "@id": "iri://task/456",
             "@type": "TaskNode",
             "summary": "Test task"

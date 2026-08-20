@@ -307,7 +307,7 @@ impl Blackboard {
                             let type_uri = if t.contains("://") {
                                 format!("<{}>", t)
                             } else {
-                                format!("<http://agent-os.org/ontology/{}>", t)
+                                format!("<https://agent-os.org/ontology/core/{}>", t)
                             };
                             triples.push(format!("{} a {} .", subject, type_uri));
                         } else if let Some(arr) = value.as_array() {
@@ -315,7 +315,7 @@ impl Blackboard {
                                 let type_uri = if t.contains("://") {
                                     format!("<{}>", t)
                                 } else {
-                                    format!("<http://agent-os.org/ontology/{}>", t)
+                                    format!("<https://agent-os.org/ontology/core/{}>", t)
                                 };
                                 triples.push(format!("{} a {} .", subject, type_uri));
                             }
@@ -325,7 +325,7 @@ impl Blackboard {
                 }
 
                 let escaped_key = key.replace(' ', "_");
-                let predicate = format!("<http://agent-os.org/ontology/{}>", escaped_key);
+                let predicate = format!("<https://agent-os.org/ontology/core/{}>", escaped_key);
 
                 match value {
                     serde_json::Value::String(s) => {
@@ -1342,7 +1342,7 @@ impl Blackboard {
                 if t.contains("://") {
                     format!("<{}>", t)
                 } else {
-                    format!("<http://agent-os.org/ontology/{}>", t)
+                    format!("<https://agent-os.org/ontology/core/{}>", t)
                 }
             })
             .collect();
@@ -2856,7 +2856,7 @@ mod tests {
         bb.write_node_to_graph(
             "iri://workspace/file/main.rs",
             json_ld,
-            "http://agent-os.org/workspace",
+            "https://agent-os.org/workspace",
             &config,
         )
         .unwrap();

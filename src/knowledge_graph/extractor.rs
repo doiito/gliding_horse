@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_validate_extraction_valid() {
-        let json = r#"{"nodes": [{"id": "a", "node_type": "https://agentos.ontology/core/Person", "label": "Alice", "properties": {}}], "edges": [{"source": "a", "target": "b", "relation": "https://agentos.ontology/business/worksFor", "properties": {}}]}"#;
+        let json = r#"{"nodes": [{"id": "a", "node_type": "https://agent-os.org/ontology/core/Person", "label": "Alice", "properties": {}}], "edges": [{"source": "a", "target": "b", "relation": "https://agent-os.org/ontology/biz/worksFor", "properties": {}}]}"#;
         let result = KnowledgeExtractor::validate_extraction(json);
         assert!(result.is_ok());
         let output = result.unwrap();
@@ -425,10 +425,10 @@ mod tests {
 
     #[test]
     fn test_build_extraction_prompt() {
-        let vocab = "## Available entity types\n- IRI: https://agentos.ontology/core/Person | name: Person | Represents a person";
+        let vocab = "## Available entity types\n- IRI: https://agent-os.org/ontology/core/Person | name: Person | Represents a person";
         let prompt = KnowledgeExtractor::build_extraction_prompt("test text", vocab);
         assert!(prompt.contains("knowledge graph extraction expert"));
-        assert!(prompt.contains("https://agentos.ontology/core/Person"));
+        assert!(prompt.contains("https://agent-os.org/ontology/core/Person"));
         assert!(prompt.contains("test text"));
         assert!(prompt.contains("nodes"));
         assert!(prompt.contains("edges"));

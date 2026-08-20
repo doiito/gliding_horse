@@ -134,7 +134,7 @@ impl ProjectionEngine {
                 max_nodes: 20,
                 sparql_template: Some(
                     r#"
-                PREFIX ex: <http://agent-os.org/ontology/>
+                PREFIX ex: <https://agent-os.org/ontology/core/>
                 CONSTRUCT {
                     ?node ex:summary ?summary .
                     ?node ex:status ?status .
@@ -153,7 +153,7 @@ impl ProjectionEngine {
                 params: vec![],
                 jsonld_frame: Some(
                     FrameTemplate::new(serde_json::json!({
-                        "agent": "https://agent-harness.os/agent#"
+                        "agent": "https://agent-os.org/ontology/agent#"
                     }))
                     .with_include_properties(vec!["summary".to_string(), "status".to_string()])
                     .with_max_depth(1),
@@ -187,7 +187,7 @@ impl ProjectionEngine {
                 max_nodes: 10,
                 sparql_template: Some(
                     r#"
-                PREFIX ex: <http://agent-os.org/ontology/>
+                PREFIX ex: <https://agent-os.org/ontology/core/>
                 CONSTRUCT {
                     ?task ex:goal ?goal .
                     ?task ex:constraints ?constraints .
@@ -207,8 +207,8 @@ impl ProjectionEngine {
                 params: vec!["task_iri".to_string()],
                 jsonld_frame: Some(
                     FrameTemplate::new(serde_json::json!({
-                        "exec": "https://agent-harness.os/exec#",
-                        "task": "https://agent-harness.os/task#"
+                        "exec": "https://agent-os.org/ontology/exec#",
+                        "task": "https://agent-os.org/ontology/task#"
                     }))
                     .with_embed_rule("task:subTasks".to_string(), EmbedDirective::Always)
                     .with_embed_rule("exec:assignedTo".to_string(), EmbedDirective::Link)
@@ -235,7 +235,7 @@ impl ProjectionEngine {
                 max_nodes: 10,
                 sparql_template: Some(
                     r#"
-                PREFIX ex: <http://agent-os.org/ontology/>
+                PREFIX ex: <https://agent-os.org/ontology/core/>
                 CONSTRUCT {
                     ?node ex:instructions ?instructions .
                     ?node ex:dependencies ?deps .
@@ -255,8 +255,8 @@ impl ProjectionEngine {
                 params: vec!["plan_iri".to_string()],
                 jsonld_frame: Some(
                     FrameTemplate::new(serde_json::json!({
-                        "exec": "https://agent-harness.os/exec#",
-                        "task": "https://agent-harness.os/task#"
+                        "exec": "https://agent-os.org/ontology/exec#",
+                        "task": "https://agent-os.org/ontology/task#"
                     }))
                     .with_embed_rule("task:inputData".to_string(), EmbedDirective::Always)
                     .with_embed_rule("task:resources".to_string(), EmbedDirective::Link)
@@ -302,8 +302,8 @@ impl ProjectionEngine {
                 params: vec!["artifact_iri".to_string()],
                 jsonld_frame: Some(
                     FrameTemplate::new(serde_json::json!({
-                        "exec": "https://agent-harness.os/exec#",
-                        "task": "https://agent-harness.os/task#"
+                        "exec": "https://agent-os.org/ontology/exec#",
+                        "task": "https://agent-os.org/ontology/task#"
                     }))
                     .with_embed_rule("exec:results".to_string(), EmbedDirective::Always)
                     .with_embed_rule("exec:validationRules".to_string(), EmbedDirective::Always)
@@ -342,8 +342,8 @@ impl ProjectionEngine {
                 params: vec!["review_iri".to_string()],
                 jsonld_frame: Some(
                     FrameTemplate::new(serde_json::json!({
-                        "exec": "https://agent-harness.os/exec#",
-                        "task": "https://agent-harness.os/task#"
+                        "exec": "https://agent-os.org/ontology/exec#",
+                        "task": "https://agent-os.org/ontology/task#"
                     }))
                     .with_embed_rule("exec:reviewResults".to_string(), EmbedDirective::Always)
                     .with_embed_rule("exec:alternatives".to_string(), EmbedDirective::Link)
@@ -431,7 +431,7 @@ impl ProjectionEngine {
                 max_nodes: 20,
                 sparql_template: Some(
                     r#"
-        PREFIX task: <https://pdca-agent.org/ontology/task#>
+        PREFIX task: <https://agent-os.org/ontology/task#>
         CONSTRUCT {
             ?node task:what ?what .
             ?node task:why ?why .
@@ -451,7 +451,7 @@ impl ProjectionEngine {
                 params: vec![],
                 jsonld_frame: Some(
                     FrameTemplate::new(serde_json::json!({
-                        "task": "https://pdca-agent.org/ontology/task#"
+                        "task": "https://agent-os.org/ontology/task#"
                     }))
                     .with_include_properties(vec![
                         "task:what".to_string(),
@@ -828,17 +828,17 @@ impl ProjectionEngine {
             return "@type".to_string();
         }
 
-        if let Some(prop) = predicate.strip_prefix("http://agent-os.org/prop/") {
+        if let Some(prop) = predicate.strip_prefix("https://agent-os.org/ontology/core/") {
             return prop.replace('_', " ");
         }
 
-        if let Some(prop) = predicate.strip_prefix("http://agent-os.org/ontology/") {
+        if let Some(prop) = predicate.strip_prefix("https://agent-os.org/ontology/core/") {
             return prop.to_string();
         }
 
         for prefix in &[
-            "https://agent-harness.os/task#",
-            "https://agent-harness.os/exec#",
+            "https://agent-os.org/ontology/task#",
+            "https://agent-os.org/ontology/exec#",
         ] {
             if let Some(prop) = predicate.strip_prefix(prefix) {
                 return prop.to_string();
@@ -1196,7 +1196,7 @@ impl ProjectionEngine {
         let mut current_tokens = 0;
 
         let default_frame = FrameTemplate::new(serde_json::json!({
-            "agent": "https://agent-harness.os/agent#"
+            "agent": "https://agent-os.org/ontology/agent#"
         }))
         .with_max_depth(3);
 
@@ -1225,7 +1225,7 @@ impl ProjectionEngine {
         projection.insert(
             "@context".to_string(),
             serde_json::json!({
-                "agent": "https://agent-harness.os/agent#"
+                "agent": "https://agent-os.org/ontology/agent#"
             }),
         );
         projection.insert("task_iri".to_string(), Value::String(task_iri.to_string()));
@@ -1370,7 +1370,7 @@ mod tests {
         );
 
         let frame = FrameTemplate::new(serde_json::json!({
-            "task": "https://agent-harness.os/task#"
+            "task": "https://agent-os.org/ontology/task#"
         }))
         .with_include_properties(vec!["summary".to_string(), "status".to_string()])
         .with_max_depth(2);

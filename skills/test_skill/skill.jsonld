@@ -1,7 +1,7 @@
 {
   "@context": {
     "schema": "https://schema.org/",
-    "skill": "https://agent-harness.os/skill#"
+    "skill": "https://agent-os.org/ontology/skill#"
   },
   "@id": "iri://skills/test_skill",
   "@type": [

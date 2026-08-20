@@ -34,17 +34,19 @@ pub const NS_TMPL: &str = "tmpl";
 pub const NS_EXP: &str = "exp";
 pub const NS_ADV: &str = "adv";
 pub const NS_NODE: &str = "node";
+pub const NS_CORE: &str = "core";
 
-pub const URI_AGENT: &str = "https://pdca-agent.org/ontology/agent#";
-pub const URI_TASK: &str = "https://pdca-agent.org/ontology/task#";
-pub const URI_SKILL: &str = "https://pdca-agent.org/ontology/skill#";
-pub const URI_MEM: &str = "https://pdca-agent.org/ontology/memory#";
-pub const URI_SEC: &str = "https://pdca-agent.org/ontology/security#";
-pub const URI_MON: &str = "https://pdca-agent.org/ontology/monitoring#";
-pub const URI_TMPL: &str = "https://pdca-agent.org/ontology/template#";
-pub const URI_EXP: &str = "https://pdca-agent.org/ontology/experience#";
-pub const URI_ADV: &str = "https://pdca-agent.org/ontology/advisory#";
-pub const URI_NODE: &str = "https://pdca-agent.org/ontology/node#";
+pub const URI_CORE: &str = "https://agent-os.org/ontology/core/";
+pub const URI_AGENT: &str = "https://agent-os.org/ontology/agent#";
+pub const URI_TASK: &str = "https://agent-os.org/ontology/task#";
+pub const URI_SKILL: &str = "https://agent-os.org/ontology/skill#";
+pub const URI_MEM: &str = "https://agent-os.org/ontology/memory#";
+pub const URI_SEC: &str = "https://agent-os.org/ontology/security#";
+pub const URI_MON: &str = "https://agent-os.org/ontology/monitoring#";
+pub const URI_TMPL: &str = "https://agent-os.org/ontology/template#";
+pub const URI_EXP: &str = "https://agent-os.org/ontology/experience#";
+pub const URI_ADV: &str = "https://agent-os.org/ontology/advisory#";
+pub const URI_NODE: &str = "https://agent-os.org/ontology/node#";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonLdContext {
@@ -110,6 +112,7 @@ impl JsonLdContext {
         // re-injecting them via named constants ensures they aren't broken by accidentally deleted context.json fields.
         // Values are identical (guaranteed by const URI_* constants), duplicate insertion is a no-op.
         for (prefix, uri) in [
+            ("core", URI_CORE),
             ("agent", URI_AGENT),
             ("task", URI_TASK),
             ("skill", URI_SKILL),
@@ -223,6 +226,7 @@ mod tests {
     #[test]
     fn test_context_value_contains_namespaces() {
         let ctx = JsonLdContext::context_value();
+        assert_eq!(ctx.get("core").and_then(Value::as_str), Some(URI_CORE));
         assert!(ctx.get("agent").is_some());
         assert!(ctx.get("task").is_some());
         assert!(ctx.get("skill").is_some());
@@ -230,12 +234,12 @@ mod tests {
 
     #[test]
     fn test_map_field_to_iri() {
-        assert_eq!(map_field_to_iri("summary"), "pdca:summary");
-        assert_eq!(map_field_to_iri("status"), "pdca:status");
-        assert_eq!(map_field_to_iri("confidence"), "pdca:confidence");
-        assert_eq!(map_field_to_iri("created_at"), "pdca:createdAt");
-        assert_eq!(map_field_to_iri("what"), "pdca:what");
-        assert_eq!(map_field_to_iri("plan_iri"), "pdca:planIRI");
+        assert_eq!(map_field_to_iri("summary"), "core:summary");
+        assert_eq!(map_field_to_iri("status"), "core:status");
+        assert_eq!(map_field_to_iri("confidence"), "core:confidence");
+        assert_eq!(map_field_to_iri("created_at"), "core:createdAt");
+        assert_eq!(map_field_to_iri("what"), "core:what");
+        assert_eq!(map_field_to_iri("plan_iri"), "core:planIRI");
         assert_eq!(map_field_to_iri("@id"), "@id");
         assert_eq!(map_field_to_iri("unknown_field"), "node:unknown_field");
     }
@@ -247,6 +251,23 @@ mod tests {
         assert!(ctx.contains_key("skill_version"));
         assert!(ctx.contains_key("summary"));
         assert!(ctx.contains_key("status"));
+    }
+
+    #[test]
+    fn test_context_uses_canonical_namespace() {
+        let ctx = JsonLdContext::context_value();
+        for prefix in [
+            "core", "agent", "task", "skill", "mem", "sec", "mon", "tmpl", "exp", "adv", "node",
+        ] {
+            let uri = ctx
+                .get(prefix)
+                .and_then(Value::as_str)
+                .expect("namespace must be a string");
+            assert!(
+                uri.starts_with("https://agent-os.org/ontology/"),
+                "{prefix} namespace is not canonical: {uri}"
+            );
+        }
     }
 
     #[test]

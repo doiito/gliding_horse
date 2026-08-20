@@ -790,7 +790,7 @@ impl SkillGraphNode {
             self.maturity,
         );
 
-        format!("PREFIX skill: <https://agent-harness.os/skill#>\nINSERT DATA {{ GRAPH <{}> {{ {} }} }}", graph, triples)
+        format!("PREFIX skill: <https://agent-os.org/ontology/skill#>\nINSERT DATA {{ GRAPH <{}> {{ {} }} }}", graph, triples)
     }
 
     pub fn to_json_ld(&self) -> serde_json::Value {
@@ -808,7 +808,7 @@ impl SkillGraphNode {
 
         json!({
             "@context": {
-                "skill": "https://agent-harness.os/skill#",
+                "skill": "https://agent-os.org/ontology/skill#",
                 "schema": "https://schema.org/"
             },
             "@id": self.skill_iri,

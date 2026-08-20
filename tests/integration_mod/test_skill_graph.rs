@@ -7,9 +7,9 @@ use glidinghorse::skill_graph::*;
 use glidinghorse::tools::{SkillRegistry, ToolExecutor};
 
 const AXURE_TO_VUE2_SKILL_MD: &str =
-    include_str!("../../.trae-test-skills/axure-to-vue2-skill/SKILL.md");
+    include_str!("../fixtures/skills/axure-to-vue2-skill/SKILL.md");
 const AXURE_VUE2_REFACTOR_SKILL_MD: &str =
-    include_str!("../../.trae-test-skills/axure-vue2-refactor/SKILL.md");
+    include_str!("../fixtures/skills/axure-vue2-refactor/SKILL.md");
 
 fn create_test_graph_with_skills() -> Arc<SkillGraphStore> {
     let store = Arc::new(SkillGraphStore::new());
@@ -458,7 +458,7 @@ fn test_skill_creator_register_axure_to_vue2() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
-        use_responses_api: false,
+            use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -558,7 +558,7 @@ fn test_skill_creator_register_axure_vue2_refactor() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
-        use_responses_api: false,
+            use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -604,7 +604,7 @@ async fn test_skill_creator_two_skills_coexist() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
-        use_responses_api: false,
+            use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -744,7 +744,7 @@ fn test_skill_creator_json_ld_validity() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
-        use_responses_api: false,
+            use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),
@@ -821,7 +821,7 @@ fn test_skill_creator_disclosure_levels() {
             timeout_seconds: 30,
             max_retries: 1,
             retry_base_ms: 500,
-        use_responses_api: false,
+            use_responses_api: false,
             model_mapping: Default::default(),
         })
         .unwrap(),

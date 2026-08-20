@@ -258,7 +258,7 @@ sequenceDiagram
 ```jsonld
 {
   "@context": {
-    "ws": "https://agent-harness.os/workspace#",
+    "ws": "https://agent-os.org/ontology/workspace#",
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
   },
   "@id": "iri://workspace/file/src/main.rs",
@@ -299,7 +299,7 @@ stateDiagram-v2
 
 ```sparql
 -- 列出目录下所有文件及状态
-PREFIX ws: <https://agent-harness.os/workspace#>
+PREFIX ws: <https://agent-os.org/ontology/workspace#>
 SELECT ?path ?size ?state ?lastRead ?lang
 WHERE {
   GRAPH <iri://workspace> {
@@ -314,7 +314,7 @@ WHERE {
 } ORDER BY ?path
 
 -- 查询文件的依赖关系
-PREFIX ws: <https://agent-harness.os/workspace#>
+PREFIX ws: <https://agent-os.org/ontology/workspace#>
 SELECT ?importedBy ?importedByState
 WHERE {
   GRAPH <iri://workspace> {
@@ -324,7 +324,7 @@ WHERE {
 }
 
 -- 统计文件状态分布
-PREFIX ws: <https://agent-harness.os/workspace#>
+PREFIX ws: <https://agent-os.org/ontology/workspace#>
 SELECT ?state (COUNT(?file) as ?count) (SUM(?size) as ?totalBytes)
 WHERE {
   GRAPH <iri://workspace> {

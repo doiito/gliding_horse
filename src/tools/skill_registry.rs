@@ -966,7 +966,7 @@ impl SkillRegistry {
     pub fn sync_to_oxigraph(&self, blackboard: &Blackboard) -> Result<usize, CoreError> {
         use std::fmt::Write;
         let skills = self.list_all_skills();
-        let mut sparql = String::from("PREFIX skill: <https://agent-harness.os/skill#>\n");
+        let mut sparql = String::from("PREFIX skill: <https://agent-os.org/ontology/skill#>\n");
         for s in &skills {
             let iri = &s.skill_iri;
             let name = s.name.replace('\\', "\\\\").replace('\'', "\\'");
@@ -997,7 +997,7 @@ impl SkillRegistry {
     ) -> Result<Vec<SkillMeta>, CoreError> {
         let safe_query = query.replace('\'', "\\'");
         let sparql = format!(
-            "PREFIX skill: <https://agent-harness.os/skill#>
+            "PREFIX skill: <https://agent-os.org/ontology/skill#>
              SELECT ?iri ?name ?desc ?cat ?sec WHERE {{
                GRAPH <system:skills> {{
                  ?iri a skill:RegisteredSkill ;
@@ -1103,7 +1103,7 @@ impl SkillRegistry {
             .unwrap_or_default();
         context_map.insert(
             "schema".to_string(),
-            serde_json::json!("https://agent-harness.os/schema#"),
+            serde_json::json!("https://agent-os.org/ontology/schema#"),
         );
 
         let mut input_props = serde_json::Map::new();

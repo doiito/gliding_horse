@@ -1189,7 +1189,7 @@ impl CodeCliEngine {
         // This gives the KG auto-growing task records queryable via SPARQL.
         {
             use std::fmt::Write as FmtWrite;
-            let mut sparql = String::from("PREFIX task: <https://agent-harness.os/task#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n");
+            let mut sparql = String::from("PREFIX task: <https://agent-os.org/ontology/task#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n");
             let escape_sparql = |s: &str| -> String {
                 s.replace('\\', "\\\\")
                     .replace('\'', "\\'")
@@ -1533,7 +1533,7 @@ impl CodeCliEngine {
     fn write_task_metadata(&self, task_iri: &str, user_input: &str, result: &TaskResult) {
         use std::fmt::Write as FmtWrite;
         let mut sparql = String::from(
-            "PREFIX task: <https://agent-harness.os/task#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n"
+            "PREFIX task: <https://agent-os.org/ontology/task#>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n"
         );
         let escape_sparql = |s: &str| -> String {
             s.replace('\\', "\\\\")

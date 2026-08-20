@@ -50,9 +50,9 @@ impl KnowledgeBridge {
 
     fn relation_to_iri(relation: &BridgeRelationType) -> &'static str {
         match relation {
-            BridgeRelationType::HasSkill => "https://agentos.ontology/bridge/hasSkill",
-            BridgeRelationType::ApplicableIn => "https://agentos.ontology/bridge/applicableIn",
-            BridgeRelationType::RelatedTo => "https://agentos.ontology/bridge/relatedTo",
+            BridgeRelationType::HasSkill => "https://agent-os.org/ontology/bridge/hasSkill",
+            BridgeRelationType::ApplicableIn => "https://agent-os.org/ontology/bridge/applicableIn",
+            BridgeRelationType::RelatedTo => "https://agent-os.org/ontology/bridge/relatedTo",
         }
     }
 
@@ -233,7 +233,7 @@ mod tests {
             .unwrap();
 
         // Then: the data must be visible through the original kg_store
-        let sparql = "SELECT ?skill WHERE { <iri://entity/entity_shared> <https://agentos.ontology/bridge/hasSkill> ?skill }";
+        let sparql = "SELECT ?skill WHERE { <iri://entity/entity_shared> <https://agent-os.org/ontology/bridge/hasSkill> ?skill }";
         let results = kg_store.query_sparql(sparql, Some("graph:bridge")).unwrap();
         let skills: Vec<&str> = results
             .iter()

@@ -130,7 +130,7 @@ fn compute_sha256(content: &str) -> String {
 fn get_cached_hash(store: &KnowledgeGraphStore, file_path: &str, graph: &str) -> Option<String> {
     let subject_iri = format!("iri://entity/file:{}", file_path);
     let sparql = format!(
-        "SELECT ?hash WHERE {{ GRAPH <{}> {{ <{}> <https://agentos.ontology/meta/contentHash> ?hash . }} }}",
+        "SELECT ?hash WHERE {{ GRAPH <{}> {{ <{}> <https://agent-os.org/ontology/meta/contentHash> ?hash . }} }}",
         graph, subject_iri
     );
     match store.query_sparql(&sparql, None) {
@@ -286,7 +286,7 @@ impl CodeAstExtractor {
         entities.push(AstEntity {
             id: file_entity_id.clone(),
             label: file_path.to_string(),
-            entity_type: "https://agentos.ontology/code/SourceFile".to_string(),
+            entity_type: "https://agent-os.org/ontology/code/SourceFile".to_string(),
             description: Some(format!("{} source file", lang.name())),
             properties: {
                 let mut props = HashMap::new();
@@ -316,7 +316,7 @@ impl CodeAstExtractor {
                 relations.push(AstRelation {
                     source: file_entity_id.clone(),
                     target: entity.id.clone(),
-                    relation: "https://agentos.ontology/code/contains".to_string(),
+                    relation: "https://agent-os.org/ontology/code/contains".to_string(),
                 });
             }
         }
@@ -403,7 +403,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Function".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
                             description: Some(format!("fn {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -427,7 +427,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Struct".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Struct".to_string(),
                             description: Some(format!("struct {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -446,7 +446,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Enum".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Enum".to_string(),
                             description: Some(format!("enum {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -465,7 +465,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Trait".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Trait".to_string(),
                             description: Some(format!("trait {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -495,12 +495,12 @@ impl CodeAstExtractor {
                             relations.push(AstRelation {
                                 source: type_id,
                                 target: trait_id,
-                                relation: "https://agentos.ontology/code/implements".to_string(),
+                                relation: "https://agent-os.org/ontology/code/implements".to_string(),
                             });
                             entities.push(AstEntity {
                                 id: impl_id,
                                 label: format!("impl {} for {}", trait_name, type_name),
-                                entity_type: "https://agentos.ontology/code/Impl".to_string(),
+                                entity_type: "https://agent-os.org/ontology/code/Impl".to_string(),
                                 description: Some(format!("impl {} for {}", trait_name, type_name)),
                                 properties: HashMap::new(),
                                 source_location: Some(format!(
@@ -526,7 +526,7 @@ impl CodeAstExtractor {
                                 entities.push(AstEntity {
                                     id: id.clone(),
                                     label: name.clone(),
-                                    entity_type: "https://agentos.ontology/code/Method".to_string(),
+                                    entity_type: "https://agent-os.org/ontology/code/Method".to_string(),
                                     description: Some(format!("method {}", name)),
                                     properties: HashMap::new(),
                                     source_location: Some(format!(
@@ -555,7 +555,7 @@ impl CodeAstExtractor {
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: use_text.clone(),
-                        entity_type: "https://agentos.ontology/code/Import".to_string(),
+                        entity_type: "https://agent-os.org/ontology/code/Import".to_string(),
                         description: Some(use_text),
                         properties: HashMap::new(),
                         source_location: Some(format!(
@@ -606,7 +606,7 @@ impl CodeAstExtractor {
                 relations.push(AstRelation {
                     source: caller_id.to_string(),
                     target: callee_id,
-                    relation: "https://agentos.ontology/code/calls".to_string(),
+                    relation: "https://agent-os.org/ontology/code/calls".to_string(),
                 });
             }
         }
@@ -655,7 +655,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Function".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
                             description: Some(format!("def {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -677,7 +677,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Class".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Class".to_string(),
                             description: Some(format!("class {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -697,7 +697,7 @@ impl CodeAstExtractor {
                                     relations.push(AstRelation {
                                         source: id.clone(),
                                         target: parent_id,
-                                        relation: "https://agentos.ontology/code/inherits"
+                                        relation: "https://agent-os.org/ontology/code/inherits"
                                             .to_string(),
                                     });
                                 }
@@ -716,7 +716,7 @@ impl CodeAstExtractor {
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
-                        entity_type: "https://agentos.ontology/code/Import".to_string(),
+                        entity_type: "https://agent-os.org/ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
                         source_location: Some(format!(
@@ -778,7 +778,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Function".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
                             description: Some(format!("function {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -805,7 +805,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Class".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Class".to_string(),
                             description: Some(format!("class {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -824,7 +824,7 @@ impl CodeAstExtractor {
                                     relations.push(AstRelation {
                                         source: id.clone(),
                                         target: parent_id,
-                                        relation: "https://agentos.ontology/code/inherits"
+                                        relation: "https://agent-os.org/ontology/code/inherits"
                                             .to_string(),
                                     });
                                 }
@@ -844,7 +844,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Method".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Method".to_string(),
                             description: Some(format!("method {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -866,7 +866,7 @@ impl CodeAstExtractor {
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
-                        entity_type: "https://agentos.ontology/code/Import".to_string(),
+                        entity_type: "https://agent-os.org/ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
                         source_location: Some(format!(
@@ -892,7 +892,7 @@ impl CodeAstExtractor {
                             entities.push(AstEntity {
                                 id: id.clone(),
                                 label: name.clone(),
-                                entity_type: "https://agentos.ontology/code/Function".to_string(),
+                                entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
                                 description: Some(format!("const {} = () => ...", name)),
                                 properties: HashMap::new(),
                                 source_location: Some(format!(
@@ -916,7 +916,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Interface".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Interface".to_string(),
                             description: Some(format!("interface {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -935,7 +935,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/TypeAlias".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/TypeAlias".to_string(),
                             description: Some(format!("type {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -998,7 +998,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Function".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
                             description: Some(format!("func {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -1029,7 +1029,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Method".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Method".to_string(),
                             description: Some(format!("method {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -1051,9 +1051,9 @@ impl CodeAstExtractor {
                                     .map(|t| t.kind().to_string())
                                     .unwrap_or_default();
                                 let entity_type = match type_kind.as_str() {
-                                    "struct_type" => "https://agentos.ontology/code/Struct",
-                                    "interface_type" => "https://agentos.ontology/code/Interface",
-                                    _ => "https://agentos.ontology/code/Type",
+                                    "struct_type" => "https://agent-os.org/ontology/code/Struct",
+                                    "interface_type" => "https://agent-os.org/ontology/code/Interface",
+                                    _ => "https://agent-os.org/ontology/code/Type",
                                 };
                                 let id = Self::make_id(
                                     "type",
@@ -1088,7 +1088,7 @@ impl CodeAstExtractor {
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
-                        entity_type: "https://agentos.ontology/code/Import".to_string(),
+                        entity_type: "https://agent-os.org/ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
                         source_location: Some(format!(
@@ -1146,9 +1146,9 @@ impl CodeAstExtractor {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
                         let entity_type = match node.kind() {
-                            "enum_declaration" => "https://agentos.ontology/code/Enum",
-                            "record_declaration" => "https://agentos.ontology/code/Record",
-                            _ => "https://agentos.ontology/code/Class",
+                            "enum_declaration" => "https://agent-os.org/ontology/code/Enum",
+                            "record_declaration" => "https://agent-os.org/ontology/code/Record",
+                            _ => "https://agent-os.org/ontology/code/Class",
                         };
                         let id =
                             Self::make_id("class", file_path, &name, node.start_position().row + 1);
@@ -1175,7 +1175,7 @@ impl CodeAstExtractor {
                             relations.push(AstRelation {
                                 source: id.clone(),
                                 target: parent_id,
-                                relation: "https://agentos.ontology/code/inherits".to_string(),
+                                relation: "https://agent-os.org/ontology/code/inherits".to_string(),
                             });
                         }
 
@@ -1189,7 +1189,7 @@ impl CodeAstExtractor {
                                     relations.push(AstRelation {
                                         source: id.clone(),
                                         target: iface_id,
-                                        relation: "https://agentos.ontology/code/implements"
+                                        relation: "https://agent-os.org/ontology/code/implements"
                                             .to_string(),
                                     });
                                 }
@@ -1209,7 +1209,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Interface".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Interface".to_string(),
                             description: Some(format!("interface {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -1232,7 +1232,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Method".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Method".to_string(),
                             description: Some(format!("method {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -1262,7 +1262,7 @@ impl CodeAstExtractor {
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: import_text.clone(),
-                        entity_type: "https://agentos.ontology/code/Import".to_string(),
+                        entity_type: "https://agent-os.org/ontology/code/Import".to_string(),
                         description: Some(import_text),
                         properties: HashMap::new(),
                         source_location: Some(format!(
@@ -1336,7 +1336,7 @@ impl CodeAstExtractor {
                         entities.push(AstEntity {
                             id: id.clone(),
                             label: name.clone(),
-                            entity_type: "https://agentos.ontology/code/Function".to_string(),
+                            entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
                             description: Some(format!("function {}", name)),
                             properties: HashMap::new(),
                             source_location: Some(format!(
@@ -1359,9 +1359,9 @@ impl CodeAstExtractor {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         let name = Self::node_text(&name_node, source).to_string();
                         let entity_type = if node.kind() == "class_specifier" {
-                            "https://agentos.ontology/code/Class"
+                            "https://agent-os.org/ontology/code/Class"
                         } else {
-                            "https://agentos.ontology/code/Struct"
+                            "https://agent-os.org/ontology/code/Struct"
                         };
                         let id =
                             Self::make_id("class", file_path, &name, node.start_position().row + 1);
@@ -1394,7 +1394,7 @@ impl CodeAstExtractor {
                     entities.push(AstEntity {
                         id: id.clone(),
                         label: include_text.clone(),
-                        entity_type: "https://agentos.ontology/code/Import".to_string(),
+                        entity_type: "https://agent-os.org/ontology/code/Import".to_string(),
                         description: Some(include_text),
                         properties: HashMap::new(),
                         source_location: Some(format!(
@@ -1453,7 +1453,7 @@ impl CodeAstExtractor {
                 relations.push(AstRelation {
                     source: caller_id.to_string(),
                     target: callee_id,
-                    relation: "https://agentos.ontology/code/calls".to_string(),
+                    relation: "https://agent-os.org/ontology/code/calls".to_string(),
                 });
             }
         }
@@ -1918,7 +1918,7 @@ class Child(Base):
         CodeAstExtractor::extract_incremental(path_str, graph, &store).unwrap();
 
         let count_sparql = format!(
-            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE {{ GRAPH <{}> {{ ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://agentos.ontology/code/Function> . }} }}",
+            "SELECT (COUNT(DISTINCT ?s) AS ?count) WHERE {{ GRAPH <{}> {{ ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://agent-os.org/ontology/code/Function> . }} }}",
             graph
         );
         let results = store.query_sparql(&count_sparql, None).unwrap();

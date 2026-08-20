@@ -415,8 +415,8 @@ fn filter_to_summary(node: &Value) -> Value {
 
 pub static PLAN_CONTEXT_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
     FrameTemplate::new(json!({
-        "exec": "https://agent-harness.os/exec#",
-        "task": "https://agent-harness.os/task#"
+        "exec": "https://agent-os.org/ontology/exec#",
+        "task": "https://agent-os.org/ontology/task#"
     }))
     .with_embed_rule("task:subTasks".to_string(), EmbedDirective::Always)
     .with_embed_rule("exec:assignedTo".to_string(), EmbedDirective::Link)
@@ -426,8 +426,8 @@ pub static PLAN_CONTEXT_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
 
 pub static DA_INPUT_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
     FrameTemplate::new(json!({
-        "exec": "https://agent-harness.os/exec#",
-        "task": "https://agent-harness.os/task#"
+        "exec": "https://agent-os.org/ontology/exec#",
+        "task": "https://agent-os.org/ontology/task#"
     }))
     .with_embed_rule("task:inputData".to_string(), EmbedDirective::Always)
     .with_embed_rule("task:resources".to_string(), EmbedDirective::Link)
@@ -437,8 +437,8 @@ pub static DA_INPUT_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
 
 pub static CA_REVIEW_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
     FrameTemplate::new(json!({
-        "exec": "https://agent-harness.os/exec#",
-        "task": "https://agent-harness.os/task#"
+        "exec": "https://agent-os.org/ontology/exec#",
+        "task": "https://agent-os.org/ontology/task#"
     }))
     .with_embed_rule("exec:results".to_string(), EmbedDirective::Always)
     .with_embed_rule("exec:validationRules".to_string(), EmbedDirective::Always)
@@ -448,8 +448,8 @@ pub static CA_REVIEW_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
 
 pub static AA_DECISION_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
     FrameTemplate::new(json!({
-        "exec": "https://agent-harness.os/exec#",
-        "task": "https://agent-harness.os/task#"
+        "exec": "https://agent-os.org/ontology/exec#",
+        "task": "https://agent-os.org/ontology/task#"
     }))
     .with_embed_rule("exec:reviewResults".to_string(), EmbedDirective::Always)
     .with_embed_rule("exec:alternatives".to_string(), EmbedDirective::Link)
@@ -459,7 +459,7 @@ pub static AA_DECISION_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
 
 pub static SUMMARY_ONLY_FRAME: Lazy<FrameTemplate> = Lazy::new(|| {
     FrameTemplate::new(json!({
-        "agent": "https://agent-harness.os/agent#"
+        "agent": "https://agent-os.org/ontology/agent#"
     }))
     .with_embed_rule("agent:summary".to_string(), EmbedDirective::Always)
     .with_embed_rule("agent:pinnedIRIs".to_string(), EmbedDirective::Link)

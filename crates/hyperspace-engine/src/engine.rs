@@ -22,7 +22,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -36,6 +36,7 @@ use crate::jsonld_meta::JsonLdMetadataIndex;
 use crate::metric::{metric_from_kind, Metric};
 use crate::snapshot::{self, EngineSnapshot};
 use crate::storage::VectorStore;
+use crate::tangent::{is_poincare, TangentCache};
 use crate::wal::{EngineWal, WalOp, WalSyncMode};
 
 // ── SearchHit ────────────────────────────────────────────────────────────────
@@ -187,14 +188,44 @@ impl Searcher {
                 if ann_results.len() >= expected {
                     ann_results
                 } else {
-                    let mut exact = allowed
-                        .iter()
-                        .filter_map(|id| {
-                            self.vectors
-                                .get(&id)
-                                .map(|vector| (id, self.index.metric().distance(query, vector)))
-                        })
-                        .collect::<Vec<_>>();
+                    // P6#8: tangent-space pruning for Poincaré — build a tangent
+                    // cache over the allowed set, prune candidates, then exact
+                    // re-rank within the pruned candidate set.
+                    let mut exact = if is_poincare(&self.index.metric().kind())
+                        && allowed.len() as usize > top_k
+                    {
+                        let mut id_vecs: Vec<(u32, EmbeddingVector)> = allowed
+                            .iter()
+                            .filter_map(|id| {
+                                self.vectors
+                                    .get(&id)
+                                    .map(|v| (id, v.clone()))
+                            })
+                            .collect();
+                        id_vecs.sort_by_key(|(id, _)| *id);
+                        let ids: Vec<u32> = id_vecs.iter().map(|(id, _)| *id).collect();
+                        let vectors: Vec<EmbeddingVector> =
+                            id_vecs.into_iter().map(|(_, v)| v).collect();
+                        let cache = TangentCache::build(&vectors, 1.0);
+                        cache
+                            .search_with_pruning(query, &ids, top_k, 2)
+                            .into_iter()
+                            .filter_map(|id| {
+                                self.vectors.get(&id).map(|vector| {
+                                    (id, self.index.metric().distance(query, vector))
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        allowed
+                            .iter()
+                            .filter_map(|id| {
+                                self.vectors
+                                    .get(&id)
+                                    .map(|vector| (id, self.index.metric().distance(query, vector)))
+                            })
+                            .collect::<Vec<_>>()
+                    };
                     exact.sort_by(|left, right| {
                         left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal)
                     });
@@ -295,7 +326,9 @@ pub struct HyperspaceEngineImpl {
     /// Serializes mutations with checkpoint creation so a snapshot cannot be
     /// taken between a WAL append and its in-memory application (or vice versa).
     write_barrier: Mutex<()>,
-    inner: Mutex<EngineInner>,
+    /// RwLock over the index/store: searches take the read lock (concurrent),
+    /// mutations take the write lock.
+    inner: RwLock<EngineInner>,
     metadata: JsonLdMetadataIndex,
     iri_registry: Mutex<IriRegistry>,
     wal: EngineWal,
@@ -322,7 +355,7 @@ impl HyperspaceEngineImpl {
 
         let engine = Self {
             write_barrier: Mutex::new(()),
-            inner: Mutex::new(EngineInner {
+            inner: RwLock::new(EngineInner {
                 index,
                 store,
                 clock: 0,
@@ -346,7 +379,7 @@ impl HyperspaceEngineImpl {
                         snap.nodes.len(),
                         snap.clock
                     );
-                    let mut inner = engine.inner.lock().unwrap();
+                    let mut inner = engine.inner.write().unwrap();
                     let metric_kind = inner.index.metric().kind();
                     inner.index.import_nodes(snap.nodes.clone());
                     inner.clock = snap.clock;
@@ -389,7 +422,7 @@ impl HyperspaceEngineImpl {
     fn recover(&self) -> Result<(), EngineError> {
         let mut wal_paths = self.wal.frozen_paths()?;
         wal_paths.push(self.wal.active_path().to_owned());
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let mut recovered = 0u64;
 
         for wal_path in wal_paths {
@@ -466,7 +499,7 @@ impl HyperspaceEngineImpl {
     /// Create a Searcher (read-only snapshot) for concurrent querying.
     /// Note: O(n) — clones the HNSW index.
     pub fn searcher(&self) -> Searcher {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let metric_kind = inner.index.metric().kind();
         let mut new_index =
             IncrementalHNSW::new(metric_from_kind(metric_kind), self.config.clone());
@@ -509,7 +542,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                 iri: iri.to_string(),
             },
             {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.write().unwrap();
                 inner.clock += 1;
                 inner.clock
             },
@@ -518,7 +551,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         )?;
 
         // Apply to store + index + metadata
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         inner.index.remove(id);
         self.metadata.remove(id);
         inner.store.set(id, &bytes)?;
@@ -551,7 +584,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                 iri: iri.to_string(),
             },
             {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.write().unwrap();
                 inner.clock += 1;
                 inner.clock
             },
@@ -559,7 +592,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
             Some(&jsonld),
         )?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         // Replace all secondary state for this IRI; a VectorStore overwrite
         // alone cannot repair HNSW edges or metadata bitmap memberships.
         inner.index.remove(id);
@@ -588,7 +621,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                 iri: iri.to_string(),
             },
             {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = self.inner.write().unwrap();
                 inner.clock += 1;
                 inner.clock
             },
@@ -596,7 +629,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
             None,
         )?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         inner.store.remove(id);
         inner.index.remove(id);
         self.metadata.remove(id);
@@ -612,7 +645,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         top_k: usize,
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let results = match evaluate_filters(&self.metadata, filters) {
             FilterEvaluation::Unrestricted => inner.index.search(query, top_k),
             FilterEvaluation::Matched(allowed) => {
@@ -675,7 +708,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
     ) -> Result<Vec<SearchHit>, EngineError> {
         let allowed = evaluate_filters(&self.metadata, filters);
 
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
 
         // For hybrid search, text and struct use the same index.
         // In production, use separate indexes: one Cosine, one Poincaré.
@@ -762,7 +795,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         match id {
             None => Ok(None),
             Some(id) => {
-                let inner = self.inner.lock().unwrap();
+                let inner = self.inner.read().unwrap();
                 match inner.store.get(id) {
                     None => Ok(None),
                     Some(bytes) => {
@@ -825,7 +858,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
 
         // Phase 1: Build and persist a snapshot of the common clock.
         let (nodes, clock, iri_entries, forward_entries, deleted_ids) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.read().unwrap();
             let reg = self.iri_registry.lock().unwrap();
 
             let nodes = inner.index.export_nodes();
@@ -1334,6 +1367,40 @@ mod tests {
         let results = srch.search(&v(vec![1.0, 0.0, 0.0, 0.0]), 1);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].iri, "s:1");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_searches_share_read_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = std::sync::Arc::new(setup_async_engine(dir.path()));
+        for index in 0..32u32 {
+            let mut coords = vec![0.05; 4];
+            coords[(index % 4) as usize] = 1.0;
+            eng.insert(&format!("c:{}", index), v(coords), json!({"x": index}))
+                .await
+                .unwrap();
+        }
+
+        let query = v(vec![1.0, 0.0, 0.0, 0.0]);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let eng = eng.clone();
+            let query = query.clone();
+            handles.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    for _ in 0..20 {
+                        let results = eng.search(&query, 5, &[]).await.unwrap();
+                        assert!(!results.is_empty(), "concurrent search returned nothing");
+                    }
+                })
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[tokio::test]

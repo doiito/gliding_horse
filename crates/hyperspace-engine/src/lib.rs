@@ -20,7 +20,6 @@
 //!         └── JsonLdMetadataIndex (JSON-LD + RoaringBitmap filters)
 //! ```
 
-pub mod config;
 pub mod engine;
 pub mod error;
 pub mod filter;
@@ -35,7 +34,6 @@ pub mod tangent;
 pub mod wal;
 
 // Re-exports for convenience
-pub use config::HyperspaceEngineConfig;
 pub use engine::{HyperspaceEngine, HyperspaceEngineImpl, IriRegistry, SearchHit, Searcher};
 pub use error::EngineError;
 pub use filter::{compile_filter, CompiledFilter, FilterEvaluation, JsonLdFilter};

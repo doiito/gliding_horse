@@ -328,7 +328,7 @@ impl IncrementalHNSW {
     ///
     /// If `allowed` is Some, only returns IDs present in the bitmap.
     pub fn search_with_filter(
-        &mut self,
+        &self,
         query: &EmbeddingVector,
         top_k: usize,
         allowed: Option<&RoaringBitmap>,
@@ -369,7 +369,7 @@ impl IncrementalHNSW {
     }
 
     /// Legacy search interface (no filter).
-    pub fn search(&mut self, query: &EmbeddingVector, top_k: usize) -> Vec<(u32, f64)> {
+    pub fn search(&self, query: &EmbeddingVector, top_k: usize) -> Vec<(u32, f64)> {
         self.search_with_filter(query, top_k, None)
     }
 
@@ -410,7 +410,7 @@ impl IncrementalHNSW {
 
     /// Beam search at layer 0 for an external query.
     fn search_layer0_external(
-        &mut self,
+        &self,
         query: &EmbeddingVector,
         ef: usize,
         entry: u32,

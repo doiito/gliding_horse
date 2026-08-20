@@ -479,4 +479,82 @@ mod tests {
             .tool_definitions_for_role_with_allowlist("DA", Some(&disjoint))
             .is_empty());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_pkill_excludes_own_pid() {
+        rt().block_on(async {
+            // `pkill -f <our own cmdline fragment>` must NOT kill this test
+            // process (the agent itself). The wrapper resolves targets via
+            // pgrep and filters out the agent PID.
+            let self_pid = std::process::id();
+            let cmd = format!("pkill -f 'self_protect_marker_{}'", self_pid);
+            let result = super::builtins::execute_bash(json!({"command": cmd}))
+                .await
+                .unwrap();
+            // Exit code 1 = "no matching process" — correct: our own PID was
+            // filtered out, and nothing else matches the unique marker.
+            assert_eq!(result["exit_code"], 1, "own PID must be excluded: {:?}", result);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_pkill_still_kills_real_target() {
+        rt().block_on(async {
+            use std::process::Command;
+            // Spawn a real background sleep; pkill -f on a unique marker
+            // must still terminate it (protection only filters the agent).
+            let marker = format!("real_target_marker_{}", std::process::id());
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(format!("exec -a {} sleep 60", marker))
+                .spawn()
+                .expect("spawn sleep");
+            // Give it a moment to exec so the marker appears in argv[0].
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let cmd = format!("pkill -f '{}'", marker);
+            let result = super::builtins::execute_bash(json!({"command": cmd}))
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 0, "pkill should find the target: {:?}", result);
+            // The child must be gone shortly after.
+            for _ in 0..50 {
+                if let Ok(Some(status)) = child.try_wait() {
+                    assert!(!status.success() || status.code() != Some(0));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("target process was not killed");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_killall_excludes_own_pid() {
+        rt().block_on(async {
+            let self_pid = std::process::id();
+            // killall matches by process name; our unique name is not a real
+            // process, so exit 1 (nothing found) proves the wrapper didn't
+            // fall back to a broad match that would hit the test process.
+            let cmd = format!("killall nonexistent_agent_{} 2>/dev/null || true", self_pid);
+            let result = super::builtins::execute_bash(json!({"command": cmd}))
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 0);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_self_protect_plain_command_unchanged() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({"command": "printf ok"}))
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["stdout"], "ok");
+        });
+    }
 }

@@ -806,6 +806,13 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         use std::thread;
         let timeout_ms = params.timeout.unwrap_or(60_000);
 
+        // Self-protection: the DA often cleans up spawned processes with
+        // `pkill -f <name>`; because the agent's own command line embeds the
+        // task prompt (which may contain the same <name>), a full-command-line
+        // match kills the agent itself. Wrap the command so pkill/killall
+        // resolve targets via pgrep and exclude the agent PID + wrapper shell.
+        let guarded_command = self_protect_bash_command(&params.command);
+
         let spawn_child = |cmd: &str| -> Result<std::process::Child, String> {
             let mut c = Command::new("sh");
             c.arg("-c")
@@ -842,7 +849,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                 (out_buf, err_buf)
             };
 
-        let mut child = spawn_child(&params.command)?;
+        let mut child = spawn_child(&guarded_command)?;
         let (mut stdout_buf, mut stderr_buf) = spawn_readers(&mut child);
 
         let mut start = std::time::Instant::now();
@@ -877,7 +884,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                             );
                             let _ = child.kill();
                             kill_process_group(&child);
-                            child = spawn_child(&params.command)?;
+                            child = spawn_child(&guarded_command)?;
                             let (o, e) = spawn_readers(&mut child);
                             stdout_buf = o;
                             stderr_buf = e;
@@ -909,6 +916,62 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         };
         Ok(result)
     }
+}
+
+/// Guards a bash command against self-kill. The DA frequently cleans up
+/// spawned processes with `pkill -f <name>` / `killall <name>`; the agent's
+/// own process command line embeds the task prompt, which can contain the
+/// same `<name>` (e.g. a file the DA created and then pkill -f's). A plain
+/// full-command-line match then kills the agent OS process itself.
+///
+/// When the command mentions pkill/killall, we prepend shell function
+/// overrides that resolve targets via `pgrep` and exclude both the agent's
+/// own PID and the wrapper shell's PID before signaling.
+#[cfg(unix)]
+fn self_protect_bash_command(command: &str) -> String {
+    if !command.contains("pkill") && !command.contains("killall") {
+        return command.to_string();
+    }
+    let self_pid = std::process::id();
+    // pkill/killall drop-in: keep flags (signal, -f) but route matching
+    // through pgrep so we can filter out our own PID. `command pgrep`
+    // bypasses any function alias; `$$` is the wrapper shell PID.
+    format!(
+        r#"_agent_self_pid={self_pid}
+pkill() {{
+  local sig="TERM" f=""
+  for a in "$@"; do
+    case "$a" in
+      -[0-9]*|-SIG*) sig="${{a#-}}"; ;;
+      -f) f="-f"; ;;
+      -*) ;;
+      *) pat="$a"; ;;
+    esac
+  done
+  [ -z "${{pat:-}}" ] && return 1
+  local pids
+  pids="$(command pgrep $f -- "$pat" 2>/dev/null | grep -vw "$_agent_self_pid" | grep -vw "$$" || true)"
+  [ -z "$pids" ] && return 1
+  command kill "-$sig" $pids 2>/dev/null
+}}
+killall() {{
+  local sig="TERM"
+  for a in "$@"; do
+    case "$a" in
+      -[0-9]*|-SIG*) sig="${{a#-}}"; ;;
+      -*) ;;
+      *) pat="$a"; ;;
+    esac
+  done
+  [ -z "${{pat:-}}" ] && return 1
+  local pids
+  pids="$(command pgrep -- "$pat" 2>/dev/null | grep -vw "$_agent_self_pid" | grep -vw "$$" || true)"
+  [ -z "$pids" ] && return 1
+  command kill "-$sig" $pids 2>/dev/null
+}}
+{command}
+"#
+    )
 }
 
 #[cfg(unix)]

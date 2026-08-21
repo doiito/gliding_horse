@@ -592,7 +592,17 @@ impl ToolExecutor {
             "Execute a shell command. Use for running python, pytest, etc.\n\nOUTPUT MANAGEMENT (mandatory):\n- If the command may produce >100 lines of output, pipe through | head -N or | grep <keyword> to limit results\n- Use | tail -N for recent entries, | wc -l to count first, | grep -c to match-count\n- For file searches, constrain the path (e.g. grep ... path/) instead of searching the entire workspace\n- The output will be truncated at 16KB if too large; always filter proactively to avoid losing data"
         };
         self.register("bash", bash_desc, json!({
-            "properties": {"command": {"type":"string","description":"Shell command to run"},"description": {"type":"string","description":"What this command does"},"timeout": {"type":"integer","description":"Timeout in milliseconds"}},
+            "properties": {
+                "command": {"type":"string","description":"Shell command to run"},
+                "description": {"type":"string","description":"What this command does"},
+                "timeout": {"type":"integer","description":"Timeout in milliseconds"},
+                "run_in_background": {"type":"boolean","description":"Spawn detached and return a task id immediately (default false)"},
+                "dangerouslyDisableSandbox": {"type":"boolean","description":"Run outside the sandbox. Only use when the command cannot work sandboxed and you are certain it is safe"},
+                "namespaceRestrictions": {"type":"boolean","description":"Enable user/mount/pid namespace isolation via unshare (default true when sandbox enabled)"},
+                "isolateNetwork": {"type":"boolean","description":"Isolate network via a new network namespace (default false)"},
+                "filesystemMode": {"type":"string","enum":["off","workspace-only","allow-list"],"description":"Filesystem isolation level (default workspace-only)"},
+                "allowedMounts": {"type":"array","items":{"type":"string"},"description":"Additional paths allowed when filesystemMode is allow-list"}
+            },
             "required": ["command"]
         }), Arc::new(|input: Value| Box::pin(async move { builtins::execute_bash(input).await })), all);
         let ws_edit = self.workspace_monitor.clone();

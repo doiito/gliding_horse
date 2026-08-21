@@ -16,7 +16,7 @@
 ┌────────────────────────────────────┼────────────────────────────────┐
 │                    Edge Daemon (Rust)                               │
 │  ┌───────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
-│  │  API Server   │  │  Agent Core  │  │  Sandbox (Docker)        │  │
+│  │  API Server   │  │  Agent Core  │  │  Sandbox (Docker, 预留)   │  │
 │  │  (axum)       │──│  (SA/DA)     │──│  - 安全执行环境          │  │
 │  │  /api/health  │  │  LLM Client  │  │  - 代码编译/测试         │  │
 │  │  /api/chat    │  │  async-openai│  │  - 文件操作              │  │
@@ -53,7 +53,7 @@
 | 层级 | 语言 | 框架 | 职责 |
 |------|------|------|------|
 | **Center** | Go 1.25+ | Gin + Temporal + gRPC | 工作流编排、项目管理、Agent 注册、API 网关 |
-| **Edge Daemon** | Rust 1.94+ | axum + async-openai + bollard | 本地 LLM 执行、Docker 沙箱、图数据缓存、VS Code 通信 |
+| **Edge Daemon** | Rust 1.94+ | axum + async-openai + bollard | 本地 LLM 执行、Docker 沙箱（重型隔离，预留）、图数据缓存、VS Code 通信 |
 | **VS Code Plugin** | TypeScript | VS Code API + WebSocket | 开发者交互界面、任务视图、实时日志、图可视化 |
 
 ## 目录结构
@@ -143,7 +143,7 @@ software_engineering_golang_team/
 │   │   │   │   ├── local_store.rs # sled 持久化
 │   │   │   │   ├── delta.rs     # 变更追踪
 │   │   │   │   └── sync.rs      # 中心同步
-│   │   │   └── sandbox/         # Docker 沙箱
+│   │   │   └── sandbox/         # Docker 沙箱（重型隔离，预留；主仓 unshare 沙盒为默认轻量级）
 │   │   │       ├── mod.rs
 │   │   │       └── manage.rs    # 容器生命周期
 │   │   ├── Cargo.toml
@@ -170,7 +170,7 @@ software_engineering_golang_team/
 - Go 1.25+
 - Rust 1.94+
 - Cargo（Rust 工具链）
-- Docker（沙箱执行）
+- Docker（沙箱执行，重型隔离——预留；默认命令沙盒走主仓 unshare 进程级隔离）
 - Temporal Server（工作流引擎）
 
 ### 配置
@@ -263,7 +263,7 @@ llm:
 
 sandbox:
   docker_socket: "/var/run/docker.sock"  # Docker 套接字路径
-  default_image: "ubuntu:22.04"          # 默认沙箱镜像
+  default_image: "ubuntu:22.04"          # 默认沙箱镜像（重型容器级隔离，预留）
 
 graph:
   db_path: "./data/graph"  # 本地图数据库路径

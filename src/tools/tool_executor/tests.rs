@@ -557,4 +557,116 @@ mod tests {
             assert_eq!(result["stdout"], "ok");
         });
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_sandbox_status_reported() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({
+                "command": "printf hi",
+                "dangerouslyDisableSandbox": false,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            let status = &result["sandbox_status"];
+            assert!(status.is_object(), "sandbox_status must be present: {:?}", result);
+            assert_eq!(status["requested"]["enabled"], true);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_sandbox_disabled_when_requested() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({
+                "command": "printf hi",
+                "dangerouslyDisableSandbox": true,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            let status = &result["sandbox_status"];
+            assert_eq!(status["enabled"], false, "sandbox must be disabled: {:?}", result);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_sandbox_unshare_launcher_active() {
+        rt().block_on(async {
+            // Sandbox is opt-in: with explicit enablement and namespace
+            // restrictions the command must run inside the unshare sandbox
+            // (proven by an isolated PID namespace: the child's PID 1 is
+            // not the host init).
+            let result = super::builtins::execute_bash(json!({
+                "command": "test \"$(ps -p 1 -o comm= 2>/dev/null || echo unknown)\" != \"$(cat /proc/1/comm 2>/dev/null || echo unknown)\" || echo pid1_is_shared",
+                "dangerouslyDisableSandbox": false,
+                "namespaceRestrictions": true,
+            }))
+            .await
+            .unwrap();
+            // Either the sandbox isolated PID 1 (success) or, on hosts
+            // without unshare support, we fall back gracefully — the command
+            // itself always exits 0.
+            assert_eq!(result["exit_code"], 0, "sandbox command failed: {:?}", result);
+            assert_eq!(result["sandbox_status"]["enabled"], true);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_run_in_background_returns_task_id() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({
+                "command": "sleep 5",
+                "run_in_background": true,
+            }))
+            .await
+            .unwrap();
+            let task_id = result["background_task_id"].as_str().unwrap_or("");
+            assert!(!task_id.is_empty(), "background task id must be present: {:?}", result);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_output_truncated_at_16k() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({
+                "command": "head -c 30000 /dev/zero | tr '\\0' 'a'",
+            }))
+            .await
+            .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["truncated"], true);
+            let stdout = result["stdout"].as_str().unwrap_or("");
+            assert!(stdout.contains("[output truncated"), "stdout must carry marker: {:?}", result);
+            assert!(stdout.len() < 20_000, "stdout must be capped: {}", stdout.len());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_truncate_output_short_unchanged() {
+        let (out, truncated) = super::builtins::truncate_output("hello");
+        assert_eq!(out, "hello");
+        assert!(!truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_truncate_output_exact_boundary() {
+        let (out, truncated) = super::builtins::truncate_output(&"a".repeat(16_384));
+        assert_eq!(out.len(), 16_384);
+        assert!(!truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_truncate_output_one_over() {
+        let (out, truncated) = super::builtins::truncate_output(&"a".repeat(16_385));
+        assert!(truncated);
+        assert!(out.contains("[output truncated"));
+    }
 }

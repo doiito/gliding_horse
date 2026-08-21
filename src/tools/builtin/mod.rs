@@ -1,4 +1,3 @@
-pub mod bash;
 pub mod file_ops;
 pub mod hooks;
 pub mod knowledge;

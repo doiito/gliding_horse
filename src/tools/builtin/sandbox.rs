@@ -158,6 +158,17 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
+/// Create the sandbox working directories under `cwd` (idempotent).
+/// Returns the resolved `.sandbox-home` / `.sandbox-tmp` paths.
+#[must_use]
+pub fn ensure_sandbox_dirs(cwd: &Path) -> (PathBuf, PathBuf) {
+    let home = cwd.join(".sandbox-home");
+    let tmp = cwd.join(".sandbox-tmp");
+    let _ = fs::create_dir_all(&home);
+    let _ = fs::create_dir_all(&tmp);
+    (home, tmp)
+}
+
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();

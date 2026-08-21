@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Opt-in unshare sandbox for the bash tool**: the registered `ToolExecutor` bash now supports per-command sandboxing via `dangerouslyDisableSandbox` / `namespaceRestrictions` / `isolateNetwork` / `filesystemMode` / `allowedMounts` overrides. When enabled (opt-in, disabled by default to keep pkill/pgrep able to manage host processes across the namespace boundary), commands run under `unshare` (user/mount/pid/ipc/uts/net namespaces) with sandboxed `HOME`/`TMPDIR`. The effective `SandboxStatus` is returned in the `sandbox_status` field. Also migrated in: 16KB output truncation (`truncated` / `original_size` fields) and background execution (`run_in_background` → immediate `background_task_id`).
+  - `src/tools/tool_executor/builtins.rs` (+139), `src/tools/tool_executor/mod.rs` (bash schema), `src/tools/builtin/sandbox.rs` (+11, `ensure_sandbox_dirs`), `src/tools/tool_executor/tests.rs` (+112, 8 new tests)
+
+- **Bash pkill/killall self-protection**: commands mentioning `pkill`/`killall` are wrapped with shell-function overrides that resolve targets via `pgrep` and exclude the agent's own PID and the wrapper shell PID before signaling — the DA can clean up spawned processes without killing the agent OS process itself (whose command line embeds the task prompt, including the same file names it pkill -f's).
+  - `src/tools/tool_executor/builtins.rs` (4 unit tests)
+
+### Changed
+
+- **Unified bash implementation**: the sandbox-capable orphan `src/tools/builtin/bash.rs` (352 lines, zero callers) was merged into the registered `tool_executor` bash — the single bash now carries sandboxing, truncation, background execution, pkill self-protection, timeout retry, process-group management, permission policy/hooks integration, and Windows PowerShell delegation together, eliminating the previous split where security lived on the live path and isolation on a dead one.
+  - `src/tools/tool_executor/builtins.rs`
+
+### Removed
+
+- **`src/tools/builtin/bash.rs`**: deleted after its capabilities were migrated into `tool_executor`; `pub mod bash` removed from `src/tools/builtin/mod.rs`. `src/tools/builtin/sandbox.rs` remains as a pure logic library (container detection, status resolution, unshare launcher construction, `ensure_sandbox_dirs`).
+
+- **Edge daemon Docker sandbox repositioned (not removed)**: `SandboxManager` (container lifecycle: create/exec/destroy/list) is retained and documented as the reserved heavy-weight container isolation layer — complementary to the process-level unshare sandbox, not a replacement. Wired into nothing yet; enabling requires instantiating it in the daemon agent execution path.
+  - `apps/software_engineering_team/edge/daemon/src/sandbox/mod.rs` (module doc), `apps/software_engineering_team/README.md`
+
+### Added
+
 - **Methodology usage-window settlement**: `MethodologyGate` now captures a settled `MethodologyUsageRecord` (methodology → task → agent → success/duration/error) for every activation window opened at `SkillBefore` and closed at `SkillAfter` (success) or `TaskError` (failure). Settled methodologies leave the active set so the next qualifying tool call re-activates them. `usage_history()` / `usage_count()` expose the records.
   - `src/methodology/gate.rs` (+443), `tests/verify_gate_activation.rs` (new, runtime activation verification)
 

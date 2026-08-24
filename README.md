@@ -262,6 +262,10 @@ export EXA_API_KEY="your-exa-api-key"
 # With MCP server attached
 ./glidingcode --mcp-server chrome=http://localhost:3000/sse
 
+# Optional: use Parallel Search MCP (no account or API key required)
+# Chosen queries and requested URLs are sent to Parallel.
+./glidingcode --mcp-server parallel-search=https://search.parallel.ai/mcp
+
 # Resume from checkpoint
 ./glidingcode --resume task:abc123
 ```

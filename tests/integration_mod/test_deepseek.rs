@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "live-tests"), allow(dead_code, unused_imports))]
+
 use glidinghorse::config::GatewaySettings;
 use glidinghorse::gateway::UnifiedGateway;
 use std::sync::Arc;
@@ -26,7 +28,7 @@ fn get_gateway() -> Arc<UnifiedGateway> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_deepseek_chat_completion() {
     let gateway = get_gateway();
 
@@ -52,7 +54,7 @@ async fn test_deepseek_chat_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_deepseek_sa_workflow() {
     let gateway = get_gateway();
 
@@ -83,7 +85,7 @@ async fn test_deepseek_sa_workflow() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_deepseek_with_tools() {
     let gateway = get_gateway();
 

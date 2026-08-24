@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "live-tests"), allow(dead_code, unused_imports))]
+
 use std::sync::Arc;
 
 use glidinghorse::config::settings::LoggingSettings;
@@ -130,7 +132,7 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
 /// AI Agent 调研任务测试 - 探索性任务
 /// 任务：调研并对比多种 AI Agent 框架
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_research_ai_agent_frameworks() {
     init_e2e_logging();
 
@@ -223,7 +225,7 @@ Save the complete research report to /tmp/agent_os_e2e/ai_agent_research.md
 /// AI Agent 安防场景调研 - 标准任务
 /// 任务：调研 AI Agent 在安防监控场景的应用
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_research_security_agents() {
     init_e2e_logging();
 
@@ -305,7 +307,7 @@ async fn test_e2e_research_security_agents() {
 /// 复杂编程 + 调研混合任务
 /// 任务：调研 Rust Web 框架并创建一个简单的 HTTP 服务
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_research_and_code_rust_web() {
     init_e2e_logging();
 

@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "live-tests"), allow(dead_code, unused_imports))]
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -50,7 +52,7 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
     let tmpl = Arc::new(TemplateEngine::new(&templates_dir).unwrap());
     let skills = Arc::new(SkillRegistry::new());
     let agent_settings = AgentSettings::default();
-    let runner = Arc::new(AgentRunner::new(
+    let mut runner = Arc::new(AgentRunner::new(
         gateway,
         skills.clone(),
         l2.clone(),
@@ -59,6 +61,11 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
         tmpl.clone(),
         agent_settings,
     ));
+    let e2e_workspace = std::path::PathBuf::from("target/agent_os_e2e");
+    std::fs::create_dir_all(&e2e_workspace).unwrap();
+    Arc::get_mut(&mut runner)
+        .expect("runner must be uniquely owned during test setup")
+        .workspace_root = Some(e2e_workspace);
     let sa = SupervisorAgent::new(
         runner,
         tmpl,
@@ -103,7 +110,7 @@ fn build_runner() -> (Arc<AgentRunner>, TempDir) {
     let tmpl = Arc::new(TemplateEngine::new(&templates_dir).unwrap());
     let skills = Arc::new(SkillRegistry::new());
     let agent_settings = AgentSettings::default();
-    let runner = Arc::new(AgentRunner::new(
+    let mut runner = Arc::new(AgentRunner::new(
         gateway,
         skills.clone(),
         l2,
@@ -112,11 +119,16 @@ fn build_runner() -> (Arc<AgentRunner>, TempDir) {
         tmpl.clone(),
         agent_settings,
     ));
+    let e2e_workspace = std::path::PathBuf::from("target/agent_os_e2e");
+    std::fs::create_dir_all(&e2e_workspace).unwrap();
+    Arc::get_mut(&mut runner)
+        .expect("runner must be uniquely owned during test setup")
+        .workspace_root = Some(e2e_workspace);
     (runner, dir)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_da_single_agent_programming() {
     let (runner, _dir) = build_runner();
 
@@ -127,7 +139,7 @@ async fn test_e2e_da_single_agent_programming() {
 
     let ctx = TaskContext::new(
         "iri://task/e2e_da",
-        "Write a Python function that checks if a number is prime. Save it to /tmp/agent_os_e2e/prime.py and test it with the number 17.",
+        "Write a Python function that checks if a number is prime. Save it to target/agent_os_e2e/prime.py and test it with the number 17.",
         8,
     );
 
@@ -150,7 +162,7 @@ async fn test_e2e_da_single_agent_programming() {
 
     assert_eq!(task_result.status, "success", "DA task should succeed");
 
-    let prime_path = Path::new("/tmp/agent_os_e2e/prime.py");
+    let prime_path = Path::new("target/agent_os_e2e/prime.py");
     if prime_path.exists() {
         let content = std::fs::read_to_string(prime_path).unwrap();
         eprintln!("=== Generated prime.py ===\n{}", content);
@@ -162,7 +174,7 @@ async fn test_e2e_da_single_agent_programming() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_sa_simple_task() {
     let (mut sa, _dir) = build_system(10);
 
@@ -189,12 +201,12 @@ async fn test_e2e_sa_simple_task() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_sa_programming_full_pipeline() {
-    std::fs::create_dir_all("/tmp/agent_os_e2e").ok();
+    std::fs::create_dir_all("target/agent_os_e2e").ok();
     let (mut sa, _dir) = build_system(10);
 
-    let user_input = "Write a Python function called 'fibonacci' that takes an integer n and returns the nth Fibonacci number. Save it to /tmp/agent_os_e2e/fibonacci.py and then run it with n=10 to verify it works correctly.";
+    let user_input = "Write a Python function called 'fibonacci' that takes an integer n and returns the nth Fibonacci number. Save it to target/agent_os_e2e/fibonacci.py and then run it with n=10 to verify it works correctly.";
 
     let task_iri = "iri://task/e2e_full";
     let result = sa.process_task(user_input, task_iri).await;
@@ -219,7 +231,7 @@ async fn test_e2e_sa_programming_full_pipeline() {
         "Task should not fail completely"
     );
 
-    let fib_path = Path::new("/tmp/agent_os_e2e/fibonacci.py");
+    let fib_path = Path::new("target/agent_os_e2e/fibonacci.py");
     if fib_path.exists() {
         let content = std::fs::read_to_string(fib_path).unwrap();
         eprintln!("=== Generated fibonacci.py ===\n{}", content);

@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "live-tests"), allow(dead_code, unused_imports))]
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -192,7 +194,7 @@ fn read_artifact_content(path: &str) -> Option<String> {
 /// 真正的端到端自主测试 - 编程任务
 /// 用户只输入一句话，系统自动完成：分析、规划、编码、测试、验证全流程
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_autonomous_programming_task() {
     init_e2e_logging();
 
@@ -233,7 +235,7 @@ async fn test_autonomous_programming_task() {
 /// 真正的端到端自主测试 - 数据分析任务
 /// 用户只输入一句话，系统自动完成：读取数据、分析、生成报告
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_autonomous_data_analysis_task() {
     init_e2e_logging();
 
@@ -272,7 +274,7 @@ async fn test_autonomous_data_analysis_task() {
 /// 真正的端到端自主测试 - 系统运维任务
 /// 用户只输入一句话，系统自动完成：检查系统状态、诊断问题、生成报告
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_autonomous_system_ops_task() {
     init_e2e_logging();
 
@@ -309,7 +311,7 @@ async fn test_autonomous_system_ops_task() {
 /// 真正的端到端自主测试 - 复杂多步骤任务
 /// 用户只输入一句话，系统自动完成：创建项目、编写代码、配置文件、测试验证
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_autonomous_full_project_task() {
     init_e2e_logging();
 
@@ -364,7 +366,7 @@ async fn test_autonomous_full_project_task() {
 /// 真正的端到端自主测试 - 调研任务
 /// 用户只输入一句话，系统自动完成：搜索、整理、生成报告
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_autonomous_research_task() {
     init_e2e_logging();
 
@@ -405,7 +407,7 @@ async fn test_autonomous_research_task() {
 /// 真正的端到端自主测试 - 极简提示词
 /// 测试系统对最简单提示词的理解和执行能力
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_autonomous_minimal_prompt() {
     init_e2e_logging();
 

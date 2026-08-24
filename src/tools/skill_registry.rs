@@ -134,6 +134,46 @@ impl SkillRegistry {
         for skill in Self::default_skills() {
             self.register_skill(skill);
         }
+        // Built-in tools are executable skills too.  Keep them in the
+        // canonical registry so tracked tool outcomes can feed the skill
+        // graph and evolution engine instead of being silently discarded.
+        for tool_name in [
+            "file_list",
+            "glob_search",
+            "grep_search",
+            "kg_search",
+            "knowledge_query",
+            "knowledge_neighbors",
+            "tool_search",
+            "codebase_search",
+            "workspace_status",
+            "rag_search",
+        ] {
+            self.register_skill(Self::builtin_tool_skill(tool_name));
+        }
+    }
+
+    fn builtin_tool_skill(tool_name: &str) -> SkillMeta {
+        SkillMeta {
+            skill_iri: format!("iri://skills/{tool_name}"),
+            name: tool_name.to_string(),
+            description: format!("Built-in executable tool: {tool_name}"),
+            version: "1.0.0".to_string(),
+            category: "builtin".to_string(),
+            security_level: "normal".to_string(),
+            allowed_roles: ["PA", "DA", "CA", "AA"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            input_schema: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
+            compiled_template: "{}".to_string(),
+            signature: None,
+            signature_algorithm: None,
+            input_mapping: HashMap::new(),
+            output_mapping: HashMap::new(),
+            skill_types: vec!["iri://skill-types/BuiltinTool".to_string()],
+        }
     }
 
     fn default_skills() -> Vec<SkillMeta> {
@@ -1265,6 +1305,17 @@ mod tests {
             Some("iri://skills/file_read")
         );
         assert_eq!(registry.skill_iri_for_tool_name("unknown_tool"), None);
+    }
+
+    #[test]
+    fn test_builtin_observability_tools_are_evolution_skills() {
+        let registry = SkillRegistry::new();
+        for tool in ["file_list", "glob_search", "kg_search", "knowledge_neighbors"] {
+            let iri = registry
+                .skill_iri_for_tool_name(tool)
+                .expect("built-in tool must resolve to a canonical skill IRI");
+            assert_eq!(iri, format!("iri://skills/{tool}"));
+        }
     }
 
     #[test]

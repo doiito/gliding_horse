@@ -510,7 +510,7 @@ impl ProactiveEngine {
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        if status == "success" || status == "failed" {
+        if matches!(status, "success" | "completed" | "partial_success" | "failed" | "timeout") {
             debug!(task = %task_iri, status = %status, "Extracting experience");
 
             let cache_key = Self::cache_key("task_start", task_iri);
@@ -537,7 +537,11 @@ impl ProactiveEngine {
                 experience_id: format!("exp_{}", uuid::Uuid::new_v4().hyphenated()),
                 scenario: scenario.clone(),
                 pattern: format!("task_{}", status),
-                success_rating: if status == "success" { 0.9 } else { 0.1 },
+                success_rating: match status {
+                    "success" | "completed" => 0.9,
+                    "partial_success" => 0.5,
+                    _ => 0.1,
+                },
                 tags,
                 created_at: Utc::now(),
             };
@@ -551,6 +555,15 @@ impl ProactiveEngine {
                 "success_rating": experience.success_rating,
                 "tags": &experience.tags,
             });
+            // Preserve outcome evidence with the experience so a later task
+            // can distinguish a reusable method from a mere summary.
+            if let Some(obj) = experience_json.as_object_mut() {
+                for key in ["turn_count", "tool_call_count", "errors", "tracked_actions"] {
+                    if let Some(value) = task_result.get(key) {
+                        obj.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
             if let Some(ref analysis) = task_analysis {
                 if let Some(obj) = experience_json.as_object_mut() {
                     obj.insert("complexity".to_string(), json!(analysis.complexity));
@@ -1085,6 +1098,28 @@ mod tests {
         let experience = engine.on_task_end(&task_result, "iri://task/2").await;
         assert!(experience.is_some());
         assert_eq!(experience.unwrap().success_rating, 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_completed_experience_preserves_execution_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let engine = ProactiveEngine::new(l0.clone(), test_event_bus());
+        let task_result = serde_json::json!({
+            "status": "completed",
+            "summary": "Reusable parser fix",
+            "turn_count": 4,
+            "tool_call_count": 2,
+            "errors": [],
+            "tracked_actions": [{"tool_name": "file_write", "status": "success"}]
+        });
+        let experience = engine.on_task_end(&task_result, "iri://task/completed").await;
+        assert_eq!(experience.as_ref().map(|e| e.success_rating), Some(0.9));
+        let entries = l0.search_by_tags(&["experience".to_string()]).unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.content.contains("tracked_actions")
+                && entry.content.contains("file_write")
+        }));
     }
 
     #[tokio::test]

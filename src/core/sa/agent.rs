@@ -22,6 +22,7 @@ use crate::templates::template_engine::TemplateEngine;
 use crate::tools::sharing::SharingProtocol;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::tools::tool_executor::ToolExecutor;
+use crate::core::policy_learning::ConstrainedPolicy;
 
 use super::types::CycleState;
 
@@ -58,6 +59,9 @@ pub struct SupervisorAgent {
     pub(super) approval_wait_secs: u64,
     /// Skill discovery engine for semantic skill search during planning
     pub(super) discovery_engine: Option<Arc<SkillDiscoveryEngine>>,
+    /// Constrained contextual policy; it may rank hints but never overrides
+    /// CA/AA, governance, security, or terminal-state rules.
+    pub(super) policy_learning: ConstrainedPolicy,
 }
 
 impl SupervisorAgent {
@@ -121,6 +125,7 @@ impl SupervisorAgent {
             execution_timeout_secs: 30,
             approval_wait_secs: 5,
             discovery_engine: None,
+            policy_learning: ConstrainedPolicy::default().with_persistence(runner.l0_store.clone()),
         }
     }
 

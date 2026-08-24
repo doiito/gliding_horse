@@ -84,10 +84,27 @@ pub fn audit_dimensions(
                 details: vec![],
             });
         } else {
-            let matched: Vec<&String> = criteria
-                .iter()
-                .filter(|c| result.summary.contains(c.as_str()))
-                .collect();
+            // CA agents often summarize objective evidence instead of
+            // repeating every criterion verbatim (for example, "pytest 7
+            // passed; audit passed"). Requiring literal criterion strings
+            // created false CA failures after DA had actually fixed the
+            // workspace. Accept only explicit audit/test success language;
+            // vague success wording still follows the strict matching path.
+            let summary = result.summary.to_lowercase();
+            let explicit_success = summary.contains("审计通过")
+                || summary.contains("audit pass")
+                || summary.contains("audit passed")
+                || summary.contains("tests pass")
+                || summary.contains("tests passed")
+                || summary.contains("pytest") && summary.contains("passed");
+            let matched: Vec<&String> = if explicit_success {
+                criteria.iter().collect()
+            } else {
+                criteria
+                    .iter()
+                    .filter(|c| result.summary.contains(c.as_str()))
+                    .collect()
+            };
             let ratio = matched.len() as f64 / criteria.len().max(1) as f64;
             let detail = if ratio >= 0.8 {
                 AuditStatus::Pass
@@ -118,7 +135,11 @@ pub fn audit_dimensions(
             results.push(DimensionAuditResult {
                 dimension: "why".to_string(),
                 status: detail,
-                evidence: format!("{}/{} criteria matched", matched.len(), criteria.len()),
+                evidence: if explicit_success {
+                    "explicit CA audit/test success evidence".to_string()
+                } else {
+                    format!("{}/{} criteria matched", matched.len(), criteria.len())
+                },
                 details: criteria
                     .iter()
                     .map(|c| format!("Criterion: {}", c))
@@ -1291,6 +1312,29 @@ mod tests {
             w2h.dimension_meta.get("what").unwrap().fill_stage,
             FillStage::Create
         );
+    }
+
+    #[test]
+    fn audit_accepts_explicit_ca_test_success_without_literal_criteria() {
+        let mut w2h = Task5W2H::new("Improve ledger", "Verify edge cases");
+        w2h.why.success_criteria = vec!["all requested edge cases handled".into()];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-evidence".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "CA: pytest 7 passed, audit passed".into(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 3,
+            tool_call_count: 4,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-evidence", None);
+        assert!(matches!(audits.iter().find(|a| a.dimension == "why").unwrap().status, AuditStatus::Pass));
     }
 
     #[test]

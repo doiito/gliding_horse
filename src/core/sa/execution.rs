@@ -5,6 +5,81 @@ use tracing::{info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::core::agent_runner::{TaskContext, TaskResult, TaskVerdict};
+
+/// Apply the CA 5W2H audit to a result and return whether any dimension failed.
+///
+/// The audit is deliberately applied both to the normal CA node and to the
+/// CA re-evaluations in the correction loop.  This keeps the terminal status
+/// tied to the latest evidence rather than to a stale warning in a log.
+fn apply_ca_dimension_audit(
+    five_w2h: &crate::core::five_w2h::Task5W2H,
+    result: &mut TaskResult,
+    task_iri: &str,
+    causal_engine: Option<&crate::causal::CausalEngine>,
+) -> crate::core::recovery::AuditReport {
+    let audit_results = crate::core::five_w2h::audit_dimensions(
+        five_w2h,
+        result,
+        task_iri,
+        causal_engine,
+    );
+    let report = crate::core::recovery::AuditReport::from_results(&audit_results);
+    let failures: Vec<&crate::core::five_w2h::DimensionAuditResult> = audit_results
+        .iter()
+        .filter(|r| matches!(r.status, crate::core::five_w2h::AuditStatus::Fail(_)))
+        .collect();
+
+    if failures.is_empty() {
+        return report;
+    }
+
+    let fail_summary: Vec<String> = failures
+        .iter()
+        .map(|r| {
+            format!(
+                "[{}] {}: {}",
+                r.dimension,
+                match &r.status {
+                    crate::core::five_w2h::AuditStatus::Fail(msg) => msg.as_str(),
+                    _ => "failed",
+                },
+                r.evidence
+            )
+        })
+        .collect();
+    warn!(
+        task_iri = %task_iri,
+        dimensions = ?failures.iter().map(|r| &r.dimension).collect::<Vec<_>>(),
+        "Dimension audit: {} dimension(s) failed — causal observations recorded",
+        failures.len()
+    );
+    if result.summary.len() < 4000 {
+        let audit_note = format!(
+            "\n\n--- Dimension Audit ---\n{}\n[Recovery] scope={:?} reason={:?}",
+            fail_summary.join("\n"),
+            report.scope,
+            report.reason
+        );
+        if !result.summary.contains("Dimension Audit") {
+            result.summary.push_str(&audit_note);
+        }
+    }
+    report
+}
+
+fn enforce_ca_audit_terminal_status(result: &mut TaskResult, ca_audit_failed: bool) {
+    if ca_audit_failed && result.status != "failed" {
+        result.status = "failed".to_string();
+        result.verdict = Some(TaskVerdict::Failed);
+        result.errors.push(
+            "CA dimension audit failed; task cannot be reported as successful".to_string(),
+        );
+        result.summary.push_str(
+            "\n\nFinal status forced to failed because the latest CA dimension audit failed.",
+        );
+    }
+}
+
 use crate::memory::l2_blackboard::QueryFilter;
 use crate::CoreError;
 
@@ -221,16 +296,15 @@ impl SupervisorAgent {
         };
 
         match result.status.as_str() {
-            "success" => {
-                let task_result =
-                    serde_json::json!({"status": "success", "summary": &result.summary});
-                self.perception
-                    .on_task_end(&task_result, &result.task_iri)
-                    .await;
-            }
-            "failed" => {
-                let task_result =
-                    serde_json::json!({"status": "failed", "summary": &result.summary});
+            "success" | "completed" | "partial_success" | "failed" | "timeout" => {
+                let task_result = serde_json::json!({
+                    "status": &result.status,
+                    "summary": &result.summary,
+                    "turn_count": result.turn_count,
+                    "tool_call_count": result.tool_call_count,
+                    "errors": &result.errors,
+                    "tracked_actions": &result.tracked_actions,
+                });
                 self.perception
                     .on_task_end(&task_result, &result.task_iri)
                     .await;
@@ -405,6 +479,12 @@ impl SupervisorAgent {
         let mut prev_summary: Option<String> = initial_prev_summary;
         // Track the Do agent's output separately so AA can access it alongside CA's evaluation.
         let mut da_output: Option<String> = None;
+        // The latest CA audit is a terminal quality gate.  A later successful
+        // re-audit clears this flag; an unresolved failure forces final status.
+        let mut latest_ca_report: Option<crate::core::recovery::AuditReport> = None;
+        let mut local_repairs_used = 0u32;
+        let mut previous_ca_signature: Option<Vec<String>> = None;
+        let mut repeated_ca_failures = 0u32;
 
         // Resume mode: determine which phase to start from
         // Load latest checkpoint from L0 to resolve phase tags
@@ -980,6 +1060,9 @@ impl SupervisorAgent {
                             result_wi,
                             &mut prev_summary,
                             &mut da_output,
+                            &mut latest_ca_report,
+                            &mut previous_ca_signature,
+                            &mut repeated_ca_failures,
                             &mut last_result,
                             &mut completed_node_results,
                             &mut skip_nodes,
@@ -1020,6 +1103,9 @@ impl SupervisorAgent {
                         wt.wi,
                         &mut prev_summary,
                         &mut da_output,
+                        &mut latest_ca_report,
+                        &mut previous_ca_signature,
+                        &mut repeated_ca_failures,
                         &mut last_result,
                         &mut completed_node_results,
                         &mut skip_nodes,
@@ -1045,20 +1131,24 @@ impl SupervisorAgent {
         let mut correction_count = 0;
         loop {
             let ca_summary = prev_summary.clone();
-            let has_ca_failures = ca_summary.as_ref().map_or(false, |ps| {
-                ps.contains("Dimension Audit")
-                    && (ps.contains("[what]")
-                        || ps.contains("[why]")
-                        || ps.contains("[how]")
-                        || ps.contains("[how_much]"))
-                    && ps.len() > 50
+            let directive = latest_ca_report.as_ref().map(|report| {
+                crate::core::recovery::select_directive(
+                    report,
+                    local_repairs_used,
+                    MAX_CA_DA_CORRECTIONS as u32,
+                )
             });
+            let has_local_ca_failures = matches!(
+                directive,
+                Some(crate::core::recovery::RecoveryDirective::RetryDa)
+            ) && ca_summary.is_some();
 
-            if !has_ca_failures || correction_count >= MAX_CA_DA_CORRECTIONS {
+            if !has_local_ca_failures || correction_count >= MAX_CA_DA_CORRECTIONS {
                 break;
             }
 
             correction_count += 1;
+            local_repairs_used += 1;
             let ca_text = ca_summary.unwrap_or_default();
 
             info!(
@@ -1108,6 +1198,19 @@ impl SupervisorAgent {
                         .await
                     {
                         Ok(ca_result) => {
+                            let mut ca_result = ca_result;
+                            let mut ca_report = apply_ca_dimension_audit(
+                                &five_w2h,
+                                &mut ca_result,
+                                task_iri,
+                                self.runner.causal_engine.as_ref().map(|ce| ce.as_ref()),
+                            );
+                            crate::core::recovery::track_non_convergence(
+                                &mut ca_report,
+                                &mut previous_ca_signature,
+                                &mut repeated_ca_failures,
+                            );
+                            latest_ca_report = Some(ca_report);
                             let archive_ref = ca_result
                                 .archive_iri
                                 .as_ref()
@@ -1159,7 +1262,7 @@ impl SupervisorAgent {
             )
             .await;
 
-        Ok(last_result.unwrap_or(TaskResult {
+        let mut final_result = last_result.unwrap_or(TaskResult {
             task_iri: task_iri.to_string(),
             status: "completed".to_string(),
             summary: "No agents executed".to_string(),
@@ -1173,7 +1276,12 @@ impl SupervisorAgent {
             tracked_actions: Vec::new(),
             verdict: None,
             archive_iri: None,
-        }))
+        });
+        enforce_ca_audit_terminal_status(
+            &mut final_result,
+            latest_ca_report.as_ref().is_some_and(|report| report.failed()),
+        );
+        Ok(final_result)
     }
 
     fn build_failed_step_result(
@@ -1220,6 +1328,9 @@ impl SupervisorAgent {
         i: usize,
         prev_summary: &mut Option<String>,
         da_output: &mut Option<String>,
+        latest_ca_report: &mut Option<crate::core::recovery::AuditReport>,
+        previous_ca_signature: &mut Option<Vec<String>>,
+        repeated_ca_failures: &mut u32,
         last_result: &mut Option<TaskResult>,
         completed_node_results: &mut std::collections::HashMap<
             String,
@@ -1374,47 +1485,25 @@ impl SupervisorAgent {
                 info!(advisory = ?advisory, "CA perception advisories generated");
             }
 
-            // Run dimension-level audit against the 5W2H specification
-            let audit_results = crate::core::five_w2h::audit_dimensions(
+            // Run dimension-level audit against the 5W2H specification.  The
+            // latest CA result controls the terminal quality gate.
+            let mut ca_report = apply_ca_dimension_audit(
                 five_w2h,
-                &result,
+                &mut result,
                 task_iri,
                 self.runner.causal_engine.as_ref().map(|ce| ce.as_ref()),
             );
-            let failures: Vec<&crate::core::five_w2h::DimensionAuditResult> = audit_results
-                .iter()
-                .filter(|r| matches!(r.status, crate::core::five_w2h::AuditStatus::Fail(_)))
-                .collect();
-            if !failures.is_empty() {
-                let fail_summary: Vec<String> = failures
-                    .iter()
-                    .map(|r| {
-                        format!(
-                            "[{}] {}: {}",
-                            r.dimension,
-                            match &r.status {
-                                crate::core::five_w2h::AuditStatus::Fail(msg) => msg.as_str(),
-                                _ => "failed",
-                            },
-                            r.evidence
-                        )
-                    })
-                    .collect();
-                warn!(
-                    task_iri = %task_iri,
-                    dimensions = ?failures.iter().map(|r| &r.dimension).collect::<Vec<_>>(),
-                    "Dimension audit: {} dimension(s) failed — causal observations recorded",
-                    failures.len()
-                );
-                // Append dimension audit findings to the CA agent's result summary
-                if result.summary.len() < 4000 {
-                    let audit_note =
-                        format!("\n\n--- Dimension Audit ---\n{}", fail_summary.join("\n"));
-                    if !result.summary.contains("Dimension Audit") {
-                        result.summary.push_str(&audit_note);
-                    }
-                }
-            }
+            // The same failed dimensions twice in a row indicate that DA
+            // cannot converge locally; SA must escalate to a PA re-plan.
+            // The counters live in execute_plan and are intentionally shared
+            // by the normal CA path and the CA→DA correction path.
+            // (The report is still attached to the result for observability.)
+            crate::core::recovery::track_non_convergence(
+                &mut ca_report,
+                previous_ca_signature,
+                repeated_ca_failures,
+            );
+            *latest_ca_report = Some(ca_report);
         }
 
         // AA early exit — skip remaining PDCA cycles after AA evaluates
@@ -1943,5 +2032,62 @@ Output only JSON."#,
             .await;
             Ok(sub_summaries.join("\n\n"))
         })
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::*;
+
+    #[test]
+    fn ca_dimension_failure_forces_terminal_failure() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/ca-gate".to_string(),
+            status: "success".to_string(),
+            summary: "AA reported success".to_string(),
+            output: None,
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: Vec::new(),
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            verdict: Some(TaskVerdict::Success),
+            archive_iri: None,
+        };
+
+        enforce_ca_audit_terminal_status(&mut result, true);
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.verdict, Some(TaskVerdict::Failed));
+        assert!(result
+            .errors
+            .iter()
+            .any(|error| error.contains("CA dimension audit failed")));
+    }
+
+    #[test]
+    fn passing_ca_does_not_change_terminal_status() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/ca-pass".to_string(),
+            status: "success".to_string(),
+            summary: "all checks passed".to_string(),
+            output: None,
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: Vec::new(),
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            verdict: Some(TaskVerdict::Success),
+            archive_iri: None,
+        };
+
+        enforce_ca_audit_terminal_status(&mut result, false);
+
+        assert_eq!(result.status, "success");
+        assert!(result.errors.is_empty());
     }
 }

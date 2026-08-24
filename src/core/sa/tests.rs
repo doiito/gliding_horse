@@ -601,6 +601,9 @@ mod tests {
 
         let mut prev_summary = None;
         let mut da_output = None;
+        let mut latest_ca_report = None;
+        let mut previous_ca_signature = None;
+        let mut repeated_ca_failures = 0;
         let mut last_result = None;
         let mut completed_node_results = std::collections::HashMap::new();
         let mut skip_nodes = std::collections::HashSet::new();
@@ -630,6 +633,9 @@ mod tests {
                 step_2_wave,
                 &mut prev_summary,
                 &mut da_output,
+                &mut latest_ca_report,
+                &mut previous_ca_signature,
+                &mut repeated_ca_failures,
                 &mut last_result,
                 &mut completed_node_results,
                 &mut skip_nodes,
@@ -660,6 +666,9 @@ mod tests {
 
         let mut prev_summary = None;
         let mut da_output = None;
+        let mut latest_ca_report = None;
+        let mut previous_ca_signature = None;
+        let mut repeated_ca_failures = 0;
         let mut last_result = None;
         let mut completed_node_results = std::collections::HashMap::new();
         let mut skip_nodes = std::collections::HashSet::new();
@@ -689,6 +698,9 @@ mod tests {
                 step_1_wave,
                 &mut prev_summary,
                 &mut da_output,
+                &mut latest_ca_report,
+                &mut previous_ca_signature,
+                &mut repeated_ca_failures,
                 &mut last_result,
                 &mut completed_node_results,
                 &mut skip_nodes,

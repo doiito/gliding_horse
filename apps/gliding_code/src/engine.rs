@@ -594,6 +594,7 @@ impl CodeCliEngine {
         let evolution_engine = Arc::new(tokio::sync::Mutex::new(
             SkillEvolutionEngine::new(skill_graph.clone())
                 .with_causal_analysis(5000)
+                .with_usage_persistence(l0.clone())
                 .with_causal_engine(causal_engine.clone()),
         ));
 
@@ -996,6 +997,7 @@ impl CodeCliEngine {
         if let Ok(mut ee) = self.evolution_engine.try_lock() {
             let success = result.status == "completed" || result.status == "success";
             let mut affected_skill_iris = Vec::new();
+            let mut skill_outcomes = Vec::new();
 
             // Record actual action outcomes against the canonical SkillRegistry
             // IRI. Unknown tools remain observable but are never turned into a
@@ -1014,6 +1016,7 @@ impl CodeCliEngine {
                     action.status,
                     glidinghorse::core::tracked_action::ActionStatus::Success
                 );
+                let before = ee.get_usage_stats(&skill_iri);
                 let mut usage = glidinghorse::skill_graph::evolution::UsageRecord::new(
                     &skill_iri,
                     &task_iri,
@@ -1036,7 +1039,45 @@ impl CodeCliEngine {
                         "Failed to record skill evolution usage"
                     );
                 } else if !affected_skill_iris.contains(&skill_iri) {
-                    affected_skill_iris.push(skill_iri);
+                    affected_skill_iris.push(skill_iri.clone());
+                    let after = ee.get_usage_stats(&skill_iri);
+                    let assessment = glidinghorse::skill_graph::evolution::assess_outcome(
+                        before.success_rate,
+                        after.success_rate,
+                        before.total_usage,
+                        after.total_usage,
+                    );
+                    skill_outcomes.push(serde_json::json!({
+                        "skill_iri": skill_iri,
+                        "task_iri": task_iri,
+                        "action_success": action_success,
+                        "before_usage": before.total_usage,
+                        "before_success_rate": before.success_rate,
+                        "after_usage": after.total_usage,
+                        "after_success_rate": after.success_rate,
+                        "success_rate_delta": assessment.success_rate_delta,
+                        "evidence_verdict": assessment.verdict,
+                        "duration_seconds": action.duration_secs,
+                        "task_status": result.status,
+                    }));
+                }
+            }
+
+            if !skill_outcomes.is_empty() {
+                let outcome_iri = format!("{}#skill-outcomes", task_iri);
+                let outcome_json = serde_json::json!({
+                    "@id": outcome_iri,
+                    "@type": "SkillOutcomeEvidence",
+                    "task_iri": task_iri,
+                    "outcomes": skill_outcomes,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Err(error) = self.l2_bb.write_node(
+                    &outcome_iri,
+                    &outcome_json.to_string(),
+                    &self.core_config,
+                ) {
+                    warn!(task_iri = %task_iri, %error, "Failed to persist skill outcome evidence");
                 }
             }
 
@@ -1060,6 +1101,30 @@ impl CodeCliEngine {
                 {
                     let suggestions = ee.get_pending_suggestions().to_vec();
                     if !suggestions.is_empty() {
+                        // Causal knowledge fragments are governed proposals,
+                        // not merely log entries. They become reusable graph
+                        // knowledge only after explicit approval/validation.
+                        let proposal_store = EvolutionProposalStore::new(self.l0.clone());
+                        for suggestion in &suggestions {
+                            if suggestion.patch.is_none() {
+                                continue;
+                            }
+                            let Ok(serialized) = serde_json::to_vec(suggestion) else {
+                                continue;
+                            };
+                            let key = format!(
+                                "{}:causal-evolution:{}",
+                                task_iri,
+                                hex::encode(Sha256::digest(serialized))
+                            );
+                            if let Err(error) = proposal_store.create_or_get(
+                                &key,
+                                suggestion.clone(),
+                                self.skill_graph.as_ref(),
+                            ) {
+                                warn!(task_iri = %task_iri, %error, "Failed to persist causal knowledge proposal");
+                            }
+                        }
                         let causal_summary = suggestions
                             .iter()
                             .map(|s| {
@@ -1649,6 +1714,7 @@ impl CodeCliEngine {
             return;
         };
         let mut affected_skill_iris = Vec::new();
+        let mut skill_outcomes = Vec::new();
         for action in &result.tracked_actions {
             let Some(skill_iri) = self.skills.skill_iri_for_tool_name(&action.tool_name) else {
                 warn!(task_iri = %task_iri, tool = %action.tool_name, "No skill IRI for TUI tracked action");
@@ -1658,6 +1724,7 @@ impl CodeCliEngine {
                 action.status,
                 glidinghorse::core::tracked_action::ActionStatus::Success
             );
+            let before = evolution.get_usage_stats(&skill_iri);
             let mut usage = glidinghorse::skill_graph::evolution::UsageRecord::new(
                 &skill_iri,
                 task_iri,
@@ -1673,7 +1740,45 @@ impl CodeCliEngine {
             if let Err(error) = evolution.record_usage(usage) {
                 warn!(task_iri = %task_iri, skill_iri = %skill_iri, %error, "Failed to record TUI skill usage");
             } else if !affected_skill_iris.contains(&skill_iri) {
-                affected_skill_iris.push(skill_iri);
+                affected_skill_iris.push(skill_iri.clone());
+                let after = evolution.get_usage_stats(&skill_iri);
+                let assessment = glidinghorse::skill_graph::evolution::assess_outcome(
+                    before.success_rate,
+                    after.success_rate,
+                    before.total_usage,
+                    after.total_usage,
+                );
+                skill_outcomes.push(serde_json::json!({
+                    "skill_iri": skill_iri,
+                    "task_iri": task_iri,
+                    "action_success": succeeded,
+                    "before_usage": before.total_usage,
+                    "before_success_rate": before.success_rate,
+                    "after_usage": after.total_usage,
+                    "after_success_rate": after.success_rate,
+                    "success_rate_delta": assessment.success_rate_delta,
+                    "evidence_verdict": assessment.verdict,
+                    "duration_seconds": action.duration_secs,
+                    "task_status": result.status,
+                }));
+            }
+        }
+
+        if !skill_outcomes.is_empty() {
+            let outcome_iri = format!("{}#skill-outcomes", task_iri);
+            let outcome = serde_json::json!({
+                "@id": outcome_iri,
+                "@type": "SkillOutcomeEvidence",
+                "task_iri": task_iri,
+                "outcomes": skill_outcomes,
+                "entrypoint": "tui_or_resume",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+            if let Err(error) = self
+                .l2_bb
+                .write_node(&outcome_iri, &outcome.to_string(), &self.core_config)
+            {
+                warn!(task_iri = %task_iri, %error, "Failed to persist TUI skill outcome evidence");
             }
         }
 

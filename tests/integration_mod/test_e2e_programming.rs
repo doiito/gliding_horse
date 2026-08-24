@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "live-tests"), allow(dead_code, unused_imports))]
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -201,7 +203,7 @@ fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
 /// 3. 运行测试验证功能
 /// 4. 验证所有Agent输出为有效的JSON-LD格式
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_complex_programming_task() {
     init_e2e_logging();
 
@@ -385,7 +387,7 @@ async fn test_e2e_complex_programming_task() {
 
 /// 测试 SA 使用 LLM 生成详细计划
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_sa_llm_plan_generation() {
     init_e2e_logging();
 
@@ -428,7 +430,7 @@ async fn test_e2e_sa_llm_plan_generation() {
 
 /// 测试 Agent 隔离执行
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_agent_isolation() {
     init_e2e_logging();
 
@@ -514,7 +516,7 @@ async fn test_e2e_agent_isolation() {
 /// 7. 测试文件 (tests/test_api.py)
 /// 8. 运行测试验证
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[cfg(feature = "live-tests")]
 async fn test_e2e_full_project_creation() {
     init_e2e_logging();
 

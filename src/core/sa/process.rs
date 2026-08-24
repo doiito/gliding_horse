@@ -27,6 +27,15 @@ fn dedup_hints(hints: Vec<String>, cap: usize) -> Vec<String> {
     out
 }
 
+fn policy_reward(result: &TaskResult) -> f32 {
+    match result.status.as_str() {
+        "success" | "completed" if !result.summary.contains("[Recovery] scope=Task") => 1.0,
+        "partial_success" => 0.25,
+        "failed" | "timeout" => -1.0,
+        _ => -0.5,
+    }
+}
+
 impl SupervisorAgent {
     #[instrument(skip(self, user_input), fields(task_iri = %task_iri))]
     pub async fn process_task(
@@ -122,6 +131,10 @@ impl SupervisorAgent {
 
         // Enrich with skill discovery results if a discovery engine is available
         let mut all_hints: Vec<String> = perception_hints;
+        let policy_context = format!(
+            "planning:{}",
+            five_w2h.what.chars().take(80).collect::<String>().to_lowercase()
+        );
         if let Some(ref de) = self.discovery_engine {
             let disc_task = crate::skill_graph::discovery::Task5W2H {
                 what: five_w2h.what.clone(),
@@ -145,6 +158,21 @@ impl SupervisorAgent {
                 })
                 .take(5)
                 .collect();
+            let knowledge_hints: Vec<String> = if let Some(graph) = self.runner.skill_graph_store.as_ref() {
+                matches
+                    .iter()
+                    .flat_map(|m| graph.get_fragments_for_skill(&m.skill.skill_iri))
+                    .map(|fragment| {
+                        format!(
+                            "Knowledge fragment for {}: problem={} mitigation={}",
+                            fragment.attached_to, fragment.problem, fragment.recommendation
+                        )
+                    })
+                    .take(8)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if !skill_hints.is_empty() {
                 all_hints.extend(skill_hints);
                 tracing::info!(
@@ -152,7 +180,35 @@ impl SupervisorAgent {
                     "Skill discovery enriched planning with relevant skills"
                 );
             }
+            if !knowledge_hints.is_empty() {
+                all_hints.extend(knowledge_hints);
+                tracing::info!(
+                    task_iri = %task_iri,
+                    "Committed skill knowledge fragments enriched planning"
+                );
+            }
         }
+        all_hints = dedup_hints(all_hints, MAX_ALL_HINTS);
+        let policy_choice = self.policy_learning.choose(
+            &policy_context,
+            &[
+                "baseline".to_string(),
+                "knowledge_first".to_string(),
+                "skill_first".to_string(),
+            ],
+            "baseline",
+        );
+        if policy_choice.action == "knowledge_first" {
+            all_hints.sort_by_key(|hint| if hint.starts_with("Knowledge fragment") { 0 } else { 1 });
+        } else if policy_choice.action == "skill_first" {
+            all_hints.sort_by_key(|hint| {
+                if hint.contains("skill") || hint.contains("Skill") { 0 } else { 1 }
+            });
+        }
+        all_hints.push(format!(
+            "Constrained policy: {} (confidence {:.2}; fallback={})",
+            policy_choice.action, policy_choice.confidence, policy_choice.used_fallback
+        ));
         all_hints = dedup_hints(all_hints, MAX_ALL_HINTS);
 
         // Unified execution path: build ExecutionPlan from JSON-LD workflow or LLM
@@ -362,8 +418,61 @@ impl SupervisorAgent {
         };
         let mut cycle_feedback: Option<String> = None;
         let mut final_result: Option<TaskResult> = None;
+        let mut plan_revision = 1u32;
+        let mut orchestration_trajectory = Vec::new();
+        let token_budget = five_w2h.how_much.as_ref().and_then(|h| h.token_budget);
 
         for cycle_num in 0..max_cycles {
+            if let Some(limit) = token_budget {
+                let used = self
+                    .runner
+                    .total_prompt_tokens
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(
+                        self.runner
+                            .total_completion_tokens
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                if used >= limit {
+                    let summary = format!(
+                        "Recovery blocked: token budget exhausted before PDCA cycle {} (used {}, limit {}).",
+                        cycle_num + 1,
+                        used,
+                        limit
+                    );
+                    tracing::warn!(task_iri = %task_iri, used, limit, "Task token budget exhausted");
+                    self.event_bus
+                        .emit(task_iri, "RECOVERY_BLOCKED", "SA", &summary)
+                        .await;
+                    // Preserve the last completed cycle's evidence. Replacing
+                    // it with a zeroed result made a budget stop look like a
+                    // task that had executed no turns or tools at all.
+                    let mut blocked_result = final_result.take().unwrap_or_else(|| TaskResult {
+                        task_iri: task_iri.to_string(),
+                        status: "failed".to_string(),
+                        summary: String::new(),
+                        output: None,
+                        jsonld_output: None,
+                        artifacts: Vec::new(),
+                        errors: Vec::new(),
+                        turn_count: 0,
+                        tool_call_count: 0,
+                        five_w2h_updates: None,
+                        tracked_actions: Vec::new(),
+                        verdict: None,
+                        archive_iri: None,
+                    });
+                    blocked_result.status = "failed".to_string();
+                    blocked_result.summary = if blocked_result.summary.is_empty() {
+                        summary.clone()
+                    } else {
+                        format!("{}\n\n{}", blocked_result.summary, summary)
+                    };
+                    blocked_result.errors.push("token budget exhausted".to_string());
+                    final_result = Some(blocked_result);
+                    break;
+                }
+            }
             let resumed = if cycle_num == 0 {
                 ctx.resumed_messages.clone()
             } else {
@@ -374,6 +483,8 @@ impl SupervisorAgent {
             let current_plan =
                 if cycle_num >= 1 && plan.verify_first && !plan.fallback_steps.is_empty() {
                     let mut fb = plan.clone();
+                    plan_revision = cycle_num as u32 + 1;
+                    fb.plan_id = format!("{}_rev_{}", plan.plan_id, plan_revision);
                     fb.steps = plan.fallback_steps.clone();
                     fb.verify_first = false;
                     fb.agent_sequence = fb.steps.iter().map(|s| s.role).collect();
@@ -385,7 +496,12 @@ impl SupervisorAgent {
                 );
                     fb
                 } else {
-                    plan.clone()
+                    let mut current = plan.clone();
+                    if cycle_num > 0 {
+                        plan_revision = cycle_num as u32 + 1;
+                        current.plan_id = format!("{}_rev_{}", plan.plan_id, plan_revision);
+                    }
+                    current
                 };
 
             info!(
@@ -415,6 +531,12 @@ impl SupervisorAgent {
                 .await;
             }
 
+            let mode = if current_plan.dag_jsonld.is_some() {
+                crate::core::recovery::OrchestrationMode::Dag
+            } else {
+                crate::core::recovery::OrchestrationMode::Pdca
+            };
+            let is_dag_plan = current_plan.dag_jsonld.is_some();
             let result = self
                 .execute_plan(
                     current_plan,
@@ -436,6 +558,52 @@ impl SupervisorAgent {
                 && plan.verify_first
                 && verify_aa_needs_execution(&result);
 
+            let decision_report = if result.status == "success" && !needs_execution_after_verify {
+                crate::core::recovery::DecisionReport {
+                    mode,
+                    directive: crate::core::recovery::RecoveryDirective::Accept,
+                    reason: crate::core::recovery::RecoveryReason::Accepted,
+                    scope: crate::core::recovery::RepairScope::Task,
+                    plan_revision,
+                }
+            } else {
+                crate::core::recovery::DecisionReport {
+                    mode,
+                    directive: crate::core::recovery::RecoveryDirective::ReplanPa,
+                    reason: if result.summary.contains("Dimension Audit") {
+                        crate::core::recovery::RecoveryReason::PlanInvalid
+                    } else {
+                        crate::core::recovery::RecoveryReason::LocalExecutionGap
+                    },
+                    scope: crate::core::recovery::RepairScope::Task,
+                    plan_revision,
+                }
+            };
+            self.event_bus
+                .emit(
+                    task_iri,
+                    "AA_DECISION",
+                    "SA",
+                    &serde_json::to_string(&decision_report).unwrap_or_else(|_| "{}".to_string()),
+                )
+                .await;
+
+            let mode_action = match mode {
+                crate::core::recovery::OrchestrationMode::Dag => "dag",
+                crate::core::recovery::OrchestrationMode::Pdca => "pdca",
+            };
+            orchestration_trajectory.push(crate::core::policy_learning::TrajectoryStep {
+                context: format!("orchestration:{}", five_w2h.what),
+                action: mode_action.to_string(),
+                candidates: if is_dag_plan {
+                    vec!["pdca".to_string(), "dag".to_string()]
+                } else {
+                    vec!["pdca".to_string()]
+                },
+                reward: policy_reward(&result),
+                terminal: result.status == "success" && !needs_execution_after_verify,
+            });
+
             if result.status == "success" && !needs_execution_after_verify {
                 info!(task_iri = %task_iri, cycle_num = cycle_num + 1, "PDCA cycle passed");
                 self.emit_sa_thought(
@@ -447,6 +615,28 @@ impl SupervisorAgent {
 
                 if let Some(scheduler) = &self.scheduler {
                     let _ = scheduler.on_task_complete(task_iri).await;
+                }
+                let _ = self
+                    .policy_learning
+                    .record_reward(&policy_choice, policy_reward(&result));
+                if let Ok(holdout) = crate::core::policy_learning::ConstrainedPolicy::load_observations(
+                    self.runner.l0_store.as_ref(),
+                ) {
+                    if let Ok((metrics, evaluation)) = self.policy_learning.train_trajectory_gated(
+                        &orchestration_trajectory,
+                        &holdout,
+                        0.9,
+                        crate::core::policy_learning::PolicyGate::default(),
+                    ) {
+                        self.event_bus
+                            .emit(
+                                task_iri,
+                                "POLICY_TRAINING",
+                                "SA",
+                                &serde_json::json!({"metrics": metrics, "evaluation": evaluation}).to_string(),
+                            )
+                            .await;
+                    }
                 }
                 return Ok(result);
             }
@@ -471,13 +661,15 @@ impl SupervisorAgent {
             // to preserve the plan structure and focus on specific DA improvements.
             // The CA→DA correction loop (in execute_plan) already handles in-cycle fixes;
             // this SA-level feedback addresses persistent failures requiring plan adjustment.
-            let da_fixes = result.summary.contains("Dimension Audit")
-                || result.summary.contains("execution failed")
-                || result.summary.contains("not completed");
+            let task_level_audit = result.summary.contains("[Recovery] scope=Task");
+            let da_fixes = !task_level_audit
+                && (result.summary.contains("Dimension Audit")
+                    || result.summary.contains("execution failed")
+                    || result.summary.contains("not completed"));
 
             cycle_feedback = Some(if da_fixes {
                 format!(
-                    "PDCA Cycle #{}: AA identified execution-level issues.\n\
+                    "PDCA Cycle #{} (plan revision {}): AA identified execution-level issues.\n\
                      Status: {}\n\n\
                      AA Evaluation:\n{}\n\n\
                      ---\n\
@@ -486,16 +678,19 @@ impl SupervisorAgent {
                      2. What DA needs to do differently (more detail, different approach)\n\
                      3. Do NOT create a brand new plan — refine the existing one",
                     cycle_num + 1,
+                    plan_revision,
                     result.status,
                     result.summary
                 )
             } else {
                 format!(
-                    "PDCA Cycle #{} result:\nStatus: {}\n\n\
+                    "PDCA Cycle #{} (plan revision {}): result\nStatus: {}\nRecovery directive: replan_pa\n\n\
                      AA Evaluation:\n{}\n\n\
                      ---\n\
-                     Please analyze the issues above and create an improved approach.",
+                     The previous plan is not sufficient. Re-plan the task at PA,\
+                     preserve verified evidence where possible, and create an improved approach.",
                     cycle_num + 1,
+                    plan_revision,
                     result.status,
                     result.summary
                 )
@@ -506,7 +701,7 @@ impl SupervisorAgent {
         if let Some(scheduler) = &self.scheduler {
             let _ = scheduler.on_task_complete(task_iri).await;
         }
-        Ok(final_result.unwrap_or_else(|| TaskResult {
+        let final_result = final_result.unwrap_or_else(|| TaskResult {
             task_iri: task_iri.to_string(),
             status: "failed".to_string(),
             summary: "All PDCA cycles exhausted without success".to_string(),
@@ -520,7 +715,30 @@ impl SupervisorAgent {
             tracked_actions: Vec::new(),
             verdict: None,
             archive_iri: None,
-        }))
+        });
+        let _ = self
+            .policy_learning
+            .record_reward(&policy_choice, policy_reward(&final_result));
+        if let Ok(holdout) = crate::core::policy_learning::ConstrainedPolicy::load_observations(
+            self.runner.l0_store.as_ref(),
+        ) {
+            if let Ok((metrics, evaluation)) = self.policy_learning.train_trajectory_gated(
+                &orchestration_trajectory,
+                &holdout,
+                0.9,
+                crate::core::policy_learning::PolicyGate::default(),
+            ) {
+                self.event_bus
+                    .emit(
+                        task_iri,
+                        "POLICY_TRAINING",
+                        "SA",
+                        &serde_json::json!({"metrics": metrics, "evaluation": evaluation}).to_string(),
+                    )
+                    .await;
+            }
+        }
+        Ok(final_result)
     }
 }
 

@@ -17,7 +17,7 @@ use crate::skill_graph::types::*;
 use crate::skill_graph::{GraphVerifier, ViolationSeverity};
 use crate::CoreError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub skill_iri: String,
     pub task_iri: String,
@@ -27,6 +27,47 @@ pub struct UsageRecord {
     pub duration_seconds: u32,
     pub error_message: Option<String>,
     pub context_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutcomeAssessment {
+    pub baseline_success_rate: f32,
+    pub current_success_rate: f32,
+    pub success_rate_delta: f32,
+    pub sample_count: u32,
+    pub verdict: String,
+}
+
+/// Evaluate the observable effect of a new usage record without pretending
+/// that one sample proves a causal improvement. A positive verdict requires
+/// at least two observations and a non-negative rate delta.
+pub fn assess_outcome(
+    before_success_rate: f32,
+    after_success_rate: f32,
+    _before_usage: u32,
+    after_usage: u32,
+) -> OutcomeAssessment {
+    let delta = after_success_rate - before_success_rate;
+    // `after_usage` is cumulative evidence for this skill. The delta is
+    // useful for the rate change, but using it as sample count would make
+    // every single task permanently "insufficient".
+    let sample_count = after_usage;
+    let verdict = if sample_count < 2 {
+        "insufficient_evidence"
+    } else if delta > 0.0 {
+        "improved"
+    } else if delta < 0.0 {
+        "degraded"
+    } else {
+        "stable"
+    };
+    OutcomeAssessment {
+        baseline_success_rate: before_success_rate,
+        current_success_rate: after_success_rate,
+        success_rate_delta: delta,
+        sample_count,
+        verdict: verdict.to_string(),
+    }
 }
 
 impl UsageRecord {
@@ -130,6 +171,13 @@ pub enum EvolutionPatch {
         strength: LinkStrength,
         description: String,
     },
+    /// Add a governed knowledge fragment to an existing skill.
+    CreateFragment {
+        skill_iri: String,
+        problem: String,
+        recommendation: String,
+        discoverer: String,
+    },
     /// Governed record for a methodology adjustment recommendation. The
     /// matching skill IRI is synthetic (`iri://methodology/<methodology_id>`)
     /// and never requires a graph node.
@@ -155,6 +203,18 @@ pub enum EvolutionSuggestionType {
 /// Prefix for synthetic skill IRIs representing methodologies in the
 /// proposal store. These IRIs never correspond to graph nodes.
 pub const METHODOLOGY_IRI_PREFIX: &str = "iri://methodology/";
+
+fn knowledge_fragment_iri(skill_iri: &str, problem: &str, recommendation: &str) -> String {
+    format!(
+        "{}#fragment_{}",
+        skill_iri,
+        Sha256::digest(format!("{problem}\n{recommendation}").as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
 
 pub fn is_methodology_iri(iri: &str) -> bool {
     iri.starts_with(METHODOLOGY_IRI_PREFIX)
@@ -507,6 +567,29 @@ impl EvolutionProposalStore {
                     });
                 }
             }
+            Some(EvolutionPatch::CreateFragment {
+                skill_iri,
+                problem,
+                recommendation,
+                discoverer,
+            }) => {
+                if graph_store.get_skill(skill_iri).is_none() {
+                    return Err(CoreError::SkillNotFound {
+                        iri: skill_iri.clone(),
+                    });
+                }
+                if problem.trim().is_empty() || recommendation.trim().is_empty() {
+                    return Err(CoreError::ValidationFailed {
+                        message: "Knowledge fragment requires problem and recommendation"
+                            .to_string(),
+                    });
+                }
+                if discoverer.trim().is_empty() {
+                    return Err(CoreError::ValidationFailed {
+                        message: "Knowledge fragment requires a discoverer".to_string(),
+                    });
+                }
+            }
             None => {
                 return Err(CoreError::ValidationFailed {
                     message: "Proposal has no typed patch".to_string(),
@@ -557,6 +640,60 @@ impl EvolutionProposalStore {
             self.save(&proposal)?;
             return Ok(proposal);
         }
+        if let Some(EvolutionPatch::CreateFragment {
+            skill_iri,
+            problem,
+            recommendation,
+            discoverer,
+        }) = &proposal.suggestion.patch
+        {
+            let fragment_iri = knowledge_fragment_iri(skill_iri, problem, recommendation);
+            let before = graph_store
+                .get_skill(skill_iri)
+                .ok_or_else(|| CoreError::SkillNotFound {
+                    iri: skill_iri.clone(),
+                })?;
+            proposal.preimages.insert(skill_iri.clone(), before);
+            proposal.status = EvolutionProposalStatus::Applying;
+            proposal.updated_at = Utc::now();
+            self.save(&proposal)?;
+            let write_result = graph_store.create_fragment(
+                &fragment_iri,
+                skill_iri,
+                problem,
+                recommendation,
+                Some(discoverer),
+            );
+            let applied = write_result.is_ok()
+                && graph_store
+                    .get_fragments_for_skill(skill_iri)
+                    .iter()
+                    .any(|fragment| fragment.fragment_iri == fragment_iri);
+            if applied {
+                proposal.status = EvolutionProposalStatus::Committed;
+            } else {
+                let _ = graph_store.remove_fragment(&fragment_iri);
+                let restored = proposal
+                    .preimages
+                    .get(skill_iri)
+                    .cloned()
+                    .map(|skill| graph_store.update_skill(skill));
+                proposal.status = if restored.is_some_and(|result| result.is_ok()) {
+                    EvolutionProposalStatus::RolledBack
+                } else {
+                    EvolutionProposalStatus::Failed
+                };
+            }
+            proposal.updated_at = Utc::now();
+            self.save(&proposal)?;
+            return match write_result {
+                Ok(_) if applied => Ok(proposal),
+                Err(error) => Err(error),
+                Ok(_) => Err(CoreError::StorageError {
+                    message: format!("Proposal {} knowledge fragment verification failed", proposal.proposal_id),
+                }),
+            };
+        }
         let (source_iri, target_iri, link_type, strength, description, is_removal) =
             match &proposal.suggestion.patch {
                 Some(EvolutionPatch::AddLink {
@@ -590,6 +727,11 @@ impl EvolutionProposalStore {
                 Some(EvolutionPatch::Methodology { .. }) => {
                     return Err(CoreError::ValidationFailed {
                         message: "Methodology proposal has no link patch to commit".to_string(),
+                    })
+                }
+                Some(EvolutionPatch::CreateFragment { .. }) => {
+                    return Err(CoreError::ValidationFailed {
+                        message: "Knowledge fragment proposal was not handled by fragment commit path".to_string(),
                     })
                 }
                 None => {
@@ -699,6 +841,7 @@ impl EvolutionProposalStore {
                     report.committed += 1;
                     continue;
                 }
+                Some(EvolutionPatch::CreateFragment { skill_iri, .. }) => skill_iri,
                 None => {
                     proposal.status = EvolutionProposalStatus::Failed;
                     proposal.updated_at = Utc::now();
@@ -844,6 +987,7 @@ impl EvolutionProposalStore {
                 ..
             } => vec![source_iri.clone(), target_iri.clone()],
             EvolutionPatch::Methodology { .. } => Vec::new(),
+            EvolutionPatch::CreateFragment { skill_iri, .. } => vec![skill_iri.clone()],
         }
     }
 
@@ -851,6 +995,18 @@ impl EvolutionProposalStore {
         let (source_iri, target_iri, link_type, strength, description, is_removal) = match patch {
             EvolutionPatch::Methodology { .. } => {
                 return true;
+            }
+            EvolutionPatch::CreateFragment {
+                skill_iri,
+                problem,
+                recommendation,
+                ..
+            } => {
+                let iri = knowledge_fragment_iri(skill_iri, problem, recommendation);
+                return graph_store
+                    .get_fragments_for_skill(skill_iri)
+                    .iter()
+                    .any(|fragment| fragment.fragment_iri == iri);
             }
             EvolutionPatch::AddLink {
                 source_iri,
@@ -937,6 +1093,7 @@ impl EvolutionProposalStore {
 pub struct SkillEvolutionEngine {
     graph_store: Arc<SkillGraphStore>,
     usage_history: Vec<UsageRecord>,
+    usage_store: Option<Arc<L0Store>>,
     pending_suggestions: Vec<EvolutionSuggestion>,
     // P1-3: Causal failure analysis (legacy)
     causal_model: SkillCausalModel,
@@ -953,6 +1110,7 @@ impl SkillEvolutionEngine {
         Self {
             graph_store,
             usage_history: Vec::new(),
+            usage_store: None,
             pending_suggestions: Vec::new(),
             causal_model: SkillCausalModel::new(),
             event_history: VecDeque::new(),
@@ -970,6 +1128,21 @@ impl SkillEvolutionEngine {
     /// Attach a CausalEngine for graph-backend-based root cause inference.
     pub fn with_causal_engine(mut self, engine: Arc<CausalEngine>) -> Self {
         self.causal_engine = Some(engine);
+        self
+    }
+
+    /// Attach durable usage evidence and restore records from L0.  Graph
+    /// counters remain the fast summary; these records preserve the evidence
+    /// needed for restart-safe diagnosis, statistics, and evolution review.
+    pub fn with_usage_persistence(mut self, store: Arc<L0Store>) -> Self {
+        const PREFIX: &str = "iri://governance/skill-usage/";
+        if let Ok(entries) = store.scan_iri_prefix(PREFIX, usize::MAX) {
+            self.usage_history = entries
+                .into_iter()
+                .filter_map(|entry| serde_json::from_str::<UsageRecord>(&entry.content).ok())
+                .collect();
+        }
+        self.usage_store = Some(store);
         self
     }
 
@@ -998,6 +1171,17 @@ impl SkillEvolutionEngine {
             }
         }
 
+        if let Some(store) = &self.usage_store {
+            let key = format!(
+                "iri://governance/skill-usage/{}/{}",
+                uuid::Uuid::new_v4(),
+                record.skill_iri.replace('/', "%2F")
+            );
+            let content = serde_json::to_string(&record).map_err(|error| CoreError::StorageError {
+                message: format!("Failed to serialize skill usage evidence: {error}"),
+            })?;
+            store.store(&key, &content)?;
+        }
         self.usage_history.push(record);
 
         Ok(())
@@ -1067,7 +1251,12 @@ impl SkillEvolutionEngine {
                         skill_iri, error, error_class, inference.confidence
                     ),
                     confidence: inference.confidence,
-                    patch: None,
+                    patch: Some(EvolutionPatch::CreateFragment {
+                        skill_iri: skill_iri.to_string(),
+                        problem: error.to_string(),
+                        recommendation: "Add the verified mitigation to the skill knowledge fragment and use it before retrying this task class.".to_string(),
+                        discoverer: agent_id.to_string(),
+                    }),
                     approval: EvolutionApproval::Pending,
                 });
                 return;
@@ -1122,7 +1311,12 @@ impl SkillEvolutionEngine {
                 skill_iri, error, error_class
             ),
             confidence: 0.7,
-            patch: None,
+            patch: Some(EvolutionPatch::CreateFragment {
+                skill_iri: skill_iri.to_string(),
+                problem: error.to_string(),
+                recommendation: "Add the verified mitigation to the skill knowledge fragment and use it before retrying this task class.".to_string(),
+                discoverer: agent_id.to_string(),
+            }),
             approval: EvolutionApproval::Pending,
         });
     }
@@ -1431,6 +1625,21 @@ impl SkillEvolutionEngine {
                 description,
             ),
             Some(EvolutionPatch::Methodology { .. }) => Ok(()),
+            Some(EvolutionPatch::CreateFragment {
+                skill_iri,
+                problem,
+                recommendation,
+                discoverer,
+            }) => {
+                let fragment_iri = knowledge_fragment_iri(skill_iri, problem, recommendation);
+                self.graph_store.create_fragment(
+                    &fragment_iri,
+                    skill_iri,
+                    problem,
+                    recommendation,
+                    Some(discoverer),
+                ).map(|_| ())
+            }
             None => Err(CoreError::ValidationFailed {
                 message: "Suggestion has no typed patch; approval is required".to_string(),
             }),
@@ -1581,6 +1790,13 @@ impl SkillEvolutionEngine {
                 });
             }
 
+            // Similarity alone is not evidence of a useful evolution.  Do
+            // not create durable link proposals for skills that have not yet
+            // accumulated repeated observed usage in this engine.
+            let usage = self.get_usage_stats(&skill.skill_iri);
+            if usage.total_usage < 3 {
+                continue;
+            }
             let link_suggestions = self.graph_store.suggest_links(&skill.skill_iri, None).await;
             for (target, link_type, confidence) in link_suggestions {
                 if confidence > 0.5 {
@@ -1699,6 +1915,30 @@ mod tests {
         assert_eq!(stats.total_usage, 1);
         assert_eq!(stats.successful, 1);
         assert_eq!(stats.avg_tokens, 1500);
+    }
+
+    #[test]
+    fn test_usage_evidence_survives_engine_restart() {
+        let graph = setup_test_store();
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap());
+        let mut first = SkillEvolutionEngine::new(graph.clone()).with_usage_persistence(l0.clone());
+        first
+            .record_usage(
+                UsageRecord::new(
+                    "iri://skills/test-skill",
+                    "iri://task/persisted",
+                    "agent:test",
+                    true,
+                )
+                .with_tokens(42),
+            )
+            .unwrap();
+
+        let restored = SkillEvolutionEngine::new(graph).with_usage_persistence(l0);
+        let stats = restored.get_usage_stats("iri://skills/test-skill");
+        assert_eq!(stats.total_usage, 1);
+        assert_eq!(stats.avg_tokens, 42);
     }
 
     #[test]
@@ -2752,6 +2992,68 @@ mod tests {
             .suggestion
             .patch
             .is_some_and(|p| matches!(p, EvolutionPatch::Methodology { .. })));
+    }
+
+    #[test]
+    fn outcome_assessment_requires_repeated_evidence() {
+        let first = assess_outcome(0.5, 1.0, 0, 1);
+        assert_eq!(first.verdict, "insufficient_evidence");
+        let improved = assess_outcome(0.5, 0.75, 2, 4);
+        assert_eq!(improved.verdict, "improved");
+        let degraded = assess_outcome(0.8, 0.6, 3, 5);
+        assert_eq!(degraded.verdict, "degraded");
+    }
+
+    #[test]
+    fn knowledge_fragment_proposal_requires_review_and_commits_reusable_knowledge() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(
+            crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap(),
+        );
+        let graph = Arc::new(SkillGraphStore::new().with_l0_store(l0.clone()));
+        graph
+            .register_skill(SkillGraphNode::new(
+                "iri://skills/parser",
+                "parser",
+                "parsing skill",
+            ))
+            .unwrap();
+        let suggestion = EvolutionSuggestion {
+            suggestion_type: EvolutionSuggestionType::CreateFragment,
+            skill_iri: "iri://skills/parser".into(),
+            description: "persist parser failure mitigation".into(),
+            confidence: 0.9,
+            patch: Some(EvolutionPatch::CreateFragment {
+                skill_iri: "iri://skills/parser".into(),
+                problem: "malformed input".into(),
+                recommendation: "validate the input before parsing".into(),
+                discoverer: "agent:test".into(),
+            }),
+            approval: EvolutionApproval::Pending,
+        };
+        let proposals = EvolutionProposalStore::new(l0.clone());
+        let proposal = proposals
+            .create_or_get("fragment-lifecycle", suggestion, graph.as_ref())
+            .unwrap();
+        assert!(matches!(
+            proposal.status,
+            EvolutionProposalStatus::PendingReview
+        ));
+        let approved = proposals
+            .approve(&proposal.proposal_id, "reviewer:test", None)
+            .unwrap();
+        let validated = proposals
+            .validate_for_commit(&approved.proposal_id, graph.as_ref())
+            .unwrap();
+        let committed = proposals
+            .commit_validated_link_patch(&validated.proposal_id, graph.as_ref())
+            .unwrap();
+        assert_eq!(committed.status, EvolutionProposalStatus::Committed);
+        assert_eq!(graph.get_fragments_for_skill("iri://skills/parser").len(), 1);
+        assert_eq!(
+            graph.get_skill("iri://skills/parser").unwrap().graph_meta.known_failure_modes.len(),
+            1
+        );
     }
 
     #[test]

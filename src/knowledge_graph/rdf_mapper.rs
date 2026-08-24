@@ -10,11 +10,14 @@ impl RdfMapper {
     /// Replace or percent-encode characters not allowed in SPARQL IRIs.
     /// Allowed unreserved chars: A-Z a-z 0-9 - . _ ~
     /// Allowed sub-delims:      ! $ & ' ( ) * + , ; =
-    /// Also preserved:          : / @ # ? %
+    /// Also preserved:          : / @ and already-valid `%XX` escapes.
     /// Everything else (spaces, brackets, etc.) → percent-encoded.
     pub(crate) fn sanitize_id(id: &str) -> String {
         let mut out = String::with_capacity(id.len() + 8);
-        for b in id.bytes() {
+        let bytes = id.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let b = bytes[index];
             match b {
                 b'A'..=b'Z'
                 | b'a'..=b'z'
@@ -36,13 +39,21 @@ impl RdfMapper {
                 | b'='
                 | b':'
                 | b'/'
-                | b'@'
-                | b'#'
-                | b'?'
-                | b'%' => out.push(b as char),
+                | b'@' => out.push(b as char),
+                b'%' if index + 2 < bytes.len()
+                    && bytes[index + 1].is_ascii_hexdigit()
+                    && bytes[index + 2].is_ascii_hexdigit() =>
+                {
+                    out.push('%');
+                    out.push(bytes[index + 1] as char);
+                    out.push(bytes[index + 2] as char);
+                    index += 2;
+                }
+                b'%' => out.push_str("%25"),
                 b' ' | b'\n' | b'\r' | b'\t' => out.push('_'),
                 _ => out.push_str(&format!("%{:02X}", b)),
             }
+            index += 1;
         }
         out
     }
@@ -314,6 +325,17 @@ mod tests {
         let node = make_node("my node", "Concept", "My Node");
         let quads = RdfMapper::map_nodes(&[node], "g");
         assert_eq!(quads[0].subject, "iri://entity/my_node");
+    }
+
+    #[test]
+    fn test_sanitize_id_encodes_invalid_percent_sequences() {
+        assert_eq!(
+            RdfMapper::sanitize_id("chrono::Local::now().format(%H:%M:%S)"),
+            "chrono::Local::now().format(%25H:%25M:%25S)"
+        );
+        assert_eq!(RdfMapper::sanitize_id("already%2Fencoded"), "already%2Fencoded");
+        assert_eq!(RdfMapper::sanitize_id("literal%%7B"), "literal%25%7B");
+        assert_eq!(RdfMapper::sanitize_id("raw#fragment?query"), "raw%23fragment%3Fquery");
     }
 
     #[test]

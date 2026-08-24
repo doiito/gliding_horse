@@ -1,0 +1,24 @@
+{
+  "@context": {
+    "skill": "https://agent-os.org/ontology/skill#"
+  },
+  "skills": [{
+  "@id": "iri://skills/evolution_probe",
+  "@type": ["skill:Skill", "skill:Atomic"],
+  "skill:name": "evolution_probe",
+  "skill:description": "Deterministic test skill for validating usage evidence, causal analysis, and governed evolution.",
+  "skill:version": "1.0.0",
+  "skill:category": "testing",
+  "skill:allowedRoles": ["DA", "CA"],
+  "skill:inputSchema": {"type": "object", "properties": {"case": {"type": "string"}}, "required": ["case"]},
+  "skill:outputSchema": {"type": "object", "properties": {"success": {"type": "boolean"}}},
+  "skill:5W2H": {
+    "skill:what": "Exercise a skill self-evolution cycle",
+    "skill:why": "Verify evidence survives restart and produces governed proposals",
+    "skill:who": {"skill:requiredRole": "DA"},
+    "skill:how": {"skill:approach": "Record deterministic success and failure outcomes"},
+    "skill:when": {"skill:applicablePhase": ["Do", "Check"]}
+  },
+  "skill:tags": ["test", "evolution", "causal", "persistence"]
+  }]
+}

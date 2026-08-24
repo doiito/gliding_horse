@@ -127,8 +127,15 @@ fn compute_sha256(content: &str) -> String {
     hex
 }
 
+fn file_entity_iri(file_path: &str) -> String {
+    format!(
+        "iri://entity/file:{}",
+        super::rdf_mapper::RdfMapper::sanitize_id(file_path)
+    )
+}
+
 fn get_cached_hash(store: &KnowledgeGraphStore, file_path: &str, graph: &str) -> Option<String> {
-    let subject_iri = format!("iri://entity/file:{}", file_path);
+    let subject_iri = file_entity_iri(file_path);
     let sparql = format!(
         "SELECT ?hash WHERE {{ GRAPH <{}> {{ <{}> <https://agent-os.org/ontology/meta/contentHash> ?hash . }} }}",
         graph, subject_iri
@@ -177,7 +184,7 @@ impl CodeAstExtractor {
         let is_update = cached_hash.is_some();
 
         let deleted_quads = if is_update {
-            store.delete_code_file_subgraph(&format!("iri://entity/file:{}", path), graph)?
+            store.delete_code_file_subgraph(&file_entity_iri(path), graph)?
         } else {
             0
         };
@@ -1807,6 +1814,25 @@ class Child(Base):
             has_source_file,
             "extraction result should include sourceFile property"
         );
+    }
+
+    #[test]
+    fn test_extract_rust_call_with_strftime_percent_codes_is_valid_rdf() {
+        let store = KnowledgeGraphStore::new().unwrap();
+        let source = r#"
+            fn timestamp() {
+                chrono::Local::now().format("%H:%M:%S").to_string();
+            }
+        "#;
+        let result = CodeAstExtractor::extract_from_source(
+            source,
+            &CodeLanguage::Rust,
+            "apps/gliding_code/src/tui.rs",
+            "graph:code",
+        )
+        .unwrap();
+
+        store.write_quads(&result.quads, "graph:code").unwrap();
     }
 
     #[test]

@@ -9,8 +9,10 @@ pub mod event_bus;
 pub mod execution_event;
 pub mod five_w2h;
 pub mod perception_store;
+pub mod policy_learning;
 pub mod prompt_loader;
 pub mod relevance_tracker;
+pub mod recovery;
 pub mod sa;
 pub mod supplementary_store;
 pub mod syscall_gate;
@@ -35,7 +37,16 @@ pub use execution_event::{
 pub use five_w2h::*;
 pub use perception_store::{PerceptionEntry, PerceptionSource, PerceptionStore};
 pub use prompt_loader::{PromptConfig, PromptLoader};
+pub use policy_learning::{
+    ArmStats, ConstrainedPolicy, PolicyChoice, PolicyObservation, PolicyState,
+    PolicyDriftReport, PolicyEvaluation, PolicyGate, PolicyVersion, TrainablePolicyModel,
+    TrainingMetrics, TrajectoryStep,
+};
 pub use relevance_tracker::RelevanceTracker;
+pub use recovery::{
+    AuditReport, AuditVerdict, DecisionReport, OrchestrationMode, RecoveryDirective,
+    RecoveryReason, RepairScope,
+};
 pub use sa::SupervisorAgent;
 pub use supplementary_store::{SupplementEntry, SupplementaryInputStore};
 pub use syscall_gate::{SyscallGate, WhitelistManager};

@@ -266,6 +266,10 @@ export EXA_API_KEY="your-exa-api-key"
 # Chosen queries and requested URLs are sent to Parallel.
 ./glidingcode --mcp-server parallel-search=https://search.parallel.ai/mcp
 
+# Privacy note: third-party MCP servers (e.g. chrome, parallel-search)
+# receive the queries, URLs, and prompts you send through them. Review
+# each server's privacy policy before enabling.
+
 # Resume from checkpoint
 ./glidingcode --resume task:abc123
 ```

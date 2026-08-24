@@ -133,13 +133,24 @@ const MICRO_TOOL_PREFIXES: &[&str] = &[
 /// Keep this table explicit: an unknown tool must still fail closed.
 fn builtin_security_skill_iri(name: &str) -> Option<&'static str> {
     match name {
-        "tool_search" | "glob_search" | "grep_search" | "file_read" | "file_list"
-        | "workspace_status" | "rag_search" | "kg_search" | "codebase_search"
-        | "knowledge_list" | "knowledge_search" | "knowledge_extract_code"
-        | "knowledge_query" | "knowledge_neighbors"
-        | "read_agent_output" | "read_full_result" | "get_entity_details" | "expand_relation" => {
-            Some("iri://skills/file_read")
-        }
+        "tool_search"
+        | "glob_search"
+        | "grep_search"
+        | "file_read"
+        | "file_list"
+        | "workspace_status"
+        | "rag_search"
+        | "kg_search"
+        | "codebase_search"
+        | "knowledge_list"
+        | "knowledge_search"
+        | "knowledge_extract_code"
+        | "knowledge_query"
+        | "knowledge_neighbors"
+        | "read_agent_output"
+        | "read_full_result"
+        | "get_entity_details"
+        | "expand_relation" => Some("iri://skills/file_read"),
         "bash" | "file_write" | "file_edit" => Some("iri://skills/file_write"),
         "web_search" | "web_fetch" | "http_request" => Some("iri://skills/http_request"),
         "llm_chat" => Some("iri://skills/llm_chat"),
@@ -1397,11 +1408,7 @@ impl ToolExecutor {
     pub fn list_tools(&self, role: &str) -> Vec<String> {
         self.tool_definitions_for_role(role)
             .into_iter()
-            .filter_map(|td| {
-                td["function"]["name"]
-                    .as_str()
-                    .map(|s| s.to_string())
-            })
+            .filter_map(|td| td["function"]["name"].as_str().map(|s| s.to_string()))
             .collect()
     }
 
@@ -1494,6 +1501,37 @@ impl ToolExecutor {
         );
 
         result
+    }
+
+    /// Return only the default tool window for a role. On-demand tools remain
+    /// discoverable through `tool_search` and can be registered dynamically;
+    /// they are not sent to the model on every request. The historical
+    /// `tool_definitions_for_role` API intentionally remains unchanged for
+    /// compatibility with callers that need the complete role-allowed set.
+    pub fn visible_tool_definitions_for_role(&self, role: &str) -> Vec<Value> {
+        let role_name = match role {
+            "PA" | "Plan" => "Plan",
+            "DA" | "Do" => "Do",
+            "CA" | "Check" => "Check",
+            "AA" | "Act" => "Act",
+            _ => role,
+        };
+        let Some(manager) = self.tool_group_manager.as_ref() else {
+            // Keep the legacy fallback behavior when no explicit group
+            // manager exists; built-in registrations do not carry the
+            // default/on-demand distinction needed for safe filtering.
+            return self.tool_definitions_for_role(role);
+        };
+        let (default_tools, _) = manager.get_tool_names_for_role(role_name);
+        self.tool_definitions_for_role(role)
+            .into_iter()
+            .filter(|td| {
+                td["function"]["name"]
+                    .as_str()
+                    .map(|name| default_tools.contains(name) || name == "tool_search")
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
     /// Role-filtered tool definitions intersected with an explicit allowlist.

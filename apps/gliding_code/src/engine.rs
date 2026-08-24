@@ -9,6 +9,7 @@ use glidinghorse::config::{McpServerConfig, McpStdioServerConfig};
 use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::{Event, EventBus};
 use glidinghorse::core::sa::SupervisorAgent;
+use glidinghorse::core::ApplicationPromptProfile;
 use glidinghorse::gateway::UnifiedGateway;
 use glidinghorse::graph_backend::{GraphBackend, PetgraphBackend, SkillGraphSnapshotBackend};
 use glidinghorse::graph_features::features::FeatureExtractor;
@@ -427,8 +428,12 @@ impl CodeCliEngine {
         // before the bootstrap loop so they join the skill graph at startup.
         if let Some(skill_dir) = config.skill_dir.as_deref() {
             match skills.load_from_jsonld_dir(skill_dir) {
-                Ok(count) => info!(count, path = %skill_dir, "Loaded external skills from --skill-dir"),
-                Err(error) => warn!(path = %skill_dir, %error, "Failed to load skills from --skill-dir"),
+                Ok(count) => {
+                    info!(count, path = %skill_dir, "Loaded external skills from --skill-dir")
+                }
+                Err(error) => {
+                    warn!(path = %skill_dir, %error, "Failed to load skills from --skill-dir")
+                }
             }
         }
 
@@ -557,6 +562,7 @@ impl CodeCliEngine {
             tmpl.clone(),
             agent_settings.clone(),
         )
+        .with_application_prompt(glidingcode_prompt_profile())
         .with_prompt_loader(glidinghorse::core::prompt_loader::PromptLoader::new(
             Default::default(),
             tmpl.clone(),
@@ -643,7 +649,8 @@ impl CodeCliEngine {
                 db_path: Some(ws_db_path),
                 ..Default::default()
             };
-            match WorkspaceMonitor::initialize(ws_config, Some(l2.clone()), Some(event_bus.clone())) {
+            match WorkspaceMonitor::initialize(ws_config, Some(l2.clone()), Some(event_bus.clone()))
+            {
                 Ok(ws) => {
                     ws.register_hooks(&runner.hook_manager);
                     info!(root = %config.workspace, "WorkspaceMonitor 已初始化");
@@ -1774,9 +1781,9 @@ impl CodeCliEngine {
                 "entrypoint": "tui_or_resume",
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
-            if let Err(error) = self
-                .l2_bb
-                .write_node(&outcome_iri, &outcome.to_string(), &self.core_config)
+            if let Err(error) =
+                self.l2_bb
+                    .write_node(&outcome_iri, &outcome.to_string(), &self.core_config)
             {
                 warn!(task_iri = %task_iri, %error, "Failed to persist TUI skill outcome evidence");
             }
@@ -1893,9 +1900,70 @@ impl CodeCliEngine {
     }
 }
 
+/// Application-level software-engineering contract. Kernel policy, role
+/// permissions, and lifecycle rules remain authoritative and are injected
+/// separately by AgentRunner.
+fn glidingcode_prompt_profile() -> ApplicationPromptProfile {
+    ApplicationPromptProfile::new(
+        "glidingcode",
+        "v1",
+        r#"Software-engineering application rules:
+- Treat the configured workspace as the only project scope. Ignore .git, .gliding_horse, caches, generated binaries, and unrelated projects unless the task explicitly names them.
+- Prefer targeted reads and minimal changes. Preserve existing public behavior unless the task requires a change.
+- For code changes, identify affected files and the relevant test command before claiming completion.
+- DA must report changed file paths, commands run, and command results. CA must verify the declared acceptance criteria with direct evidence.
+- PA application extension: identify the smallest relevant code scope, target files, dependencies, and executable acceptance checks.
+- DA application extension: make the smallest scoped code change, preserve existing behavior, and record changed artifacts plus verification commands.
+- CA application extension: verify each declared acceptance criterion with concrete file or command evidence; do not invent coverage, performance, or security requirements.
+- AA application extension: decide from the structured CA evidence. Do not modify code or explore files unless the runtime explicitly enables correction or challenge mode.
+- Test failures, build failures, incomplete code analysis, or unavailable external services are evidence to report; do not hide them or claim success without a valid fallback.
+- Code AST/knowledge-graph information is auxiliary evidence. Its absence or partial failure does not fail an ordinary file-editing task unless graph analysis is an explicit requirement.
+- Do not modify repository metadata, internal runtime state, or generated artifacts unless explicitly requested."#,
+    )
+    .with_optimized_contract(
+        r#"Software-engineering application contract:
+
+Scope
+- Treat the configured workspace as the only project scope. Ignore .git, .gliding_horse, caches, generated binaries, and unrelated projects unless explicitly named.
+- Prefer targeted reads and the smallest sufficient change. Preserve existing public behavior unless the task requires a change.
+
+Execution evidence
+- PA identifies target files, dependencies, risks, and executable acceptance checks.
+- DA reports changed paths, commands run, exit results, and any unverified assumption.
+- CA verifies every declared criterion with direct file or command evidence. A failed, skipped, unavailable, or incomplete check remains visible as such.
+- AA decides only from structured CA evidence and the declared criteria. It does not silently repair, explore, or expand scope.
+
+Engineering boundaries
+- AST/knowledge-graph information is auxiliary evidence. Missing or partial graph data does not fail ordinary file-editing unless graph analysis is explicitly required.
+- Do not invent coverage, performance, or security requirements. Do not modify repository metadata, runtime state, or generated artifacts unless explicitly requested.
+- If tests/builds/external services fail, report the exact failure and distinguish it from a code defect.
+
+Required handoff shape
+- `criteria`: each declared criterion and status (`pass`, `fail`, `blocked`, or `unverified`)
+- `evidence`: file paths, relevant excerpts, commands, and exit results
+- `changes`: files actually changed (empty for read-only work)
+- `remaining`: unresolved risks or follow-up work
+- Final status must be supported by the evidence; never claim success from an absent check."#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{collect_workspace_code_files, load_code_scan_exclusions};
+    use super::{
+        collect_workspace_code_files, glidingcode_prompt_profile, load_code_scan_exclusions,
+    };
+
+    #[test]
+    fn glidingcode_prompt_is_application_specific_and_preserves_kernel_boundary() {
+        let prompt = glidingcode_prompt_profile().render();
+        assert!(prompt.contains("Application: glidingcode"));
+        assert!(prompt.contains("Software-engineering application contract"));
+        assert!(prompt.contains("tests/builds") || prompt.contains("test command"));
+        assert!(prompt.contains("AST/knowledge-graph"));
+        assert!(prompt.contains("criteria"));
+        assert!(!prompt.contains("Constitution"));
+        assert!(!prompt.contains("PDCA"));
+    }
 
     #[test]
     fn code_scan_honors_configured_and_gitignore_exclusions_recursively() {

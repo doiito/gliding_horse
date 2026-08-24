@@ -11,6 +11,7 @@ pub mod five_w2h;
 pub mod perception_store;
 pub mod policy_learning;
 pub mod prompt_loader;
+pub mod prompt_contract;
 pub mod relevance_tracker;
 pub mod recovery;
 pub mod sa;
@@ -37,6 +38,7 @@ pub use execution_event::{
 pub use five_w2h::*;
 pub use perception_store::{PerceptionEntry, PerceptionSource, PerceptionStore};
 pub use prompt_loader::{PromptConfig, PromptLoader};
+pub use prompt_contract::{ApplicationPromptProfile, PromptAssemblyReport, PromptVariant};
 pub use policy_learning::{
     ArmStats, ConstrainedPolicy, PolicyChoice, PolicyObservation, PolicyState,
     PolicyDriftReport, PolicyEvaluation, PolicyGate, PolicyVersion, TrainablePolicyModel,

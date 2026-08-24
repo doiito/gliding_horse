@@ -42,11 +42,8 @@ mod tests {
                 .execute_with_security_context(
                     "bash",
                     input,
-                    crate::skill_graph::security::SecurityContext::new(
-                        "agent:test",
-                        "DA",
-                    )
-                    .with_task("iri://tasks/allowlist-test"),
+                    crate::skill_graph::security::SecurityContext::new("agent:test", "DA")
+                        .with_task("iri://tasks/allowlist-test"),
                     Some(&["file_read".to_string()]),
                 )
                 .await
@@ -68,11 +65,8 @@ mod tests {
                 .execute_with_security_context(
                     "tool_search",
                     input,
-                    crate::skill_graph::security::SecurityContext::new(
-                        "agent:test",
-                        "DA",
-                    )
-                    .with_task("iri://tasks/allowlist-test"),
+                    crate::skill_graph::security::SecurityContext::new("agent:test", "DA")
+                        .with_task("iri://tasks/allowlist-test"),
                     Some(&["tool_search".to_string()]),
                 )
                 .await
@@ -141,9 +135,7 @@ mod tests {
                     &meta,
                 ))
                 .unwrap();
-            let whitelist = std::collections::HashSet::from([
-                "iri://skills/file_read".to_string(),
-            ]);
+            let whitelist = std::collections::HashSet::from(["iri://skills/file_read".to_string()]);
             let security = Arc::new(
                 crate::skill_graph::security::SecurityEngine::with_whitelisted_skills(
                     graph.clone(),
@@ -197,8 +189,9 @@ mod tests {
                 .get_audit_log(Some("iri://skills/file_read"), Some("agent:test"), 50)
                 .await;
             assert!(
-                audit.iter().any(|e| e.outcome
-                    == crate::skill_graph::types::AuditOutcome::Success),
+                audit
+                    .iter()
+                    .any(|e| e.outcome == crate::skill_graph::types::AuditOutcome::Success),
                 "whitelisted read skill should produce allow audit entries"
             );
         });
@@ -410,9 +403,7 @@ mod tests {
                 "mcp_server_browse",
                 "MCP-registered browsing tool",
                 json!({"type": "object", "properties": {}}),
-                Arc::new(|input: Value| {
-                    Box::pin(async move { Ok(json!({"ok": input})) })
-                }),
+                Arc::new(|input: Value| Box::pin(async move { Ok(json!({"ok": input})) })),
                 &["Plan", "Do", "Check", "Act"],
             );
 
@@ -420,12 +411,7 @@ mod tests {
                 let defs = executor.tool_definitions_for_role(role);
                 let names: Vec<String> = defs
                     .iter()
-                    .map(|d| {
-                        d["function"]["name"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string()
-                    })
+                    .map(|d| d["function"]["name"].as_str().unwrap_or("").to_string())
                     .collect();
                 assert!(
                     names.contains(&"mcp_server_browse".to_string()),
@@ -465,8 +451,7 @@ mod tests {
 
         // Single-tool allowlist → intersection keeps only that tool
         let one = vec![full_names[0].clone()];
-        let filtered =
-            executor.tool_definitions_for_role_with_allowlist("DA", Some(&one));
+        let filtered = executor.tool_definitions_for_role_with_allowlist("DA", Some(&one));
         assert_eq!(filtered.len(), 1);
         assert_eq!(
             filtered[0]["function"]["name"].as_str().unwrap(),
@@ -478,6 +463,23 @@ mod tests {
         assert!(executor
             .tool_definitions_for_role_with_allowlist("DA", Some(&disjoint))
             .is_empty());
+    }
+
+    #[test]
+    fn optimized_visible_tools_hide_on_demand_groups_until_search() {
+        let mut executor = ToolExecutor::new();
+        executor.set_tool_group_manager(crate::tools::tool_groups::ToolGroupManager::new(None));
+
+        let visible = executor.visible_tool_definitions_for_role("AA");
+        let names: std::collections::HashSet<String> = visible
+            .iter()
+            .filter_map(|td| td["function"]["name"].as_str().map(String::from))
+            .collect();
+
+        assert!(names.contains("file_read"));
+        assert!(names.contains("tool_search"));
+        assert!(!names.contains("rag_search"));
+        assert!(!names.contains("knowledge_search"));
     }
 
     #[cfg(unix)]
@@ -494,7 +496,11 @@ mod tests {
                 .unwrap();
             // Exit code 1 = "no matching process" — correct: our own PID was
             // filtered out, and nothing else matches the unique marker.
-            assert_eq!(result["exit_code"], 1, "own PID must be excluded: {:?}", result);
+            assert_eq!(
+                result["exit_code"], 1,
+                "own PID must be excluded: {:?}",
+                result
+            );
         });
     }
 
@@ -517,7 +523,11 @@ mod tests {
             let result = super::builtins::execute_bash(json!({"command": cmd}))
                 .await
                 .unwrap();
-            assert_eq!(result["exit_code"], 0, "pkill should find the target: {:?}", result);
+            assert_eq!(
+                result["exit_code"], 0,
+                "pkill should find the target: {:?}",
+                result
+            );
             // The child must be gone shortly after.
             for _ in 0..50 {
                 if let Ok(Some(status)) = child.try_wait() {
@@ -570,7 +580,11 @@ mod tests {
             .unwrap();
             assert_eq!(result["exit_code"], 0);
             let status = &result["sandbox_status"];
-            assert!(status.is_object(), "sandbox_status must be present: {:?}", result);
+            assert!(
+                status.is_object(),
+                "sandbox_status must be present: {:?}",
+                result
+            );
             assert_eq!(status["requested"]["enabled"], true);
         });
     }
@@ -587,7 +601,11 @@ mod tests {
             .unwrap();
             assert_eq!(result["exit_code"], 0);
             let status = &result["sandbox_status"];
-            assert_eq!(status["enabled"], false, "sandbox must be disabled: {:?}", result);
+            assert_eq!(
+                status["enabled"], false,
+                "sandbox must be disabled: {:?}",
+                result
+            );
         });
     }
 
@@ -625,7 +643,11 @@ mod tests {
             .await
             .unwrap();
             let task_id = result["background_task_id"].as_str().unwrap_or("");
-            assert!(!task_id.is_empty(), "background task id must be present: {:?}", result);
+            assert!(
+                !task_id.is_empty(),
+                "background task id must be present: {:?}",
+                result
+            );
         });
     }
 
@@ -641,8 +663,16 @@ mod tests {
             assert_eq!(result["exit_code"], 0);
             assert_eq!(result["truncated"], true);
             let stdout = result["stdout"].as_str().unwrap_or("");
-            assert!(stdout.contains("[output truncated"), "stdout must carry marker: {:?}", result);
-            assert!(stdout.len() < 20_000, "stdout must be capped: {}", stdout.len());
+            assert!(
+                stdout.contains("[output truncated"),
+                "stdout must carry marker: {:?}",
+                result
+            );
+            assert!(
+                stdout.len() < 20_000,
+                "stdout must be capped: {}",
+                stdout.len()
+            );
         });
     }
 

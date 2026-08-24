@@ -603,7 +603,9 @@ impl super::AgentRunner {
         let context_data = self.gather_context_data_async(agent.role, &ctx).await;
         let agent_md = self.build_agent_md(agent.role, &ctx.objective, &context_data, &model);
 
-        let system_content = self.build_system_prompt(agent, &ctx, &session, &agent_md).await;
+        let system_content = self
+            .build_system_prompt(agent, &ctx, &session, &agent_md)
+            .await;
 
         let summary_chain = session.get_summary_chain();
         let summary_text = summary_chain
@@ -643,10 +645,7 @@ impl super::AgentRunner {
             },
         ];
 
-        let tools = self
-            .tool_executor
-            .read()
-            .tool_definitions_for_role(&agent.role.to_string());
+        let tools = self.tool_definitions_for_agent(&agent.role.to_string());
 
         info!(
             "AgentRunner streaming started: role={}, model={}, tools={}",
@@ -690,10 +689,8 @@ impl super::AgentRunner {
                     None,
                     {
                         // Refresh the tools list before each call to include newly registered micro-tools
-                        let current_tools = self
-                            .tool_executor
-                            .read()
-                            .tool_definitions_for_role(&agent.role.to_string());
+                        let current_tools =
+                            self.tool_definitions_for_agent(&agent.role.to_string());
                         if current_tools.is_empty() {
                             None
                         } else {
@@ -967,37 +964,36 @@ impl super::AgentRunner {
                         turn += 1;
 
                         // Check if compression is needed after each tool call (consistent with exec() behavior)
-                        let cwm_did_compress = if let Some(ref cwm_lock) =
-                            self.context_window_manager
-                        {
-                            if let Ok(cwm) = cwm_lock.lock() {
-                                let model = self
-                                    .gateway
-                                    .get_model(&agent.role.to_string().to_lowercase());
-                                if cwm.should_compress_for_model(
-                                    running_messages.len(),
-                                    &running_messages,
-                                    &model,
-                                ) {
-                                    let (compressed, _summary) =
-                                        cwm.compress_messages(&running_messages);
-                                    let orig_count = running_messages.len();
-                                    running_messages = compressed;
-                                    debug!(
-                                        "[Streaming] Context compression: {} → {} messages",
-                                        orig_count,
-                                        running_messages.len()
-                                    );
-                                    true
+                        let cwm_did_compress =
+                            if let Some(ref cwm_lock) = self.context_window_manager {
+                                if let Ok(cwm) = cwm_lock.lock() {
+                                    let model = self
+                                        .gateway
+                                        .get_model(&agent.role.to_string().to_lowercase());
+                                    if cwm.should_compress_for_model(
+                                        running_messages.len(),
+                                        &running_messages,
+                                        &model,
+                                    ) {
+                                        let (compressed, _summary) =
+                                            cwm.compress_messages(&running_messages);
+                                        let orig_count = running_messages.len();
+                                        running_messages = compressed;
+                                        debug!(
+                                            "[Streaming] Context compression: {} → {} messages",
+                                            orig_count,
+                                            running_messages.len()
+                                        );
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 } else {
                                     false
                                 }
                             } else {
                                 false
-                            }
-                        } else {
-                            false
-                        };
+                            };
 
                         // Fallback: hard truncation (safety net when CWM is unavailable or misconfigured)
                         if !cwm_did_compress && running_messages.len() > 40 {

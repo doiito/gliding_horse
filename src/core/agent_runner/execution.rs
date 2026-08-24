@@ -629,10 +629,7 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         });
 
-        let tools = self
-            .tool_executor
-            .read()
-            .tool_definitions_for_role(&agent.role.to_string());
+        let tools = self.tool_definitions_for_agent(&agent.role.to_string());
 
         info!(
             "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
@@ -1069,10 +1066,8 @@ Output the summary report directly, not in JSON format."#,
                     None,
                     {
                         // Refresh tools list before each call to ensure newly registered micro-tools (e.g. read_full_result_*) are included
-                        let current_tools = self
-                            .tool_executor
-                            .read()
-                            .tool_definitions_for_role(&agent.role.to_string());
+                        let current_tools =
+                            self.tool_definitions_for_agent(&agent.role.to_string());
                         if current_tools.is_empty() {
                             None
                         } else {

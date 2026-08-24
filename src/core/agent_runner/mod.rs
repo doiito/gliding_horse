@@ -317,6 +317,12 @@ pub struct AgentRunner {
     pub tool_result_aging: Option<crate::core::ToolResultAging>,
     pub context_window_manager: Option<Arc<std::sync::Mutex<ContextWindowManager>>>,
     pub prompt_loader: Option<Arc<crate::core::prompt_loader::PromptLoader>>,
+    /// Optional application-level contract layered below kernel policy and
+    /// above role/task context.
+    pub application_prompt: Option<crate::core::prompt_contract::ApplicationPromptProfile>,
+    /// Prompt experiment arm. Defaults to the optimized contract; set
+    /// GLIDING_PROMPT_VARIANT=baseline for a controlled A/B comparison.
+    pub prompt_variant: crate::core::prompt_contract::PromptVariant,
     pub methodology_gate: Option<MethodologyGateHandle>,
     pub root_cause_engine: Option<Arc<RootCauseEngine>>,
     /// Supplementary input store (SA writes → AgentRunner consumes at CycleStart)
@@ -404,6 +410,8 @@ impl AgentRunner {
             tool_result_aging: None,
             context_window_manager: None,
             prompt_loader: None,
+            application_prompt: None,
+            prompt_variant: crate::core::prompt_contract::PromptVariant::from_env(),
             methodology_gate,
             root_cause_engine,
             supplement_store: crate::core::supplementary_store::SupplementaryInputStore::new(),
@@ -453,7 +461,8 @@ impl AgentRunner {
         self.token_optimization = token_optimization;
         self.init_context_compressors();
         self
-    }    pub fn with_prefetch_engine(mut self, prefetch_engine: Arc<PrefetchEngine>) -> Self {
+    }
+    pub fn with_prefetch_engine(mut self, prefetch_engine: Arc<PrefetchEngine>) -> Self {
         self.prefetch_engine = Some(prefetch_engine);
         self
     }
@@ -503,6 +512,35 @@ impl AgentRunner {
     pub fn with_prompt_loader(mut self, loader: crate::core::prompt_loader::PromptLoader) -> Self {
         self.prompt_loader = Some(Arc::new(loader));
         self
+    }
+
+    /// Attach a domain application contract without replacing kernel policy.
+    pub fn with_application_prompt(
+        mut self,
+        profile: crate::core::prompt_contract::ApplicationPromptProfile,
+    ) -> Self {
+        self.application_prompt = Some(profile);
+        self
+    }
+
+    pub fn with_prompt_variant(
+        mut self,
+        variant: crate::core::prompt_contract::PromptVariant,
+    ) -> Self {
+        self.prompt_variant = variant;
+        self
+    }
+
+    pub(super) fn tool_definitions_for_agent(&self, role: &str) -> Vec<Value> {
+        let executor = self.tool_executor.read();
+        match self.prompt_variant {
+            crate::core::prompt_contract::PromptVariant::Baseline => {
+                executor.tool_definitions_for_role(role)
+            }
+            crate::core::prompt_contract::PromptVariant::Optimized => {
+                executor.visible_tool_definitions_for_role(role)
+            }
+        }
     }
 
     /// Set the workspace root directory for all agents.

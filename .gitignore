@@ -1,5 +1,6 @@
 # Rust build outputs (all levels)
 target/
+target*/
 
 # Generated protobuf files
 apps/gliding_code/target/

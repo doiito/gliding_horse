@@ -235,6 +235,8 @@ pub struct PlanStep {
     pub retry_count: u32,
     #[serde(default)]
     pub retry_delay_secs: u64,
+    #[serde(default)]
+    pub effect_policy: crate::core::effect::EffectPolicy,
 }
 
 /// Execution result of a human approval node
@@ -299,8 +301,23 @@ pub struct CycleState {
     pub iteration: u32,
     pub max_iterations: u32,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Start/deadline of the current outer PDCA attempt. `started_at` remains
+    /// the task lifetime clock for task-level SLO reporting.
+    pub pdca_started_at: chrono::DateTime<chrono::Utc>,
+    pub cycle_deadline_at: chrono::DateTime<chrono::Utc>,
+    pub last_progress_at: chrono::DateTime<chrono::Utc>,
+    pub last_timeout_alert_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub next_timeout_alert_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub timeout_alert_count: u32,
+    pub outer_cycle_number: u32,
     pub phase_history: Vec<String>,
     pub task_completed: bool,
+    /// Number retrieved before treatment is applied; used by shadow-mode
+    /// evaluation without exposing the content to BizAgents.
+    pub observed_experience_hint_count: usize,
+    /// Stable, non-content fingerprints prove which experience records were
+    /// observed across treatments without leaking their prompt text.
+    pub observed_experience_hint_fingerprints: Vec<String>,
     pub experience_hints: Vec<String>,
     /// Accumulated SA intervention state, applied at dispatch time.
     pub intervention: InterventionState,
@@ -324,7 +341,9 @@ pub fn verify_aa_needs_execution(result: &TaskResult) -> bool {
         }
     }
     let s = result.summary.to_lowercase();
-    const COMPLETION_MARKERS: [&str; 8] = [
+    const COMPLETION_MARKERS: [&str; 10] = [
+        "success:",
+        "aa success:",
         "verified-pass",
         "verified pass",
         "task already done",

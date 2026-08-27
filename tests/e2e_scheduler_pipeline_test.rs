@@ -6,9 +6,12 @@
 //! PrefetchEngine + spawn_consumer.
 //!
 //! `test_e2e_scheduler_full_pipeline_real_api` requires `DEEPSEEK_API_KEY`
-//! (real LLM call), so it is `#[ignore]`d like the other e2e tests. The
-//! prefetch-consumer and WriteThrough/projection-invalidation tests are
-//! pure in-memory and run in the default suite.
+//! (real LLM call), so it is compiled when the explicit `live-tests` feature
+//! is enabled. The prefetch-consumer and WriteThrough/projection-invalidation
+//! tests are pure in-memory and run in the default suite. No test is hidden
+//! behind `#[ignore]`.
+
+#![cfg_attr(not(feature = "live-tests"), allow(unused_imports))]
 
 use std::sync::Arc;
 
@@ -18,10 +21,10 @@ use glidinghorse::core::event_bus::EventBus;
 use glidinghorse::core::sa::SupervisorAgent;
 use glidinghorse::gateway::UnifiedGateway;
 use glidinghorse::memory::consistency_engine::ConsistencyEngine;
-use glidinghorse::memory::memory_bus::MemoryBus;
 use glidinghorse::memory::l0_store::L0Store;
 use glidinghorse::memory::l2_blackboard::Blackboard;
 use glidinghorse::memory::l3_projection::ProjectionEngine;
+use glidinghorse::memory::memory_bus::MemoryBus;
 use glidinghorse::memory::memory_manager::MemoryManager;
 use glidinghorse::memory::prefetch_engine::PrefetchEngine;
 use glidinghorse::memory::scheduler::MemoryScheduler;
@@ -32,7 +35,7 @@ use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // requires DEEPSEEK_API_KEY (real LLM call)
+#[cfg(feature = "live-tests")]
 async fn test_e2e_scheduler_full_pipeline_real_api() {
     let _ = init_logging(&glidinghorse::config::settings::LoggingSettings {
         level: "info".to_string(),
@@ -65,9 +68,7 @@ async fn test_e2e_scheduler_full_pipeline_real_api() {
     let gateway = Arc::new(UnifiedGateway::new(&settings).expect("gateway"));
 
     let dir = TempDir::new().unwrap();
-    let l0 = Arc::new(
-        L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap(),
-    );
+    let l0 = Arc::new(L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap());
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let event_bus = Arc::new(EventBus::new(100));
@@ -89,7 +90,11 @@ async fn test_e2e_scheduler_full_pipeline_real_api() {
         consistency.clone(),
         memory_bus.clone(),
     ));
-    let prefetch = Arc::new(PrefetchEngine::new(memory_bus.clone(), l2.clone(), proj.clone()));
+    let prefetch = Arc::new(PrefetchEngine::new(
+        memory_bus.clone(),
+        l2.clone(),
+        proj.clone(),
+    ));
     prefetch.spawn_consumer(event_bus.clone(), l2.clone());
 
     let core_config = CoreConfig::default();
@@ -127,7 +132,10 @@ async fn test_e2e_scheduler_full_pipeline_real_api() {
         .expect("task should succeed");
     eprintln!("=== E2E SCHEDULER PIPELINE RESULT ===");
     eprintln!("Status: {}", result.status);
-    eprintln!("Turns: {}, Tools: {}", result.turn_count, result.tool_call_count);
+    eprintln!(
+        "Turns: {}, Tools: {}",
+        result.turn_count, result.tool_call_count
+    );
     eprintln!("Errors: {:?}", result.errors);
 
     assert_ne!(result.status, "failed", "task must not fail");
@@ -137,15 +145,17 @@ async fn test_e2e_scheduler_full_pipeline_real_api() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_prefetch_consumer_wires_and_drains() {
     let dir = TempDir::new().unwrap();
-    let l0 = Arc::new(
-        L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap(),
-    );
+    let _l0 = Arc::new(L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap());
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let event_bus = Arc::new(EventBus::new(100));
     let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
 
-    let prefetch = Arc::new(PrefetchEngine::new(memory_bus.clone(), l2.clone(), proj.clone()));
+    let prefetch = Arc::new(PrefetchEngine::new(
+        memory_bus.clone(),
+        l2.clone(),
+        proj.clone(),
+    ));
     prefetch.spawn_consumer(event_bus.clone(), l2.clone());
 
     // Publish a PREFETCH_REQUEST via memory_bus; consumer should drain the queue.
@@ -159,14 +169,12 @@ async fn test_e2e_prefetch_consumer_wires_and_drains() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_writethrough_and_projection_invalidation() {
     let dir = TempDir::new().unwrap();
-    let l0 = Arc::new(
-        L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap(),
-    );
+    let l0 = Arc::new(L0Store::new(dir.path().join("l0").to_string_lossy().as_ref()).unwrap());
     let l2 = Arc::new(Blackboard::new().unwrap());
     let proj = Arc::new(ProjectionEngine::new(l2.clone(), 500));
     let event_bus = Arc::new(EventBus::new(100));
     let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
-    let consistency = Arc::new(ConsistencyEngine::new(
+    let _consistency = Arc::new(ConsistencyEngine::new(
         memory_bus.clone(),
         l0.clone(),
         l2.clone(),
@@ -178,7 +186,8 @@ async fn test_e2e_writethrough_and_projection_invalidation() {
 
     // 1. Write a node with critical tags -> WriteThrough to L0
     let json_ld = r#"{"@id":"iri://task/wt_e2e_test/n1","@type":"KnowledgeFragment","tags":["user_intent","confirmed_fact"]}"#;
-    l2.write_node("iri://task/wt_e2e_test/n1", json_ld, &core_config).unwrap();
+    l2.write_node("iri://task/wt_e2e_test/n1", json_ld, &core_config)
+        .unwrap();
 
     // 2. Project L3 view (cache populated)
     let _ = proj
@@ -189,11 +198,15 @@ async fn test_e2e_writethrough_and_projection_invalidation() {
     // 3. Update node with critical tag -> triggers consistency hook:
     //    WriteThrough (L0 persist) + projection invalidation
     let updated = r#"{"@id":"iri://task/wt_e2e_test/n1","@type":"KnowledgeFragment","content":"updated","tags":["user_intent"]}"#;
-    l2.write_node("iri://task/wt_e2e_test/n1", updated, &core_config).unwrap();
+    l2.write_node("iri://task/wt_e2e_test/n1", updated, &core_config)
+        .unwrap();
 
     // 4. Verify L0 received the critical write-through
     let stored = l0.retrieve("iri://task/wt_e2e_test/n1").unwrap();
-    assert!(stored.is_some(), "WriteThrough: critical node must persist to L0");
+    assert!(
+        stored.is_some(),
+        "WriteThrough: critical node must persist to L0"
+    );
 
     // 5. Verify projection was invalidated (cache miss on next project)
     let views_before = proj.cache_stats().total_views;
@@ -203,7 +216,8 @@ async fn test_e2e_writethrough_and_projection_invalidation() {
         .unwrap();
     eprintln!(
         "projection stats: views before={} after={}",
-        views_before, proj.cache_stats().total_views
+        views_before,
+        proj.cache_stats().total_views
     );
     eprintln!("✅ WriteThrough + projection invalidation verified");
 }

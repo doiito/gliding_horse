@@ -84,29 +84,119 @@ pub fn audit_dimensions(
                 details: vec![],
             });
         } else {
+            // CA agents often put the complete audit in `output` while the
+            // short `summary` is empty or deliberately terse.  Auditing only
+            // the summary caused a verified PASS to become a false 0% match.
+            let output_evidence = result
+                .output
+                .as_ref()
+                .map(|output| match output {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            let evidence_text = format!("{}\n{}", result.summary, output_evidence);
+            let evidence_lower = evidence_text.to_lowercase();
+
+            // Prefer an explicit overall CA verdict over token matching.  The
+            // per-perspective body may contain both PASS and FAIL, so only a
+            // line labelled as the overall verdict is authoritative.
+            let summary_verdict = {
+                let summary = result.summary.trim().to_lowercase();
+                if summary.starts_with("conditional_pass:")
+                    || summary.starts_with("conditional pass:")
+                    || summary.starts_with("有条件通过：")
+                {
+                    Some(AuditStatus::Warning(
+                        "CA summary verdict is conditional".to_string(),
+                    ))
+                } else if summary.starts_with("fail:")
+                    || summary.starts_with("failed:")
+                    || summary.starts_with("ca fail:")
+                    || summary.starts_with("ca failed:")
+                    || summary.starts_with("不通过：")
+                {
+                    Some(AuditStatus::Fail("CA summary verdict is FAIL".to_string()))
+                } else if summary.starts_with("pass:")
+                    || summary.starts_with("ca pass:")
+                    || summary.starts_with("通过：")
+                {
+                    Some(AuditStatus::Pass)
+                } else {
+                    None
+                }
+            };
+            let evidence_lines: Vec<&str> = evidence_text.lines().collect();
+            let labelled_verdict = evidence_lines.iter().enumerate().find_map(|(index, line)| {
+                let lower = line.to_lowercase();
+                let is_overall = lower.contains("overall_verdict")
+                    || lower.contains("overall conclusion")
+                    || lower.trim_start().starts_with("verdict:")
+                    || line.contains("总体结论")
+                    || line.contains("整体结论")
+                    || line.contains("审计结论");
+                if !is_overall {
+                    return None;
+                }
+                // Some models put the label and value on adjacent lines.
+                let verdict_text = format!(
+                    "{} {}",
+                    line,
+                    evidence_lines.get(index + 1).copied().unwrap_or_default()
+                );
+                let verdict_lower = verdict_text.to_lowercase();
+                if verdict_lower.contains("conditional_pass")
+                    || verdict_lower.contains("conditional pass")
+                    || verdict_text.contains("有条件通过")
+                {
+                    Some(AuditStatus::Warning(
+                        "CA overall verdict is conditional".to_string(),
+                    ))
+                } else if verdict_lower.contains("fail") || verdict_text.contains("不通过") {
+                    Some(AuditStatus::Fail("CA overall verdict is FAIL".to_string()))
+                } else if verdict_lower.contains("pass") || verdict_text.contains("通过") {
+                    Some(AuditStatus::Pass)
+                } else {
+                    None
+                }
+            });
+            let structured_verdict = summary_verdict.or(labelled_verdict);
+
             // CA agents often summarize objective evidence instead of
             // repeating every criterion verbatim (for example, "pytest 7
             // passed; audit passed"). Requiring literal criterion strings
             // created false CA failures after DA had actually fixed the
             // workspace. Accept only explicit audit/test success language;
             // vague success wording still follows the strict matching path.
-            let summary = result.summary.to_lowercase();
-            let explicit_success = summary.contains("审计通过")
-                || summary.contains("audit pass")
-                || summary.contains("audit passed")
-                || summary.contains("tests pass")
-                || summary.contains("tests passed")
-                || summary.contains("pytest") && summary.contains("passed");
+            let all_criteria_verified = (evidence_lower.contains("all success criteria")
+                && (evidence_lower.contains("verified")
+                    || evidence_lower.contains("met")
+                    || evidence_lower.contains("pass")))
+                || ((evidence_text.contains("全部验收标准")
+                    || evidence_text.contains("所有成功标准")
+                    || evidence_text.contains("全部成功标准"))
+                    && (evidence_text.contains("已验证")
+                        || evidence_text.contains("满足")
+                        || evidence_text.contains("通过")));
+            let explicit_success = evidence_lower.contains("审计通过")
+                || evidence_lower.contains("audit pass")
+                || evidence_lower.contains("audit passed")
+                || evidence_lower.contains("tests pass")
+                || evidence_lower.contains("tests passed")
+                || evidence_lower.contains("pytest") && evidence_lower.contains("passed")
+                || all_criteria_verified;
             let matched: Vec<&String> = if explicit_success {
                 criteria.iter().collect()
             } else {
                 criteria
                     .iter()
-                    .filter(|c| result.summary.contains(c.as_str()))
+                    .filter(|c| evidence_text.contains(c.as_str()))
                     .collect()
             };
             let ratio = matched.len() as f64 / criteria.len().max(1) as f64;
-            let detail = if ratio >= 0.8 {
+            let detail = if let Some(verdict) = structured_verdict {
+                verdict
+            } else if ratio >= 0.8 {
                 AuditStatus::Pass
             } else if ratio >= 0.5 {
                 AuditStatus::Warning(format!("{:.0}% of success criteria met", ratio * 100.0))
@@ -135,7 +225,17 @@ pub fn audit_dimensions(
             results.push(DimensionAuditResult {
                 dimension: "why".to_string(),
                 status: detail,
-                evidence: if explicit_success {
+                evidence: if evidence_text.lines().any(|line| {
+                    let lower = line.to_lowercase();
+                    lower.contains("overall_verdict")
+                        || lower.contains("overall conclusion")
+                        || lower.trim_start().starts_with("verdict:")
+                        || line.contains("总体结论")
+                        || line.contains("整体结论")
+                        || line.contains("审计结论")
+                }) {
+                    "structured CA overall verdict from full output".to_string()
+                } else if explicit_success {
                     "explicit CA audit/test success evidence".to_string()
                 } else {
                     format!("{}/{} criteria matched", matched.len(), criteria.len())
@@ -1334,7 +1434,207 @@ mod tests {
             archive_iri: None,
         };
         let audits = audit_dimensions(&w2h, &result, "iri://task/audit-evidence", None);
-        assert!(matches!(audits.iter().find(|a| a.dimension == "why").unwrap().status, AuditStatus::Pass));
+        assert!(matches!(
+            audits.iter().find(|a| a.dimension == "why").unwrap().status,
+            AuditStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn audit_accepts_complete_criteria_verification_from_reasoning_fallback() {
+        let mut w2h = Task5W2H::new("Clean duplicate tests", "Restore exact test scope");
+        w2h.why.success_criteria = vec![
+            "only one test file remains".into(),
+            "all nineteen tests pass".into(),
+        ];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-reasoning-fallback".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "Cleanup verified: 19/19 pass, single test file".into(),
+            output: Some(serde_json::Value::String(
+                "All success criteria independently verified with direct filesystem and command evidence. Everything passes exactly: one test file and 19/19 tests.".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 6,
+            tool_call_count: 11,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-reasoning-fallback", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn audit_uses_structured_ca_verdict_from_full_output_not_only_summary() {
+        let mut w2h = Task5W2H::new("Create exact file", "Verify exact content");
+        w2h.why.success_criteria = vec!["file exists".into(), "content is exact".into()];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-full-output".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: String::new(),
+            output: Some(serde_json::Value::String(
+                "File bytes verified.\nOverall conclusion: PASS".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 2,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-full-output", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn audit_accepts_verified_pass_verdict_from_deepseek_plain_text() {
+        let mut w2h = Task5W2H::new("Verify workspace", "Meet every acceptance criterion");
+        w2h.why.success_criteria = vec![
+            "single expected file".into(),
+            "exact test count".into(),
+            "complete inventory".into(),
+        ];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-verified-pass".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "All evidence collected.".into(),
+            output: Some(serde_json::Value::String(
+                "Audit Evidence\nCriterion 1: PASS\nCriterion 2: PASS\nVERDICT: VERIFIED-PASS\nAll checks have direct evidence.".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 5,
+            tool_call_count: 8,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-verified-pass", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn structured_ca_failure_overrides_incidental_pass_words() {
+        let mut w2h = Task5W2H::new("Verify task", "Reject incomplete work");
+        w2h.why.success_criteria = vec!["all checks pass".into()];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-full-output-fail".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "Several individual checks PASS".into(),
+            output: Some(serde_json::Value::String(
+                "Perspective A: PASS\nPerspective B: FAIL\nOverall conclusion: FAIL".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-full-output-fail", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn audit_accepts_explicit_pass_prefix_in_ca_summary() {
+        let mut w2h = Task5W2H::new("Create exact file", "Verify exact content");
+        w2h.why.success_criteria = vec!["file exists".into(), "content is exact".into()];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-summary-pass".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "PASS: file content byte-exact, no extra chars".into(),
+            output: Some(serde_json::Value::String("Detailed evidence".into())),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 2,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-summary-pass", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn audit_accepts_role_prefixed_ca_pass_summary() {
+        let mut w2h = Task5W2H::new("Create exact file", "Verify exact content");
+        w2h.why.success_criteria = vec!["file exists".into(), "content is exact".into()];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-ca-summary-pass".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "CA PASS: file content byte-exact".into(),
+            output: Some(serde_json::Value::String("Detailed evidence".into())),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 2,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-ca-summary-pass", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Pass
+        ));
     }
 
     #[test]

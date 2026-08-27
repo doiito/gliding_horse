@@ -569,9 +569,12 @@ impl HyperspaceStore {
     ///
     /// Call periodically (or after tasks) to bound WAL replay time on restart.
     pub async fn checkpoint(&self) -> Result<(), CoreError> {
-        self.engine.checkpoint().await.map_err(|e| CoreError::Internal {
-            message: format!("Hyperspace checkpoint: {e}"),
-        })
+        self.engine
+            .checkpoint()
+            .await
+            .map_err(|e| CoreError::Internal {
+                message: format!("Hyperspace checkpoint: {e}"),
+            })
     }
 
     /// Reclaim metadata index space for tombstoned/deleted entries.

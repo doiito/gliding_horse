@@ -360,10 +360,10 @@ impl PrefetchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::event_bus::EventBus;
     use crate::memory::l2_blackboard::Blackboard;
     use crate::memory::l3_projection::ProjectionEngine;
     use crate::memory::memory_bus::MemoryBus;
-    use crate::core::event_bus::EventBus;
 
     fn build() -> (Arc<PrefetchEngine>, Arc<Blackboard>) {
         let blackboard = Arc::new(Blackboard::new().unwrap());
@@ -395,17 +395,14 @@ mod tests {
     #[test]
     fn get_related_entities_excludes_self_and_respects_hops() {
         let (engine, _) = build();
-        engine.update_entity_graph(
-            "iri://entity/root",
-            &["iri://entity/hop1".to_string()],
-        );
-        engine.update_entity_graph(
-            "iri://entity/hop1",
-            &["iri://entity/hop2".to_string()],
-        );
+        engine.update_entity_graph("iri://entity/root", &["iri://entity/hop1".to_string()]);
+        engine.update_entity_graph("iri://entity/hop1", &["iri://entity/hop2".to_string()]);
         let related = engine.get_related_entities("iri://entity/root", 2);
         let map: HashMap<String, f64> = related.into_iter().collect();
-        assert!(!map.contains_key("iri://entity/root"), "self must be excluded");
+        assert!(
+            !map.contains_key("iri://entity/root"),
+            "self must be excluded"
+        );
         assert!(
             (map["iri://entity/hop1"] - 0.5).abs() < f64::EPSILON,
             "hop1 must decay to 0.5"
@@ -422,8 +419,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             engine.on_new_entity("iri://entity/a");
-            engine.on_intent_change("new intent", &["iri://entity/a".to_string()]).await;
-            assert_eq!(engine.queue_len(), 1, "single entity enqueued via on_new_entity");
+            engine
+                .on_intent_change("new intent", &["iri://entity/a".to_string()])
+                .await;
+            assert_eq!(
+                engine.queue_len(),
+                1,
+                "single entity enqueued via on_new_entity"
+            );
         });
     }
 
@@ -440,7 +443,11 @@ mod tests {
         let (engine, _) = build();
         engine.update_entity_graph("iri://entity/a", &["iri://entity/b".to_string()]);
         engine.on_new_entity("iri://entity/a");
-        assert!(engine.queue_len() >= 2, "a self + cascade b, got {}", engine.queue_len());
+        assert!(
+            engine.queue_len() >= 2,
+            "a self + cascade b, got {}",
+            engine.queue_len()
+        );
     }
 
     #[test]

@@ -315,10 +315,7 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
             }
         }
         "response.output_text.delta" => {
-            let delta = json
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let delta = json.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if delta.is_empty() {
                 return Ok(None);
             }
@@ -336,10 +333,7 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
             )))
         }
         "response.reasoning_text.delta" => {
-            let delta = json
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let delta = json.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if delta.is_empty() {
                 return Ok(None);
             }
@@ -353,10 +347,7 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
             )))
         }
         "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
-            let delta = json
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let delta = json.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if delta.is_empty() {
                 return Ok(None);
             }
@@ -401,10 +392,8 @@ fn parse_responses_api_event(json: &Value) -> Result<Option<StreamEvent>, SseErr
             };
             let usage = response.and_then(|r| r.get("usage")).map(|u| Usage {
                 prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                completion_tokens: u
-                    .get("output_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
+                completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    as u32,
                 total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             });
             Ok(Some(StreamEvent::MessageDelta(MessageDeltaEvent {

@@ -316,7 +316,11 @@ impl AgentOsWorker {
         let runner_perception = runner.perception_store.clone();
 
         let sa = SupervisorAgent::new(runner, templates_engine, skills, event_bus.clone(), 20)
-            .with_memory(Some(blackboard.clone()), Some(prefetch.clone()), Some(scheduler))
+            .with_memory(
+                Some(blackboard.clone()),
+                Some(prefetch.clone()),
+                Some(scheduler),
+            )
             .with_perception_store(Arc::new(runner_perception))
             .with_execution_timeout(600);
 

@@ -210,8 +210,90 @@ impl SkillDiscoveryEngine {
             });
         }
 
+        // Structured task effects are stronger evidence than fallback vector
+        // similarity. Applications may declare a generic workspace mutation
+        // contract without teaching the kernel their business domain; map it
+        // only to explicit file-write capabilities already present in the
+        // authoritative skill graph.
+        let requires_workspace_mutation = task.constraints.iter().any(|constraint| {
+            let normalized = constraint.to_ascii_lowercase().replace(' ', "");
+            normalized == "required_effect=workspace_mutation"
+                || normalized == "required_effect:workspace_mutation"
+        });
+        if requires_workspace_mutation {
+            for skill in self.graph_store.list_all_skills() {
+                let has_file_capability = skill.tags.iter().any(|tag| {
+                    let tag = tag.to_ascii_lowercase();
+                    tag.ends_with("fileoperation") || tag.ends_with("file-operation")
+                });
+                let has_write_capability = skill.tags.iter().any(|tag| {
+                    let tag = tag.to_ascii_lowercase();
+                    tag.ends_with("writeoperation") || tag.ends_with("write-operation")
+                });
+                if has_file_capability
+                    && has_write_capability
+                    && seen_iris.insert(skill.skill_iri.clone())
+                {
+                    let required_dependencies = self
+                        .graph_store
+                        .resolve_dependencies(&skill.skill_iri)
+                        .into_iter()
+                        .filter(|dependency| dependency != &skill.skill_iri)
+                        .collect();
+                    matches.push(SkillMatch {
+                        skill,
+                        relevance_score: 0.9,
+                        match_reasons: vec![
+                            "required workspace mutation capability matched".to_string()
+                        ],
+                        required_dependencies,
+                    });
+                }
+            }
+        }
+
+        // Applications may nominate one non-executable workflow skill as the
+        // home for their accumulated, CA-validated knowledge. The kernel only
+        // resolves an existing graph IRI; it neither invents the application
+        // skill nor grants it tool permissions.
+        let preferred_learning_skill = task.constraints.iter().find_map(|constraint| {
+            constraint
+                .strip_prefix("learning_skill_iri=")
+                .or_else(|| constraint.strip_prefix("learning_skill_iri:"))
+                .map(str::trim)
+        });
+        if let Some(skill_iri) = preferred_learning_skill {
+            if let Some(skill) = self.graph_store.get_skill(skill_iri) {
+                if seen_iris.insert(skill.skill_iri.clone()) {
+                    let required_dependencies = self
+                        .graph_store
+                        .resolve_dependencies(&skill.skill_iri)
+                        .into_iter()
+                        .filter(|dependency| dependency != &skill.skill_iri)
+                        .collect();
+                    matches.push(SkillMatch {
+                        skill,
+                        relevance_score: 1.0,
+                        match_reasons: vec![
+                            "application learning skill explicitly selected".to_string()
+                        ],
+                        required_dependencies,
+                    });
+                }
+            }
+        }
+
         // Phase 2: semantic vector search for complementary results
-        if self.vector_store.is_some() {
+        // Hash fallback vectors are an availability mechanism, not semantic
+        // evidence. Their top-k always returns something and previously
+        // injected unrelated/destructive skills into otherwise simple tasks.
+        // Keep deterministic 5W2H matching, but only trust semantic ranking
+        // from a real embedding provider.
+        if self
+            .vector_store
+            .as_ref()
+            .is_some_and(|store| store.embedding_provider() != "fallback")
+        {
             let query = [
                 task.what.as_str(),
                 task.why.as_str(),
@@ -584,6 +666,89 @@ mod tests {
         assert!(matches
             .iter()
             .any(|m| m.skill.skill_iri == "iri://skills/jwt-auth"));
+    }
+
+    #[tokio::test]
+    async fn fallback_embeddings_do_not_fabricate_skill_relevance() {
+        let store = setup_test_store();
+        let dir = tempfile::tempdir().unwrap();
+        let vector_store = Arc::new(
+            HyperspaceStore::open(
+                dir.path(),
+                Arc::new(FallbackEmbeddingService::with_dimension(32)),
+            )
+            .unwrap(),
+        );
+        let engine = SkillDiscoveryEngine::new(store).with_vector_store(vector_store);
+        engine.index_all_skills().await.unwrap();
+
+        let matches = engine
+            .discover_for_task(&Task5W2H::new(
+                "unrelated banana astronomy",
+                "observe distant galaxies",
+            ))
+            .await;
+
+        assert!(matches.is_empty(), "got fabricated matches: {matches:?}");
+    }
+
+    #[tokio::test]
+    async fn structured_workspace_effect_discovers_only_explicit_write_capabilities() {
+        let store = Arc::new(SkillGraphStore::new());
+        store
+            .register_skill(
+                SkillGraphNode::new("iri://skills/file-write", "file_write", "Write a file")
+                    .with_tag("iri://skill-types/FileOperation")
+                    .with_tag("iri://skill-types/WriteOperation"),
+            )
+            .unwrap();
+        store
+            .register_skill(
+                SkillGraphNode::new("iri://skills/file-read", "file_read", "Read a file")
+                    .with_tag("iri://skill-types/FileOperation")
+                    .with_tag("iri://skill-types/ReadOperation"),
+            )
+            .unwrap();
+        let engine = SkillDiscoveryEngine::new(store);
+        let task = Task5W2H::new("opaque multilingual objective", "complete task")
+            .with_constraint("required_effect=workspace_mutation");
+
+        let matches = engine.discover_for_task(&task).await;
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].skill.skill_iri, "iri://skills/file-write");
+        assert_eq!(matches[0].relevance_score, 0.9);
+    }
+
+    #[tokio::test]
+    async fn application_learning_skill_is_resolved_without_execution_authority() {
+        let store = Arc::new(SkillGraphStore::new());
+        store
+            .register_skill(
+                SkillGraphNode::new(
+                    "iri://skills/application-workflow",
+                    "application workflow",
+                    "Non-executable learning home",
+                )
+                .with_tag("non-executable-learning-skill"),
+            )
+            .unwrap();
+        let engine = SkillDiscoveryEngine::new(store);
+        let task = Task5W2H::new("unrelated wording", "current task")
+            .with_constraint("learning_skill_iri=iri://skills/application-workflow");
+
+        let matches = engine.discover_for_task(&task).await;
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].skill.skill_iri,
+            "iri://skills/application-workflow"
+        );
+        assert_eq!(matches[0].relevance_score, 1.0);
+        assert!(matches[0]
+            .match_reasons
+            .iter()
+            .any(|reason| reason.contains("explicitly selected")));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use chrono::Utc;
 use oxigraph::store::Store;
 use parking_lot::RwLock;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::memory::l0_store::L0Store;
@@ -17,6 +18,7 @@ use crate::snapshots::{GraphMutation, TimelineStore};
 use crate::CoreError;
 
 const SKILL_GRAPH_NAMED_GRAPH: &str = "system:skill_graph";
+const KNOWLEDGE_FRAGMENT_STORAGE_PREFIX: &str = "iri://knowledge-fragments/";
 
 pub struct SkillGraphStore {
     skills: RwLock<HashMap<String, SkillGraphNode>>,
@@ -92,20 +94,99 @@ impl SkillGraphStore {
         };
         let entries = l0_store.scan_iri_prefix("iri://skills/", usize::MAX)?;
         let mut restored = 0;
-        for entry in entries {
-            let Ok(skill) = serde_json::from_str::<SkillGraphNode>(&entry.content) else {
+        let mut removed_duplicate_links = 0usize;
+        for mut entry in entries {
+            let Ok(mut skill) = serde_json::from_str::<SkillGraphNode>(&entry.content) else {
                 continue;
             };
             if skill.skill_iri != entry.iri {
                 warn!(entry_iri = %entry.iri, skill_iri = %skill.skill_iri, "Ignoring mismatched persisted skill node");
                 continue;
             }
+            let removed = Self::deduplicate_exact_links(&mut skill.links);
+            if removed > 0 {
+                removed_duplicate_links += removed;
+                entry.content =
+                    serde_json::to_string(&skill).map_err(|error| CoreError::StorageError {
+                        message: format!("Failed to repair duplicate skill links: {error}"),
+                    })?;
+                entry.content_hash.clear();
+                // Repair legacy records once so subsequent starts do not pay
+                // the deserialization and scan cost for historical duplicates.
+                l0_store.store_entry(&entry)?;
+            }
             self.index.index_skill(&skill);
             self.skills.write().insert(skill.skill_iri.clone(), skill);
             restored += 1;
         }
-        info!(restored, "Hydrated skill graph from L0");
+        let fragment_entries =
+            l0_store.scan_iri_prefix(KNOWLEDGE_FRAGMENT_STORAGE_PREFIX, usize::MAX)?;
+        let mut restored_fragments = 0usize;
+        for entry in fragment_entries {
+            let Ok(fragment) = serde_json::from_str::<KnowledgeFragment>(&entry.content) else {
+                continue;
+            };
+            self.fragments
+                .write()
+                .insert(fragment.fragment_iri.clone(), fragment);
+            restored_fragments += 1;
+        }
+        info!(
+            restored,
+            restored_fragments, removed_duplicate_links, "Hydrated skill graph from L0"
+        );
         Ok(restored)
+    }
+
+    fn deduplicate_exact_links(links: &mut Vec<SkillLink>) -> usize {
+        let original_len = links.len();
+        let mut unique = Vec::with_capacity(original_len);
+        for link in links.drain(..) {
+            let duplicate = unique.iter().any(|existing: &SkillLink| {
+                existing.target_iri == link.target_iri
+                    && existing.link_type == link.link_type
+                    && existing.strength == link.strength
+                    && existing.description == link.description
+            });
+            if !duplicate {
+                unique.push(link);
+            }
+        }
+        *links = unique;
+        original_len - links.len()
+    }
+
+    fn fragment_storage_iri(fragment_iri: &str) -> String {
+        format!(
+            "{}{}",
+            KNOWLEDGE_FRAGMENT_STORAGE_PREFIX,
+            hex::encode(Sha256::digest(fragment_iri.as_bytes()))
+        )
+    }
+
+    fn persist_fragment(&self, fragment: &KnowledgeFragment) -> Result<(), CoreError> {
+        let Some(l0_store) = &self.l0_store else {
+            return Ok(());
+        };
+        let now = Utc::now();
+        l0_store.store_entry(&crate::memory::l0_store::L0Entry {
+            iri: Self::fragment_storage_iri(&fragment.fragment_iri),
+            content: serde_json::to_string(fragment).map_err(|error| CoreError::StorageError {
+                message: format!("Failed to serialize knowledge fragment: {error}"),
+            })?,
+            importance: 0.7,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            tags: vec!["knowledge_fragment".to_string(), "skill_graph".to_string()],
+            metadata: serde_json::Map::new(),
+            mesi_state: crate::memory::l0_store::MesiState::Shared,
+            content_hash: String::new(),
+            named_graph: Some(SKILL_GRAPH_NAMED_GRAPH.to_string()),
+            jsonld_context: None,
+            jsonld_types: vec!["skill:KnowledgeFragment".to_string()],
+        })?;
+        Ok(())
     }
 
     pub fn get_index(&self) -> &PreAggregatedIndex {
@@ -285,6 +366,23 @@ impl SkillGraphStore {
             return Err(CoreError::SkillNotFound {
                 iri: format!("Target skill not found: {}", target_iri),
             });
+        }
+
+        // Link creation is a governed graph mutation and must be idempotent.
+        // In particular, glidingcode derives bootstrap Related edges on every
+        // start; persisting the same edge repeatedly made startup and later
+        // graph scans progressively slower for long-lived workspaces.
+        if source.links.iter().any(|link| {
+            link.target_iri == target_iri
+                && link.link_type == link_type
+                && link.strength == strength
+                && link.description == description
+        }) {
+            debug!(
+                "Skipping duplicate link: {} -> {} ({:?})",
+                source_iri, target_iri, link_type
+            );
+            return Ok(());
         }
 
         source.links.push(SkillLink {
@@ -568,6 +666,7 @@ impl SkillGraphStore {
             attached_to, fragment_iri
         );
 
+        self.persist_fragment(&fragment)?;
         self.fragments
             .write()
             .insert(fragment_iri.to_string(), fragment.clone());
@@ -580,8 +679,13 @@ impl SkillGraphStore {
                 discovered_by: discoverer.map(|s| s.to_string()),
                 mitigation: recommendation.to_string(),
             });
-            self.index.update_skill(&skill);
-            self.skills.write().insert(attached_to.to_string(), skill);
+            if let Err(error) = self.update_skill(skill) {
+                self.fragments.write().remove(fragment_iri);
+                if let Some(l0_store) = &self.l0_store {
+                    let _ = l0_store.delete(&Self::fragment_storage_iri(fragment_iri));
+                }
+                return Err(error);
+            }
         }
 
         Ok(fragment)
@@ -605,6 +709,7 @@ impl SkillGraphStore {
     /// skill already contains its failure-mode metadata; using
     /// `create_fragment` would duplicate that metadata.
     pub fn register_fragment(&self, fragment: KnowledgeFragment) -> Result<(), CoreError> {
+        self.persist_fragment(&fragment)?;
         self.fragments
             .write()
             .insert(fragment.fragment_iri.clone(), fragment);
@@ -614,6 +719,14 @@ impl SkillGraphStore {
     /// Remove a knowledge fragment without changing the attached skill's
     /// historical failure-mode metadata.
     pub fn remove_fragment(&self, fragment_iri: &str) -> Result<(), CoreError> {
+        if !self.fragments.read().contains_key(fragment_iri) {
+            return Err(CoreError::NodeNotFound {
+                iri: fragment_iri.to_string(),
+            });
+        }
+        if let Some(l0_store) = &self.l0_store {
+            l0_store.delete(&Self::fragment_storage_iri(fragment_iri))?;
+        }
         if self.fragments.write().remove(fragment_iri).is_some() {
             Ok(())
         } else {
@@ -1327,6 +1440,47 @@ mod tests {
     }
 
     #[test]
+    fn test_hydrate_from_l0_restores_committed_knowledge_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let source = SkillGraphStore::new().with_l0_store(l0.clone());
+        source
+            .register_skill(SkillGraphNode::new(
+                "iri://skills/probe",
+                "Probe",
+                "persistent knowledge probe",
+            ))
+            .unwrap();
+        source
+            .create_fragment(
+                "iri://skills/probe#fragment_exact_bytes",
+                "iri://skills/probe",
+                "trailing newline",
+                "verify the exact byte count before acceptance",
+                Some("agent:test"),
+            )
+            .unwrap();
+
+        let restored = SkillGraphStore::new().with_l0_store(l0);
+        assert_eq!(restored.hydrate_from_l0().unwrap(), 1);
+        let fragments = restored.get_fragments_for_skill("iri://skills/probe");
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(
+            fragments[0].recommendation,
+            "verify the exact byte count before acceptance"
+        );
+        assert_eq!(
+            restored
+                .get_skill("iri://skills/probe")
+                .unwrap()
+                .graph_meta
+                .known_failure_modes
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn test_add_link_is_persisted_for_hydration() {
         let dir = tempfile::tempdir().unwrap();
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
@@ -1353,6 +1507,71 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target_iri, "iri://skills/b");
         assert_eq!(links[0].description, "persist this relation");
+    }
+
+    #[test]
+    fn test_add_link_is_idempotent_across_repeated_startup_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let source = SkillGraphStore::new().with_l0_store(l0.clone());
+        source
+            .register_skill(SkillGraphNode::new("iri://skills/a", "A", "source"))
+            .unwrap();
+        source
+            .register_skill(SkillGraphNode::new("iri://skills/b", "B", "target"))
+            .unwrap();
+
+        for _ in 0..3 {
+            source
+                .add_link(
+                    "iri://skills/a",
+                    "iri://skills/b",
+                    SkillLinkType::Related,
+                    LinkStrength::Navigation,
+                    "Related via: software-engineering",
+                )
+                .unwrap();
+        }
+        assert_eq!(source.get_skill("iri://skills/a").unwrap().links.len(), 1);
+
+        let restored = SkillGraphStore::new().with_l0_store(l0);
+        assert_eq!(restored.hydrate_from_l0().unwrap(), 2);
+        assert_eq!(restored.get_skill("iri://skills/a").unwrap().links.len(), 1);
+    }
+
+    #[test]
+    fn test_hydrate_repairs_legacy_duplicate_links_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let source = SkillGraphStore::new().with_l0_store(l0.clone());
+        let mut a = SkillGraphNode::new("iri://skills/a", "A", "source");
+        let duplicate = SkillLink {
+            link_type: SkillLinkType::Related,
+            target_iri: "iri://skills/b".to_string(),
+            strength: LinkStrength::Navigation,
+            description: "legacy duplicate".to_string(),
+        };
+        a.links.push(duplicate.clone());
+        a.links.push(duplicate);
+        source.register_skill(a).unwrap();
+        source
+            .register_skill(SkillGraphNode::new("iri://skills/b", "B", "target"))
+            .unwrap();
+
+        let restored = SkillGraphStore::new().with_l0_store(l0.clone());
+        assert_eq!(restored.hydrate_from_l0().unwrap(), 2);
+        assert_eq!(restored.get_skill("iri://skills/a").unwrap().links.len(), 1);
+
+        let restored_again = SkillGraphStore::new().with_l0_store(l0);
+        assert_eq!(restored_again.hydrate_from_l0().unwrap(), 2);
+        assert_eq!(
+            restored_again
+                .get_skill("iri://skills/a")
+                .unwrap()
+                .links
+                .len(),
+            1
+        );
     }
 
     #[test]

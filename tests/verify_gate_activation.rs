@@ -25,7 +25,10 @@ fn verify_tool_category_activates_when_hooked_with_tool_name() {
     let mut g = gate();
     let ctx = ctx_with(HookPoint::SkillBefore, "DA", Some("glob"));
     let activated = g.on_hook_trigger(HookPoint::SkillBefore, &ctx);
-    let ids: Vec<&str> = activated.iter().map(|a| a.methodology_id.as_str()).collect();
+    let ids: Vec<&str> = activated
+        .iter()
+        .map(|a| a.methodology_id.as_str())
+        .collect();
     println!("[SkillBefore+glob] activated: {:?}", ids);
     assert!(
         ids.contains(&"methodology:index-priority"),
@@ -50,7 +53,10 @@ fn verify_hook_point_string_mismatch_never_activates() {
     ] {
         let ctx = ctx_with(point, "DA", Some("bash"));
         let activated = g.on_hook_trigger(point, &ctx);
-        let ids: Vec<&str> = activated.iter().map(|a| a.methodology_id.as_str()).collect();
+        let ids: Vec<&str> = activated
+            .iter()
+            .map(|a| a.methodology_id.as_str())
+            .collect();
         println!("[{}] activated: {:?}", point.as_str(), ids);
         assert!(
             !ids.contains(&"methodology:cost-awareness"),
@@ -61,7 +67,10 @@ fn verify_hook_point_string_mismatch_never_activates() {
     // SkillBefore 应激活 cost-awareness(此前因字符串失配死锁)
     let ctx = ctx_with(HookPoint::SkillBefore, "DA", Some("bash"));
     let activated = g.on_hook_trigger(HookPoint::SkillBefore, &ctx);
-    let ids: Vec<&str> = activated.iter().map(|a| a.methodology_id.as_str()).collect();
+    let ids: Vec<&str> = activated
+        .iter()
+        .map(|a| a.methodology_id.as_str())
+        .collect();
     println!("[SkillBefore] activated: {:?}", ids);
     assert!(
         ids.contains(&"methodology:cost-awareness"),
@@ -76,7 +85,10 @@ fn verify_phase_end_condition_requires_phase_end_point() {
     let mut ctx = ctx_with(HookPoint::PhaseEnd, "DA", None);
     ctx = ctx.with_data("phase", Value::String("ACT".to_string()));
     let activated = g.on_hook_trigger(HookPoint::PhaseEnd, &ctx);
-    let ids: Vec<&str> = activated.iter().map(|a| a.methodology_id.as_str()).collect();
+    let ids: Vec<&str> = activated
+        .iter()
+        .map(|a| a.methodology_id.as_str())
+        .collect();
     println!("[PhaseEnd+ACT] activated: {:?}", ids);
     assert!(
         ids.contains(&"methodology:verification-before-completion"),
@@ -89,18 +101,30 @@ fn verify_always_and_task_error_conditions_work() {
     let mut g = gate();
     let ctx = ctx_with(HookPoint::AgentInit, "SA", None);
     let activated = g.on_hook_trigger(HookPoint::AgentInit, &ctx);
-    let ids: Vec<&str> = activated.iter().map(|a| a.methodology_id.as_str()).collect();
+    let ids: Vec<&str> = activated
+        .iter()
+        .map(|a| a.methodology_id.as_str())
+        .collect();
     println!("[AgentInit] activated: {:?}", ids);
-    for id in ["methodology:boundary-enforcement", "methodology:using-superpowers"] {
+    for id in [
+        "methodology:boundary-enforcement",
+        "methodology:using-superpowers",
+    ] {
         assert!(ids.contains(&id), "Always 条件 {} 应激活", id);
     }
 
     let mut ctx2 = ctx_with(HookPoint::TaskError, "DA", None);
     ctx2.error = Some("boom".to_string());
     let activated2 = g.on_hook_trigger(HookPoint::TaskError, &ctx2);
-    let ids2: Vec<&str> = activated2.iter().map(|a| a.methodology_id.as_str()).collect();
+    let ids2: Vec<&str> = activated2
+        .iter()
+        .map(|a| a.methodology_id.as_str())
+        .collect();
     println!("[TaskError] activated: {:?}", ids2);
-    assert!(ids2.contains(&"methodology:systematic-debugging"), "OnTaskError 应激活");
+    assert!(
+        ids2.contains(&"methodology:systematic-debugging"),
+        "OnTaskError 应激活"
+    );
 }
 
 #[test]
@@ -112,11 +136,20 @@ fn verify_all_builtin_activation_conditions() {
         println!("  {} → {:?}", m.id, m.activation);
     }
     // 静态断言: 死锁条件集合
-    let dead = ["methodology:index-priority", "methodology:cost-awareness",
-                "methodology:least-privilege", "methodology:brainstorming",
-                "methodology:test-driven-development", "methodology:verification-before-completion"];
-    let alive = ["methodology:boundary-enforcement", "methodology:using-superpowers",
-                 "methodology:complexity-assessment", "methodology:systematic-debugging"];
+    let dead = [
+        "methodology:index-priority",
+        "methodology:cost-awareness",
+        "methodology:least-privilege",
+        "methodology:brainstorming",
+        "methodology:test-driven-development",
+        "methodology:verification-before-completion",
+    ];
+    let alive = [
+        "methodology:boundary-enforcement",
+        "methodology:using-superpowers",
+        "methodology:complexity-assessment",
+        "methodology:systematic-debugging",
+    ];
     for id in &dead {
         assert!(registry.get(id).is_some(), "{} 应存在", id);
     }
@@ -131,12 +164,18 @@ fn verify_ontoolcategory_false_activation_on_empty_tool_name() {
     let mut g = gate();
     let ctx = ctx_with(HookPoint::AgentInit, "DA", None);
     let activated = g.on_hook_trigger(HookPoint::AgentInit, &ctx);
-    let ids: Vec<&str> = activated.iter().map(|a| a.methodology_id.as_str()).collect();
-    println!("[AgentInit, no tool_name] activated: {:?}", ids);
-    let tool_cat_activated = ["methodology:index-priority", "methodology:least-privilege",
-                              "methodology:test-driven-development"]
+    let ids: Vec<&str> = activated
         .iter()
-        .any(|id| ids.contains(id));
+        .map(|a| a.methodology_id.as_str())
+        .collect();
+    println!("[AgentInit, no tool_name] activated: {:?}", ids);
+    let tool_cat_activated = [
+        "methodology:index-priority",
+        "methodology:least-privilege",
+        "methodology:test-driven-development",
+    ]
+    .iter()
+    .any(|id| ids.contains(id));
     println!(
         "OnToolCategory 方法论在无 tool_name 上下文被误激活: {}",
         tool_cat_activated
@@ -236,21 +275,21 @@ fn verify_methodology_suggestion_flows_through_proposal_gate() {
     assert!(gate_ref.read().usage_count() >= 3);
 
     let suggestions = gate_ref.read().suggest_methodology_adjustments(3, 0.5);
-    assert!(
-        !suggestions.is_empty(),
-        "低成功率方法论必须生成治理建议"
-    );
+    assert!(!suggestions.is_empty(), "低成功率方法论必须生成治理建议");
 
     let dir = tempfile::tempdir().unwrap();
-    let l0 =
-        glidinghorse::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap();
+    let l0 = glidinghorse::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap();
     let store = EvolutionProposalStore::new(std::sync::Arc::new(l0));
     let graph = glidinghorse::skill_graph::graph_store::SkillGraphStore::new();
 
     let mut committed = Vec::new();
     for (i, suggestion) in suggestions.iter().enumerate() {
         let proposal = store
-            .create_or_get(&format!("methodology-verify-{i}"), suggestion.clone(), &graph)
+            .create_or_get(
+                &format!("methodology-verify-{i}"),
+                suggestion.clone(),
+                &graph,
+            )
             .unwrap();
         assert_eq!(proposal.status, EvolutionProposalStatus::PendingReview);
         assert!(

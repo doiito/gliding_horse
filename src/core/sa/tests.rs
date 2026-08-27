@@ -107,7 +107,8 @@ mod tests {
     fn test_parse_llm_plan_truncates_to_max_steps() {
         let (sa, _dir) = make_sa_with_tempdir();
         let mut steps_json = String::new();
-        for i in 1..=10 {
+        let configured_limit = sa.runner.agent_settings.execution_budget.max_plan_steps;
+        for i in 1..=(configured_limit + 4) {
             steps_json.push_str(&format!(
                 r#"{{"step_id":"step_{}","role":"Do","objective":"obj {}","expected_output":"out","dependencies":[],"tools_allowed":[],"success_criteria":"done"}},"#,
                 i, i
@@ -120,7 +121,7 @@ mod tests {
             steps_json
         );
         let plan = sa.parse_llm_plan(&content).unwrap();
-        assert_eq!(plan.steps.len(), super::planning::MAX_PLAN_STEPS);
+        assert_eq!(plan.steps.len(), configured_limit);
     }
 
     #[test]
@@ -205,7 +206,10 @@ mod tests {
         assert!(approved, "timeout must default to approved (harmless)");
         let map = sa.pending_approvals.lock().await;
         assert_eq!(map.len(), 1, "pending_approvals must record the request");
-        assert!(map.values().all(|v| *v), "timeout default must be recorded as approved");
+        assert!(
+            map.values().all(|v| *v),
+            "timeout default must be recorded as approved"
+        );
     }
 
     #[tokio::test]
@@ -240,14 +244,14 @@ mod tests {
                             if let Some(rid) = v.get("request_id").and_then(|r| r.as_str()) {
                                 let rid = rid.to_string();
                                 for _ in 0..20 {
-                                    bus2
-                                        .emit(
-                                            &task_iri_owned,
-                                            "HUMAN_APPROVAL_RESULT",
-                                            "TEST",
-                                            &serde_json::json!({"request_id": rid, "approved": false}).to_string(),
-                                        )
-                                        .await;
+                                    bus2.emit(
+                                        &task_iri_owned,
+                                        "HUMAN_APPROVAL_RESULT",
+                                        "TEST",
+                                        &serde_json::json!({"request_id": rid, "approved": false})
+                                            .to_string(),
+                                    )
+                                    .await;
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 }
                                 return;
@@ -258,10 +262,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         });
-        let approved = sa
-            .request_human_approval(&action, task_iri)
-            .await
-            .unwrap();
+        let approved = sa.request_human_approval(&action, task_iri).await.unwrap();
         responder.await.unwrap();
         assert!(!approved, "explicit deny event must be respected");
     }
@@ -278,8 +279,17 @@ mod tests {
                 iteration: 1,
                 max_iterations: 10,
                 started_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                pdca_started_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                cycle_deadline_at: chrono::Utc::now() - chrono::Duration::hours(1),
+                last_progress_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                last_timeout_alert_at: None,
+                next_timeout_alert_at: None,
+                timeout_alert_count: 0,
+                outer_cycle_number: 1,
                 phase_history: vec![],
                 task_completed: true,
+                observed_experience_hint_count: 0,
+                observed_experience_hint_fingerprints: vec![],
                 experience_hints: vec![],
                 intervention: InterventionState::default(),
             },
@@ -344,6 +354,13 @@ mod tests {
             )),
             "VERIFIED-PASS must not require execution"
         );
+        assert!(
+            !verify_aa_needs_execution(&result_with(
+                "SUCCESS: verified 19/19, single test file",
+                Some(TaskVerdict::Success)
+            )),
+            "the required AA SUCCESS contract must terminate verify-first"
+        );
     }
 
     #[test]
@@ -372,10 +389,7 @@ mod tests {
             "Blocked verdict must require execution"
         );
         assert!(
-            verify_aa_needs_execution(&result_with(
-                "task already done",
-                Some(TaskVerdict::Failed)
-            )),
+            verify_aa_needs_execution(&result_with("task already done", Some(TaskVerdict::Failed))),
             "Failed verdict must override a completion-looking summary"
         );
         assert!(
@@ -442,19 +456,27 @@ mod tests {
             iteration: 1,
             max_iterations: 10,
             started_at: chrono::Utc::now(),
+            pdca_started_at: chrono::Utc::now(),
+            cycle_deadline_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            last_progress_at: chrono::Utc::now(),
+            last_timeout_alert_at: None,
+            next_timeout_alert_at: None,
+            timeout_alert_count: 0,
+            outer_cycle_number: 1,
             phase_history: vec![],
             task_completed: false,
+            observed_experience_hint_count: 0,
+            observed_experience_hint_fingerprints: vec![],
             experience_hints: vec![],
             intervention: InterventionState::default(),
         };
         let task_iri = "iri://task/1";
 
-        let timeout_handler = super::actions::get_action_handler(
-            &InterventionAction::IncreaseTimeout {
+        let timeout_handler =
+            super::actions::get_action_handler(&InterventionAction::IncreaseTimeout {
                 additional_seconds: 60,
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let params = ActionParams {
             additional_seconds: Some(60),
             ..Default::default()
@@ -464,10 +486,11 @@ mod tests {
             .unwrap();
         assert_eq!(cycle.intervention.timeout_delta_secs, 60);
 
-        let retry_handler = super::actions::get_action_handler(&InterventionAction::IncreaseRetry {
-            additional_retries: 3,
-        })
-        .unwrap();
+        let retry_handler =
+            super::actions::get_action_handler(&InterventionAction::IncreaseRetry {
+                additional_retries: 3,
+            })
+            .unwrap();
         let params = ActionParams {
             additional_retries: Some(3),
             ..Default::default()
@@ -477,12 +500,11 @@ mod tests {
             .unwrap();
         assert_eq!(cycle.intervention.max_iterations_delta, 3);
 
-        let restrict_handler = super::actions::get_action_handler(
-            &InterventionAction::RestrictTools {
+        let restrict_handler =
+            super::actions::get_action_handler(&InterventionAction::RestrictTools {
                 allowed_tools: vec!["file_read".to_string()],
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let params = ActionParams {
             allowed_tools: Some(vec!["file_read".to_string()]),
             ..Default::default()
@@ -516,8 +538,17 @@ mod tests {
                 iteration: 1,
                 max_iterations: 10,
                 started_at: chrono::Utc::now(),
+                pdca_started_at: chrono::Utc::now(),
+                cycle_deadline_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+                last_progress_at: chrono::Utc::now(),
+                last_timeout_alert_at: None,
+                next_timeout_alert_at: None,
+                timeout_alert_count: 0,
+                outer_cycle_number: 1,
                 phase_history: vec![],
                 task_completed: false,
+                observed_experience_hint_count: 0,
+                observed_experience_hint_fingerprints: vec![],
                 experience_hints: vec![],
                 intervention: InterventionState {
                     max_iterations_delta: 5,
@@ -550,7 +581,52 @@ mod tests {
         assert_eq!(sa.effective_timeout_secs("missing", 30), 30);
     }
 
-    fn branch_fixture() -> (crate::core::workflow::loader::WorkflowDag, Vec<petgraph::graph::NodeIndex>) {
+    #[test]
+    fn timeout_is_edge_triggered_and_recent_progress_extends_same_deadline() {
+        let now = chrono::Utc::now();
+        let mut cycle = CycleState {
+            cycle_id: "timeout-edge".to_string(),
+            task_iri: "iri://task/timeout-edge".to_string(),
+            phase: CyclePhase::Executing,
+            iteration: 1,
+            max_iterations: 10,
+            started_at: now - chrono::Duration::minutes(10),
+            pdca_started_at: now - chrono::Duration::minutes(6),
+            cycle_deadline_at: now - chrono::Duration::seconds(1),
+            last_progress_at: now - chrono::Duration::seconds(5),
+            last_timeout_alert_at: None,
+            next_timeout_alert_at: None,
+            timeout_alert_count: 0,
+            outer_cycle_number: 1,
+            phase_history: vec![],
+            task_completed: false,
+            observed_experience_hint_count: 0,
+            observed_experience_hint_fingerprints: vec![],
+            experience_hints: vec![],
+            intervention: InterventionState::default(),
+        };
+        assert_eq!(
+            super::execution::evaluate_cycle_timeout(&mut cycle, now, 300, 60),
+            super::execution::TimeoutDecision::ExtendedWithProgress
+        );
+        assert!(cycle.cycle_deadline_at > now);
+        assert_eq!(cycle.timeout_alert_count, 1);
+        assert_eq!(
+            super::execution::evaluate_cycle_timeout(
+                &mut cycle,
+                now + chrono::Duration::seconds(1),
+                300,
+                60,
+            ),
+            super::execution::TimeoutDecision::None
+        );
+        assert_eq!(cycle.timeout_alert_count, 1);
+    }
+
+    fn branch_fixture() -> (
+        crate::core::workflow::loader::WorkflowDag,
+        Vec<petgraph::graph::NodeIndex>,
+    ) {
         let json = r#"{
             "@id": "wf:branch4",
             "name": "Branch4",
@@ -592,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn branch_on_failure_skips_intermediates_to_fallback() {
-        let (sa, _dir) = make_sa_with_tempdir();
+        let (mut sa, _dir) = make_sa_with_tempdir();
         let (dag, order) = branch_fixture();
         let step_2_idx = *dag.node_index.get("step_2").unwrap();
         let step = crate::core::workflow::adapter::node_to_planstep(&dag.graph[step_2_idx].def);
@@ -605,6 +681,7 @@ mod tests {
         let mut previous_ca_signature = None;
         let mut repeated_ca_failures = 0;
         let mut last_result = None;
+        let mut execution_facts = super::execution::TaskExecutionFacts::default();
         let mut completed_node_results = std::collections::HashMap::new();
         let mut skip_nodes = std::collections::HashSet::new();
         let mut five_w2h = crate::core::five_w2h::Task5W2H::default();
@@ -624,6 +701,8 @@ mod tests {
             fallback_steps: vec![],
         };
         let step_2_wave = order.iter().position(|idx| *idx == step_2_idx).unwrap();
+        let task_constraints = std::collections::HashMap::new();
+        let mut recursive_budget = super::execution::RecursiveExecutionBudget::new(1, 1);
 
         let outcome = sa
             .handle_step_result(
@@ -637,6 +716,7 @@ mod tests {
                 &mut previous_ca_signature,
                 &mut repeated_ca_failures,
                 &mut last_result,
+                &mut execution_facts,
                 &mut completed_node_results,
                 &mut skip_nodes,
                 &mut five_w2h,
@@ -646,19 +726,34 @@ mod tests {
                 &dag,
                 &order,
                 "iri://task/branch-test/5w2h",
+                &crate::core::effect::EffectPolicy::None,
+                &task_constraints,
+                &mut recursive_budget,
             )
             .await
             .unwrap();
 
-        assert!(outcome.is_none(), "branch must continue execution, not abort");
-        assert!(skip_nodes.contains("step_3"), "intermediate step_3 must be skipped");
-        assert!(!skip_nodes.contains("step_4"), "branch fallback step_4 must NOT be skipped");
-        assert!(last_result.is_some(), "failed result must still be recorded");
+        assert!(
+            outcome.is_none(),
+            "branch must continue execution, not abort"
+        );
+        assert!(
+            skip_nodes.contains("step_3"),
+            "intermediate step_3 must be skipped"
+        );
+        assert!(
+            !skip_nodes.contains("step_4"),
+            "branch fallback step_4 must NOT be skipped"
+        );
+        assert!(
+            last_result.is_some(),
+            "failed result must still be recorded"
+        );
     }
 
     #[tokio::test]
     async fn failed_without_branch_aborts_plan() {
-        let (sa, _dir) = make_sa_with_tempdir();
+        let (mut sa, _dir) = make_sa_with_tempdir();
         let (dag, order) = branch_fixture();
         let step_1_idx = *dag.node_index.get("step_1").unwrap();
         let step = crate::core::workflow::adapter::node_to_planstep(&dag.graph[step_1_idx].def);
@@ -670,6 +765,7 @@ mod tests {
         let mut previous_ca_signature = None;
         let mut repeated_ca_failures = 0;
         let mut last_result = None;
+        let mut execution_facts = super::execution::TaskExecutionFacts::default();
         let mut completed_node_results = std::collections::HashMap::new();
         let mut skip_nodes = std::collections::HashSet::new();
         let mut five_w2h = crate::core::five_w2h::Task5W2H::default();
@@ -689,6 +785,8 @@ mod tests {
             fallback_steps: vec![],
         };
         let step_1_wave = order.iter().position(|idx| *idx == step_1_idx).unwrap();
+        let task_constraints = std::collections::HashMap::new();
+        let mut recursive_budget = super::execution::RecursiveExecutionBudget::new(1, 1);
 
         let outcome = sa
             .handle_step_result(
@@ -702,6 +800,7 @@ mod tests {
                 &mut previous_ca_signature,
                 &mut repeated_ca_failures,
                 &mut last_result,
+                &mut execution_facts,
                 &mut completed_node_results,
                 &mut skip_nodes,
                 &mut five_w2h,
@@ -711,11 +810,17 @@ mod tests {
                 &dag,
                 &order,
                 "iri://task/branch-test/5w2h",
+                &crate::core::effect::EffectPolicy::None,
+                &task_constraints,
+                &mut recursive_budget,
             )
             .await
             .unwrap();
 
-        assert!(outcome.is_some(), "failure without branch must abort the plan");
+        assert!(
+            outcome.is_some(),
+            "failure without branch must abort the plan"
+        );
         assert!(skip_nodes.is_empty(), "no nodes may be skipped on abort");
     }
 
@@ -746,6 +851,7 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 3, "initial + 2 retries");
         assert_eq!(result.status, "failed");
+        assert_eq!(result.turn_count, 3, "all retry attempts remain observable");
     }
 
     #[tokio::test]
@@ -777,5 +883,167 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 2, "second attempt succeeds, no third dispatch");
         assert_eq!(result.status, "success");
+        assert_eq!(result.turn_count, 2, "successful retries retain prior work");
+    }
+
+    #[test]
+    fn ca_handoff_inlines_evidence_for_toolless_aa() {
+        let result = TaskResult {
+            task_iri: "iri://task/ca-handoff".to_string(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "PASS: all criteria verified".to_string(),
+            output: Some(serde_json::Value::String(
+                "criterion A: PASS; command result: 19 passed".to_string(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![serde_json::json!({"path": "report.json"})],
+            errors: vec![],
+            turn_count: 3,
+            tool_call_count: 3,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: Some("iri://task/ca-handoff/turn_3".to_string()),
+        };
+
+        let handoff = super::execution::result_handoff(&result, AgentRole::Check, 6_000);
+        assert!(handoff.contains("Detailed CA Evidence (directly supplied)"));
+        assert!(handoff.contains("19 passed"));
+        assert!(handoff.contains("verification tool calls: 3"));
+        assert!(handoff.contains("Trace Reference (not required for this decision)"));
+        assert!(!handoff.contains("use read_agent_output"));
+    }
+
+    #[test]
+    fn ca_handoff_bounds_large_unicode_evidence() {
+        let result = TaskResult {
+            task_iri: "iri://task/ca-handoff-large".to_string(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "PASS".to_string(),
+            output: Some(serde_json::Value::String("证".repeat(7_000))),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: None,
+        };
+
+        let handoff = super::execution::result_handoff(&result, AgentRole::Check, 6_000);
+        assert!(handoff.contains("CA evidence truncated"));
+        assert!(handoff.chars().count() < 6_500);
+    }
+
+    #[test]
+    fn da_handoff_is_summary_bounded_and_keeps_on_demand_archive_reference() {
+        let result = TaskResult {
+            task_iri: "iri://task/da-handoff-large".to_string(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "implementation-detail-".repeat(1_000),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: Some("iri://task/da-handoff-large/turn_1".to_string()),
+        };
+
+        let handoff = super::execution::result_handoff(&result, AgentRole::Do, 2_000);
+        assert!(handoff.contains("read_agent_output"));
+        assert!(handoff.contains("iri://task/da-handoff-large/turn_1"));
+        assert!(handoff.chars().count() < 2_200);
+    }
+
+    fn recovery_step(id: &str, role: AgentRole, dependencies: &[&str]) -> PlanStep {
+        PlanStep {
+            step_id: id.to_string(),
+            role,
+            objective: id.to_string(),
+            expected_output: String::new(),
+            dependencies: dependencies.iter().map(|value| value.to_string()).collect(),
+            tools_allowed: Vec::new(),
+            success_criteria: String::new(),
+            branch_on_failure: false,
+            branch_fallback: None,
+            retry_count: 0,
+            retry_delay_secs: 0,
+            effect_policy: crate::core::effect::EffectPolicy::None,
+        }
+    }
+
+    #[test]
+    fn pdca_scoped_recovery_keeps_only_failed_step_and_successors() {
+        let plan = ExecutionPlan {
+            plan_id: "p".to_string(),
+            agent_sequence: vec![
+                AgentRole::Plan,
+                AgentRole::Do,
+                AgentRole::Check,
+                AgentRole::Act,
+            ],
+            parallel_groups: Vec::new(),
+            task_complexity: TaskComplexity::Complex,
+            description: String::new(),
+            steps: vec![
+                recovery_step("pa", AgentRole::Plan, &[]),
+                recovery_step("da", AgentRole::Do, &["pa"]),
+                recovery_step("ca", AgentRole::Check, &["da"]),
+                recovery_step("aa", AgentRole::Act, &["ca"]),
+            ],
+            context_requirements: HashMap::new(),
+            success_metrics: Vec::new(),
+            max_recursion_depth: 0,
+            sub_tasks: Vec::new(),
+            dag_jsonld: None,
+            verify_first: true,
+            fallback_steps: vec![recovery_step("fallback", AgentRole::Do, &[])],
+        };
+
+        let delta = super::process::scoped_recovery_plan(&plan, "da", 2).unwrap();
+        assert_eq!(
+            delta
+                .steps
+                .iter()
+                .map(|step| step.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["da", "ca", "aa"]
+        );
+        assert!(delta.steps[0].dependencies.is_empty());
+        assert_eq!(delta.steps[1].dependencies, vec!["da"]);
+        assert!(!delta.verify_first);
+        assert!(delta.fallback_steps.is_empty());
+    }
+
+    #[test]
+    fn external_dag_topology_is_not_rewritten_by_pdca_recovery() {
+        let plan = ExecutionPlan {
+            plan_id: "dag".to_string(),
+            agent_sequence: vec![AgentRole::Do],
+            parallel_groups: Vec::new(),
+            task_complexity: TaskComplexity::Complex,
+            description: String::new(),
+            steps: vec![recovery_step("da", AgentRole::Do, &[])],
+            context_requirements: HashMap::new(),
+            success_metrics: Vec::new(),
+            max_recursion_depth: 0,
+            sub_tasks: Vec::new(),
+            dag_jsonld: Some("{}".to_string()),
+            verify_first: false,
+            fallback_steps: Vec::new(),
+        };
+        assert!(super::process::scoped_recovery_plan(&plan, "da", 2).is_none());
+    }
+
+    #[test]
+    fn recoverable_tool_error_is_not_misclassified_as_agent_blocked() {
+        assert!(!super::event_requires_blocked_intervention("AGENT_ERROR"));
+        assert!(super::event_requires_blocked_intervention("AGENT_BLOCKED"));
     }
 }

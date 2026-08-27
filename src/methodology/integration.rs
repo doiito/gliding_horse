@@ -159,18 +159,19 @@ impl MethodologyPromptInjector {
             "As the Decision Agent, you must perform pressure testing:".to_string(),
             "".to_string(),
             "### 1. Pressure Testing".to_string(),
-            "Before approving CA's audit conclusions, actively seek out vulnerabilities:".to_string(),
-            "- Assume CA may have missed issues → try to find what CA didn't discover".to_string(),
-            "- Examine from the opposite perspective: 'If this conclusion is wrong, where might the error be?'".to_string(),
-            "- Check whether CA only verified surface-level results without deep inspection".to_string(),
-            "- Raise at least one challenge to CA's PASS conclusion and verify it".to_string(),
+            "Before approving CA's audit conclusions, test the supplied evidence for concrete vulnerabilities:".to_string(),
+            "- Examine from the opposite perspective: 'If this conclusion is wrong, which supplied fact would expose the error?'".to_string(),
+            "- Check whether CA only verified surface-level results without inspecting required dimensions".to_string(),
+            "- Raise a challenge only when the supplied evidence contains a specific contradiction, unsupported criterion, or material gap".to_string(),
+            "- Do not invent a challenge merely to demonstrate independence".to_string(),
             "".to_string(),
             "### 2. Meta-Test Protocol".to_string(),
-            "Verify whether CA's own verification process is reliable:".to_string(),
-            "- Did CA use tools for verification? (Or rely solely on summary?)".to_string(),
-            "- Did CA check all relevant dimensions? (Is 5W2H fully covered?)".to_string(),
-            "- Are CA's audit conclusions supported by clear evidence?".to_string(),
-            "- If CA's verification has gaps → flag and request supplementary checks".to_string(),
+            "Assess whether CA's verification process is reliable from the evidence directly supplied to you:".to_string(),
+            "- Did CA report actual verification actions/results rather than an unsupported assertion?".to_string(),
+            "- Did CA check all acceptance criteria and relevant dimensions?".to_string(),
+            "- Are CA's conclusions supported by clear, internally consistent evidence?".to_string(),
+            "- If a material criterion lacks evidence, identify that exact criterion and request a supplementary check".to_string(),
+            "- Do not reject solely because an archive or execution tool is unavailable to AA; AA is a non-mutating decision role".to_string(),
             "".to_string(),
             "### 3. Decision Responsibility".to_string(),
             "The final decision rests with you; you are accountable for its consequences:".to_string(),
@@ -357,6 +358,14 @@ mod tests {
         assert!(
             text.contains("rubber stamp"),
             "AA addendum should warn against rubber-stamping"
+        );
+        assert!(
+            text.contains("Do not invent a challenge"),
+            "AA must not manufacture a failure when CA evidence is complete"
+        );
+        assert!(
+            text.contains("non-mutating decision role"),
+            "AA must respect its no-tool decision boundary"
         );
     }
 

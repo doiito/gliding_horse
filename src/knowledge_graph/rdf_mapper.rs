@@ -333,9 +333,15 @@ mod tests {
             RdfMapper::sanitize_id("chrono::Local::now().format(%H:%M:%S)"),
             "chrono::Local::now().format(%25H:%25M:%25S)"
         );
-        assert_eq!(RdfMapper::sanitize_id("already%2Fencoded"), "already%2Fencoded");
+        assert_eq!(
+            RdfMapper::sanitize_id("already%2Fencoded"),
+            "already%2Fencoded"
+        );
         assert_eq!(RdfMapper::sanitize_id("literal%%7B"), "literal%25%7B");
-        assert_eq!(RdfMapper::sanitize_id("raw#fragment?query"), "raw%23fragment%3Fquery");
+        assert_eq!(
+            RdfMapper::sanitize_id("raw#fragment?query"),
+            "raw%23fragment%3Fquery"
+        );
     }
 
     #[test]

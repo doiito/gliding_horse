@@ -2,6 +2,68 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::core::agent_instance::AgentRole;
+use crate::tools::ToolExecutor;
+
+/// Kernel capability ceilings for real business-agent roles.
+///
+/// `None` means that the role has no additional role-level ceiling (DA still
+/// remains subject to task, skill-security, and sandbox policy). `Some([])` is
+/// deliberately different: AA is a decision-only BizAgent and has no tools.
+pub const PA_TOOL_CEILING: &[&str] = &[
+    "file_read",
+    "file_list",
+    "grep_search",
+    "glob_search",
+    "tool_search",
+    "web_search",
+    "web_fetch",
+    "rag_search",
+    "kg_search",
+    "codebase_search",
+    "knowledge_list",
+    "knowledge_search",
+    "knowledge_query",
+    "knowledge_neighbors",
+    "read_agent_output",
+];
+
+pub const CA_TOOL_CEILING: &[&str] = &[
+    "file_read",
+    "file_list",
+    "grep_search",
+    "glob_search",
+    "bash",
+    "tool_search",
+    "jsonld_validate",
+    "rag_search",
+    "kg_search",
+    "codebase_search",
+    "knowledge_list",
+    "knowledge_search",
+    "knowledge_query",
+    "knowledge_neighbors",
+    "read_agent_output",
+    "ontology_validate_turtle",
+    "ontology_validate_shacl",
+    "ontology_lint_turtle",
+    "ontology_diff_turtle",
+    "ontology_reason",
+];
+
+pub fn business_role_tool_ceiling(role: AgentRole) -> Option<&'static [&'static str]> {
+    match role {
+        AgentRole::Plan => Some(PA_TOOL_CEILING),
+        AgentRole::Do => None,
+        AgentRole::Check => Some(CA_TOOL_CEILING),
+        AgentRole::Act => Some(&[]),
+    }
+}
+
+pub fn business_role_allows_tool(role: AgentRole, tool_name: &str) -> bool {
+    business_role_tool_ceiling(role)
+        .map(|ceiling| ceiling.contains(&tool_name))
+        .unwrap_or(true)
+}
 
 #[derive(Clone)]
 pub struct ToolController {
@@ -35,6 +97,8 @@ impl ToolController {
 
     pub fn is_readonly_tool(&self, tool_name: &str) -> bool {
         self.readonly_tools.contains(&tool_name)
+            || tool_name == "read_agent_output"
+            || ToolExecutor::is_micro_tool_name(tool_name)
     }
 
     pub fn is_write_tool(&self, tool_name: &str) -> bool {
@@ -65,23 +129,39 @@ impl ToolController {
                     .cloned()
                     .collect()
             }
-            AgentRole::Do | AgentRole::Check | AgentRole::Act => tool_calls.to_vec(),
+            role => {
+                let denied: Vec<String> = tool_calls
+                    .iter()
+                    .filter(|(name, _)| !business_role_allows_tool(*role, name))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if !denied.is_empty() {
+                    warn!(role = %role, tools = ?denied, "Role capability ceiling filtered tool calls");
+                }
+                tool_calls
+                    .iter()
+                    .filter(|(name, _)| business_role_allows_tool(*role, name))
+                    .cloned()
+                    .collect()
+            }
         }
     }
 
     pub fn should_force_finish(&self, tool_calls: &[(String, Value)], role: &AgentRole) -> bool {
         match role {
-            AgentRole::Plan => tool_calls.iter().any(|(name, _)| self.is_write_tool(name)),
-            AgentRole::Act => false,
-            AgentRole::Do => false,
-            AgentRole::Check => false,
+            AgentRole::Plan => tool_calls
+                .iter()
+                .any(|(name, _)| !self.is_readonly_tool(name)),
+            role => tool_calls
+                .iter()
+                .any(|(name, _)| !business_role_allows_tool(*role, name)),
         }
     }
 
     pub fn list_available_tools(&self, role: &AgentRole) -> Vec<String> {
         match role {
             AgentRole::Plan => self.readonly_tools.iter().map(|s| s.to_string()).collect(),
-            AgentRole::Do | AgentRole::Check | AgentRole::Act => {
+            AgentRole::Do => {
                 let mut tools: Vec<String> = self
                     .readonly_tools
                     .iter()
@@ -92,6 +172,11 @@ impl ToolController {
                 tools.dedup();
                 tools
             }
+            role => business_role_tool_ceiling(*role)
+                .unwrap_or_default()
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
         }
     }
 }
@@ -156,6 +241,12 @@ mod tests {
         assert!(tc.should_force_finish(&calls, &AgentRole::Plan));
         let calls2 = vec![("file_read".to_string(), Value::Null)];
         assert!(!tc.should_force_finish(&calls2, &AgentRole::Plan));
+        let agent_output = vec![("read_agent_output".to_string(), Value::Null)];
+        assert!(!tc.should_force_finish(&agent_output, &AgentRole::Plan));
+        let micro_tool = vec![("read_full_result_call_session_a".to_string(), Value::Null)];
+        assert!(!tc.should_force_finish(&micro_tool, &AgentRole::Plan));
+        let unknown = vec![("unregistered_dynamic_tool".to_string(), Value::Null)];
+        assert!(tc.should_force_finish(&unknown, &AgentRole::Plan));
     }
 
     #[test]
@@ -166,5 +257,17 @@ mod tests {
         assert!(!plan_tools.contains(&"file_write".to_string()));
         let do_tools = tc.list_available_tools(&AgentRole::Do);
         assert!(do_tools.contains(&"file_write".to_string()));
+        let check_tools = tc.list_available_tools(&AgentRole::Check);
+        assert!(check_tools.contains(&"bash".to_string()));
+        assert!(!check_tools.contains(&"file_write".to_string()));
+        assert!(tc.list_available_tools(&AgentRole::Act).is_empty());
+    }
+
+    #[test]
+    fn test_act_is_decision_only() {
+        let tc = ToolController::new();
+        let calls = vec![("file_read".to_string(), Value::Null)];
+        assert!(tc.filter_tools_for_role(&calls, &AgentRole::Act).is_empty());
+        assert!(tc.should_force_finish(&calls, &AgentRole::Act));
     }
 }

@@ -45,6 +45,26 @@ pub struct WorkspaceSettings {
     /// Maximum debounce wait in ms.
     #[serde(default = "default_max_debounce_wait_ms")]
     pub max_debounce_wait_ms: u64,
+    /// Maximum time a task waits for the deferred metadata scan. The TUI is
+    /// already visible; after this bound tools fall back to targeted disk IO.
+    #[serde(default = "default_initial_scan_wait_ms")]
+    pub initial_scan_wait_ms: u64,
+    #[serde(default = "default_workspace_change_history_capacity")]
+    pub change_history_capacity: usize,
+    /// Maximum file count hashed for controlled learning replay snapshots.
+    #[serde(default = "default_learning_snapshot_max_files")]
+    pub learning_snapshot_max_files: usize,
+    /// Maximum aggregate bytes hashed for controlled learning replay snapshots.
+    #[serde(default = "default_learning_snapshot_max_bytes")]
+    pub learning_snapshot_max_bytes: u64,
+    /// Maximum file count hashed when confirming that a shell-like tool made
+    /// a semantic workspace change.  If exceeded, confirmation falls back to
+    /// the monitor's generation/delta evidence.
+    #[serde(default = "default_effect_snapshot_max_files")]
+    pub effect_snapshot_max_files: usize,
+    /// Maximum aggregate bytes hashed for one semantic effect snapshot.
+    #[serde(default = "default_effect_snapshot_max_bytes")]
+    pub effect_snapshot_max_bytes: u64,
 }
 
 fn default_content_cache_capacity() -> usize {
@@ -58,6 +78,24 @@ fn default_debounce_ms() -> u64 {
 }
 fn default_max_debounce_wait_ms() -> u64 {
     5000
+}
+fn default_initial_scan_wait_ms() -> u64 {
+    250
+}
+fn default_workspace_change_history_capacity() -> usize {
+    2048
+}
+fn default_learning_snapshot_max_files() -> usize {
+    100_000
+}
+fn default_learning_snapshot_max_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+fn default_effect_snapshot_max_files() -> usize {
+    10_000
+}
+fn default_effect_snapshot_max_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 impl Default for WorkspaceSettings {
@@ -83,6 +121,12 @@ impl Default for WorkspaceSettings {
             poll_interval_ms: default_poll_interval_ms(),
             debounce_ms: default_debounce_ms(),
             max_debounce_wait_ms: default_max_debounce_wait_ms(),
+            initial_scan_wait_ms: default_initial_scan_wait_ms(),
+            change_history_capacity: default_workspace_change_history_capacity(),
+            learning_snapshot_max_files: default_learning_snapshot_max_files(),
+            learning_snapshot_max_bytes: default_learning_snapshot_max_bytes(),
+            effect_snapshot_max_files: default_effect_snapshot_max_files(),
+            effect_snapshot_max_bytes: default_effect_snapshot_max_bytes(),
         }
     }
 }
@@ -120,6 +164,23 @@ pub struct L0Settings {
     pub path: String,
     pub max_entries: u64,
     pub compression: bool,
+    #[serde(default = "default_l0_blob_inline_threshold")]
+    pub blob_inline_threshold: usize,
+    /// redb page-cache size. redb's upstream default is 1 GiB, which is too
+    /// large for an interactive application with a ~200 MiB idle target.
+    #[serde(default = "default_l0_cache_size_bytes")]
+    pub cache_size_bytes: usize,
+    /// Persist allocator state on every commit so an unclean exit does not
+    /// require a multi-pass scan of the complete L0 database at next startup.
+    #[serde(default = "default_true")]
+    pub quick_repair: bool,
+}
+
+fn default_l0_blob_inline_threshold() -> usize {
+    4_096
+}
+fn default_l0_cache_size_bytes() -> usize {
+    128 * 1024 * 1024
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -147,6 +208,17 @@ pub struct L1Settings {
     /// Override default L1 eviction beta fusion weight.
     #[serde(default)]
     pub eviction_beta: Option<f64>,
+    #[serde(default = "default_l1_max_low_relevance_refs")]
+    pub max_low_relevance_refs: usize,
+    #[serde(default = "default_l1_reload_preview_chars")]
+    pub reload_preview_chars: usize,
+}
+
+fn default_l1_max_low_relevance_refs() -> usize {
+    3
+}
+fn default_l1_reload_preview_chars() -> usize {
+    400
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -155,6 +227,12 @@ pub struct L2Settings {
     pub max_projection_size: usize,
     #[serde(default)]
     pub max_memory_mb: u64,
+    #[serde(default = "default_l2_sync_queue_capacity")]
+    pub sync_queue_capacity: usize,
+}
+
+fn default_l2_sync_queue_capacity() -> usize {
+    1_024
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -235,6 +313,190 @@ pub struct AgentSettings {
     /// Embedding service call timeout in seconds (default 30).
     #[serde(default = "default_embedding_timeout_secs")]
     pub embedding_timeout_secs: u64,
+    /// Per-BizAgent execution budgets and progress guards. Role limits default
+    /// to `None`, which inherits the task's configured max_iterations.
+    #[serde(default)]
+    pub execution_budget: AgentExecutionBudgetSettings,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RoleTurnLimitSettings {
+    #[serde(default)]
+    pub plan: Option<u32>,
+    #[serde(default)]
+    pub do_agent: Option<u32>,
+    #[serde(default)]
+    pub check: Option<u32>,
+    #[serde(default)]
+    pub act: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentExecutionBudgetSettings {
+    #[serde(default)]
+    pub role_max_turns: RoleTurnLimitSettings,
+    #[serde(default = "default_turn_early_warning_remaining")]
+    pub early_warning_remaining: u32,
+    #[serde(default = "default_turn_final_warning_remaining")]
+    pub final_warning_remaining: u32,
+    #[serde(default = "default_effect_progress_warning_turns")]
+    pub effect_progress_warning_turns: u32,
+    /// Zero disables blocking; otherwise this must be no smaller than the
+    /// progress-warning threshold.
+    #[serde(default = "default_effect_progress_block_turns")]
+    pub effect_progress_block_turns: u32,
+    /// A CA→DA repair already carries criterion-linked evidence, so it should
+    /// not consume the same cold-inspection window as a fresh execution. Zero
+    /// inherits `effect_progress_block_turns`.
+    #[serde(default = "default_da_repair_effect_block_turns")]
+    pub da_repair_effect_block_turns: u32,
+    /// After this many CA tool turns, advertise only focused verification
+    /// tools and require CA to name a still-unverified criterion before doing
+    /// more work. Zero disables the evidence-convergence prompt.
+    #[serde(default = "default_ca_evidence_focus_turns")]
+    pub ca_evidence_focus_turns: u32,
+    /// After this many CA tool turns, remove tools and require the final
+    /// criterion-linked PASS/FAIL verdict. Zero disables the close gate.
+    #[serde(default = "default_ca_evidence_close_turns")]
+    pub ca_evidence_close_turns: u32,
+    /// After this many PA tool turns, runtime removes inspection tools and
+    /// asks PA to emit the executable plan from evidence already collected.
+    /// Zero disables the convergence gate.
+    #[serde(default = "default_pa_planning_focus_turns")]
+    pub pa_planning_focus_turns: u32,
+    #[serde(default = "default_biz_agent_max_sub_agents")]
+    pub max_sub_agents: usize,
+    #[serde(default = "default_ca_handoff_max_chars")]
+    pub ca_handoff_max_chars: usize,
+    #[serde(default = "default_recursive_handoff_max_chars")]
+    pub recursive_handoff_max_chars: usize,
+    #[serde(default = "default_sa_stream_emit_min_chars")]
+    pub sa_stream_emit_min_chars: usize,
+    #[serde(default = "default_sa_stream_emit_interval_ms")]
+    pub sa_stream_emit_interval_ms: u64,
+    #[serde(default = "default_max_plan_steps")]
+    pub max_plan_steps: usize,
+    #[serde(default = "default_max_recursive_sub_tasks")]
+    pub max_recursive_sub_tasks: usize,
+    /// Task-wide cap across the whole recursive residual tree.  This is
+    /// separate from `max_recursive_sub_tasks`, which limits one
+    /// decomposition result, so depth cannot multiply work without bound.
+    #[serde(default = "default_max_recursive_task_executions")]
+    pub max_recursive_task_executions: usize,
+    /// Task-wide turn budget shared by every recursive residual BizAgent.
+    /// Operators can raise it for unusually large tasks without weakening the
+    /// normal DA/CA budgets.
+    #[serde(default = "default_max_recursive_total_turns")]
+    pub max_recursive_total_turns: u32,
+    #[serde(default = "default_max_ca_da_corrections")]
+    pub max_ca_da_corrections: usize,
+    /// Independent cap for task-scope PA replans. Local DA/CA corrections and
+    /// scoped DAG retries do not consume this budget.
+    #[serde(default = "default_max_plan_revisions")]
+    pub max_plan_revisions: u32,
+    #[serde(default = "default_ca_correction_handoff_max_chars")]
+    pub ca_correction_handoff_max_chars: usize,
+    #[serde(default = "default_force_finish_max_tool_entries")]
+    pub force_finish_max_tool_entries: usize,
+    #[serde(default = "default_force_finish_tool_result_max_chars")]
+    pub force_finish_tool_result_max_chars: usize,
+}
+
+fn default_turn_early_warning_remaining() -> u32 {
+    8
+}
+fn default_turn_final_warning_remaining() -> u32 {
+    3
+}
+fn default_effect_progress_warning_turns() -> u32 {
+    5
+}
+fn default_effect_progress_block_turns() -> u32 {
+    8
+}
+fn default_da_repair_effect_block_turns() -> u32 {
+    4
+}
+fn default_ca_evidence_focus_turns() -> u32 {
+    5
+}
+fn default_ca_evidence_close_turns() -> u32 {
+    10
+}
+fn default_pa_planning_focus_turns() -> u32 {
+    4
+}
+fn default_biz_agent_max_sub_agents() -> usize {
+    5
+}
+fn default_ca_handoff_max_chars() -> usize {
+    6_000
+}
+fn default_recursive_handoff_max_chars() -> usize {
+    4_000
+}
+fn default_sa_stream_emit_min_chars() -> usize {
+    128
+}
+fn default_sa_stream_emit_interval_ms() -> u64 {
+    50
+}
+fn default_max_plan_steps() -> usize {
+    12
+}
+fn default_max_recursive_sub_tasks() -> usize {
+    5
+}
+fn default_max_recursive_task_executions() -> usize {
+    8
+}
+fn default_max_recursive_total_turns() -> u32 {
+    60
+}
+fn default_max_ca_da_corrections() -> usize {
+    3
+}
+fn default_max_plan_revisions() -> u32 {
+    2
+}
+fn default_ca_correction_handoff_max_chars() -> usize {
+    6_000
+}
+fn default_force_finish_max_tool_entries() -> usize {
+    20
+}
+fn default_force_finish_tool_result_max_chars() -> usize {
+    2_000
+}
+
+impl Default for AgentExecutionBudgetSettings {
+    fn default() -> Self {
+        Self {
+            role_max_turns: RoleTurnLimitSettings::default(),
+            early_warning_remaining: default_turn_early_warning_remaining(),
+            final_warning_remaining: default_turn_final_warning_remaining(),
+            effect_progress_warning_turns: default_effect_progress_warning_turns(),
+            effect_progress_block_turns: default_effect_progress_block_turns(),
+            da_repair_effect_block_turns: default_da_repair_effect_block_turns(),
+            ca_evidence_focus_turns: default_ca_evidence_focus_turns(),
+            ca_evidence_close_turns: default_ca_evidence_close_turns(),
+            pa_planning_focus_turns: default_pa_planning_focus_turns(),
+            max_sub_agents: default_biz_agent_max_sub_agents(),
+            ca_handoff_max_chars: default_ca_handoff_max_chars(),
+            recursive_handoff_max_chars: default_recursive_handoff_max_chars(),
+            sa_stream_emit_min_chars: default_sa_stream_emit_min_chars(),
+            sa_stream_emit_interval_ms: default_sa_stream_emit_interval_ms(),
+            max_plan_steps: default_max_plan_steps(),
+            max_recursive_sub_tasks: default_max_recursive_sub_tasks(),
+            max_recursive_task_executions: default_max_recursive_task_executions(),
+            max_recursive_total_turns: default_max_recursive_total_turns(),
+            max_ca_da_corrections: default_max_ca_da_corrections(),
+            max_plan_revisions: default_max_plan_revisions(),
+            ca_correction_handoff_max_chars: default_ca_correction_handoff_max_chars(),
+            force_finish_max_tool_entries: default_force_finish_max_tool_entries(),
+            force_finish_tool_result_max_chars: default_force_finish_tool_result_max_chars(),
+        }
+    }
 }
 
 fn default_max_pdca_cycles() -> u32 {
@@ -284,6 +546,7 @@ impl Default for AgentSettings {
             tool_timeout_secs: 60,
             mcp_timeout_secs: 30,
             embedding_timeout_secs: 30,
+            execution_budget: AgentExecutionBudgetSettings::default(),
         }
     }
 }
@@ -443,10 +706,20 @@ pub struct ToolResultRouterSettings {
     /// preparing for reference-based reclamation under context pressure.
     #[serde(default = "default_prepare_threshold")]
     pub prepare_threshold: usize,
+    #[serde(default = "default_micro_tool_page_size")]
+    pub micro_tool_page_size: usize,
+    #[serde(default = "default_micro_tool_max_page_size")]
+    pub micro_tool_max_page_size: usize,
 }
 
 fn default_prepare_threshold() -> usize {
     3072
+}
+fn default_micro_tool_page_size() -> usize {
+    100
+}
+fn default_micro_tool_max_page_size() -> usize {
+    200
 }
 
 impl Default for ToolResultRouterSettings {
@@ -462,6 +735,8 @@ impl Default for ToolResultRouterSettings {
             sparql_query_timeout_ms: 100,
             auto_cleanup: true,
             prepare_threshold: default_prepare_threshold(),
+            micro_tool_page_size: default_micro_tool_page_size(),
+            micro_tool_max_page_size: default_micro_tool_max_page_size(),
         }
     }
 }
@@ -577,7 +852,7 @@ impl Default for EmbeddingSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TokenOptimizationSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -591,6 +866,19 @@ pub struct TokenOptimizationSettings {
     pub tool_result_aging: ToolResultAgingSettings,
     #[serde(default)]
     pub prompt_optimization: PromptOptimizationSettings,
+}
+
+impl Default for TokenOptimizationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tool_groups: ToolGroupSettings::default(),
+            tool_result_compressor: ToolResultCompressorSettings::default(),
+            context_window: ContextWindowSettings::default(),
+            tool_result_aging: ToolResultAgingSettings::default(),
+            prompt_optimization: PromptOptimizationSettings::default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -610,10 +898,14 @@ impl Default for ToolGroupSettings {
                 default: vec![
                     "Core".to_string(),
                     "Search".to_string(),
-                    "Knowledge".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "Knowledge".to_string(),
+                    "Code".to_string(),
+                    "Skill".to_string(),
+                ],
             },
         );
         roles.insert(
@@ -623,12 +915,14 @@ impl Default for ToolGroupSettings {
                     "Core".to_string(),
                     "Write".to_string(),
                     "Search".to_string(),
-                    "Web".to_string(),
-                    "Code".to_string(),
-                    "Skill".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Knowledge".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "Knowledge".to_string(),
+                    "Code".to_string(),
+                    "Skill".to_string(),
+                ],
             },
         );
         roles.insert(
@@ -637,10 +931,14 @@ impl Default for ToolGroupSettings {
                 default: vec![
                     "Core".to_string(),
                     "Search".to_string(),
-                    "Knowledge".to_string(),
+                    "Verify".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Web".to_string(), "Code".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "Knowledge".to_string(),
+                    "Code".to_string(),
+                ],
             },
         );
         roles.insert(
@@ -725,8 +1023,8 @@ pub struct ContextWindowSettings {
     pub compression_ratio: f32,
     #[serde(default = "default_preserve_recent")]
     pub preserve_recent: usize,
-    /// When true, the compression budget is derived from the active model's
-    /// context window (proportional), overriding `max_tokens`.
+    /// When true, the active model's safe proportional budget is also applied.
+    /// The configured `max_tokens` remains an operator cost ceiling.
     #[serde(default = "default_false")]
     pub model_aware: bool,
 }
@@ -804,6 +1102,57 @@ pub struct PromptOptimizationSettings {
     pub use_layered_prompts: bool,
     #[serde(default = "default_true")]
     pub store_specs_in_kg: bool,
+    #[serde(default = "default_max_injected_skills")]
+    pub max_injected_skills: usize,
+    #[serde(default = "default_max_workspace_manifest_files")]
+    pub max_workspace_manifest_files: usize,
+    #[serde(default = "default_max_workspace_manifest_chars")]
+    pub max_workspace_manifest_chars: usize,
+    #[serde(default = "default_max_kg_context_entities")]
+    pub max_kg_context_entities: usize,
+    #[serde(default = "default_max_kg_context_bytes")]
+    pub max_kg_context_bytes: usize,
+    #[serde(default = "default_max_learning_hints")]
+    pub max_learning_hints: usize,
+    #[serde(default = "default_max_learning_hint_chars")]
+    pub max_learning_hint_chars: usize,
+    #[serde(default = "default_max_learning_hint_total_chars")]
+    pub max_learning_hint_total_chars: usize,
+    #[serde(default = "default_max_discovered_skill_hints")]
+    pub max_discovered_skill_hints: usize,
+    #[serde(default = "default_max_knowledge_fragments")]
+    pub max_knowledge_fragments: usize,
+}
+
+fn default_max_injected_skills() -> usize {
+    10
+}
+fn default_max_workspace_manifest_files() -> usize {
+    160
+}
+fn default_max_workspace_manifest_chars() -> usize {
+    12_000
+}
+fn default_max_kg_context_entities() -> usize {
+    12
+}
+fn default_max_kg_context_bytes() -> usize {
+    4_096
+}
+fn default_max_learning_hints() -> usize {
+    20
+}
+fn default_max_learning_hint_chars() -> usize {
+    700
+}
+fn default_max_learning_hint_total_chars() -> usize {
+    6_000
+}
+fn default_max_discovered_skill_hints() -> usize {
+    10
+}
+fn default_max_knowledge_fragments() -> usize {
+    12
 }
 
 impl Default for PromptOptimizationSettings {
@@ -812,6 +1161,16 @@ impl Default for PromptOptimizationSettings {
             enabled: true,
             use_layered_prompts: true,
             store_specs_in_kg: true,
+            max_injected_skills: default_max_injected_skills(),
+            max_workspace_manifest_files: default_max_workspace_manifest_files(),
+            max_workspace_manifest_chars: default_max_workspace_manifest_chars(),
+            max_kg_context_entities: default_max_kg_context_entities(),
+            max_kg_context_bytes: default_max_kg_context_bytes(),
+            max_learning_hints: default_max_learning_hints(),
+            max_learning_hint_chars: default_max_learning_hint_chars(),
+            max_learning_hint_total_chars: default_max_learning_hint_total_chars(),
+            max_discovered_skill_hints: default_max_discovered_skill_hints(),
+            max_knowledge_fragments: default_max_knowledge_fragments(),
         }
     }
 }
@@ -976,6 +1335,9 @@ impl Default for Settings {
                     path: "./data/l0".to_string(),
                     max_entries: 1_000_000,
                     compression: true,
+                    blob_inline_threshold: default_l0_blob_inline_threshold(),
+                    cache_size_bytes: default_l0_cache_size_bytes(),
+                    quick_repair: true,
                 },
                 l1: L1Settings {
                     max_messages: 100,
@@ -988,11 +1350,14 @@ impl Default for Settings {
                     eviction_relevance_threshold: None,
                     eviction_safe_window_seconds: None,
                     eviction_beta: None,
+                    max_low_relevance_refs: default_l1_max_low_relevance_refs(),
+                    reload_preview_chars: default_l1_reload_preview_chars(),
                 },
                 l2: L2Settings {
                     max_node_size: 5_242_880,
                     max_projection_size: 500,
                     max_memory_mb: 0,
+                    sync_queue_capacity: default_l2_sync_queue_capacity(),
                 },
                 l3: L3Settings {
                     default_frame: "summary_only".to_string(),
@@ -1073,6 +1438,120 @@ impl Settings {
         }
         if self.agents.max_iterations == 0 {
             return Err("agents.max_iterations must be > 0".to_string());
+        }
+        let budget = &self.agents.execution_budget;
+        for (role, limit) in [
+            ("plan", budget.role_max_turns.plan),
+            ("do_agent", budget.role_max_turns.do_agent),
+            ("check", budget.role_max_turns.check),
+            ("act", budget.role_max_turns.act),
+        ] {
+            if limit == Some(0) {
+                return Err(format!(
+                    "agents.execution_budget.role_max_turns.{role} must be > 0 when set"
+                ));
+            }
+        }
+        if budget.early_warning_remaining > 0
+            && budget.final_warning_remaining > 0
+            && budget.early_warning_remaining <= budget.final_warning_remaining
+        {
+            return Err(
+                "agents.execution_budget.early_warning_remaining must be greater than final_warning_remaining"
+                    .to_string(),
+            );
+        }
+        if budget.effect_progress_block_turns != 0
+            && budget.effect_progress_block_turns < budget.effect_progress_warning_turns
+        {
+            return Err(
+                "agents.execution_budget.effect_progress_block_turns must be zero or >= effect_progress_warning_turns"
+                    .to_string(),
+            );
+        }
+        if budget.ca_evidence_close_turns != 0
+            && budget.ca_evidence_focus_turns != 0
+            && budget.ca_evidence_close_turns <= budget.ca_evidence_focus_turns
+        {
+            return Err(
+                "agents.execution_budget.ca_evidence_close_turns must be zero or greater than ca_evidence_focus_turns"
+                    .to_string(),
+            );
+        }
+        if budget.max_sub_agents == 0 {
+            return Err("agents.execution_budget.max_sub_agents must be > 0".to_string());
+        }
+        if budget.ca_handoff_max_chars == 0 {
+            return Err("agents.execution_budget.ca_handoff_max_chars must be > 0".to_string());
+        }
+        if budget.recursive_handoff_max_chars == 0 {
+            return Err(
+                "agents.execution_budget.recursive_handoff_max_chars must be > 0".to_string(),
+            );
+        }
+        if budget.sa_stream_emit_min_chars == 0 || budget.sa_stream_emit_interval_ms == 0 {
+            return Err(
+                "agents.execution_budget SA stream emit thresholds must be > 0".to_string(),
+            );
+        }
+        for (name, value) in [
+            ("max_plan_steps", budget.max_plan_steps),
+            ("max_recursive_sub_tasks", budget.max_recursive_sub_tasks),
+            (
+                "max_recursive_task_executions",
+                budget.max_recursive_task_executions,
+            ),
+            ("max_ca_da_corrections", budget.max_ca_da_corrections),
+            (
+                "ca_correction_handoff_max_chars",
+                budget.ca_correction_handoff_max_chars,
+            ),
+            (
+                "force_finish_max_tool_entries",
+                budget.force_finish_max_tool_entries,
+            ),
+            (
+                "force_finish_tool_result_max_chars",
+                budget.force_finish_tool_result_max_chars,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("agents.execution_budget.{name} must be > 0"));
+            }
+        }
+        if budget.max_recursive_total_turns == 0 {
+            return Err(
+                "agents.execution_budget.max_recursive_total_turns must be > 0".to_string(),
+            );
+        }
+        if self.workspace.learning_snapshot_max_files == 0
+            || self.workspace.learning_snapshot_max_bytes == 0
+        {
+            return Err("workspace learning snapshot limits must be > 0".to_string());
+        }
+        if self.workspace.effect_snapshot_max_files == 0
+            || self.workspace.effect_snapshot_max_bytes == 0
+        {
+            return Err("workspace effect snapshot limits must be > 0".to_string());
+        }
+        if self.tool_result_router.max_micro_tools == 0
+            || self.tool_result_router.micro_tool_page_size == 0
+            || self.tool_result_router.micro_tool_max_page_size
+                < self.tool_result_router.micro_tool_page_size
+        {
+            return Err(
+                "tool_result_router micro-tool limits must be positive and max_page_size >= page_size"
+                    .to_string(),
+            );
+        }
+        if self.memory.l0.blob_inline_threshold == 0 {
+            return Err("memory.l0.blob_inline_threshold must be > 0".to_string());
+        }
+        if self.memory.l0.cache_size_bytes == 0 {
+            return Err("memory.l0.cache_size_bytes must be > 0".to_string());
+        }
+        if self.memory.l2.sync_queue_capacity == 0 {
+            return Err("memory.l2.sync_queue_capacity must be > 0".to_string());
         }
         Ok(())
     }
@@ -1162,6 +1641,30 @@ mod tests {
             snapshot_frequency: 2000
             max_full_snapshots: 5
             max_projection_size: 1024
+            execution_budget:
+              role_max_turns:
+                check: 24
+              early_warning_remaining: 6
+              final_warning_remaining: 2
+              effect_progress_warning_turns: 7
+              effect_progress_block_turns: 15
+              da_repair_effect_block_turns: 4
+              ca_evidence_focus_turns: 9
+              ca_evidence_close_turns: 14
+              pa_planning_focus_turns: 6
+              max_sub_agents: 8
+              ca_handoff_max_chars: 9000
+              recursive_handoff_max_chars: 5000
+              sa_stream_emit_min_chars: 64
+              sa_stream_emit_interval_ms: 25
+              max_plan_steps: 18
+              max_recursive_sub_tasks: 7
+              max_recursive_task_executions: 11
+              max_recursive_total_turns: 90
+              max_ca_da_corrections: 4
+              ca_correction_handoff_max_chars: 8000
+              force_finish_max_tool_entries: 30
+              force_finish_tool_result_max_chars: 3000
         "#;
         let cfg = Config::builder()
             .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
@@ -1172,6 +1675,19 @@ mod tests {
         assert_eq!(settings.snapshot_frequency, 2000);
         assert_eq!(settings.max_full_snapshots, 5);
         assert_eq!(settings.max_projection_size, 1024);
+        assert_eq!(settings.execution_budget.role_max_turns.check, Some(24));
+        assert_eq!(settings.execution_budget.early_warning_remaining, 6);
+        assert_eq!(settings.execution_budget.ca_evidence_focus_turns, 9);
+        assert_eq!(settings.execution_budget.ca_evidence_close_turns, 14);
+        assert_eq!(settings.execution_budget.da_repair_effect_block_turns, 4);
+        assert_eq!(settings.execution_budget.pa_planning_focus_turns, 6);
+        assert_eq!(settings.execution_budget.max_sub_agents, 8);
+        assert_eq!(settings.execution_budget.ca_handoff_max_chars, 9_000);
+        assert_eq!(settings.execution_budget.max_plan_steps, 18);
+        assert_eq!(settings.execution_budget.max_recursive_sub_tasks, 7);
+        assert_eq!(settings.execution_budget.max_recursive_task_executions, 11);
+        assert_eq!(settings.execution_budget.max_recursive_total_turns, 90);
+        assert_eq!(settings.execution_budget.max_ca_da_corrections, 4);
     }
 
     #[test]
@@ -1193,5 +1709,41 @@ mod tests {
         assert_eq!(settings.snapshot_frequency, 1000);
         assert_eq!(settings.max_full_snapshots, 10);
         assert_eq!(settings.max_projection_size, 500);
+        assert_eq!(settings.execution_budget.role_max_turns.check, None);
+        assert_eq!(settings.execution_budget.early_warning_remaining, 8);
+        assert_eq!(settings.execution_budget.final_warning_remaining, 3);
+        assert_eq!(settings.execution_budget.max_plan_steps, 12);
+        assert_eq!(settings.execution_budget.max_recursive_sub_tasks, 5);
+        assert_eq!(settings.execution_budget.max_recursive_task_executions, 8);
+        assert_eq!(settings.execution_budget.max_recursive_total_turns, 60);
+    }
+
+    #[test]
+    fn repository_config_deserializes_runtime_limits() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.yaml");
+        let config = Config::builder()
+            .add_source(config::File::from(path))
+            .build()
+            .unwrap();
+        let settings: Settings = config.try_deserialize().unwrap();
+        assert_eq!(settings.agents.execution_budget.role_max_turns.check, None);
+        assert_eq!(settings.agents.execution_budget.max_plan_steps, 12);
+        assert_eq!(settings.agents.execution_budget.max_recursive_sub_tasks, 5);
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .max_recursive_task_executions,
+            8
+        );
+        assert_eq!(
+            settings.agents.execution_budget.max_recursive_total_turns,
+            60
+        );
+        assert_eq!(settings.tool_result_router.micro_tool_page_size, 100);
+        assert_eq!(settings.memory.l1.reload_preview_chars, 400);
+        assert_eq!(settings.workspace.effect_snapshot_max_files, 10_000);
+        assert_eq!(settings.workspace.effect_snapshot_max_bytes, 67_108_864);
+        settings.validate().unwrap();
     }
 }

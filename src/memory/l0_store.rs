@@ -3,8 +3,10 @@
 //! This module handles persistent storage of memories and knowledge, supporting MESI cache coherence states and tag secondary indexes.
 
 use chrono::{DateTime, Utc};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -65,6 +67,91 @@ pub struct L0Config {
     pub path: String,
     pub max_entries: usize,
     pub compression: bool,
+    pub blob_inline_threshold: usize,
+    pub cache_size_bytes: usize,
+    pub quick_repair: bool,
+}
+
+/// Logical lifetime/query partition retained behind the unified L0 API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L0RecordKind {
+    CanonicalKnowledge,
+    AuditEvidence,
+    Checkpoint,
+    RawInteraction,
+    Telemetry,
+    Other,
+}
+
+impl L0RecordKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalKnowledge => "canonical_knowledge",
+            Self::AuditEvidence => "audit_evidence",
+            Self::Checkpoint => "checkpoint",
+            Self::RawInteraction => "raw_interaction",
+            Self::Telemetry => "telemetry",
+            Self::Other => "other",
+        }
+    }
+
+    fn infer(iri: &str) -> Self {
+        let lower = iri.to_ascii_lowercase();
+        if lower.contains("/skills/")
+            || lower.contains("/knowledge/")
+            || lower.contains("/experience/")
+            || lower.contains("/policy/")
+        {
+            Self::CanonicalKnowledge
+        } else if lower.contains("/audit/")
+            || lower.contains("/governance/")
+            || lower.contains("/decision/")
+        {
+            Self::AuditEvidence
+        } else if lower.contains("/checkpoint/") {
+            Self::Checkpoint
+        } else if lower.contains("/archive/") {
+            Self::RawInteraction
+        } else if lower.contains("/trace/")
+            || lower.contains("/telemetry/")
+            || lower.contains("/metrics/")
+        {
+            Self::Telemetry
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionClass {
+    Permanent,
+    LongLived,
+    TaskScoped,
+    Ephemeral,
+}
+
+impl RetentionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::LongLived => "long_lived",
+            Self::TaskScoped => "task_scoped",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+
+    fn for_kind(kind: L0RecordKind) -> Self {
+        match kind {
+            L0RecordKind::CanonicalKnowledge | L0RecordKind::AuditEvidence => Self::Permanent,
+            L0RecordKind::Checkpoint => Self::TaskScoped,
+            L0RecordKind::RawInteraction => Self::LongLived,
+            L0RecordKind::Telemetry => Self::Ephemeral,
+            L0RecordKind::Other => Self::LongLived,
+        }
+    }
 }
 
 impl Default for L0Config {
@@ -73,6 +160,9 @@ impl Default for L0Config {
             path: "./data/l0_store".to_string(),
             max_entries: 1_000_000,
             compression: true,
+            blob_inline_threshold: 4_096,
+            cache_size_bytes: 128 * 1024 * 1024,
+            quick_repair: true,
         }
     }
 }
@@ -92,6 +182,27 @@ fn compute_content_hash(content: &str) -> String {
 const ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
 const TAG_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tag_index");
 const NAMED_GRAPH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("named_graph");
+const TYPE_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("type_index");
+const RECORD_KIND_INDEX_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("record_kind_index");
+const BLOB_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("content_blobs");
+const BLOB_REFCOUNT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_refcounts");
+
+const META_SCHEMA_VERSION: &str = "_gh_schema_version";
+const META_RECORD_KIND: &str = "_gh_record_kind";
+const META_RETENTION_CLASS: &str = "_gh_retention_class";
+const META_EXPIRES_AT: &str = "_gh_expires_at";
+const META_GENERATION: &str = "_gh_generation";
+const META_UPDATED_AT: &str = "_gh_updated_at";
+const META_BLOB_REF: &str = "_gh_blob_ref";
+const CURRENT_RECORD_SCHEMA_VERSION: u64 = 1;
+const BLOB_ENVELOPE_MAGIC: &[u8; 4] = b"GHB0";
+
+const ENTRY_ENVELOPE_MAGIC: &[u8; 4] = b"GHE0";
+const ENTRY_ENVELOPE_VERSION: u8 = 1;
+const CODEC_RAW: u8 = 0;
+const CODEC_GZIP: u8 = 1;
+const ENVELOPE_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 32;
 
 /// L0 Store
 pub struct L0Store {
@@ -105,27 +216,370 @@ pub struct L0Store {
 }
 
 impl L0Store {
-    pub fn new(path: &str) -> Result<Self, CoreError> {
-        info!("Initializing L0 Store: {}", path);
+    fn encode_entry(entry: &L0Entry, compress: bool) -> Result<Vec<u8>, CoreError> {
+        let raw = serde_json::to_vec(entry).map_err(|e| CoreError::StorageError {
+            message: format!("Failed to serialize L0 entry: {e}"),
+        })?;
+        let (codec, payload) = if compress && !raw.is_empty() {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder
+                .write_all(&raw)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to compress L0 entry: {e}"),
+                })?;
+            let compressed = encoder.finish().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to finish L0 entry compression: {e}"),
+            })?;
+            // Small JSON records can grow under gzip. Keep a raw envelope in
+            // that case while preserving the same versioned disk format.
+            if compressed.len() < raw.len() {
+                (CODEC_GZIP, compressed)
+            } else {
+                (CODEC_RAW, raw.clone())
+            }
+        } else {
+            (CODEC_RAW, raw.clone())
+        };
 
-        std::fs::create_dir_all(path).map_err(|e| CoreError::StorageError {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(&raw);
+        let mut encoded = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
+        encoded.extend_from_slice(ENTRY_ENVELOPE_MAGIC);
+        encoded.push(ENTRY_ENVELOPE_VERSION);
+        encoded.push(codec);
+        encoded.extend_from_slice(&(raw.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(&digest);
+        encoded.extend_from_slice(&payload);
+        Ok(encoded)
+    }
+
+    fn decode_entry(bytes: &[u8]) -> Result<L0Entry, CoreError> {
+        // Existing databases stored plain JSON. This branch is intentionally
+        // retained indefinitely so upgrades are online and non-destructive.
+        if !bytes.starts_with(ENTRY_ENVELOPE_MAGIC) {
+            return serde_json::from_slice(bytes).map_err(|e| CoreError::StorageError {
+                message: format!("Failed to deserialize legacy L0 entry: {e}"),
+            });
+        }
+        if bytes.len() < ENVELOPE_HEADER_LEN {
+            return Err(CoreError::StorageError {
+                message: "Truncated L0 entry envelope".to_string(),
+            });
+        }
+        let version = bytes[4];
+        if version != ENTRY_ENVELOPE_VERSION {
+            return Err(CoreError::StorageError {
+                message: format!("Unsupported L0 entry envelope version: {version}"),
+            });
+        }
+        let codec = bytes[5];
+        let expected_len = u64::from_be_bytes(
+            bytes[6..14]
+                .try_into()
+                .expect("fixed envelope length checked above"),
+        ) as usize;
+        let expected_digest = &bytes[14..46];
+        let payload = &bytes[ENVELOPE_HEADER_LEN..];
+        let raw = match codec {
+            CODEC_RAW => payload.to_vec(),
+            CODEC_GZIP => {
+                let mut decoder = GzDecoder::new(payload);
+                let mut decoded = Vec::with_capacity(expected_len);
+                decoder
+                    .read_to_end(&mut decoded)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to decompress L0 entry: {e}"),
+                    })?;
+                decoded
+            }
+            other => {
+                return Err(CoreError::StorageError {
+                    message: format!("Unsupported L0 entry codec: {other}"),
+                })
+            }
+        };
+        if raw.len() != expected_len {
+            return Err(CoreError::StorageError {
+                message: format!(
+                    "L0 entry length mismatch: expected={expected_len}, actual={}",
+                    raw.len()
+                ),
+            });
+        }
+        use sha2::Digest;
+        let actual_digest = sha2::Sha256::digest(&raw);
+        if actual_digest.as_slice() != expected_digest {
+            return Err(CoreError::StorageError {
+                message: "L0 entry checksum mismatch".to_string(),
+            });
+        }
+        serde_json::from_slice(&raw).map_err(|e| CoreError::StorageError {
+            message: format!("Failed to deserialize L0 entry envelope payload: {e}"),
+        })
+    }
+
+    fn encode_blob(content: &str, compress: bool) -> Result<Vec<u8>, CoreError> {
+        let raw = content.as_bytes();
+        let (codec, payload) = if compress && !raw.is_empty() {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder
+                .write_all(raw)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to compress L0 blob: {e}"),
+                })?;
+            let compressed = encoder.finish().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to finish L0 blob compression: {e}"),
+            })?;
+            if compressed.len() < raw.len() {
+                (CODEC_GZIP, compressed)
+            } else {
+                (CODEC_RAW, raw.to_vec())
+            }
+        } else {
+            (CODEC_RAW, raw.to_vec())
+        };
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(raw);
+        let mut encoded = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
+        encoded.extend_from_slice(BLOB_ENVELOPE_MAGIC);
+        encoded.push(ENTRY_ENVELOPE_VERSION);
+        encoded.push(codec);
+        encoded.extend_from_slice(&(raw.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(&digest);
+        encoded.extend_from_slice(&payload);
+        Ok(encoded)
+    }
+
+    fn decode_blob(bytes: &[u8]) -> Result<String, CoreError> {
+        if bytes.len() < ENVELOPE_HEADER_LEN || !bytes.starts_with(BLOB_ENVELOPE_MAGIC) {
+            return Err(CoreError::StorageError {
+                message: "Invalid L0 blob envelope".to_string(),
+            });
+        }
+        if bytes[4] != ENTRY_ENVELOPE_VERSION {
+            return Err(CoreError::StorageError {
+                message: format!("Unsupported L0 blob version: {}", bytes[4]),
+            });
+        }
+        let expected_len = u64::from_be_bytes(
+            bytes[6..14]
+                .try_into()
+                .expect("fixed blob envelope length checked above"),
+        ) as usize;
+        let payload = &bytes[ENVELOPE_HEADER_LEN..];
+        let raw = match bytes[5] {
+            CODEC_RAW => payload.to_vec(),
+            CODEC_GZIP => {
+                let mut decoder = GzDecoder::new(payload);
+                let mut decoded = Vec::with_capacity(expected_len);
+                decoder
+                    .read_to_end(&mut decoded)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to decompress L0 blob: {e}"),
+                    })?;
+                decoded
+            }
+            codec => {
+                return Err(CoreError::StorageError {
+                    message: format!("Unsupported L0 blob codec: {codec}"),
+                })
+            }
+        };
+        if raw.len() != expected_len {
+            return Err(CoreError::StorageError {
+                message: format!(
+                    "L0 blob length mismatch: expected={expected_len}, actual={}",
+                    raw.len()
+                ),
+            });
+        }
+        use sha2::Digest;
+        if sha2::Sha256::digest(&raw).as_slice() != &bytes[14..46] {
+            return Err(CoreError::StorageError {
+                message: "L0 blob checksum mismatch".to_string(),
+            });
+        }
+        String::from_utf8(raw).map_err(|e| CoreError::StorageError {
+            message: format!("L0 blob is not valid UTF-8: {e}"),
+        })
+    }
+
+    fn entry_record_kind(entry: &L0Entry) -> L0RecordKind {
+        entry
+            .metadata
+            .get(META_RECORD_KIND)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| {
+                serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+            })
+            .unwrap_or_else(|| L0RecordKind::infer(&entry.iri))
+    }
+
+    pub fn entry_generation(entry: &L0Entry) -> u64 {
+        entry
+            .metadata
+            .get(META_GENERATION)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    fn entry_blob_ref(entry: &L0Entry) -> Option<&str> {
+        entry
+            .metadata
+            .get(META_BLOB_REF)
+            .and_then(serde_json::Value::as_str)
+    }
+
+    fn is_expired(entry: &L0Entry, now: DateTime<Utc>) -> bool {
+        entry
+            .metadata
+            .get(META_EXPIRES_AT)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|expires| expires.with_timezone(&Utc) <= now)
+    }
+
+    fn normalize_lifecycle(
+        mut entry: L0Entry,
+        existing: Option<&L0Entry>,
+        explicit_kind: Option<L0RecordKind>,
+        explicit_retention: Option<RetentionClass>,
+    ) -> L0Entry {
+        let kind = explicit_kind
+            .or_else(|| {
+                entry
+                    .metadata
+                    .get(META_RECORD_KIND)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| {
+                        serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+                    })
+            })
+            .unwrap_or_else(|| L0RecordKind::infer(&entry.iri));
+        let retention = explicit_retention
+            .or_else(|| {
+                entry
+                    .metadata
+                    .get(META_RETENTION_CLASS)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| {
+                        serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+                    })
+            })
+            .unwrap_or_else(|| RetentionClass::for_kind(kind));
+        let previous_generation = existing.map(Self::entry_generation).unwrap_or(0);
+        let changed = existing.is_none_or(|old| {
+            old.content_hash != entry.content_hash
+                || old.tags != entry.tags
+                || old.named_graph != entry.named_graph
+                || old.jsonld_types != entry.jsonld_types
+        });
+        let computed_generation = if previous_generation == 0 {
+            1
+        } else if changed {
+            previous_generation.saturating_add(1)
+        } else {
+            previous_generation
+        };
+        let requested_generation = entry
+            .metadata
+            .get(META_GENERATION)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let generation = computed_generation.max(requested_generation);
+        entry.metadata.insert(
+            META_SCHEMA_VERSION.to_string(),
+            serde_json::Value::from(CURRENT_RECORD_SCHEMA_VERSION),
+        );
+        entry.metadata.insert(
+            META_RECORD_KIND.to_string(),
+            serde_json::Value::String(kind.as_str().to_string()),
+        );
+        entry.metadata.insert(
+            META_RETENTION_CLASS.to_string(),
+            serde_json::Value::String(retention.as_str().to_string()),
+        );
+        entry.metadata.insert(
+            META_GENERATION.to_string(),
+            serde_json::Value::from(generation),
+        );
+        entry.metadata.insert(
+            META_UPDATED_AT.to_string(),
+            serde_json::Value::String(Utc::now().to_rfc3339()),
+        );
+        entry
+    }
+
+    fn hydrate_entry(&self, mut entry: L0Entry) -> Result<L0Entry, CoreError> {
+        let Some(blob_ref) = Self::entry_blob_ref(&entry).map(str::to_string) else {
+            return Ok(entry);
+        };
+        let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
+            message: format!("Failed to begin L0 blob read: {e}"),
+        })?;
+        let blobs = read_txn
+            .open_table(BLOB_TABLE)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open L0 blob table: {e}"),
+            })?;
+        let value = blobs
+            .get(blob_ref.as_str())
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to read L0 blob {blob_ref}: {e}"),
+            })?
+            .ok_or_else(|| CoreError::StorageError {
+                message: format!("Missing L0 content blob: {blob_ref}"),
+            })?;
+        entry.content = Self::decode_blob(value.value())?;
+        Ok(entry)
+    }
+
+    pub fn new(path: &str) -> Result<Self, CoreError> {
+        Self::with_config(L0Config {
+            path: path.to_string(),
+            ..Default::default()
+        })
+    }
+
+    pub fn with_config(config: L0Config) -> Result<Self, CoreError> {
+        Self::with_config_and_repair_callback(config, None)
+    }
+
+    pub fn with_config_and_repair_callback(
+        config: L0Config,
+        repair_callback: Option<Arc<dyn Fn(f64) + Send + Sync>>,
+    ) -> Result<Self, CoreError> {
+        info!("Initializing L0 Store: {}", config.path);
+
+        std::fs::create_dir_all(&config.path).map_err(|e| CoreError::StorageError {
             message: format!("Failed to create storage directory: {}", e),
         })?;
 
-        let db_path = std::path::Path::new(path).join("l0.redb");
-        let db_path_str = db_path.to_string_lossy();
-        let db = Database::create(db_path_str.as_ref()).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to open database: {}", e),
-        })?;
+        let db_path = std::path::Path::new(&config.path).join("l0.redb");
+        let mut builder = Database::builder();
+        builder.set_cache_size(config.cache_size_bytes);
+        if let Some(callback) = repair_callback {
+            builder.set_repair_callback(move |session| callback(session.progress()));
+        }
+        let db = builder
+            .create(&db_path)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open database: {}", e),
+            })?;
 
         // Ensure tables exist by opening them in a write transaction
         {
-            let write_txn = db.begin_write().map_err(|e| CoreError::StorageError {
+            let mut write_txn = db.begin_write().map_err(|e| CoreError::StorageError {
                 message: format!("Failed to begin write transaction: {}", e),
             })?;
+            write_txn.set_quick_repair(config.quick_repair);
             let _ = write_txn.open_table(ENTRIES_TABLE);
             let _ = write_txn.open_table(TAG_INDEX_TABLE);
             let _ = write_txn.open_table(NAMED_GRAPH_TABLE);
+            let _ = write_txn.open_table(TYPE_INDEX_TABLE);
+            let _ = write_txn.open_table(RECORD_KIND_INDEX_TABLE);
+            let _ = write_txn.open_table(BLOB_TABLE);
+            let _ = write_txn.open_table(BLOB_REFCOUNT_TABLE);
             write_txn.commit().map_err(|e| CoreError::StorageError {
                 message: format!("Failed to commit transaction: {}", e),
             })?;
@@ -148,117 +602,27 @@ impl L0Store {
 
         Ok(Self {
             db,
-            config: L0Config {
-                path: path.to_string(),
-                ..Default::default()
-            },
+            config,
             entry_count,
             iri_registry: None,
         })
     }
 
-    /// Update tag index: remove old tag indexes, then insert new tag indexes
-    fn update_tag_index(
-        &self,
-        iri: &str,
-        old_tags: &[String],
-        new_tags: &[String],
-    ) -> Result<(), CoreError> {
-        for tag in old_tags {
-            let index_key = format!("tag:{}", tag);
-            self.remove_iri_from_tag_index(&index_key, iri)?;
-        }
-        for tag in new_tags {
-            let index_key = format!("tag:{}", tag);
-            self.add_iri_to_tag_index(&index_key, iri)?;
-        }
-        Ok(())
-    }
-
-    /// Add IRI to tag index
-    fn add_iri_to_tag_index(&self, index_key: &str, iri: &str) -> Result<(), CoreError> {
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
-        {
-            let mut table =
-                write_txn
-                    .open_table(TAG_INDEX_TABLE)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to open tag index: {}", e),
-                    })?;
-            let mut iris: Vec<String> = match table.get(index_key) {
-                Ok(Some(guard)) => serde_json::from_slice(guard.value()).unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            if !iris.contains(&iri.to_string()) {
-                iris.push(iri.to_string());
-            }
-            let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
-                message: format!("Failed to serialize tag index: {}", e),
+    fn begin_write(&self, error_context: &str) -> Result<redb::WriteTransaction, CoreError> {
+        let mut transaction = self
+            .db
+            .begin_write()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("{error_context}: {error}"),
             })?;
-            table
-                .insert(index_key, encoded.as_slice())
-                .map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to write tag index: {}", e),
-                })?;
-        }
-        write_txn.commit().map_err(|e| CoreError::StorageError {
-            message: format!("Failed to commit transaction: {}", e),
-        })?;
-        Ok(())
-    }
-
-    /// Remove IRI from tag index
-    fn remove_iri_from_tag_index(&self, index_key: &str, iri: &str) -> Result<(), CoreError> {
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
-        let iris_empty = {
-            let mut table =
-                write_txn
-                    .open_table(TAG_INDEX_TABLE)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to open tag index: {}", e),
-                    })?;
-            let mut iris: Vec<String> = match table.get(index_key) {
-                Ok(Some(guard)) => serde_json::from_slice(guard.value()).unwrap_or_default(),
-                _ => return Ok(()),
-            };
-            iris.retain(|i| i != iri);
-            if iris.is_empty() {
-                table
-                    .remove(index_key)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to delete tag index: {}", e),
-                    })?;
-                true
-            } else {
-                let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to serialize tag index: {}", e),
-                })?;
-                table.insert(index_key, encoded.as_slice()).map_err(|e| {
-                    CoreError::StorageError {
-                        message: format!("Failed to write tag index: {}", e),
-                    }
-                })?;
-                false
-            }
-        };
-        let _ = iris_empty;
-        write_txn.commit().map_err(|e| CoreError::StorageError {
-            message: format!("Failed to commit transaction: {}", e),
-        })?;
-        Ok(())
+        transaction.set_quick_repair(self.config.quick_repair);
+        Ok(transaction)
     }
 
     pub fn store(&self, iri: &str, content: &str) -> Result<(), CoreError> {
         let content_hash = compute_content_hash(content);
-
-        let existing_entry = self.retrieve_without_update(iri)?;
-
-        let entry = if let Some(existing) = existing_entry {
-            let new_entry = L0Entry {
+        self.write_entry_atomic(
+            &L0Entry {
                 iri: iri.to_string(),
                 content: content.to_string(),
                 importance: 0.5,
@@ -270,56 +634,13 @@ impl L0Store {
                 mesi_state: MesiState::Shared,
                 content_hash,
                 named_graph: None,
-
                 jsonld_context: None,
                 jsonld_types: Vec::new(),
-            };
-            Self::merge_entries(&existing, &new_entry)
-        } else {
-            L0Entry {
-                iri: iri.to_string(),
-                content: content.to_string(),
-                importance: 0.5,
-                access_count: 0,
-                created_at: Utc::now(),
-                last_accessed: Utc::now(),
-                tags: Vec::new(),
-                metadata: serde_json::Map::new(),
-                mesi_state: MesiState::Shared,
-                content_hash,
-                named_graph: None,
-
-                jsonld_context: None,
-                jsonld_types: Vec::new(),
-            }
-        };
-
-        let value = serde_json::to_vec(&entry).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to serialize entry: {}", e),
-        })?;
-
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
-        {
-            let mut table =
-                write_txn
-                    .open_table(ENTRIES_TABLE)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to open table: {}", e),
-                    })?;
-            table
-                .insert(iri, value.as_slice())
-                .map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to store entry: {}", e),
-                })?;
-        }
-        write_txn.commit().map_err(|e| CoreError::StorageError {
-            message: format!("Failed to commit transaction: {}", e),
-        })?;
-
-        debug!(iri = %entry.iri, "Entry stored to L0");
-        Ok(())
+            },
+            true,
+            None,
+            None,
+        )
     }
 
     fn retrieve_without_update(&self, iri: &str) -> Result<Option<L0Entry>, CoreError> {
@@ -335,11 +656,12 @@ impl L0Store {
             message: format!("Failed to retrieve entry: {}", e),
         })? {
             Some(guard) => {
-                let entry: L0Entry =
-                    serde_json::from_slice(guard.value()).map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to deserialize entry: {}", e),
-                    })?;
-                Ok(Some(entry))
+                let entry = self.hydrate_entry(Self::decode_entry(guard.value())?)?;
+                if Self::is_expired(&entry, Utc::now()) {
+                    Ok(None)
+                } else {
+                    Ok(Some(entry))
+                }
             }
             None => Ok(None),
         }
@@ -386,57 +708,435 @@ impl L0Store {
         }
     }
 
-    pub fn store_entry(&self, entry: &L0Entry) -> Result<(), CoreError> {
-        let old_tags = self.get_entry_tags(&entry.iri)?;
-        let old_named_graph = self.get_entry_named_graph(&entry.iri)?;
+    fn write_entry_atomic(
+        &self,
+        entry: &L0Entry,
+        merge: bool,
+        explicit_kind: Option<L0RecordKind>,
+        explicit_retention: Option<RetentionClass>,
+    ) -> Result<(), CoreError> {
+        let content_hash = compute_content_hash(&entry.content);
 
-        let content_hash = if entry.content_hash.is_empty() {
-            compute_content_hash(&entry.content)
-        } else {
-            entry.content_hash.clone()
-        };
-
-        let existing_entry = self.retrieve_without_update(&entry.iri)?;
-        let entry = if let Some(existing) = existing_entry {
-            let entry_with_hash = L0Entry {
-                content_hash,
-                ..entry.clone()
-            };
-            Self::merge_entries(&existing, &entry_with_hash)
-        } else {
-            L0Entry {
-                content_hash,
-                ..entry.clone()
-            }
-        };
-
-        self.update_tag_index(&entry.iri, &old_tags, &entry.tags)?;
-
-        if old_named_graph != entry.named_graph {
-            if let Some(ref old_graph) = old_named_graph {
-                self.remove_iri_from_named_graph_index(old_graph, &entry.iri)?;
-            }
-            if let Some(ref new_graph) = entry.named_graph {
-                self.add_iri_to_named_graph_index(new_graph, &entry.iri)?;
-            }
-        }
-
-        let value = serde_json::to_vec(&entry).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to serialize entry: {}", e),
-        })?;
-
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
+        let write_txn = self.begin_write("Write transaction failed")?;
         {
-            let mut table =
+            let mut entries =
                 write_txn
                     .open_table(ENTRIES_TABLE)
                     .map_err(|e| CoreError::StorageError {
                         message: format!("Failed to open table: {}", e),
                     })?;
-            table
-                .insert(entry.iri.as_str(), value.as_slice())
+            let existing =
+                match entries
+                    .get(entry.iri.as_str())
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to read existing entry: {}", e),
+                    })? {
+                    Some(guard) => Some(self.hydrate_entry(Self::decode_entry(guard.value())?)?),
+                    None => None,
+                };
+
+            if existing.is_none()
+                && self.config.max_entries > 0
+                && entries.len().map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to count entries: {}", e),
+                })? as usize
+                    >= self.config.max_entries
+            {
+                return Err(CoreError::StorageError {
+                    message: format!(
+                        "L0 entry capacity reached: max_entries={}",
+                        self.config.max_entries
+                    ),
+                });
+            }
+
+            let incoming = L0Entry {
+                content_hash,
+                ..entry.clone()
+            };
+            let final_entry = if merge {
+                existing
+                    .as_ref()
+                    .map(|old| Self::merge_entries(old, &incoming))
+                    .unwrap_or(incoming)
+            } else {
+                incoming
+            };
+            let mut final_entry = Self::normalize_lifecycle(
+                final_entry,
+                existing.as_ref(),
+                explicit_kind,
+                explicit_retention,
+            );
+            let old_tags = existing
+                .as_ref()
+                .map(|old| old.tags.clone())
+                .unwrap_or_default();
+            let old_graph = existing.as_ref().and_then(|old| old.named_graph.clone());
+            let old_types = existing
+                .as_ref()
+                .map(|old| old.jsonld_types.clone())
+                .unwrap_or_default();
+            let old_kind = existing.as_ref().map(Self::entry_record_kind);
+            let final_kind = Self::entry_record_kind(&final_entry);
+
+            let mut tags =
+                write_txn
+                    .open_table(TAG_INDEX_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open tag index: {}", e),
+                    })?;
+            for tag in &old_tags {
+                let key = format!("tag:{}", tag);
+                let mut iris =
+                    match tags
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read tag index: {}", e),
+                        })? {
+                        Some(guard) => {
+                            serde_json::from_slice::<Vec<String>>(guard.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                iris.retain(|candidate| candidate != &final_entry.iri);
+                if iris.is_empty() {
+                    tags.remove(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove tag index: {}", e),
+                        })?;
+                } else {
+                    let encoded =
+                        serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to serialize tag index: {}", e),
+                        })?;
+                    tags.insert(key.as_str(), encoded.as_slice()).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to update tag index: {}", e),
+                        }
+                    })?;
+                }
+            }
+            for tag in &final_entry.tags {
+                let key = format!("tag:{}", tag);
+                let mut iris =
+                    match tags
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read tag index: {}", e),
+                        })? {
+                        Some(guard) => {
+                            serde_json::from_slice::<Vec<String>>(guard.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                if !iris.contains(&final_entry.iri) {
+                    iris.push(final_entry.iri.clone());
+                }
+                let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to serialize tag index: {}", e),
+                })?;
+                tags.insert(key.as_str(), encoded.as_slice()).map_err(|e| {
+                    CoreError::StorageError {
+                        message: format!("Failed to update tag index: {}", e),
+                    }
+                })?;
+            }
+
+            let mut graphs =
+                write_txn
+                    .open_table(NAMED_GRAPH_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open named graph index: {}", e),
+                    })?;
+            if let Some(graph) = old_graph {
+                let key = format!("graph:{}", graph);
+                let mut iris =
+                    match graphs
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read named graph index: {}", e),
+                        })? {
+                        Some(guard) => {
+                            serde_json::from_slice::<Vec<String>>(guard.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                iris.retain(|candidate| candidate != &final_entry.iri);
+                if iris.is_empty() {
+                    graphs
+                        .remove(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove named graph index: {}", e),
+                        })?;
+                } else {
+                    let encoded =
+                        serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to serialize named graph index: {}", e),
+                        })?;
+                    graphs
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to update named graph index: {}", e),
+                        })?;
+                }
+            }
+            if let Some(graph) = &final_entry.named_graph {
+                let key = format!("graph:{}", graph);
+                let mut iris =
+                    match graphs
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read named graph index: {}", e),
+                        })? {
+                        Some(guard) => {
+                            serde_json::from_slice::<Vec<String>>(guard.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                if !iris.contains(&final_entry.iri) {
+                    iris.push(final_entry.iri.clone());
+                }
+                let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to serialize named graph index: {}", e),
+                })?;
+                graphs
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to update named graph index: {}", e),
+                    })?;
+            }
+
+            let mut types =
+                write_txn
+                    .open_table(TYPE_INDEX_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open type index: {}", e),
+                    })?;
+            for type_iri in old_types {
+                let key = format!("type:{}", type_iri);
+                let mut iris =
+                    match types
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read type index: {}", e),
+                        })? {
+                        Some(guard) => {
+                            serde_json::from_slice::<Vec<String>>(guard.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                iris.retain(|candidate| candidate != &final_entry.iri);
+                if iris.is_empty() {
+                    types
+                        .remove(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove type index: {}", e),
+                        })?;
+                } else {
+                    let encoded =
+                        serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to serialize type index: {}", e),
+                        })?;
+                    types
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to update type index: {}", e),
+                        })?;
+                }
+            }
+            for type_iri in &final_entry.jsonld_types {
+                let key = format!("type:{}", type_iri);
+                let mut iris =
+                    match types
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read type index: {}", e),
+                        })? {
+                        Some(guard) => {
+                            serde_json::from_slice::<Vec<String>>(guard.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                if !iris.contains(&final_entry.iri) {
+                    iris.push(final_entry.iri.clone());
+                }
+                let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to serialize type index: {}", e),
+                })?;
+                types
+                    .insert(key.as_str(), encoded.as_slice())
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to update type index: {}", e),
+                    })?;
+            }
+
+            let mut kind_index = write_txn.open_table(RECORD_KIND_INDEX_TABLE).map_err(|e| {
+                CoreError::StorageError {
+                    message: format!("Failed to open record-kind index: {e}"),
+                }
+            })?;
+            if let Some(old_kind) = old_kind {
+                let key = format!("kind:{}", old_kind.as_str());
+                let mut iris =
+                    match kind_index
+                        .get(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read record-kind index: {e}"),
+                        })? {
+                        Some(value) => {
+                            serde_json::from_slice::<Vec<String>>(value.value()).unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                iris.retain(|iri| iri != &final_entry.iri);
+                if iris.is_empty() {
+                    kind_index
+                        .remove(key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove record-kind index: {e}"),
+                        })?;
+                } else {
+                    let encoded =
+                        serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to encode record-kind index: {e}"),
+                        })?;
+                    kind_index
+                        .insert(key.as_str(), encoded.as_slice())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to update record-kind index: {e}"),
+                        })?;
+                }
+            }
+            let kind_key = format!("kind:{}", final_kind.as_str());
+            let mut iris =
+                match kind_index
+                    .get(kind_key.as_str())
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to read record-kind index: {e}"),
+                    })? {
+                    Some(value) => {
+                        serde_json::from_slice::<Vec<String>>(value.value()).unwrap_or_default()
+                    }
+                    None => Vec::new(),
+                };
+            if !iris.contains(&final_entry.iri) {
+                iris.push(final_entry.iri.clone());
+            }
+            let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                message: format!("Failed to encode record-kind index: {e}"),
+            })?;
+            kind_index
+                .insert(kind_key.as_str(), encoded.as_slice())
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to update record-kind index: {e}"),
+                })?;
+
+            let old_blob_ref = existing
+                .as_ref()
+                .and_then(Self::entry_blob_ref)
+                .map(str::to_string);
+            final_entry.metadata.remove(META_BLOB_REF);
+            let new_blob_ref = (final_entry.content.len() >= self.config.blob_inline_threshold)
+                .then(|| final_entry.content_hash.clone());
+            let mut stored_entry = final_entry.clone();
+            if let Some(blob_ref) = &new_blob_ref {
+                stored_entry.metadata.insert(
+                    META_BLOB_REF.to_string(),
+                    serde_json::Value::String(blob_ref.clone()),
+                );
+                stored_entry.content.clear();
+            }
+
+            let mut blobs =
+                write_txn
+                    .open_table(BLOB_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open content blob table: {e}"),
+                    })?;
+            let mut refs =
+                write_txn
+                    .open_table(BLOB_REFCOUNT_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open blob refcount table: {e}"),
+                    })?;
+            if old_blob_ref != new_blob_ref {
+                if let Some(old_ref) = old_blob_ref.as_deref() {
+                    let count = refs
+                        .get(old_ref)
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read old blob refcount: {e}"),
+                        })?
+                        .and_then(|value| value.value().try_into().ok().map(u64::from_be_bytes))
+                        .unwrap_or(1);
+                    if count <= 1 {
+                        refs.remove(old_ref).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove blob refcount: {e}"),
+                        })?;
+                        blobs.remove(old_ref).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove unreferenced blob: {e}"),
+                        })?;
+                    } else {
+                        let next = (count - 1).to_be_bytes();
+                        refs.insert(old_ref, next.as_slice()).map_err(|e| {
+                            CoreError::StorageError {
+                                message: format!("Failed to decrement blob refcount: {e}"),
+                            }
+                        })?;
+                    }
+                }
+                if let Some(new_ref) = new_blob_ref.as_deref() {
+                    if blobs
+                        .get(new_ref)
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to look up content blob: {e}"),
+                        })?
+                        .is_none()
+                    {
+                        let blob =
+                            Self::encode_blob(&final_entry.content, self.config.compression)?;
+                        blobs.insert(new_ref, blob.as_slice()).map_err(|e| {
+                            CoreError::StorageError {
+                                message: format!("Failed to store content blob: {e}"),
+                            }
+                        })?;
+                    }
+                    let count = refs
+                        .get(new_ref)
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read blob refcount: {e}"),
+                        })?
+                        .and_then(|value| value.value().try_into().ok().map(u64::from_be_bytes))
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    let encoded = count.to_be_bytes();
+                    refs.insert(new_ref, encoded.as_slice()).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to increment blob refcount: {e}"),
+                        }
+                    })?;
+                }
+            } else if let Some(blob_ref) = new_blob_ref.as_deref() {
+                // Repair an incomplete blob table without changing refcount.
+                if blobs
+                    .get(blob_ref)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to verify content blob: {e}"),
+                    })?
+                    .is_none()
+                {
+                    let blob = Self::encode_blob(&final_entry.content, self.config.compression)?;
+                    blobs.insert(blob_ref, blob.as_slice()).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to repair content blob: {e}"),
+                        }
+                    })?;
+                }
+            }
+
+            let value = Self::encode_entry(&stored_entry, self.config.compression)?;
+            entries
+                .insert(final_entry.iri.as_str(), value.as_slice())
                 .map_err(|e| CoreError::StorageError {
                     message: format!("Failed to store entry: {}", e),
                 })?;
@@ -445,137 +1145,52 @@ impl L0Store {
             message: format!("Failed to commit transaction: {}", e),
         })?;
 
-        debug!(iri = %entry.iri, "Entry stored to L0");
+        debug!(iri = %entry.iri, merge, "Entry stored to L0 atomically");
         Ok(())
     }
 
-    fn get_entry_named_graph(&self, iri: &str) -> Result<Option<String>, CoreError> {
-        let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
-            message: format!("Read transaction failed: {}", e),
-        })?;
-        let table = read_txn
-            .open_table(ENTRIES_TABLE)
-            .map_err(|e| CoreError::StorageError {
-                message: format!("Failed to open table: {}", e),
-            })?;
-        match table.get(iri).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to retrieve entry: {}", e),
-        })? {
-            Some(guard) => {
-                let entry: L0Entry =
-                    serde_json::from_slice(guard.value()).map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to deserialize entry: {}", e),
-                    })?;
-                Ok(entry.named_graph)
-            }
-            _ => Ok(None),
-        }
+    /// Merge an entry with an existing entity. This compatibility API retains
+    /// accumulated tags/types/metadata. Use `replace_entry` for exact updates.
+    pub fn store_entry(&self, entry: &L0Entry) -> Result<(), CoreError> {
+        self.write_entry_atomic(entry, true, None, None)
     }
 
-    fn add_iri_to_named_graph_index(&self, graph: &str, iri: &str) -> Result<(), CoreError> {
-        let key = format!("graph:{}", graph);
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
-        {
-            let mut table =
-                write_txn
-                    .open_table(NAMED_GRAPH_TABLE)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to open named graph index: {}", e),
-                    })?;
-            let mut iris: Vec<String> = match table.get(key.as_str()) {
-                Ok(Some(guard)) => serde_json::from_slice(guard.value()).unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            if !iris.contains(&iri.to_string()) {
-                iris.push(iri.to_string());
-            }
-            let encoded = serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
-                message: format!("Failed to serialize named graph index: {}", e),
-            })?;
-            table
-                .insert(key.as_str(), encoded.as_slice())
-                .map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to write named graph index: {}", e),
-                })?;
-        }
-        write_txn.commit().map_err(|e| CoreError::StorageError {
-            message: format!("Failed to commit transaction: {}", e),
-        })?;
-        Ok(())
+    /// Replace an entry exactly while atomically migrating all secondary indices.
+    pub fn replace_entry(&self, entry: &L0Entry) -> Result<(), CoreError> {
+        self.write_entry_atomic(entry, false, None, None)
     }
 
-    fn remove_iri_from_named_graph_index(&self, graph: &str, iri: &str) -> Result<(), CoreError> {
-        let key = format!("graph:{}", graph);
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
-        {
-            let mut table =
-                write_txn
-                    .open_table(NAMED_GRAPH_TABLE)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to open named graph index: {}", e),
-                    })?;
-            let iris: Vec<String> = match table.get(key.as_str()) {
-                Ok(Some(guard)) => serde_json::from_slice(guard.value()).unwrap_or_default(),
-                _ => return Ok(()),
-            };
-            if iris.is_empty() {
-                return Ok(());
+    /// Store through the unified L0 API while explicitly selecting the
+    /// lifecycle partition and optional expiration time.
+    pub fn store_with_policy(
+        &self,
+        entry: &L0Entry,
+        kind: L0RecordKind,
+        retention: RetentionClass,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<(), CoreError> {
+        let mut classified = entry.clone();
+        match expires_at {
+            Some(value) => {
+                classified.metadata.insert(
+                    META_EXPIRES_AT.to_string(),
+                    serde_json::Value::String(value.to_rfc3339()),
+                );
             }
-            // rebuild without the target iri
-            let filtered: Vec<String> = iris.into_iter().filter(|i| i != iri).collect();
-            if filtered.is_empty() {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to delete named graph index: {}", e),
-                    })?;
-            } else {
-                let encoded =
-                    serde_json::to_vec(&filtered).map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to serialize named graph index: {}", e),
-                    })?;
-                table
-                    .insert(key.as_str(), encoded.as_slice())
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to write named graph index: {}", e),
-                    })?;
+            None => {
+                classified.metadata.remove(META_EXPIRES_AT);
             }
         }
-        write_txn.commit().map_err(|e| CoreError::StorageError {
-            message: format!("Failed to commit transaction: {}", e),
-        })?;
-        Ok(())
-    }
-
-    /// Get existing tags of an entry (for index updates)
-    fn get_entry_tags(&self, iri: &str) -> Result<Vec<String>, CoreError> {
-        let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
-            message: format!("Read transaction failed: {}", e),
-        })?;
-        let table = read_txn
-            .open_table(ENTRIES_TABLE)
-            .map_err(|e| CoreError::StorageError {
-                message: format!("Failed to open table: {}", e),
-            })?;
-        match table.get(iri).map_err(|e| CoreError::StorageError {
-            message: format!("Failed to retrieve entry: {}", e),
-        })? {
-            Some(guard) => {
-                let entry: L0Entry =
-                    serde_json::from_slice(guard.value()).map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to deserialize entry: {}", e),
-                    })?;
-                Ok(entry.tags)
-            }
-            _ => Ok(Vec::new()),
-        }
+        self.write_entry_atomic(&classified, false, Some(kind), Some(retention))
     }
 
     pub fn retrieve(&self, iri: &str) -> Result<Option<L0Entry>, CoreError> {
+        self.retrieve_without_update(iri)
+    }
+
+    /// Retrieve and synchronously persist access metadata. Normal reads use
+    /// `retrieve()` and remain read-only to avoid write amplification.
+    pub fn retrieve_and_touch(&self, iri: &str) -> Result<Option<L0Entry>, CoreError> {
         let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
             message: format!("Read transaction failed: {}", e),
         })?;
@@ -590,15 +1205,16 @@ impl L0Store {
 
         match value {
             Some(guard) => {
-                let mut entry: L0Entry =
-                    serde_json::from_slice(guard.value()).map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to deserialize entry: {}", e),
-                    })?;
+                let mut entry = self.hydrate_entry(Self::decode_entry(guard.value())?)?;
                 drop(read_txn);
+
+                if Self::is_expired(&entry, Utc::now()) {
+                    return Ok(None);
+                }
 
                 entry.access_count += 1;
                 entry.last_accessed = Utc::now();
-                self.store_entry(&entry)?;
+                self.replace_entry(&entry)?;
 
                 Ok(Some(entry))
             }
@@ -607,33 +1223,222 @@ impl L0Store {
     }
 
     pub fn delete(&self, iri: &str) -> Result<bool, CoreError> {
-        let old_tags = self.get_entry_tags(iri)?;
+        let write_txn = self.begin_write("Write transaction failed")?;
+        let removed =
+            {
+                let mut entries =
+                    write_txn
+                        .open_table(ENTRIES_TABLE)
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to open table: {}", e),
+                        })?;
+                let existing = match entries.get(iri).map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to read entry before delete: {}", e),
+                })? {
+                    Some(guard) => Some(Self::decode_entry(guard.value())?),
+                    None => None,
+                };
+                let Some(existing) = existing else {
+                    return Ok(false);
+                };
 
-        for tag in &old_tags {
-            let index_key = format!("tag:{}", tag);
-            self.remove_iri_from_tag_index(&index_key, iri)?;
-        }
-
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
-        let removed = {
-            let mut table =
-                write_txn
-                    .open_table(ENTRIES_TABLE)
-                    .map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to open table: {}", e),
-                    })?;
-            let has_removed = match table.remove(iri) {
-                Ok(_) => true,
-                Err(e) => {
-                    return Err(CoreError::StorageError {
-                        message: format!("Failed to delete entry: {}", e),
-                    });
+                let mut tags =
+                    write_txn
+                        .open_table(TAG_INDEX_TABLE)
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to open tag index: {}", e),
+                        })?;
+                for tag in &existing.tags {
+                    let key = format!("tag:{}", tag);
+                    let mut iris =
+                        match tags
+                            .get(key.as_str())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to read tag index: {}", e),
+                            })? {
+                            Some(guard) => serde_json::from_slice::<Vec<String>>(guard.value())
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                    iris.retain(|candidate| candidate != iri);
+                    if iris.is_empty() {
+                        tags.remove(key.as_str())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to remove tag index: {}", e),
+                            })?;
+                    } else {
+                        let encoded =
+                            serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to serialize tag index: {}", e),
+                            })?;
+                        tags.insert(key.as_str(), encoded.as_slice()).map_err(|e| {
+                            CoreError::StorageError {
+                                message: format!("Failed to update tag index: {}", e),
+                            }
+                        })?;
+                    }
                 }
+
+                if let Some(graph) = &existing.named_graph {
+                    let mut graphs = write_txn.open_table(NAMED_GRAPH_TABLE).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to open named graph index: {}", e),
+                        }
+                    })?;
+                    let key = format!("graph:{}", graph);
+                    let mut iris =
+                        match graphs
+                            .get(key.as_str())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to read named graph index: {}", e),
+                            })? {
+                            Some(guard) => serde_json::from_slice::<Vec<String>>(guard.value())
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                    iris.retain(|candidate| candidate != iri);
+                    if iris.is_empty() {
+                        graphs
+                            .remove(key.as_str())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to remove named graph index: {}", e),
+                            })?;
+                    } else {
+                        let encoded =
+                            serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to serialize named graph index: {}", e),
+                            })?;
+                        graphs
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to update named graph index: {}", e),
+                            })?;
+                    }
+                }
+
+                let mut types = write_txn.open_table(TYPE_INDEX_TABLE).map_err(|e| {
+                    CoreError::StorageError {
+                        message: format!("Failed to open type index: {}", e),
+                    }
+                })?;
+                for type_iri in &existing.jsonld_types {
+                    let key = format!("type:{}", type_iri);
+                    let mut iris =
+                        match types
+                            .get(key.as_str())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to read type index: {}", e),
+                            })? {
+                            Some(guard) => serde_json::from_slice::<Vec<String>>(guard.value())
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                    iris.retain(|candidate| candidate != iri);
+                    if iris.is_empty() {
+                        types
+                            .remove(key.as_str())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to remove type index: {}", e),
+                            })?;
+                    } else {
+                        let encoded =
+                            serde_json::to_vec(&iris).map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to serialize type index: {}", e),
+                            })?;
+                        types
+                            .insert(key.as_str(), encoded.as_slice())
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to update type index: {}", e),
+                            })?;
+                    }
+                }
+
+                let kind = Self::entry_record_kind(&existing);
+                let kind_key = format!("kind:{}", kind.as_str());
+                let mut kind_index =
+                    write_txn.open_table(RECORD_KIND_INDEX_TABLE).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to open record-kind index: {e}"),
+                        }
+                    })?;
+                let mut kind_iris = match kind_index.get(kind_key.as_str()).map_err(|e| {
+                    CoreError::StorageError {
+                        message: format!("Failed to read record-kind index: {e}"),
+                    }
+                })? {
+                    Some(value) => {
+                        serde_json::from_slice::<Vec<String>>(value.value()).unwrap_or_default()
+                    }
+                    None => Vec::new(),
+                };
+                kind_iris.retain(|candidate| candidate != iri);
+                if kind_iris.is_empty() {
+                    kind_index
+                        .remove(kind_key.as_str())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove record-kind index: {e}"),
+                        })?;
+                } else {
+                    let encoded =
+                        serde_json::to_vec(&kind_iris).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to encode record-kind index: {e}"),
+                        })?;
+                    kind_index
+                        .insert(kind_key.as_str(), encoded.as_slice())
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to update record-kind index: {e}"),
+                        })?;
+                }
+
+                if let Some(blob_ref) = Self::entry_blob_ref(&existing) {
+                    let mut refs = write_txn.open_table(BLOB_REFCOUNT_TABLE).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to open blob refcount table: {e}"),
+                        }
+                    })?;
+                    let mut blobs =
+                        write_txn
+                            .open_table(BLOB_TABLE)
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to open content blob table: {e}"),
+                            })?;
+                    let count = refs
+                        .get(blob_ref)
+                        .map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to read blob refcount: {e}"),
+                        })?
+                        .and_then(|value| value.value().try_into().ok().map(u64::from_be_bytes))
+                        .unwrap_or(1);
+                    if count <= 1 {
+                        refs.remove(blob_ref).map_err(|e| CoreError::StorageError {
+                            message: format!("Failed to remove blob refcount: {e}"),
+                        })?;
+                        blobs
+                            .remove(blob_ref)
+                            .map_err(|e| CoreError::StorageError {
+                                message: format!("Failed to remove unreferenced blob: {e}"),
+                            })?;
+                    } else {
+                        let next = (count - 1).to_be_bytes();
+                        refs.insert(blob_ref, next.as_slice()).map_err(|e| {
+                            CoreError::StorageError {
+                                message: format!("Failed to decrement blob refcount: {e}"),
+                            }
+                        })?;
+                    }
+                }
+
+                let has_removed = match entries.remove(iri) {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(e) => {
+                        return Err(CoreError::StorageError {
+                            message: format!("Failed to delete entry: {}", e),
+                        });
+                    }
+                };
+                has_removed
             };
-            has_removed
-        };
         write_txn.commit().map_err(|e| CoreError::StorageError {
             message: format!("Failed to commit transaction: {}", e),
         })?;
@@ -659,10 +1464,10 @@ impl L0Store {
                 message: format!("Iteration failed: {}", e),
             })?;
 
-            let entry: L0Entry =
-                serde_json::from_slice(value.value()).map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to deserialize entry: {}", e),
-                })?;
+            let entry = self.hydrate_entry(Self::decode_entry(value.value())?)?;
+            if Self::is_expired(&entry, Utc::now()) {
+                continue;
+            }
 
             let content_lower = entry.content.to_lowercase();
             let tag_match = entry
@@ -716,11 +1521,10 @@ impl L0Store {
             if !key_str.starts_with(prefix) {
                 break;
             }
-            let entry: L0Entry = serde_json::from_slice(value_guard.value()).map_err(|e| {
-                CoreError::StorageError {
-                    message: format!("Failed to deserialize entry: {}", e),
-                }
-            })?;
+            let entry = self.hydrate_entry(Self::decode_entry(value_guard.value())?)?;
+            if Self::is_expired(&entry, Utc::now()) {
+                continue;
+            }
             results.push(entry);
             if results.len() >= limit {
                 break;
@@ -801,10 +1605,10 @@ impl L0Store {
                 message: format!("Iteration failed: {}", e),
             })?;
 
-            let entry: L0Entry =
-                serde_json::from_slice(value.value()).map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to deserialize entry: {}", e),
-                })?;
+            let entry = self.hydrate_entry(Self::decode_entry(value.value())?)?;
+            if Self::is_expired(&entry, Utc::now()) {
+                continue;
+            }
 
             if tags.iter().all(|t| entry.tags.contains(t)) {
                 results.push(entry);
@@ -836,10 +1640,10 @@ impl L0Store {
                 message: format!("Iteration failed: {}", e),
             })?;
 
-            let entry: L0Entry =
-                serde_json::from_slice(value.value()).map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to deserialize entry: {}", e),
-                })?;
+            let entry = self.hydrate_entry(Self::decode_entry(value.value())?)?;
+            if Self::is_expired(&entry, Utc::now()) {
+                continue;
+            }
 
             if entry.importance >= min_importance {
                 results.push(entry);
@@ -870,10 +1674,7 @@ impl L0Store {
 
         match value {
             Some(guard) => {
-                let mut entry: L0Entry =
-                    serde_json::from_slice(guard.value()).map_err(|e| CoreError::StorageError {
-                        message: format!("Failed to deserialize entry: {}", e),
-                    })?;
+                let mut entry = Self::decode_entry(guard.value())?;
                 drop(read_txn);
                 entry.mesi_state = state;
                 self.store_entry(&entry)?;
@@ -899,9 +1700,217 @@ impl L0Store {
         })
     }
 
+    pub fn generation(&self, iri: &str) -> Result<Option<u64>, CoreError> {
+        Ok(self.retrieve(iri)?.as_ref().map(Self::entry_generation))
+    }
+
+    pub fn query_by_record_kind(&self, kind: L0RecordKind) -> Result<Vec<L0Entry>, CoreError> {
+        let key = format!("kind:{}", kind.as_str());
+        let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
+            message: format!("Failed to begin record-kind query: {e}"),
+        })?;
+        let table =
+            read_txn
+                .open_table(RECORD_KIND_INDEX_TABLE)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to open record-kind index: {e}"),
+                })?;
+        let iris = match table
+            .get(key.as_str())
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to query record-kind index: {e}"),
+            })? {
+            Some(value) => serde_json::from_slice::<Vec<String>>(value.value()).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        drop(read_txn);
+        let mut entries = Vec::with_capacity(iris.len());
+        for iri in iris {
+            if let Some(entry) = self.retrieve(&iri)? {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Physically delete expired entries. Expired records are already hidden
+    /// from normal reads; this bounded GC reclaims entries, indices and blobs.
+    pub fn gc_expired(&self, now: DateTime<Utc>, limit: usize) -> Result<usize, CoreError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let expired = {
+            let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to begin L0 TTL scan: {e}"),
+            })?;
+            let table =
+                read_txn
+                    .open_table(ENTRIES_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open L0 entries for TTL scan: {e}"),
+                    })?;
+            let mut iris = Vec::new();
+            for item in table.iter().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to iterate L0 TTL candidates: {e}"),
+            })? {
+                let (key, value) = item.map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to read L0 TTL candidate: {e}"),
+                })?;
+                let entry = Self::decode_entry(value.value())?;
+                if Self::is_expired(&entry, now) {
+                    iris.push(key.value().to_string());
+                    if iris.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            iris
+        };
+        let mut removed = 0;
+        for iri in expired {
+            if self.delete(&iri)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn blob_stats(&self) -> Result<(u64, u64), CoreError> {
+        let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
+            message: format!("Failed to begin blob stats read: {e}"),
+        })?;
+        let blobs = read_txn
+            .open_table(BLOB_TABLE)
+            .map_err(|e| CoreError::StorageError {
+                message: format!("Failed to open blob table: {e}"),
+            })?;
+        let refs =
+            read_txn
+                .open_table(BLOB_REFCOUNT_TABLE)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to open blob refcount table: {e}"),
+                })?;
+        Ok((
+            blobs.len().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to count blobs: {e}"),
+            })?,
+            refs.iter()
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to iterate blob refcounts: {e}"),
+                })?
+                .try_fold(0u64, |total, item| {
+                    let (_, value) = item.map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to read blob refcount: {e}"),
+                    })?;
+                    let count = value
+                        .value()
+                        .try_into()
+                        .ok()
+                        .map(u64::from_be_bytes)
+                        .unwrap_or(0);
+                    Ok::<_, CoreError>(total.saturating_add(count))
+                })?,
+        ))
+    }
+
     pub fn flush(&self) -> Result<(), CoreError> {
         // redb persists to disk on commit; no explicit flush needed
         Ok(())
+    }
+
+    /// Rewrite at most `limit` legacy plain-JSON records into the current
+    /// versioned envelope. Reads already support both formats, so migration is
+    /// online and optional; zero means no work rather than an unbounded scan.
+    pub fn migrate_legacy_entries(&self, limit: usize) -> Result<usize, CoreError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let write_txn = self.begin_write("Failed to begin L0 migration transaction")?;
+        let migrated = {
+            let mut entries =
+                write_txn
+                    .open_table(ENTRIES_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open L0 entries for migration: {e}"),
+                    })?;
+            let mut legacy = Vec::new();
+            {
+                let iter = entries.iter().map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to scan L0 entries for migration: {e}"),
+                })?;
+                for item in iter {
+                    let (key, value) = item.map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to read L0 migration candidate: {e}"),
+                    })?;
+                    if !value.value().starts_with(ENTRY_ENVELOPE_MAGIC) {
+                        legacy.push((key.value().to_string(), Self::decode_entry(value.value())?));
+                        if legacy.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            for (iri, entry) in &legacy {
+                let encoded = Self::encode_entry(entry, self.config.compression)?;
+                entries
+                    .insert(iri.as_str(), encoded.as_slice())
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to rewrite migrated L0 entry: {e}"),
+                    })?;
+            }
+            legacy.len()
+        };
+        write_txn.commit().map_err(|e| CoreError::StorageError {
+            message: format!("Failed to commit L0 migration: {e}"),
+        })?;
+        Ok(migrated)
+    }
+
+    /// Upgrade legacy logical records to lifecycle metadata, generation and
+    /// content-addressed blob storage. This is explicitly bounded to avoid
+    /// delaying glidingcode TUI startup on large databases.
+    pub fn migrate_records_to_current_schema(&self, limit: usize) -> Result<usize, CoreError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let candidates = {
+            let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to begin L0 schema scan: {e}"),
+            })?;
+            let entries =
+                read_txn
+                    .open_table(ENTRIES_TABLE)
+                    .map_err(|e| CoreError::StorageError {
+                        message: format!("Failed to open L0 entries for schema scan: {e}"),
+                    })?;
+            let mut candidates = Vec::new();
+            for item in entries.iter().map_err(|e| CoreError::StorageError {
+                message: format!("Failed to iterate L0 schema candidates: {e}"),
+            })? {
+                let (_, value) = item.map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to read L0 schema candidate: {e}"),
+                })?;
+                let decoded = Self::decode_entry(value.value())?;
+                let current = decoded
+                    .metadata
+                    .get(META_SCHEMA_VERSION)
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(CURRENT_RECORD_SCHEMA_VERSION);
+                let needs_blob = decoded.content.len() >= self.config.blob_inline_threshold
+                    && Self::entry_blob_ref(&decoded).is_none();
+                if !current || needs_blob {
+                    candidates.push(self.hydrate_entry(decoded)?);
+                    if candidates.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            candidates
+        };
+        for entry in &candidates {
+            self.replace_entry(entry)?;
+        }
+        Ok(candidates.len())
     }
 
     /// Query all entries by named graph
@@ -944,9 +1953,7 @@ impl L0Store {
         }
 
         let key = format!("graph:{}", graph);
-        let write_txn = self.db.begin_write().map_err(|e| CoreError::StorageError {
-            message: format!("Write transaction failed: {}", e),
-        })?;
+        let write_txn = self.begin_write("Write transaction failed")?;
         {
             let mut table =
                 write_txn
@@ -994,34 +2001,48 @@ impl L0Store {
     }
 
     pub fn query_by_type(&self, type_iri: &str) -> Result<Vec<L0Entry>, CoreError> {
-        let mut results = Vec::new();
-
+        let key = format!("type:{}", type_iri);
         let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
             message: format!("Read transaction failed: {}", e),
         })?;
-        let table = read_txn
-            .open_table(ENTRIES_TABLE)
-            .map_err(|e| CoreError::StorageError {
-                message: format!("Failed to open table: {}", e),
-            })?;
-        for result in table.iter().map_err(|e| CoreError::StorageError {
-            message: format!("Iteration failed: {}", e),
-        })? {
-            let (_, value) = result.map_err(|e| CoreError::StorageError {
-                message: format!("Iteration failed: {}", e),
-            })?;
-
-            let entry: L0Entry =
-                serde_json::from_slice(value.value()).map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to deserialize entry: {}", e),
+        let type_index =
+            read_txn
+                .open_table(TYPE_INDEX_TABLE)
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to open type index: {}", e),
                 })?;
+        let indexed_iris =
+            match type_index
+                .get(key.as_str())
+                .map_err(|e| CoreError::StorageError {
+                    message: format!("Failed to query type index: {}", e),
+                })? {
+                Some(guard) => Some(
+                    serde_json::from_slice::<Vec<String>>(guard.value()).map_err(|e| {
+                        CoreError::StorageError {
+                            message: format!("Failed to deserialize type index: {}", e),
+                        }
+                    })?,
+                ),
+                None => None,
+            };
+        drop(type_index);
+        drop(read_txn);
 
-            if entry.jsonld_types.contains(&type_iri.to_string()) {
-                results.push(entry);
+        if let Some(iris) = indexed_iris {
+            let mut entries = Vec::with_capacity(iris.len());
+            for iri in iris {
+                if let Some(entry) = self.retrieve(&iri)? {
+                    entries.push(entry);
+                }
             }
+            return Ok(entries);
         }
 
-        Ok(results)
+        // Backward-compatible lazy migration path: databases created before
+        // TYPE_INDEX_TABLE was introduced have no rows yet. A full scan keeps
+        // them readable; the next exact/merged write populates the index.
+        self.scan_by_types(std::slice::from_ref(&type_iri.to_string()))
     }
 
     pub fn query_by_types(&self, type_iris: &[String]) -> Result<Vec<L0Entry>, CoreError> {
@@ -1030,7 +2051,19 @@ impl L0Store {
         }
 
         let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for type_iri in type_iris {
+            for entry in self.query_by_type(type_iri)? {
+                if seen.insert(entry.iri.clone()) {
+                    results.push(entry);
+                }
+            }
+        }
+        Ok(results)
+    }
 
+    fn scan_by_types(&self, type_iris: &[String]) -> Result<Vec<L0Entry>, CoreError> {
+        let mut results = Vec::new();
         let read_txn = self.db.begin_read().map_err(|e| CoreError::StorageError {
             message: format!("Read transaction failed: {}", e),
         })?;
@@ -1046,10 +2079,10 @@ impl L0Store {
                 message: format!("Iteration failed: {}", e),
             })?;
 
-            let entry: L0Entry =
-                serde_json::from_slice(value.value()).map_err(|e| CoreError::StorageError {
-                    message: format!("Failed to deserialize entry: {}", e),
-                })?;
+            let entry = self.hydrate_entry(Self::decode_entry(value.value())?)?;
+            if Self::is_expired(&entry, Utc::now()) {
+                continue;
+            }
 
             if type_iris.iter().any(|t| entry.jsonld_types.contains(t)) {
                 results.push(entry);
@@ -1279,7 +2312,12 @@ impl MemoryCompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    const QUICK_REPAIR_CHILD_ENV: &str = "GLIDING_L0_QUICK_REPAIR_TEST_CHILD";
+    const QUICK_REPAIR_PATH_ENV: &str = "GLIDING_L0_QUICK_REPAIR_TEST_PATH";
 
     #[test]
     fn test_l0_store() {
@@ -1630,5 +2668,394 @@ mod tests {
         let types = retrieved["@type"].as_array().unwrap();
         assert!(types.contains(&serde_json::json!("Person")));
         assert!(types.contains(&serde_json::json!("Employee")));
+    }
+
+    #[test]
+    fn retrieve_does_not_create_write_amplification() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        store.store("iri://test/read-only", "payload").unwrap();
+
+        store.retrieve("iri://test/read-only").unwrap().unwrap();
+        store.retrieve("iri://test/read-only").unwrap().unwrap();
+
+        let raw = store
+            .retrieve_without_update("iri://test/read-only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.access_count, 0, "ordinary reads must remain read-only");
+    }
+
+    #[test]
+    fn quick_repair_avoids_full_scan_after_unclean_exit() {
+        if std::env::var_os(QUICK_REPAIR_CHILD_ENV).is_some() {
+            let path = std::env::var(QUICK_REPAIR_PATH_ENV).unwrap();
+            let store = L0Store::with_config(L0Config {
+                path,
+                cache_size_bytes: 8 * 1024 * 1024,
+                quick_repair: true,
+                ..Default::default()
+            })
+            .unwrap();
+            store
+                .store("iri://test/unclean-exit", "durable payload")
+                .unwrap();
+
+            // Model SIGKILL/power loss: skip Database::drop(), whose clean-close
+            // path would otherwise hide whether quick-repair metadata works.
+            std::process::exit(0);
+        }
+
+        let dir = tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("memory::l0_store::tests::quick_repair_avoids_full_scan_after_unclean_exit")
+            .arg("--nocapture")
+            .env(QUICK_REPAIR_CHILD_ENV, "1")
+            .env(QUICK_REPAIR_PATH_ENV, dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let repair_callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_counter = repair_callbacks.clone();
+        let store = L0Store::with_config_and_repair_callback(
+            L0Config {
+                path: dir.path().to_string_lossy().to_string(),
+                cache_size_bytes: 8 * 1024 * 1024,
+                quick_repair: true,
+                ..Default::default()
+            },
+            Some(Arc::new(move |_| {
+                callback_counter.fetch_add(1, Ordering::Relaxed);
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(repair_callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            store
+                .retrieve("iri://test/unclean-exit")
+                .unwrap()
+                .unwrap()
+                .content,
+            "durable payload"
+        );
+    }
+
+    #[test]
+    fn replace_entry_migrates_all_secondary_indices() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let now = Utc::now();
+        let original = L0Entry {
+            iri: "iri://test/replace".to_string(),
+            content: "v1".to_string(),
+            importance: 0.5,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            tags: vec!["old".to_string()],
+            metadata: serde_json::Map::new(),
+            mesi_state: MesiState::Shared,
+            content_hash: String::new(),
+            named_graph: Some("iri://graph/old".to_string()),
+            jsonld_context: None,
+            jsonld_types: vec!["OldType".to_string()],
+        };
+        store.store_entry(&original).unwrap();
+
+        let replacement = L0Entry {
+            content: "v2".to_string(),
+            tags: vec!["new".to_string()],
+            named_graph: Some("iri://graph/new".to_string()),
+            jsonld_types: vec!["NewType".to_string()],
+            ..original
+        };
+        store.replace_entry(&replacement).unwrap();
+
+        assert!(store
+            .search_by_tags(&["old".to_string()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.search_by_tags(&["new".to_string()]).unwrap().len(), 1);
+        assert!(store
+            .query_by_named_graph("iri://graph/old")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.query_by_named_graph("iri://graph/new").unwrap().len(),
+            1
+        );
+        assert!(store.query_by_type("OldType").unwrap().is_empty());
+        assert_eq!(store.query_by_type("NewType").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_cleans_named_graph_index_and_reports_absence() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let now = Utc::now();
+        store
+            .store_entry(&L0Entry {
+                iri: "iri://test/graph-delete".to_string(),
+                content: "payload".to_string(),
+                importance: 0.5,
+                access_count: 0,
+                created_at: now,
+                last_accessed: now,
+                tags: Vec::new(),
+                metadata: serde_json::Map::new(),
+                mesi_state: MesiState::Shared,
+                content_hash: String::new(),
+                named_graph: Some("iri://graph/delete".to_string()),
+                jsonld_context: None,
+                jsonld_types: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(store.delete("iri://test/graph-delete").unwrap());
+        assert!(!store.delete("iri://test/graph-delete").unwrap());
+        assert!(store
+            .query_by_named_graph("iri://graph/delete")
+            .unwrap()
+            .is_empty());
+        assert!(!store
+            .list_named_graphs()
+            .unwrap()
+            .contains(&"iri://graph/delete".to_string()));
+    }
+
+    #[test]
+    fn configured_entry_capacity_is_enforced() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::with_config(L0Config {
+            path: dir.path().to_string_lossy().to_string(),
+            max_entries: 1,
+            compression: false,
+            blob_inline_threshold: 4_096,
+            ..Default::default()
+        })
+        .unwrap();
+        store.store("iri://test/one", "one").unwrap();
+        assert!(store.store("iri://test/two", "two").is_err());
+        store.store("iri://test/one", "updated").unwrap();
+    }
+
+    #[test]
+    fn versioned_envelope_compresses_and_detects_corruption() {
+        let now = Utc::now();
+        let entry = L0Entry {
+            iri: "iri://test/envelope".to_string(),
+            content: "compressible-content-".repeat(500),
+            importance: 0.5,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            tags: Vec::new(),
+            metadata: serde_json::Map::new(),
+            mesi_state: MesiState::Shared,
+            content_hash: String::new(),
+            named_graph: None,
+            jsonld_context: None,
+            jsonld_types: Vec::new(),
+        };
+        let encoded = L0Store::encode_entry(&entry, true).unwrap();
+        assert!(encoded.starts_with(ENTRY_ENVELOPE_MAGIC));
+        assert_eq!(encoded[4], ENTRY_ENVELOPE_VERSION);
+        assert_eq!(encoded[5], CODEC_GZIP);
+        assert_eq!(
+            L0Store::decode_entry(&encoded).unwrap().content,
+            entry.content
+        );
+
+        let mut corrupted = encoded;
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x01;
+        assert!(L0Store::decode_entry(&corrupted).is_err());
+    }
+
+    #[test]
+    fn legacy_plain_json_is_dual_read_and_explicitly_migrated() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let now = Utc::now();
+        let legacy = L0Entry {
+            iri: "iri://test/legacy".to_string(),
+            content: "legacy-body".to_string(),
+            importance: 0.5,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            tags: Vec::new(),
+            metadata: serde_json::Map::new(),
+            mesi_state: MesiState::Shared,
+            content_hash: compute_content_hash("legacy-body"),
+            named_graph: None,
+            jsonld_context: None,
+            jsonld_types: Vec::new(),
+        };
+        let raw = serde_json::to_vec(&legacy).unwrap();
+        let tx = store.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(ENTRIES_TABLE).unwrap();
+            table.insert(legacy.iri.as_str(), raw.as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+
+        assert_eq!(
+            store.retrieve(&legacy.iri).unwrap().unwrap().content,
+            "legacy-body"
+        );
+        assert_eq!(store.migrate_legacy_entries(10).unwrap(), 1);
+        assert_eq!(store.migrate_legacy_entries(10).unwrap(), 0);
+
+        let tx = store.db.begin_read().unwrap();
+        let table = tx.open_table(ENTRIES_TABLE).unwrap();
+        let stored = table.get(legacy.iri.as_str()).unwrap().unwrap();
+        assert!(stored.value().starts_with(ENTRY_ENVELOPE_MAGIC));
+    }
+
+    #[test]
+    fn logical_schema_migration_classifies_and_deduplicates_legacy_content() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let now = Utc::now();
+        let content = "legacy-large-archive-content-".repeat(300);
+        let legacy = L0Entry {
+            iri: "iri://archive/legacy-large/1".to_string(),
+            content: content.clone(),
+            importance: 0.5,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            tags: Vec::new(),
+            metadata: serde_json::Map::new(),
+            mesi_state: MesiState::Shared,
+            content_hash: compute_content_hash(&content),
+            named_graph: None,
+            jsonld_context: None,
+            jsonld_types: Vec::new(),
+        };
+        let raw = serde_json::to_vec(&legacy).unwrap();
+        let tx = store.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(ENTRIES_TABLE).unwrap();
+            table.insert(legacy.iri.as_str(), raw.as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+
+        assert_eq!(store.migrate_records_to_current_schema(10).unwrap(), 1);
+        assert_eq!(store.migrate_records_to_current_schema(10).unwrap(), 0);
+        let migrated = store.retrieve(&legacy.iri).unwrap().unwrap();
+        assert_eq!(migrated.content, content);
+        assert_eq!(
+            migrated
+                .metadata
+                .get(META_SCHEMA_VERSION)
+                .and_then(serde_json::Value::as_u64),
+            Some(CURRENT_RECORD_SCHEMA_VERSION)
+        );
+        assert_eq!(store.blob_stats().unwrap(), (1, 1));
+        assert_eq!(
+            store
+                .query_by_record_kind(L0RecordKind::RawInteraction)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn classified_ttl_records_are_hidden_then_reclaimed() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let now = Utc::now();
+        let entry = L0Entry {
+            iri: "iri://telemetry/expired/1".to_string(),
+            content: "expired telemetry".to_string(),
+            importance: 0.1,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            tags: vec!["telemetry".to_string()],
+            metadata: serde_json::Map::new(),
+            mesi_state: MesiState::Shared,
+            content_hash: String::new(),
+            named_graph: None,
+            jsonld_context: None,
+            jsonld_types: Vec::new(),
+        };
+        store
+            .store_with_policy(
+                &entry,
+                L0RecordKind::Telemetry,
+                RetentionClass::Ephemeral,
+                Some(now - chrono::Duration::seconds(1)),
+            )
+            .unwrap();
+
+        assert!(store.retrieve(&entry.iri).unwrap().is_none());
+        assert!(store
+            .query_by_record_kind(L0RecordKind::Telemetry)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.gc_expired(now, 10).unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn large_duplicate_content_uses_one_reference_counted_blob() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let content = "shared-large-content-".repeat(500);
+        store.store("iri://archive/blob/1", &content).unwrap();
+        store.store("iri://archive/blob/2", &content).unwrap();
+
+        assert_eq!(store.blob_stats().unwrap(), (1, 2));
+        assert_eq!(
+            store
+                .retrieve("iri://archive/blob/1")
+                .unwrap()
+                .unwrap()
+                .content,
+            content
+        );
+        assert_eq!(
+            store
+                .query_by_record_kind(L0RecordKind::RawInteraction)
+                .unwrap()
+                .len(),
+            2
+        );
+        store.delete("iri://archive/blob/1").unwrap();
+        assert_eq!(store.blob_stats().unwrap(), (1, 1));
+        store.delete("iri://archive/blob/2").unwrap();
+        assert_eq!(store.blob_stats().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn canonical_generation_changes_only_for_canonical_content() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        store.store("iri://knowledge/generation/1", "v1").unwrap();
+        assert_eq!(
+            store.generation("iri://knowledge/generation/1").unwrap(),
+            Some(1)
+        );
+
+        store
+            .update_mesi_state("iri://knowledge/generation/1", MesiState::Modified)
+            .unwrap();
+        assert_eq!(
+            store.generation("iri://knowledge/generation/1").unwrap(),
+            Some(1)
+        );
+
+        store.store("iri://knowledge/generation/1", "v2").unwrap();
+        assert_eq!(
+            store.generation("iri://knowledge/generation/1").unwrap(),
+            Some(2)
+        );
     }
 }

@@ -80,10 +80,7 @@ impl EmbeddingService for OneApiEmbeddingService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            let err = format!(
-                "Embedding API returned error: {} - {}",
-                status, body
-            );
+            let err = format!("Embedding API returned error: {} - {}", status, body);
             warn_once_on_first_failure(&self.failure_warned, &err);
             return Err(err);
         }
@@ -119,7 +116,10 @@ impl EmbeddingService for OneApiEmbeddingService {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(format!("OneAPI health check returned status {}", resp.status()))
+            Err(format!(
+                "OneAPI health check returned status {}",
+                resp.status()
+            ))
         }
     }
 }
@@ -227,10 +227,7 @@ impl EmbeddingService for OllamaEmbeddingService {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            let err = format!(
-                "Ollama Embedding API returned error: {} - {}",
-                status, body
-            );
+            let err = format!("Ollama Embedding API returned error: {} - {}", status, body);
             warn_once_on_first_failure(&self.failure_warned, &err);
             return Err(err);
         }
@@ -358,7 +355,10 @@ fn warn_once_on_first_failure(failure_warned: &AtomicBool, detail: &str) -> bool
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        warn!("Embedding service unreachable — semantic index/search degraded: {}", detail);
+        warn!(
+            "Embedding service unreachable — semantic index/search degraded: {}",
+            detail
+        );
         true
     } else {
         false
@@ -393,7 +393,7 @@ mod tests {
         assert!(v.iter().any(|x| *x > 0.0));
     }
 
-#[test]
+    #[test]
     fn test_fnv() {
         assert_eq!(fnv_hash("a"), fnv_hash("a"));
     }
@@ -426,7 +426,8 @@ mod tests {
 
     #[tokio::test]
     async fn oneapi_health_check_fails_on_unreachable_endpoint() {
-        let svc = OneApiEmbeddingService::new("http://127.0.0.1:1", "sk-none", "text-embedding", 128);
+        let svc =
+            OneApiEmbeddingService::new("http://127.0.0.1:1", "sk-none", "text-embedding", 128);
         assert_eq!(svc.provider(), "oneapi");
         assert!(svc.health_check().await.is_err());
     }

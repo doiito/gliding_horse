@@ -77,14 +77,14 @@ impl RelevanceTracker {
         let global_score = self
             .task_5w2h_embedding
             .as_ref()
-            .map(|task_emb| cosine_similarity(embedding, task_emb).abs().max(0.001))
+            .map(|task_emb| cosine_similarity(embedding, task_emb).max(0.0))
             .unwrap_or(0.5);
 
         // Local coherence
         let local_score = self
             .prev_input_embedding
             .as_ref()
-            .map(|prev_emb| cosine_similarity(embedding, prev_emb).abs().max(0.001))
+            .map(|prev_emb| cosine_similarity(embedding, prev_emb).max(0.0))
             .unwrap_or(0.5);
 
         self.prev_input_embedding = Some(embedding.to_vec());

@@ -494,7 +494,11 @@ impl OntologyEmbedStore for HyperspaceEmbedStore {
             return Ok(text_results.into_iter().take(top_k).collect());
         }
 
-        let max_text = text_results.first().map(|r| r.score).unwrap_or(1.0).max(0.001);
+        let max_text = text_results
+            .first()
+            .map(|r| r.score)
+            .unwrap_or(1.0)
+            .max(0.001);
         let max_struct = struct_results
             .first()
             .map(|r| r.score)
@@ -1123,12 +1127,7 @@ mod tests {
 
         // Pure struct (alpha=0.0): only struct score counts → B ranks first.
         let struct_only = store
-            .search_hybrid(
-                None,
-                Some(&v_poin(vec![0.4, 0.4, 0.0, 0.0])),
-                5,
-                0.0,
-            )
+            .search_hybrid(None, Some(&v_poin(vec![0.4, 0.4, 0.0, 0.0])), 5, 0.0)
             .await
             .unwrap();
         assert_eq!(struct_only[0].iri, "onto:B");

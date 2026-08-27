@@ -162,7 +162,11 @@ impl MethodologyRegistry {
         }
         let mut loaded = 0;
         for entry in std::fs::read_dir(dir).map_err(|e| CoreError::Internal {
-            message: format!("Failed to read methodology nodes dir {}: {}", dir.display(), e),
+            message: format!(
+                "Failed to read methodology nodes dir {}: {}",
+                dir.display(),
+                e
+            ),
         })? {
             let entry = entry.map_err(|e| CoreError::Internal {
                 message: format!("read_dir entry: {}", e),
@@ -181,11 +185,16 @@ impl MethodologyRegistry {
     pub fn load_from_jsonld_file<P: AsRef<Path>>(&mut self, path: P) -> Result<usize, CoreError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(|e| CoreError::Internal {
-            message: format!("Failed to read methodology JSON-LD {}: {}", path.display(), e),
+            message: format!(
+                "Failed to read methodology JSON-LD {}: {}",
+                path.display(),
+                e
+            ),
         })?;
-        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| CoreError::InvalidJsonLd {
-            message: format!("Invalid JSON in {}: {}", path.display(), e),
-        })?;
+        let json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| CoreError::InvalidJsonLd {
+                message: format!("Invalid JSON in {}: {}", path.display(), e),
+            })?;
         let def = parse_methodology_from_jsonld(&json)?;
         if let Some(existing) = self.entries.iter_mut().find(|m| m.id == def.id) {
             *existing = def;
@@ -237,9 +246,11 @@ pub fn global_registry() -> &'static MethodologyRegistry {
 // ════════════════════════════════════════════════════════════════════════
 
 fn get_json_str<'a>(json: &'a serde_json::Value, key: &str) -> Result<&'a str, CoreError> {
-    json.get(key).and_then(|v| v.as_str()).ok_or_else(|| CoreError::InvalidJsonLd {
-        message: format!("Missing string field `{}` in methodology node", key),
-    })
+    json.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoreError::InvalidJsonLd {
+            message: format!("Missing string field `{}` in methodology node", key),
+        })
 }
 
 fn leak_str(s: String) -> &'static str {
@@ -317,7 +328,10 @@ fn parse_activation_str(raw: &str) -> Result<ActivationCondition, CoreError> {
         _ => {}
     }
 
-    if let Some(inner) = t.strip_prefix("OnHookPoint(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = t
+        .strip_prefix("OnHookPoint(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let hook = inner.trim().trim_matches('"');
         if hook.is_empty() {
             return Err(CoreError::InvalidJsonLd {
@@ -327,7 +341,10 @@ fn parse_activation_str(raw: &str) -> Result<ActivationCondition, CoreError> {
         return Ok(ActivationCondition::OnHookPoint(leak_str(hook.to_string())));
     }
 
-    if let Some(inner) = t.strip_prefix("OnPhaseEnd(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = t
+        .strip_prefix("OnPhaseEnd(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let phase = inner.trim().trim_matches('"');
         if phase.is_empty() {
             return Err(CoreError::InvalidJsonLd {
@@ -337,14 +354,25 @@ fn parse_activation_str(raw: &str) -> Result<ActivationCondition, CoreError> {
         return Ok(ActivationCondition::OnPhaseEnd(leak_str(phase.to_string())));
     }
 
-    if let Some(inner) = t.strip_prefix("OnToolCategory(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = t
+        .strip_prefix("OnToolCategory(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let items = parse_dbg_list(inner, true)?;
-        let leaked: &'static [&'static str] =
-            Box::leak(items.into_iter().map(leak_str).collect::<Vec<_>>().into_boxed_slice());
+        let leaked: &'static [&'static str] = Box::leak(
+            items
+                .into_iter()
+                .map(leak_str)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         return Ok(ActivationCondition::OnToolCategory(leaked));
     }
 
-    if let Some(inner) = t.strip_prefix("OnAgentRole(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = t
+        .strip_prefix("OnAgentRole(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let items = parse_dbg_list(inner, false)?;
         let mut roles = Vec::with_capacity(items.len());
         for item in items {
@@ -395,7 +423,10 @@ pub fn parse_methodology_from_jsonld(
 
     // Anti-patterns
     let mut anti_patterns: Vec<AntiPatternEntry> = Vec::new();
-    if let Some(arr) = json.get("methodology:antiPatterns").and_then(|v| v.as_array()) {
+    if let Some(arr) = json
+        .get("methodology:antiPatterns")
+        .and_then(|v| v.as_array())
+    {
         for ap in arr {
             anti_patterns.push(AntiPatternEntry {
                 name: leak_str(get_json_str(ap, "methodology:antiPatternName")?.to_string()),
@@ -420,7 +451,10 @@ pub fn parse_methodology_from_jsonld(
                 }
             }
         }
-        if let Some(arr) = p.get("methodology:phrasingExamples").and_then(|v| v.as_array()) {
+        if let Some(arr) = p
+            .get("methodology:phrasingExamples")
+            .and_then(|v| v.as_array())
+        {
             for item in arr {
                 if let Some(s) = item.as_str() {
                     phrasing_examples.push(leak_str(s.to_string()));
@@ -1168,7 +1202,10 @@ mod tests {
             assert_eq!(parsed.methodology_type, m.methodology_type);
             assert_eq!(parsed.domain, m.domain);
             assert_eq!(parsed.source, m.source);
-            assert_eq!(format!("{:?}", parsed.activation), format!("{:?}", m.activation));
+            assert_eq!(
+                format!("{:?}", parsed.activation),
+                format!("{:?}", m.activation)
+            );
             assert_eq!(parsed.red_flags.len(), m.red_flags.len());
             for (p, orig) in parsed.red_flags.iter().zip(m.red_flags.iter()) {
                 assert_eq!(p.pattern, orig.pattern);
@@ -1250,7 +1287,10 @@ mod tests {
                 ActivationCondition::OnHookPoint("skill_before"),
                 "OnHookPoint(\"skill_before\")",
             ),
-            (ActivationCondition::OnPhaseEnd("ACT"), "OnPhaseEnd(\"ACT\")"),
+            (
+                ActivationCondition::OnPhaseEnd("ACT"),
+                "OnPhaseEnd(\"ACT\")",
+            ),
             (
                 ActivationCondition::OnToolCategory(&["file_search", "shell"]),
                 "OnToolCategory([\"file_search\", \"shell\"])",
@@ -1264,7 +1304,8 @@ mod tests {
             ),
         ];
         for (condition, raw) in cases {
-            let parsed = parse_activation_str(raw).unwrap_or_else(|e| panic!("parse {}: {}", raw, e));
+            let parsed =
+                parse_activation_str(raw).unwrap_or_else(|e| panic!("parse {}: {}", raw, e));
             assert_eq!(
                 format!("{:?}", parsed),
                 format!("{:?}", condition),

@@ -5,7 +5,8 @@ gateway:
   timeout_seconds: 300
   max_retries: 3
   retry_base_ms: 500
-  # deepseek-v4-flash 走 Responses API (/v1/responses)，deepseek-v4-pro 继续走 chat completions
+  # true: 所有模型走 Responses API (/v1/responses)；false: 走 Chat Completions
+  # 模型是否支持 Responses 由所配置的 API 服务端决定，内核不硬编码模型名白名单。
   use_responses_api: true
   model_mapping:
     planning: "deepseek-v4-pro"
@@ -21,6 +22,14 @@ workspace:
   poll_interval_ms: 5000
   debounce_ms: 500
   max_debounce_wait_ms: 5000
+  initial_scan_wait_ms: 250
+  change_history_capacity: 2048
+  learning_snapshot_max_files: 100000
+  learning_snapshot_max_bytes: 2147483648
+  # Shell-like mutation calls are confirmed by bounded before/after content
+  # fingerprints. Oversized workspaces degrade to monitor generation evidence.
+  effect_snapshot_max_files: 10000
+  effect_snapshot_max_bytes: 67108864
   exclude_patterns:
     - "node_modules/"
     - "target/"
@@ -32,12 +41,19 @@ memory:
     path: "/tmp/agent_os_data/l0"
     max_entries: 1000000
     compression: true
+    blob_inline_threshold: 4096
+    cache_size_bytes: 134217728
+    quick_repair: true
   l1:
     max_messages: 100
     compression_threshold: 50
     max_tokens: 4096
+    max_low_relevance_refs: 3
+    reload_preview_chars: 400
   l2:
     max_node_size: 2048
+    max_projection_size: 500
+    sync_queue_capacity: 1024
   max_projection_size: 500
   sa_execution_timeout_secs: 30
   tool_timeout_secs: 60
@@ -66,6 +82,41 @@ perception:
 
 agents:
   max_iterations: 100
+  execution_budget:
+    # Omitted/null role values inherit max_iterations. Avoid fixed small caps
+    # for complex PA/CA/AA work; operators may set workload-specific ceilings.
+    role_max_turns: {}
+    early_warning_remaining: 8
+    final_warning_remaining: 3
+    effect_progress_warning_turns: 5
+    # Consecutive tool-calling turns without a substantive workspace effect;
+    # this is not the complex-task/DA total-turn limit.
+    effect_progress_block_turns: 8
+    # CA→DA repair begins from supplied audit evidence; 0 inherits the general threshold.
+    da_repair_effect_block_turns: 4
+    # 0 disables; complex audits may raise this without changing code.
+    ca_evidence_focus_turns: 5
+    # 0 disables; this caps CA evidence tool turns, not the task/DA turn budget.
+    ca_evidence_close_turns: 10
+    # 0 disables; bounds PA inspection without reducing DA execution budget.
+    pa_planning_focus_turns: 4
+    max_sub_agents: 5
+    ca_handoff_max_chars: 6000
+    recursive_handoff_max_chars: 4000
+    sa_stream_emit_min_chars: 128
+    sa_stream_emit_interval_ms: 50
+    max_plan_steps: 12
+    # Per decomposition node; does not multiply the task-wide limits below.
+    max_recursive_sub_tasks: 5
+    # Shared by the entire residual recursion tree. Raise explicitly for
+    # unusually large tasks instead of allowing depth-based branch explosion.
+    max_recursive_task_executions: 8
+    max_recursive_total_turns: 60
+    max_ca_da_corrections: 3
+    max_plan_revisions: 2
+    ca_correction_handoff_max_chars: 6000
+    force_finish_max_tool_entries: 20
+    force_finish_tool_result_max_chars: 2000
   parallel_execution: true
   max_parallel_agents: 10
   timeout_seconds: 300
@@ -133,6 +184,9 @@ tool_result_router:
   max_micro_tools: 5
   sparql_query_timeout_ms: 100
   auto_cleanup: true
+  prepare_threshold: 3072
+  micro_tool_page_size: 100
+  micro_tool_max_page_size: 200
 
 embedding:
   enabled: true
@@ -155,14 +209,14 @@ token_optimization:
     enabled: true
     roles:
       Plan:
-        default: ["Core", "Search", "Knowledge", "System"]
-        on_demand: ["Web", "Code", "Skill"]
+        default: ["Core", "Search", "System"]
+        on_demand: ["Web", "Knowledge", "Code", "Skill"]
       Do:
-        default: ["Core", "Write", "Search", "Web", "Code", "Skill", "System"]
-        on_demand: ["Knowledge"]
+        default: ["Core", "Write", "Search", "System"]
+        on_demand: ["Web", "Knowledge", "Code", "Skill"]
       Check:
-        default: ["Core", "Search", "Knowledge", "System"]
-        on_demand: ["Web", "Code"]
+        default: ["Core", "Search", "Verify", "System"]
+        on_demand: ["Web", "Knowledge", "Code"]
       Act:
         default: ["Core", "System"]
         on_demand: ["Search", "Knowledge"]
@@ -180,3 +234,13 @@ token_optimization:
     enabled: true
     use_layered_prompts: true
     store_specs_in_kg: true
+    max_injected_skills: 10
+    max_workspace_manifest_files: 160
+    max_workspace_manifest_chars: 12000
+    max_kg_context_entities: 12
+    max_kg_context_bytes: 4096
+    max_learning_hints: 20
+    max_learning_hint_chars: 700
+    max_learning_hint_total_chars: 6000
+    max_discovered_skill_hints: 10
+    max_knowledge_fragments: 12

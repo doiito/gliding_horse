@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::io::Write;
 use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -6,6 +7,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::{cursor, style, terminal};
 use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::EventBus;
 use glidinghorse::core::execution_event::{ExecutionEvent, ExecutionEventKind};
@@ -108,8 +110,7 @@ pub struct App {
     /// Checkpoint 恢复的 token 基数（resume 模式下使用）
     resume_prompt_base: u64,
     resume_completion_base: u64,
-    /// Memory limits (MB) from config
-    max_l1_mb: u64,
+    /// Byte-backed memory limits (MB) from config
     max_l2_mb: u64,
     max_l3_mb: u64,
     /// Lock-free handles for memory stats (no engine lock needed)
@@ -617,13 +618,152 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[derive(Debug)]
+struct StartupDisplayState {
+    stage: String,
+    progress: Option<f64>,
+}
+
+/// Owns a lightweight alternate-screen renderer while the synchronous engine
+/// constructor opens persistent stores. In particular, redb crash recovery
+/// may scan a large L0 file several times; the user must see that progress
+/// before the normal TUI can exist.
+struct StartupScreen {
+    state: Arc<std::sync::Mutex<StartupDisplayState>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StartupScreen {
+    fn start(workspace: &str) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        let state = Arc::new(std::sync::Mutex::new(StartupDisplayState {
+            stage: "Starting Agent OS".to_string(),
+            progress: None,
+        }));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state_for_thread = state.clone();
+        let stop_for_thread = stop.clone();
+        let workspace = workspace.to_string();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+
+        let handle = std::thread::spawn(move || {
+            let mut stdout = std::io::stdout();
+            let entered = execute!(
+                stdout,
+                EnterAlternateScreen,
+                terminal::Clear(terminal::ClearType::All),
+                cursor::Hide
+            )
+            .is_ok();
+            let _ = ready_tx.send(entered);
+            if !entered {
+                return;
+            }
+
+            let started = std::time::Instant::now();
+            let spinner = ['◴', '◷', '◶', '◵'];
+            let mut frame = 0usize;
+            while !stop_for_thread.load(Ordering::Acquire) {
+                let (stage, progress) = state_for_thread
+                    .lock()
+                    .map(|state| (state.stage.clone(), state.progress))
+                    .unwrap_or_else(|_| ("Initializing".to_string(), None));
+                let elapsed = started.elapsed().as_secs_f32();
+                let progress_line = progress.map_or_else(
+                    || "Preparing persistent services".to_string(),
+                    |value| {
+                        let percent = (value.clamp(0.0, 1.0) * 100.0).round() as u32;
+                        let filled = (percent as usize * 32) / 100;
+                        format!(
+                            "[{}{}] {percent}%",
+                            "█".repeat(filled),
+                            "░".repeat(32usize.saturating_sub(filled))
+                        )
+                    },
+                );
+                let _ = execute!(
+                    stdout,
+                    cursor::MoveTo(0, 0),
+                    terminal::Clear(terminal::ClearType::All),
+                    cursor::MoveTo(2, 1),
+                    style::Print("glidingcode · Agent OS"),
+                    cursor::MoveTo(2, 3),
+                    style::Print(format!("{}  {}", spinner[frame % spinner.len()], stage)),
+                    cursor::MoveTo(2, 5),
+                    style::Print(progress_line),
+                    cursor::MoveTo(2, 7),
+                    style::Print(format!("Workspace: {workspace}")),
+                    cursor::MoveTo(2, 8),
+                    style::Print(format!("Elapsed: {elapsed:.1}s")),
+                    cursor::MoveTo(2, 10),
+                    style::Print(
+                        "Large stores may need recovery after an unclean exit; do not terminate the process."
+                    ),
+                );
+                let _ = stdout.flush();
+                frame += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            let _ = execute!(
+                stdout,
+                cursor::Show,
+                LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture
+            );
+        });
+
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(true) => Some(Self {
+                state,
+                stop,
+                handle: Some(handle),
+            }),
+            _ => {
+                stop.store(true, Ordering::Release);
+                let _ = handle.join();
+                None
+            }
+        }
+    }
+
+    fn reporter(&self) -> super::engine::StartupReporter {
+        let state = self.state.clone();
+        Arc::new(move |stage, progress| {
+            if let Ok(mut state) = state.lock() {
+                state.stage = stage.to_string();
+                state.progress = progress;
+            }
+        })
+    }
+
+    fn update(&self, stage: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stage = stage.to_string();
+            state.progress = None;
+        }
+    }
+}
+
+impl Drop for StartupScreen {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl App {
     pub fn new(
         config: CliConfig,
         log_buffer: Arc<LogBuffer>,
         resume_task_iri: Option<String>,
     ) -> anyhow::Result<Self> {
-        let max_l1_mb = config.max_l1_mb;
+        let startup_screen = StartupScreen::start(&config.workspace);
+        let startup_reporter = startup_screen.as_ref().map(StartupScreen::reporter);
         let max_l2_mb = config.max_l2_mb;
         let max_l3_mb = config.max_l3_mb;
         let rt = tokio::runtime::Runtime::new()?;
@@ -631,7 +771,7 @@ impl App {
             // Construct the engine inside the runtime context so subsystems
             // that capture a tokio Handle at init (e.g. WatchEngine) work.
             let _rt_guard = rt.enter();
-            super::engine::CodeCliEngine::new(config)?
+            super::engine::CodeCliEngine::new_with_startup_reporter(config, startup_reporter)?
         };
         let l0 = engine.l0();
         let l2_bb = engine.l2_bb();
@@ -657,6 +797,9 @@ impl App {
         let causal_engine = engine.causal_engine();
         let timeline = engine.timeline();
 
+        if let Some(screen) = &startup_screen {
+            screen.update("Preparing initial TUI state");
+        }
         let mut app = Self {
             engine: Arc::new(tokio::sync::Mutex::new(engine)),
             event_bus,
@@ -700,7 +843,6 @@ impl App {
             context_limit,
             resume_prompt_base: 0,
             resume_completion_base: 0,
-            max_l1_mb,
             max_l2_mb,
             max_l3_mb,
             l2_bb,
@@ -960,10 +1102,7 @@ impl App {
             }
             // Read memory stats directly from the Arcs — no engine lock needed
             self.l2_count = self.l2_bb.total_bytes();
-            {
-                let _cs = self.proj.cache_stats();
-            }
-            self.l3_count = self.proj.list_frames().len() as u64;
+            self.l3_count = self.proj.cache_stats().total_size_bytes as u64;
             self.l1_count = self
                 .mm
                 .try_lock()
@@ -1247,6 +1386,12 @@ impl App {
         self.is_processing = true;
         self.current_phase = "SA".into();
         self.status_events.clear();
+        // Reset once per user task. A task may run several SA-level PDCA
+        // cycles; CYCLE_STARTED must not erase facts from earlier cycles.
+        if !self.is_resume_session {
+            self.session_turn_count = 0;
+            self.session_tool_call_count = 0;
+        }
         let preview: String = input.chars().take(60).collect();
         self.add_event("TASK_START", &preview);
 
@@ -1435,6 +1580,11 @@ impl App {
         };
 
         for ev in &batch {
+            if ev.event_type == "SA_STREAM_DELTA" {
+                self.append_sa_stream_delta(&ev.payload);
+                continue;
+            }
+
             // Sidebar: only show major phase events (SA/PA/DA/CA/AA start/end)
             let is_major_phase = matches!(
                 ev.event_type.as_str(),
@@ -1471,7 +1621,7 @@ impl App {
 
             // Stats tracking from execution events
             match ev.event_type.as_str() {
-                "TASK_START" | "CYCLE_STARTED" => {
+                "TASK_START" => {
                     // Resume 模式下不重置计数（已从 checkpoint 恢复）
                     // 使用 is_resume_session 标志判断
                     if !self.is_resume_session {
@@ -1479,6 +1629,7 @@ impl App {
                         self.session_tool_call_count = 0;
                     }
                 }
+                "CYCLE_STARTED" => {}
                 "THOUGHT" => self.session_turn_count += 1,
                 "TOOL_CALL" => self.session_tool_call_count += 1,
                 _ => {}
@@ -1503,6 +1654,49 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Append a coalesced SA SSE delta to one live TUI message. The SA stream
+    /// is deliberately separate from THOUGHT so token chunks do not inflate
+    /// logical turn counters.
+    fn append_sa_stream_delta(&mut self, payload: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+        let stage = value
+            .get("stage")
+            .and_then(Value::as_str)
+            .unwrap_or("planning");
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("content");
+        let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+
+        let prefix = format!("◆ AGENT:SA:STREAM[{}:{}] ", stage, kind);
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == MessageRole::System && last.content.starts_with(&prefix) {
+                last.content.push_str(delta);
+                if let Some(raw) = &mut last.full_raw {
+                    raw.push_str(delta);
+                }
+                return;
+            }
+        }
+
+        self.messages.push(Message {
+            role: MessageRole::System,
+            content: format!("{}{}", prefix, delta),
+            full_raw: Some(delta.to_string()),
+            can_expand: true,
+            timestamp: timestamp(),
+            mermaid_blocks: Vec::new(),
+        });
     }
 
     /// Try to extract a file path from tool-call arguments JSON or tool result JSON.
@@ -1955,7 +2149,8 @@ impl App {
         }
         .width();
         let emb_w = 5 + self.embedding_provider.width() + 1;
-        let prefix_w = 1 + 1 + status_w + 1 + 8 + self.model_name.width() + 2 + emb_w + 2 + 8 + 6 + 2 + 12;
+        let prefix_w =
+            1 + 1 + status_w + 1 + 8 + self.model_name.width() + 2 + emb_w + 2 + 8 + 6 + 2 + 12;
         let max_path_w = (area.width as usize).saturating_sub(prefix_w);
         let workspace_display = width_truncate(&self.workspace_path, max_path_w);
 
@@ -2242,16 +2437,6 @@ impl App {
         self.render_events_panel(f, chunks[1]);
     }
 
-    /// Format memory usage as "used/max MB" with percentage.
-    fn mem_ratio(&self, used_mb: u64, max_mb: u64) -> String {
-        if max_mb == 0 {
-            format!("{}/∞ MB", used_mb)
-        } else {
-            let pct = (used_mb as f64 / max_mb as f64 * 100.0).min(100.0);
-            format!("{}/{} MB ({:.0}%)", used_mb, max_mb, pct)
-        }
-    }
-
     fn fmt_l2(&self, used_bytes: u64, max_mb: u64) -> String {
         let used_mb = used_bytes as f64 / (1024.0 * 1024.0);
         if max_mb == 0 {
@@ -2288,10 +2473,7 @@ impl App {
             Style::default().fg(Color::White),
         )]));
         lines.push(Line::from(vec![Span::styled(
-            fw(&format!(
-                "L1: {}",
-                self.mem_ratio(self.l1_count, self.max_l1_mb)
-            )),
+            fw(&format!("L1: {} active", self.l1_count)),
             Style::default().fg(Color::Yellow),
         )]));
         lines.push(Line::from(vec![Span::styled(
@@ -2304,7 +2486,7 @@ impl App {
         lines.push(Line::from(vec![Span::styled(
             fw(&format!(
                 "L3: {}",
-                self.mem_ratio(self.l3_count, self.max_l3_mb)
+                self.fmt_l2(self.l3_count, self.max_l3_mb)
             )),
             Style::default().fg(Color::Yellow),
         )]));

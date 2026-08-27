@@ -128,6 +128,11 @@ pub fn node_to_planstep(node: &WorkflowNodeDef) -> PlanStep {
         branch_fallback: node.branch_on_failure.as_ref().map(|b| b.target.clone()),
         retry_count: node.retry_count,
         retry_delay_secs: node.retry_delay_secs,
+        effect_policy: match parse_role_from_str(&node.agent_role) {
+            AgentRole::Plan | AgentRole::Check => crate::core::effect::EffectPolicy::EvidenceOnly,
+            AgentRole::Act => crate::core::effect::EffectPolicy::DecisionOnly,
+            AgentRole::Do => crate::core::effect::EffectPolicy::None,
+        },
     }
 }
 
@@ -211,6 +216,7 @@ mod tests {
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: crate::core::effect::EffectPolicy::EvidenceOnly,
                 },
                 PlanStep {
                     step_id: "step_2".to_string(),
@@ -224,6 +230,7 @@ mod tests {
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: crate::core::effect::EffectPolicy::None,
                 },
             ],
             context_requirements: Default::default(),
@@ -263,6 +270,7 @@ mod tests {
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: crate::core::effect::EffectPolicy::None,
                 },
                 PlanStep {
                     step_id: "step_2".to_string(),
@@ -276,6 +284,7 @@ mod tests {
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: crate::core::effect::EffectPolicy::None,
                 },
             ],
             context_requirements: Default::default(),

@@ -26,8 +26,8 @@ graph TB
         SI["SupplementaryInput<br/>12种用户补充输入"]
     end
 
-    SA -->|动态调度| AR
-    AR -->|创建实例| BA
+    SA -->|构造并调度| BA
+    BA -->|委托底层执行| AR
     BA -->|角色类型| PA & DA & CA & AA
     AI -->|元数据| BA
     SA --> PE
@@ -99,6 +99,7 @@ sequenceDiagram
     participant LLM
     participant L0 as L0 Store
     participant EB as EventBus
+    participant BA as BizAgent
     participant AR as AgentRunner
 
     User->>SA: 提交任务
@@ -110,11 +111,13 @@ sequenceDiagram
     SA->>EB: CYCLE_STARTED 事件
     
     loop 每个步骤
-        SA->>AR: dispatch_agent(role, ctx)
+        SA->>BA: 构造 agent.md + BizAgent(role, ctx)
         alt 并行组
-            SA->>AR: dispatch_agents_parallel()
+            SA->>BA: 并行构造多个 BizAgent
         end
-        AR-->>SA: TaskResult
+        BA->>AR: 执行 ReAct / tools / memory / hooks
+        AR-->>BA: TaskResult
+        BA-->>SA: TaskResult
         SA->>PE: on_task_end() / on_plan_completed()
         SA->>EB: 步骤完成事件
     end
@@ -253,8 +256,8 @@ pub struct AgentRunner {
 
 | 方法 | 功能 |
 |------|------|
-| `execute(agent, ctx)` | 执行 Agent 的 ReAct 循环 |
-| `execute_with_biz_agent(agent, ctx, plan_step)` | 使用 BizAgent 隔离执行 |
+| `execute(agent, ctx)` | 底层独立测试或非业务 ReAct 执行入口 |
+| `execute_with_agent_md(agent, ctx, agent_md)` | BizAgent 专用底层执行入口（crate 内可见） |
 | `build_system_prompt(agent, ctx)` | 构建 Agent 系统提示词 |
 | `parse_llm_response(response)` | 解析 LLM 响应为 thought/content/summary |
 | `route_tool_result(result, tool_name, call_id)` | 工具结果智能路由 |

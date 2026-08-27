@@ -23,6 +23,44 @@ pub struct QueryFilter {
     pub node_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityClass {
+    Ephemeral,
+    WriteBack,
+    WriteThrough,
+}
+
+impl Default for DurabilityClass {
+    fn default() -> Self {
+        Self::Ephemeral
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncVersionState {
+    generation: u64,
+    tombstone: bool,
+}
+
+enum SyncCommand {
+    Upsert {
+        iri: String,
+        parsed: serde_json::Value,
+        graph: Option<String>,
+        generation: u64,
+    },
+    Delete {
+        iri: String,
+        graph: Option<String>,
+        generation: u64,
+    },
+    Barrier(std::sync::mpsc::Sender<Result<(), String>>),
+    Shutdown,
+}
+
+type WriteHook = Arc<dyn Fn(&str, &[String]) + Send + Sync>;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Node {
     pub iri: String,
@@ -37,6 +75,9 @@ pub struct Node {
     pub parent_task: Option<String>,
     pub named_graph: Option<String>,
     pub jsonld_types: Vec<String>,
+    pub generation: u64,
+    pub durability_class: DurabilityClass,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -66,24 +107,129 @@ pub struct Blackboard {
 
     node_count: AtomicU64,
     total_bytes: AtomicU64,
+    /// Zero means unlimited. Runtime settings express this value in MiB.
+    max_bytes: AtomicU64,
     permission_matrix: PermissionMatrix,
     // Battle map: Agent situational awareness
     agent_registry: RwLock<HashMap<String, AgentStatus>>,
     // Battle map: Resource lock table
     resource_locks: RwLock<Vec<ResourceLock>>,
 
-    /// Pending Oxigraph sync thread handles — joined on flush_oxigraph()
-    pending_syncs: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Bounded FIFO Oxigraph outbox. One worker preserves mutation order and
+    /// provides backpressure instead of creating one OS thread per write.
+    sync_sender: std::sync::mpsc::SyncSender<SyncCommand>,
+    sync_worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    sync_versions: Arc<DashMap<String, SyncVersionState>>,
 
     /// Optional hook invoked after every write_node, with the node IRI and its tags.
     /// Used by ConsistencyEngine to implement WriteThrough (immediate L0 flush for critical tags).
-    write_hook: parking_lot::RwLock<Option<Arc<dyn Fn(&str, &[String]) + Send + Sync>>>,
+    write_hooks: parking_lot::RwLock<Vec<WriteHook>>,
 }
 
 impl Blackboard {
+    pub const DEFAULT_SYNC_QUEUE_CAPACITY: usize = 1_024;
+
+    fn start_sync_worker(
+        store: Arc<Store>,
+        versions: Arc<DashMap<String, SyncVersionState>>,
+        errors: Arc<std::sync::Mutex<Vec<String>>>,
+        queue_capacity: usize,
+    ) -> (
+        std::sync::mpsc::SyncSender<SyncCommand>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<SyncCommand>(queue_capacity.max(1));
+        let handle = std::thread::Builder::new()
+            .name("glidinghorse-l2-oxigraph".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        SyncCommand::Upsert {
+                            iri,
+                            parsed,
+                            graph,
+                            generation,
+                        } => {
+                            let current = versions.get(&iri).map(|state| *state);
+                            if current.is_some_and(|state| {
+                                state.generation == generation && !state.tombstone
+                            }) {
+                                let result = match graph.as_deref() {
+                                    Some(graph) => Self::sync_to_oxigraph_with_graph_sync(
+                                        &store, &iri, &parsed, graph,
+                                    ),
+                                    None => Self::sync_to_oxigraph_sync(&store, &iri, &parsed),
+                                };
+                                if let Err(error) = result {
+                                    errors.lock().unwrap().push(format!(
+                                        "upsert iri={iri} generation={generation}: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                        SyncCommand::Delete {
+                            iri,
+                            graph,
+                            generation,
+                        } => {
+                            let current = versions.get(&iri).map(|state| *state);
+                            if current.is_some_and(|state| {
+                                state.generation == generation && state.tombstone
+                            }) {
+                                if let Err(error) =
+                                    Self::delete_from_oxigraph_sync(&store, &iri, graph.as_deref())
+                                {
+                                    errors.lock().unwrap().push(format!(
+                                        "delete iri={iri} generation={generation}: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                        SyncCommand::Barrier(reply) => {
+                            let failures = std::mem::take(&mut *errors.lock().unwrap());
+                            let result = if failures.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(failures.join("; "))
+                            };
+                            let _ = reply.send(result);
+                        }
+                        SyncCommand::Shutdown => break,
+                    }
+                }
+            })
+            .expect("failed to start bounded L2 Oxigraph worker");
+        (sender, handle)
+    }
+
+    fn worker_fields(
+        store: Arc<Store>,
+        queue_capacity: usize,
+    ) -> (
+        std::sync::mpsc::SyncSender<SyncCommand>,
+        std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+        Arc<DashMap<String, SyncVersionState>>,
+    ) {
+        let versions = Arc::new(DashMap::new());
+        let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, handle) =
+            Self::start_sync_worker(store, versions.clone(), errors.clone(), queue_capacity);
+        (sender, std::sync::Mutex::new(Some(handle)), versions)
+    }
+
     /// Create Blackboard with a shared unified store
     pub fn with_store(store: Arc<Store>) -> Result<Self, CoreError> {
+        Self::with_store_and_queue_capacity(store, Self::DEFAULT_SYNC_QUEUE_CAPACITY)
+    }
+
+    pub fn with_store_and_queue_capacity(
+        store: Arc<Store>,
+        queue_capacity: usize,
+    ) -> Result<Self, CoreError> {
         info!("Initializing L2 Blackboard with shared store");
+        let (sync_sender, sync_worker, sync_versions) =
+            Self::worker_fields(store.clone(), queue_capacity);
         Ok(Self {
             store,
             node_cache: DashMap::new(),
@@ -94,18 +240,28 @@ impl Blackboard {
             type_index: RwLock::new(HashMap::new()),
             node_count: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(0),
             permission_matrix: PermissionMatrix::new(),
             agent_registry: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(Vec::new()),
-            pending_syncs: std::sync::Mutex::new(Vec::new()),
-            write_hook: parking_lot::RwLock::new(None),
+            sync_sender,
+            sync_worker,
+            sync_versions,
+            write_hooks: parking_lot::RwLock::new(Vec::new()),
         })
     }
 
     pub fn new() -> Result<Self, CoreError> {
+        Self::new_with_queue_capacity(Self::DEFAULT_SYNC_QUEUE_CAPACITY)
+    }
+
+    pub fn new_with_queue_capacity(queue_capacity: usize) -> Result<Self, CoreError> {
         info!("Initializing L2 Blackboard");
+        let store = Arc::new(Store::new()?);
+        let (sync_sender, sync_worker, sync_versions) =
+            Self::worker_fields(store.clone(), queue_capacity);
         Ok(Self {
-            store: Arc::new(Store::new()?),
+            store,
             node_cache: DashMap::new(),
             task_nodes: RwLock::new(HashMap::new()),
             task_tree: RwLock::new(HashMap::new()),
@@ -114,11 +270,14 @@ impl Blackboard {
             type_index: RwLock::new(HashMap::new()),
             node_count: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(0),
             permission_matrix: PermissionMatrix::new(),
             agent_registry: RwLock::new(HashMap::new()),
             resource_locks: RwLock::new(Vec::new()),
-            pending_syncs: std::sync::Mutex::new(Vec::new()),
-            write_hook: parking_lot::RwLock::new(None),
+            sync_sender,
+            sync_worker,
+            sync_versions,
+            write_hooks: parking_lot::RwLock::new(Vec::new()),
         })
     }
 
@@ -127,7 +286,291 @@ impl Blackboard {
     where
         F: Fn(&str, &[String]) + Send + Sync + 'static,
     {
-        *self.write_hook.write() = Some(Arc::new(f));
+        *self.write_hooks.write() = vec![Arc::new(f)];
+    }
+
+    /// Add a composable write observer without replacing existing consistency,
+    /// metrics or application hooks.
+    pub fn add_write_hook<F>(&self, f: F)
+    where
+        F: Fn(&str, &[String]) + Send + Sync + 'static,
+    {
+        self.write_hooks.write().push(Arc::new(f));
+    }
+
+    pub fn set_max_memory_mb(&self, max_memory_mb: u64) {
+        self.max_bytes
+            .store(max_memory_mb.saturating_mul(1024 * 1024), Ordering::Relaxed);
+    }
+
+    fn next_generation(&self, iri: &str, tombstone: bool) -> u64 {
+        let mut state = self
+            .sync_versions
+            .entry(iri.to_string())
+            .or_insert(SyncVersionState {
+                generation: 0,
+                tombstone: false,
+            });
+        state.generation = state.generation.saturating_add(1);
+        state.tombstone = tombstone;
+        state.generation
+    }
+
+    fn durability_from_json(parsed: &serde_json::Value) -> DurabilityClass {
+        match parsed
+            .get("durability_class")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("write_through") => DurabilityClass::WriteThrough,
+            Some("write_back") => DurabilityClass::WriteBack,
+            _ => DurabilityClass::Ephemeral,
+        }
+    }
+
+    fn enqueue_upsert(
+        &self,
+        iri: &str,
+        parsed: serde_json::Value,
+        graph: Option<String>,
+    ) -> Result<(u64, DurabilityClass), CoreError> {
+        let generation = self.next_generation(iri, false);
+        let durability = Self::durability_from_json(&parsed);
+        self.sync_sender
+            .send(SyncCommand::Upsert {
+                iri: iri.to_string(),
+                parsed,
+                graph,
+                generation,
+            })
+            .map_err(|e| CoreError::OxigraphSyncFailed {
+                message: format!("L2 Oxigraph worker disconnected: {e}"),
+            })?;
+        Ok((generation, durability))
+    }
+
+    fn enqueue_delete(&self, iri: &str, graph: Option<String>) -> Result<u64, CoreError> {
+        let generation = self.next_generation(iri, true);
+        self.sync_sender
+            .send(SyncCommand::Delete {
+                iri: iri.to_string(),
+                graph,
+                generation,
+            })
+            .map_err(|e| CoreError::OxigraphSyncFailed {
+                message: format!("L2 Oxigraph worker disconnected: {e}"),
+            })?;
+        Ok(generation)
+    }
+
+    fn ensure_capacity_for<'a, I>(&self, replacements: I) -> Result<(), CoreError>
+    where
+        I: IntoIterator<Item = (&'a str, usize)>,
+    {
+        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
+        if max_bytes == 0 {
+            return Ok(());
+        }
+
+        let mut projected = self.total_bytes.load(Ordering::Relaxed);
+        let mut staged_sizes = HashMap::<String, usize>::new();
+        for (iri, new_size) in replacements {
+            let old_size = staged_sizes
+                .get(iri)
+                .copied()
+                .or_else(|| self.node_cache.get(iri).map(|node| node.size));
+            if let Some(old_size) = old_size {
+                projected = projected.saturating_sub(old_size as u64);
+            }
+            projected = projected.saturating_add(new_size as u64);
+            staged_sizes.insert(iri.to_string(), new_size);
+        }
+        if projected > max_bytes {
+            return Err(CoreError::StorageError {
+                message: format!(
+                    "L2 memory capacity exceeded: projected={} bytes, max={} bytes",
+                    projected, max_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Update the in-memory L2 view and all of its secondary indices as one
+    /// logical operation. Oxigraph persistence is handled by the caller so
+    /// single and batch paths can retain their existing sync strategy.
+    fn upsert_cached_node(
+        &self,
+        node_iri: &str,
+        json_ld: &str,
+        parsed: &serde_json::Value,
+        named_graph: Option<String>,
+        generation: u64,
+        durability_class: DurabilityClass,
+    ) {
+        let size = json_ld.len();
+        let task_iri = extract_task_iri(node_iri);
+        let previous = self.node_cache.get(node_iri).map(|node| node.clone());
+        let is_update = previous.is_some();
+
+        // Remove old secondary-index memberships before inserting the new
+        // dimensions. Without this, an updated node appears in both its old
+        // and new role/cycle/type queries indefinitely.
+        if let Some(old) = previous.as_ref() {
+            if let Some(old_task) = old.parent_task.as_ref() {
+                if let Ok(old_json) = serde_json::from_str::<serde_json::Value>(&old.json_ld) {
+                    if let Some(role_str) = old_json.get("role").and_then(|value| value.as_str()) {
+                        if let Ok(role) = role_str.parse::<AgentRole>() {
+                            let key = (old_task.clone(), role);
+                            let mut index = self.role_index.write();
+                            if let Some(iris) = index.get_mut(&key) {
+                                iris.retain(|iri| iri != node_iri);
+                            }
+                            if index.get(&key).is_some_and(Vec::is_empty) {
+                                index.remove(&key);
+                            }
+                        }
+                    }
+                    if let Some(cycle_id) =
+                        old_json.get("cycle_id").and_then(|value| value.as_str())
+                    {
+                        let key = (old_task.clone(), cycle_id.to_string());
+                        let mut index = self.cycle_index.write();
+                        if let Some(iris) = index.get_mut(&key) {
+                            iris.retain(|iri| iri != node_iri);
+                        }
+                        if index.get(&key).is_some_and(Vec::is_empty) {
+                            index.remove(&key);
+                        }
+                    }
+                }
+                let mut index = self.type_index.write();
+                for old_type in &old.jsonld_types {
+                    let key = (old_task.clone(), old_type.clone());
+                    if let Some(iris) = index.get_mut(&key) {
+                        iris.retain(|iri| iri != node_iri);
+                    }
+                    if index.get(&key).is_some_and(Vec::is_empty) {
+                        index.remove(&key);
+                    }
+                }
+            }
+        }
+
+        let jsonld_types = extract_jsonld_types(parsed);
+        let tags: Vec<String> = parsed
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let created_at = previous
+            .as_ref()
+            .map(|node| node.created_at)
+            .unwrap_or_else(chrono::Utc::now);
+        let dirty = is_update || durability_class != DurabilityClass::Ephemeral;
+        let node = Node {
+            iri: node_iri.to_string(),
+            json_ld: json_ld.to_string(),
+            size,
+            created_at,
+            created_by: parsed
+                .get("created_by")
+                .and_then(|value| value.as_str())
+                .map(String::from),
+            tags: tags.clone(),
+            node_type: jsonld_types.first().cloned(),
+            dirty,
+            mesi_state: if dirty {
+                MesiState::Modified
+            } else {
+                MesiState::Shared
+            },
+            parent_task: task_iri.clone(),
+            named_graph,
+            jsonld_types: jsonld_types.clone(),
+            generation,
+            durability_class,
+            updated_at: chrono::Utc::now(),
+        };
+        self.node_cache.insert(node_iri.to_string(), Arc::new(node));
+
+        if let Some(task_iri) = &task_iri {
+            let mut task_nodes = self.task_nodes.write();
+            let nodes = task_nodes.entry(task_iri.clone()).or_default();
+            if !nodes.iter().any(|iri| iri == node_iri) {
+                nodes.push(node_iri.to_string());
+            }
+            drop(task_nodes);
+
+            let mut tree = self.task_tree.write();
+            let tree_node = tree
+                .entry(task_iri.clone())
+                .or_insert_with(|| TaskTreeNode {
+                    task_iri: task_iri.clone(),
+                    parent: None,
+                    children: Vec::new(),
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    status: "running".to_string(),
+                    node_iris: Vec::new(),
+                });
+            if !tree_node.node_iris.iter().any(|iri| iri == node_iri) {
+                tree_node.node_iris.push(node_iri.to_string());
+            }
+            drop(tree);
+
+            if let Some(role_str) = parsed.get("role").and_then(|value| value.as_str()) {
+                if let Ok(role) = role_str.parse::<AgentRole>() {
+                    let mut index = self.role_index.write();
+                    let iris = index.entry((task_iri.clone(), role)).or_default();
+                    if !iris.iter().any(|iri| iri == node_iri) {
+                        iris.push(node_iri.to_string());
+                    }
+                }
+            }
+            if let Some(cycle_id) = parsed.get("cycle_id").and_then(|value| value.as_str()) {
+                let mut index = self.cycle_index.write();
+                let iris = index
+                    .entry((task_iri.clone(), cycle_id.to_string()))
+                    .or_default();
+                if !iris.iter().any(|iri| iri == node_iri) {
+                    iris.push(node_iri.to_string());
+                }
+            }
+            let mut index = self.type_index.write();
+            for node_type in &jsonld_types {
+                let iris = index
+                    .entry((task_iri.clone(), node_type.clone()))
+                    .or_default();
+                if !iris.iter().any(|iri| iri == node_iri) {
+                    iris.push(node_iri.to_string());
+                }
+            }
+        }
+
+        match previous {
+            Some(old) if size >= old.size => {
+                self.total_bytes
+                    .fetch_add((size - old.size) as u64, Ordering::Relaxed);
+            }
+            Some(old) => {
+                self.total_bytes
+                    .fetch_sub((old.size - size) as u64, Ordering::Relaxed);
+            }
+            None => {
+                self.node_count.fetch_add(1, Ordering::Relaxed);
+                self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
+            }
+        }
+
+        let hooks = self.write_hooks.read().clone();
+        for hook in hooks {
+            hook(node_iri, &tags);
+        }
     }
 
     #[instrument(skip(self, json_ld, config))]
@@ -163,134 +606,25 @@ impl Blackboard {
             serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("JSON parse error: {}", e),
             })?;
+        self.ensure_capacity_for(std::iter::once((node_iri, size)))?;
 
-        let task_iri = extract_task_iri(node_iri);
-
+        let named_graph = parsed
+            .get("named_graph")
+            .and_then(|value| value.as_str())
+            .map(String::from);
+        let (generation, durability) =
+            self.enqueue_upsert(node_iri, parsed.clone(), named_graph.clone())?;
         let is_update = self.node_cache.contains_key(node_iri);
-
-        let jsonld_types = extract_jsonld_types(&parsed);
-
-        let node_tags: Vec<String> = parsed
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let node = Node {
-            iri: node_iri.to_string(),
-            json_ld: json_ld.to_string(),
-            size,
-            created_at: chrono::Utc::now(),
-            created_by: parsed
-                .get("created_by")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            tags: node_tags.clone(),
-            node_type: jsonld_types.first().cloned(),
-            dirty: is_update,
-            mesi_state: if is_update {
-                MesiState::Modified
-            } else {
-                MesiState::Shared
-            },
-            parent_task: task_iri.clone(),
-            named_graph: parsed
-                .get("named_graph")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            jsonld_types: jsonld_types.clone(),
-        };
-
-        self.node_cache.insert(node_iri.to_string(), Arc::new(node));
-
-        // Defer Oxigraph sync to background thread to avoid blocking the write path.
-        // The in-memory cache returns immediately; sync errors are logged but not propagated
-        // since the node is already available via cache + indices.
-        let store = self.store.clone();
-        let iri = node_iri.to_string();
-        let parsed_json = parsed.clone();
-        let handle = std::thread::spawn(move || {
-            if let Err(e) = Self::sync_to_oxigraph_sync(&store, &iri, &parsed_json) {
-                warn!(error = %e, node_iri = %iri, "Background Oxigraph sync failed");
-            }
-        });
-        self.pending_syncs.lock().unwrap().push(handle);
-        self.reap_finished_syncs();
-
-        if let Some(task_iri) = &task_iri {
-            let mut task_nodes = self.task_nodes.write();
-            let entry = task_nodes.entry(task_iri.clone()).or_default();
-            if !entry.contains(&node_iri.to_string()) {
-                entry.push(node_iri.to_string());
-            }
-
-            let mut tree = self.task_tree.write();
-            let tree_node = tree
-                .entry(task_iri.clone())
-                .or_insert_with(|| TaskTreeNode {
-                    task_iri: task_iri.clone(),
-                    parent: None,
-                    children: Vec::new(),
-                    dependencies: Vec::new(),
-                    dependents: Vec::new(),
-                    status: "running".to_string(),
-                    node_iris: Vec::new(),
-                });
-            if !tree_node.node_iris.contains(&node_iri.to_string()) {
-                tree_node.node_iris.push(node_iri.to_string());
-            }
-        }
-
-        // ── Update secondary indices ──
-        if let Some(task_iri) = &task_iri {
-            // Role index
-            if let Some(role_str) = parsed.get("role").and_then(|v| v.as_str()) {
-                if let Ok(role) = role_str.parse::<AgentRole>() {
-                    let mut idx = self.role_index.write();
-                    let entry = idx.entry((task_iri.clone(), role)).or_default();
-                    if !entry.contains(&node_iri.to_string()) {
-                        entry.push(node_iri.to_string());
-                    }
-                }
-            }
-
-            // Cycle index
-            if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
-                let mut idx = self.cycle_index.write();
-                let entry = idx
-                    .entry((task_iri.clone(), cycle_id.to_string()))
-                    .or_default();
-                if !entry.contains(&node_iri.to_string()) {
-                    entry.push(node_iri.to_string());
-                }
-            }
-
-            // Type index
-            if let Some(node_type) = jsonld_types.first() {
-                let mut idx = self.type_index.write();
-                let entry = idx
-                    .entry((task_iri.clone(), node_type.clone()))
-                    .or_default();
-                if !entry.contains(&node_iri.to_string()) {
-                    entry.push(node_iri.to_string());
-                }
-            }
-        }
-
-        if !is_update {
-            self.node_count.fetch_add(1, Ordering::Relaxed);
-        }
-        self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
+        self.upsert_cached_node(
+            node_iri,
+            json_ld,
+            &parsed,
+            named_graph,
+            generation,
+            durability,
+        );
 
         debug!(node_iri = %node_iri, size = size, is_update = is_update, "Node written to blackboard (cache + oxigraph)");
-
-        if let Some(ref hook) = *self.write_hook.read() {
-            hook(node_iri, &node_tags);
-        }
 
         Ok(())
     }
@@ -381,6 +715,25 @@ impl Blackboard {
         Ok(())
     }
 
+    fn delete_from_oxigraph_sync(
+        store: &Store,
+        node_iri: &str,
+        graph_name: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let subject = format!("<{}>", node_iri);
+        let sparql = match graph_name {
+            Some(graph_name) => format!(
+                "DELETE WHERE {{ GRAPH <{}> {{ {} ?p ?o . }} }}",
+                graph_name, subject
+            ),
+            None => format!("DELETE WHERE {{ {} ?p ?o . }}", subject),
+        };
+        store.update(&sparql).map_err(|e| CoreError::SparqlError {
+            message: format!("Failed to delete node from Oxigraph: {e}"),
+        })?;
+        Ok(())
+    }
+
     fn escape_sparql_string(s: &str) -> String {
         let mut escaped = String::with_capacity(s.len());
         for c in s.chars() {
@@ -405,25 +758,61 @@ impl Blackboard {
         Ok(self.node_cache.get(node_iri).map(|n| n.clone()))
     }
 
+    pub fn node_generation(&self, node_iri: &str) -> Option<u64> {
+        self.node_cache.get(node_iri).map(|node| node.generation)
+    }
+
+    /// Mark an L2 copy invalid only when a newer canonical generation exists.
+    pub fn invalidate_if_older(&self, node_iri: &str, canonical_generation: u64) -> bool {
+        let Some(mut cached) = self.node_cache.get_mut(node_iri) else {
+            return false;
+        };
+        if cached.generation >= canonical_generation {
+            return false;
+        }
+        let mut node = (**cached).clone();
+        node.mesi_state = MesiState::Invalid;
+        *cached = Arc::new(node);
+        true
+    }
+
+    /// Install a canonical L0 snapshot without losing its generation. This is
+    /// used by read-time coherence repair after an Invalid/stale L2 hit.
+    pub fn write_node_from_l0(
+        &self,
+        node_iri: &str,
+        json_ld: &str,
+        canonical_generation: u64,
+        config: &CoreConfig,
+    ) -> Result<(), CoreError> {
+        let generation = canonical_generation.max(1);
+        self.sync_versions.insert(
+            node_iri.to_string(),
+            SyncVersionState {
+                generation: generation.saturating_sub(1),
+                tombstone: false,
+            },
+        );
+        self.write_node(node_iri, json_ld, config)?;
+        if let Some(mut cached) = self.node_cache.get_mut(node_iri) {
+            let mut node = (**cached).clone();
+            node.generation = generation;
+            node.dirty = false;
+            node.mesi_state = MesiState::Shared;
+            node.updated_at = chrono::Utc::now();
+            *cached = Arc::new(node);
+        }
+        Ok(())
+    }
+
     pub fn delete_node(&self, node_iri: &str) -> Result<bool, CoreError> {
         if let Some((_, node)) = self.node_cache.remove(node_iri) {
+            // Publish the tombstone before any later upsert can be enqueued.
+            // The worker checks generation and drops stale queued mutations.
+            self.enqueue_delete(node_iri, node.named_graph.clone())?;
             self.node_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(node.size as u64, Ordering::Relaxed);
-
-            let subject = format!("<{}>", node_iri);
-            let delete_sparql = if let Some(ref graph_name) = node.named_graph {
-                let graph = format!("<{}>", graph_name);
-                format!(
-                    "DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}",
-                    graph, subject
-                )
-            } else {
-                format!("DELETE WHERE {{ {} ?p ?o . }}", subject)
-            };
-            if let Err(e) = self.store.update(&delete_sparql) {
-                warn!(node_iri = %node_iri, error = %e, "Failed to delete triples from oxigraph");
-            }
 
             if let Some(task_iri) = extract_task_iri(node_iri) {
                 let mut task_nodes = self.task_nodes.write();
@@ -462,6 +851,9 @@ impl Blackboard {
                 }
             }
 
+            // Delete has strong completion semantics: once this API returns,
+            // both cache and Oxigraph must no longer expose the node.
+            self.flush_oxigraph_result()?;
             debug!(node_iri = %node_iri, named_graph = ?node.named_graph, "Node deleted from blackboard (cache + oxigraph)");
             Ok(true)
         } else {
@@ -505,6 +897,22 @@ impl Blackboard {
         l0_store: &crate::memory::l0_store::L0Store,
     ) -> Result<bool, CoreError> {
         if let Some(mut arc_node) = self.node_cache.get_mut(node_iri) {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                "_gh_generation".to_string(),
+                serde_json::Value::from(arc_node.generation),
+            );
+            metadata.insert(
+                "durability_class".to_string(),
+                serde_json::Value::String(
+                    match arc_node.durability_class {
+                        DurabilityClass::Ephemeral => "ephemeral",
+                        DurabilityClass::WriteBack => "write_back",
+                        DurabilityClass::WriteThrough => "write_through",
+                    }
+                    .to_string(),
+                ),
+            );
             let entry = crate::memory::l0_store::L0Entry {
                 iri: arc_node.iri.clone(),
                 content: arc_node.json_ld.clone(),
@@ -513,14 +921,17 @@ impl Blackboard {
                 created_at: arc_node.created_at,
                 last_accessed: chrono::Utc::now(),
                 tags: arc_node.tags.clone(),
-                metadata: serde_json::Map::new(),
+                metadata,
                 mesi_state: crate::memory::l0_store::MesiState::Shared,
                 content_hash: String::new(),
                 named_graph: arc_node.named_graph.clone(),
                 jsonld_context: None,
                 jsonld_types: arc_node.jsonld_types.clone(),
             };
-            l0_store.store_entry(&entry)?;
+            // L2 is the authoritative current snapshot for this IRI. Exact
+            // replacement prevents removed tags/types/graphs from lingering
+            // in L0 secondary indices.
+            l0_store.replace_entry(&entry)?;
             let mut node = (**arc_node).clone();
             node.dirty = false;
             node.mesi_state = MesiState::Shared;
@@ -532,7 +943,11 @@ impl Blackboard {
     }
 
     /// Immediately persist a single node to L0 (WriteThrough semantics), resetting its dirty/MESI state.
-    pub fn persist_node(&self, node_iri: &str, l0_store: &crate::memory::l0_store::L0Store) -> Result<bool, CoreError> {
+    pub fn persist_node(
+        &self,
+        node_iri: &str,
+        l0_store: &crate::memory::l0_store::L0Store,
+    ) -> Result<bool, CoreError> {
         self.flush_node_to_l0(node_iri, l0_store)
     }
 
@@ -562,9 +977,23 @@ impl Blackboard {
 
         {
             let mut tree = self.task_tree.write();
+            let released_set: std::collections::HashSet<&str> =
+                tasks_to_release.iter().map(String::as_str).collect();
             for task in &tasks_to_release {
                 tree.remove(task);
             }
+            for node in tree.values_mut() {
+                node.children
+                    .retain(|child| !released_set.contains(child.as_str()));
+                node.dependencies
+                    .retain(|dependency| !released_set.contains(dependency.as_str()));
+                node.dependents
+                    .retain(|dependent| !released_set.contains(dependent.as_str()));
+            }
+        }
+        let mut task_nodes = self.task_nodes.write();
+        for task in &tasks_to_release {
+            task_nodes.remove(task);
         }
 
         Ok(released)
@@ -815,6 +1244,7 @@ impl Blackboard {
         self.role_index.write().clear();
         self.cycle_index.write().clear();
         self.type_index.write().clear();
+        self.sync_versions.clear();
         self.node_count.store(0, Ordering::Relaxed);
         self.total_bytes.store(0, Ordering::Relaxed);
 
@@ -843,125 +1273,14 @@ impl Blackboard {
             serde_json::from_str(json_ld).map_err(|e| CoreError::InvalidJsonLd {
                 message: format!("JSON parse error: {}", e),
             })?;
+        self.ensure_capacity_for(std::iter::once((node_iri, size)))?;
 
-        let task_iri = extract_task_iri(node_iri);
-        let is_update = self.node_cache.contains_key(node_iri);
-        let jsonld_types = extract_jsonld_types(&parsed);
-
-        let node_tags: Vec<String> = parsed
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let node = Node {
-            iri: node_iri.to_string(),
-            json_ld: json_ld.to_string(),
-            size,
-            created_at: chrono::Utc::now(),
-            created_by: parsed
-                .get("created_by")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            tags: node_tags.clone(),
-            node_type: jsonld_types.first().cloned(),
-            dirty: is_update,
-            mesi_state: if is_update {
-                MesiState::Modified
-            } else {
-                MesiState::Shared
-            },
-            parent_task: task_iri.clone(),
-            named_graph: Some(graph_name.to_string()),
-            jsonld_types: jsonld_types.clone(),
-        };
-
-        self.node_cache.insert(node_iri.to_string(), Arc::new(node));
-
-        // Defer Oxigraph sync to background thread (avoids blocking the write path)
-        let store = self.store.clone();
-        let iri = node_iri.to_string();
-        let gname = graph_name.to_string();
-        let parsed_json = parsed.clone();
-        let handle = std::thread::spawn(move || {
-            if let Err(e) =
-                Self::sync_to_oxigraph_with_graph_sync(&store, &iri, &parsed_json, &gname)
-            {
-                warn!(error = %e, node_iri = %iri, graph = %gname, "Background Oxigraph sync failed");
-            }
-        });
-        self.pending_syncs.lock().unwrap().push(handle);
-        self.reap_finished_syncs();
-
-        if let Some(task_iri) = &task_iri {
-            let mut task_nodes = self.task_nodes.write();
-            let entry = task_nodes.entry(task_iri.clone()).or_default();
-            if !entry.contains(&node_iri.to_string()) {
-                entry.push(node_iri.to_string());
-            }
-
-            let mut tree = self.task_tree.write();
-            let tree_node = tree
-                .entry(task_iri.clone())
-                .or_insert_with(|| TaskTreeNode {
-                    task_iri: task_iri.clone(),
-                    parent: None,
-                    children: Vec::new(),
-                    dependencies: Vec::new(),
-                    dependents: Vec::new(),
-                    status: "running".to_string(),
-                    node_iris: Vec::new(),
-                });
-            if !tree_node.node_iris.contains(&node_iri.to_string()) {
-                tree_node.node_iris.push(node_iri.to_string());
-            }
-        }
-
-        // Secondary indices for named-graph write (same logic as write_node)
-        if let Some(task_iri) = &task_iri {
-            if let Some(role_str) = parsed.get("role").and_then(|v| v.as_str()) {
-                if let Ok(role) = role_str.parse::<AgentRole>() {
-                    let mut idx = self.role_index.write();
-                    let entry = idx.entry((task_iri.clone(), role)).or_default();
-                    if !entry.contains(&node_iri.to_string()) {
-                        entry.push(node_iri.to_string());
-                    }
-                }
-            }
-            if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
-                let mut idx = self.cycle_index.write();
-                let entry = idx
-                    .entry((task_iri.clone(), cycle_id.to_string()))
-                    .or_default();
-                if !entry.contains(&node_iri.to_string()) {
-                    entry.push(node_iri.to_string());
-                }
-            }
-            if let Some(node_type) = jsonld_types.first() {
-                let mut idx = self.type_index.write();
-                let entry = idx
-                    .entry((task_iri.clone(), node_type.clone()))
-                    .or_default();
-                if !entry.contains(&node_iri.to_string()) {
-                    entry.push(node_iri.to_string());
-                }
-            }
-        }
-
-        if !is_update {
-            self.node_count.fetch_add(1, Ordering::Relaxed);
-        }
-        self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
+        let graph = Some(graph_name.to_string());
+        let (generation, durability) =
+            self.enqueue_upsert(node_iri, parsed.clone(), graph.clone())?;
+        self.upsert_cached_node(node_iri, json_ld, &parsed, graph, generation, durability);
 
         debug!(node_iri = %node_iri, graph = %graph_name, size = size, "Node written to named graph");
-
-        if let Some(ref hook) = *self.write_hook.read() {
-            hook(node_iri, &node_tags);
-        }
 
         Ok(())
     }
@@ -996,29 +1315,29 @@ impl Blackboard {
         Ok(())
     }
 
-    /// Wait for all pending background Oxigraph syncs to complete.
-    /// Useful before querying Oxigraph directly after writes.
-    pub fn flush_oxigraph(&self) {
-        let handles = std::mem::take(&mut *self.pending_syncs.lock().unwrap());
-        for h in handles {
-            let _ = h.join();
-        }
+    /// Wait for all mutations enqueued before this call and surface worker
+    /// failures. FIFO ordering makes this a durable outbox barrier.
+    pub fn flush_oxigraph_result(&self) -> Result<(), CoreError> {
+        let (reply, receive) = std::sync::mpsc::channel();
+        self.sync_sender
+            .send(SyncCommand::Barrier(reply))
+            .map_err(|e| CoreError::OxigraphSyncFailed {
+                message: format!("L2 Oxigraph worker disconnected: {e}"),
+            })?;
+        receive
+            .recv()
+            .map_err(|e| CoreError::OxigraphSyncFailed {
+                message: format!("L2 Oxigraph barrier disconnected: {e}"),
+            })?
+            .map_err(|message| CoreError::OxigraphSyncFailed { message })
     }
 
-    /// Reap already-finished background sync handles so `pending_syncs`
-    /// stays bounded to in-flight syncs instead of growing unboundedly
-    /// under write-heavy workloads. Called on each handle push.
-    fn reap_finished_syncs(&self) {
-        let mut handles = self.pending_syncs.lock().unwrap();
-        let mut active = Vec::new();
-        for h in std::mem::take(&mut *handles) {
-            if h.is_finished() {
-                let _ = h.join();
-            } else {
-                active.push(h);
-            }
+    /// Compatibility barrier for callers that cannot return a Result. New
+    /// persistence-sensitive paths should call `flush_oxigraph_result()`.
+    pub fn flush_oxigraph(&self) {
+        if let Err(error) = self.flush_oxigraph_result() {
+            warn!(%error, "L2 Oxigraph barrier reported synchronization failure");
         }
-        *handles = active;
     }
 
     pub fn query_graph(
@@ -1059,100 +1378,28 @@ impl Blackboard {
 
             validated.push((node_iri.clone(), json_ld.clone(), parsed));
         }
-
-        let mut delete_parts = Vec::with_capacity(validated.len());
-        let mut insert_parts = Vec::new();
-
-        for (node_iri, _, parsed) in &validated {
-            let subject = format!("<{}>", node_iri);
-            let triples = Self::build_triples(node_iri, parsed);
-            if !triples.is_empty() {
-                delete_parts.push(format!("DELETE WHERE {{ {} ?p ?o . }}", subject));
-                insert_parts.push(format!("INSERT DATA {{ {} }}", triples.join("\n")));
-            }
-        }
-
-        if !delete_parts.is_empty() || !insert_parts.is_empty() {
-            let mut combined_parts = delete_parts;
-            combined_parts.extend(insert_parts);
-            let combined_sparql = combined_parts.join("; ");
-            self.store
-                .update(&combined_sparql)
-                .map_err(|e| CoreError::SparqlError {
-                    message: format!("Failed to execute batch atomic DELETE+INSERT: {}", e),
-                })?;
-        }
+        self.ensure_capacity_for(
+            validated
+                .iter()
+                .map(|(iri, json, _)| (iri.as_str(), json.len())),
+        )?;
 
         let mut results = Vec::with_capacity(validated.len());
         for (node_iri, json_ld, parsed) in &validated {
-            let size = json_ld.as_bytes().len();
-            let task_iri = extract_task_iri(node_iri);
-            let is_update = self.node_cache.contains_key(node_iri);
-            let jsonld_types = extract_jsonld_types(parsed);
-
-            let node = Node {
-                iri: node_iri.clone(),
-                json_ld: json_ld.clone(),
-                size,
-                created_at: chrono::Utc::now(),
-                created_by: parsed
-                    .get("created_by")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                tags: parsed
-                    .get("tags")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                node_type: jsonld_types.first().cloned(),
-                dirty: is_update,
-                mesi_state: if is_update {
-                    MesiState::Modified
-                } else {
-                    MesiState::Shared
-                },
-                parent_task: task_iri.clone(),
-                named_graph: parsed
-                    .get("named_graph")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                jsonld_types: jsonld_types.clone(),
-            };
-
-            self.node_cache.insert(node_iri.clone(), Arc::new(node));
-
-            if let Some(task_iri) = &task_iri {
-                let mut task_nodes = self.task_nodes.write();
-                let entry = task_nodes.entry(task_iri.clone()).or_default();
-                if !entry.contains(&node_iri.to_string()) {
-                    entry.push(node_iri.to_string());
-                }
-
-                let mut tree = self.task_tree.write();
-                let tree_node = tree
-                    .entry(task_iri.clone())
-                    .or_insert_with(|| TaskTreeNode {
-                        task_iri: task_iri.clone(),
-                        parent: None,
-                        children: Vec::new(),
-                        dependencies: Vec::new(),
-                        dependents: Vec::new(),
-                        status: "running".to_string(),
-                        node_iris: Vec::new(),
-                    });
-                if !tree_node.node_iris.contains(&node_iri.to_string()) {
-                    tree_node.node_iris.push(node_iri.to_string());
-                }
-            }
-
-            if !is_update {
-                self.node_count.fetch_add(1, Ordering::Relaxed);
-            }
-            self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
+            let named_graph = parsed
+                .get("named_graph")
+                .and_then(|value| value.as_str())
+                .map(String::from);
+            let (generation, durability) =
+                self.enqueue_upsert(node_iri, parsed.clone(), named_graph.clone())?;
+            self.upsert_cached_node(
+                node_iri,
+                json_ld,
+                parsed,
+                named_graph,
+                generation,
+                durability,
+            );
 
             results.push(Ok(()));
         }
@@ -1189,139 +1436,18 @@ impl Blackboard {
                 parsed,
             ));
         }
-
-        let mut delete_parts = Vec::with_capacity(validated.len());
-        let mut insert_parts = Vec::new();
-
-        for (node_iri, _, graph_name, parsed) in &validated {
-            let subject = format!("<{}>", node_iri);
-            let graph = format!("<{}>", graph_name);
-            let triples = Self::build_triples(node_iri, parsed);
-            if !triples.is_empty() {
-                delete_parts.push(format!(
-                    "DELETE WHERE {{ GRAPH {} {{ {} ?p ?o . }} }}",
-                    graph, subject
-                ));
-                insert_parts.push(format!(
-                    "INSERT DATA {{ GRAPH {} {{ {} }} }}",
-                    graph,
-                    triples.join("\n")
-                ));
-            }
-        }
-
-        if !delete_parts.is_empty() || !insert_parts.is_empty() {
-            let mut combined_parts = delete_parts;
-            combined_parts.extend(insert_parts);
-            let combined_sparql = combined_parts.join("; ");
-            self.store
-                .update(&combined_sparql)
-                .map_err(|e| CoreError::SparqlError {
-                    message: format!(
-                        "Failed to execute batch atomic DELETE+INSERT in named graphs: {}",
-                        e
-                    ),
-                })?;
-        }
+        self.ensure_capacity_for(
+            validated
+                .iter()
+                .map(|(iri, json, _, _)| (iri.as_str(), json.len())),
+        )?;
 
         let mut success_count = 0;
         for (node_iri, json_ld, graph_name, parsed) in &validated {
-            let size = json_ld.as_bytes().len();
-            let task_iri = extract_task_iri(node_iri);
-            let is_update = self.node_cache.contains_key(node_iri);
-            let jsonld_types = extract_jsonld_types(parsed);
-
-            let node = Node {
-                iri: node_iri.clone(),
-                json_ld: json_ld.clone(),
-                size,
-                created_at: chrono::Utc::now(),
-                created_by: parsed
-                    .get("created_by")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                tags: parsed
-                    .get("tags")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                node_type: jsonld_types.first().cloned(),
-                dirty: is_update,
-                mesi_state: if is_update {
-                    MesiState::Modified
-                } else {
-                    MesiState::Shared
-                },
-                parent_task: task_iri.clone(),
-                named_graph: Some(graph_name.clone()),
-                jsonld_types: jsonld_types.clone(),
-            };
-
-            self.node_cache.insert(node_iri.clone(), Arc::new(node));
-
-            if let Some(task_iri) = &task_iri {
-                let mut task_nodes = self.task_nodes.write();
-                let entry = task_nodes.entry(task_iri.clone()).or_default();
-                if !entry.contains(&node_iri.to_string()) {
-                    entry.push(node_iri.to_string());
-                }
-
-                let mut tree = self.task_tree.write();
-                let tree_node = tree
-                    .entry(task_iri.clone())
-                    .or_insert_with(|| TaskTreeNode {
-                        task_iri: task_iri.clone(),
-                        parent: None,
-                        children: Vec::new(),
-                        dependencies: Vec::new(),
-                        dependents: Vec::new(),
-                        status: "running".to_string(),
-                        node_iris: Vec::new(),
-                    });
-                if !tree_node.node_iris.contains(&node_iri.to_string()) {
-                    tree_node.node_iris.push(node_iri.to_string());
-                }
-            }
-
-            // Secondary indices for write_batch_to_graphs (same logic as write_node)
-            if let Some(task_iri) = &task_iri {
-                if let Some(role_str) = parsed.get("role").and_then(|v| v.as_str()) {
-                    if let Ok(role) = role_str.parse::<AgentRole>() {
-                        let mut idx = self.role_index.write();
-                        let entry = idx.entry((task_iri.clone(), role)).or_default();
-                        if !entry.contains(&node_iri.to_string()) {
-                            entry.push(node_iri.to_string());
-                        }
-                    }
-                }
-                if let Some(cycle_id) = parsed.get("cycle_id").and_then(|v| v.as_str()) {
-                    let mut idx = self.cycle_index.write();
-                    let entry = idx
-                        .entry((task_iri.clone(), cycle_id.to_string()))
-                        .or_default();
-                    if !entry.contains(&node_iri.to_string()) {
-                        entry.push(node_iri.to_string());
-                    }
-                }
-                if let Some(node_type) = jsonld_types.first() {
-                    let mut idx = self.type_index.write();
-                    let entry = idx
-                        .entry((task_iri.clone(), node_type.clone()))
-                        .or_default();
-                    if !entry.contains(&node_iri.to_string()) {
-                        entry.push(node_iri.to_string());
-                    }
-                }
-            }
-
-            if !is_update {
-                self.node_count.fetch_add(1, Ordering::Relaxed);
-            }
-            self.total_bytes.fetch_add(size as u64, Ordering::Relaxed);
+            let graph = Some(graph_name.clone());
+            let (generation, durability) =
+                self.enqueue_upsert(node_iri, parsed.clone(), graph.clone())?;
+            self.upsert_cached_node(node_iri, json_ld, parsed, graph, generation, durability);
 
             success_count += 1;
         }
@@ -2011,6 +2137,17 @@ impl PermissionMatrix {
             }
         }
         Vec::new()
+    }
+}
+
+impl Drop for Blackboard {
+    fn drop(&mut self) {
+        let _ = self.sync_sender.send(SyncCommand::Shutdown);
+        if let Ok(worker) = self.sync_worker.get_mut() {
+            if let Some(handle) = worker.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -2793,47 +2930,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reap_finished_syncs_prunes_completed_handles() {
-        let bb = Blackboard::new().unwrap();
-
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_flag = done.clone();
-        let finished_handle = std::thread::spawn(move || {
-            done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-        // Wait until the spawned thread has actually completed.
-        while !done.load(std::sync::atomic::Ordering::SeqCst) {
-            std::thread::yield_now();
+    fn bounded_sync_worker_barrier_drains_prior_mutations() {
+        let bb = Blackboard::new_with_queue_capacity(1).unwrap();
+        let config = CoreConfig::default();
+        for index in 0..100 {
+            let iri = format!("iri://task/worker/node_{index}");
+            let json = serde_json::json!({"@id": iri, "@type": "WorkerProbe"}).to_string();
+            bb.write_node(&iri, &json, &config).unwrap();
         }
-
-        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let park_flag = parked.clone();
-        let in_flight_handle = std::thread::spawn(move || {
-            while !park_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-        });
-
-        {
-            let mut pending = bb.pending_syncs.lock().unwrap();
-            pending.push(finished_handle);
-            pending.push(in_flight_handle);
-        }
-
-        bb.reap_finished_syncs();
-
-        let remaining = bb.pending_syncs.lock().unwrap();
-        assert_eq!(
-            remaining.len(),
-            1,
-            "finished sync handle must be reaped, in-flight one retained"
-        );
-        drop(remaining);
-
-        // Release the parked thread and join so the test exits cleanly.
-        parked.store(true, std::sync::atomic::Ordering::SeqCst);
-        let in_flight = bb.pending_syncs.lock().unwrap().pop().unwrap();
-        let _ = in_flight.join();
+        bb.flush_oxigraph_result().unwrap();
+        assert_eq!(bb.node_count(), 100);
     }
 
     #[test]
@@ -2870,5 +2976,242 @@ mod tests {
             "iri://workspace/file/main.rs",
             "hook must receive the written node IRI"
         );
+    }
+
+    #[test]
+    fn update_replaces_accounting_and_secondary_index_memberships() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let iri = "iri://task/l2-update/turn_1";
+        let original = serde_json::json!({
+            "@id": iri,
+            "@type": ["OldType", "AlsoOldType"],
+            "role": "Do",
+            "cycle_id": "cycle-old",
+            "content": "x".repeat(200)
+        })
+        .to_string();
+        bb.write_node(iri, &original, &config).unwrap();
+        let created_at = bb.read_node(iri).unwrap().unwrap().created_at;
+
+        let replacement = serde_json::json!({
+            "@id": iri,
+            "@type": ["NewType", "AlsoNewType"],
+            "role": "Check",
+            "cycle_id": "cycle-new",
+            "content": "short"
+        })
+        .to_string();
+        bb.write_node(iri, &replacement, &config).unwrap();
+
+        assert_eq!(bb.node_count(), 1);
+        assert_eq!(bb.total_bytes(), replacement.len() as u64);
+        assert_eq!(bb.read_node(iri).unwrap().unwrap().created_at, created_at);
+        for filter in [
+            QueryFilter {
+                role: Some(AgentRole::Do),
+                ..Default::default()
+            },
+            QueryFilter {
+                cycle_id: Some("cycle-old".to_string()),
+                ..Default::default()
+            },
+            QueryFilter {
+                node_type: Some("OldType".to_string()),
+                ..Default::default()
+            },
+            QueryFilter {
+                node_type: Some("AlsoOldType".to_string()),
+                ..Default::default()
+            },
+        ] {
+            assert!(bb
+                .query_nodes_filtered("iri://task/l2-update", &filter)
+                .unwrap()
+                .is_empty());
+        }
+        for filter in [
+            QueryFilter {
+                role: Some(AgentRole::Check),
+                ..Default::default()
+            },
+            QueryFilter {
+                cycle_id: Some("cycle-new".to_string()),
+                ..Default::default()
+            },
+            QueryFilter {
+                node_type: Some("NewType".to_string()),
+                ..Default::default()
+            },
+            QueryFilter {
+                node_type: Some("AlsoNewType".to_string()),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                bb.query_nodes_filtered("iri://task/l2-update", &filter)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn both_batch_write_paths_fire_consistency_hook_per_node() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        bb.set_write_hook(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        bb.write_nodes_batch(
+            vec![
+                (
+                    "iri://task/batch-hook/node_1".to_string(),
+                    r#"{"@id":"iri://task/batch-hook/node_1","@type":"One"}"#.to_string(),
+                ),
+                (
+                    "iri://task/batch-hook/node_2".to_string(),
+                    r#"{"@id":"iri://task/batch-hook/node_2","@type":"Two"}"#.to_string(),
+                ),
+            ],
+            &config,
+        )
+        .unwrap();
+        bb.write_batch_to_graphs(
+            vec![(
+                "iri://task/batch-hook/node_3".to_string(),
+                r#"{"@id":"iri://task/batch-hook/node_3","@type":"Three"}"#.to_string(),
+                "iri://graph/batch-hook".to_string(),
+            )],
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn composable_write_hooks_do_not_replace_existing_observers() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let first_calls = Arc::new(AtomicU64::new(0));
+        let second_calls = Arc::new(AtomicU64::new(0));
+        let first_observed = first_calls.clone();
+        let second_observed = second_calls.clone();
+        bb.add_write_hook(move |_, _| {
+            first_observed.fetch_add(1, Ordering::SeqCst);
+        });
+        bb.add_write_hook(move |_, _| {
+            second_observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        bb.write_node(
+            "iri://task/hooks/node_1",
+            r#"{"@id":"iri://task/hooks/node_1","@type":"HookProbe"}"#,
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn configured_l2_capacity_rejects_growth_but_allows_same_iri_replacement() {
+        let bb = Blackboard::new().unwrap();
+        bb.set_max_memory_mb(1);
+        let config = CoreConfig::default();
+        let large = serde_json::json!({
+            "@id": "iri://task/l2-capacity/node_1",
+            "@type": "Payload",
+            "content": "x".repeat(800_000)
+        })
+        .to_string();
+        bb.write_node("iri://task/l2-capacity/node_1", &large, &config)
+            .unwrap();
+
+        let replacement = serde_json::json!({
+            "@id": "iri://task/l2-capacity/node_1",
+            "@type": "Payload",
+            "content": "y".repeat(800_000)
+        })
+        .to_string();
+        bb.write_node("iri://task/l2-capacity/node_1", &replacement, &config)
+            .unwrap();
+
+        let overflow = serde_json::json!({
+            "@id": "iri://task/l2-capacity/node_2",
+            "@type": "Payload",
+            "content": "z".repeat(300_000)
+        })
+        .to_string();
+        assert!(bb
+            .write_node("iri://task/l2-capacity/node_2", &overflow, &config)
+            .is_err());
+        assert_eq!(bb.node_count(), 1);
+    }
+
+    #[test]
+    fn generation_and_tombstone_prevent_stale_outbox_replay() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let iri = "iri://task/generation/node_1";
+        for version in 1..=20 {
+            let json = serde_json::json!({
+                "@id": iri,
+                "@type": "GenerationProbe",
+                "version": version
+            })
+            .to_string();
+            bb.write_node(iri, &json, &config).unwrap();
+        }
+        bb.flush_oxigraph_result().unwrap();
+        assert_eq!(bb.node_generation(iri), Some(20));
+        let values = bb
+            .query(&format!(
+                "SELECT ?value WHERE {{ <{}> <https://agent-os.org/ontology/core/version> ?value . }}",
+                iri
+            ))
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert!(values[0].to_string().contains("20"));
+
+        assert!(bb.delete_node(iri).unwrap());
+        assert!(bb
+            .query(&format!("SELECT ?p WHERE {{ <{}> ?p ?o . }}", iri))
+            .unwrap()
+            .is_empty());
+
+        let recreated = serde_json::json!({"@id": iri, "version": 21}).to_string();
+        bb.write_node(iri, &recreated, &config).unwrap();
+        bb.flush_oxigraph_result().unwrap();
+        assert_eq!(bb.node_generation(iri), Some(22));
+    }
+
+    #[test]
+    fn explicit_write_back_node_is_dirty_and_preserves_generation_in_l0() {
+        let bb = Blackboard::new().unwrap();
+        let config = CoreConfig::default();
+        let iri = "iri://task/durable/node_1";
+        let json = serde_json::json!({
+            "@id": iri,
+            "@type": "DurableProbe",
+            "durability_class": "write_back",
+            "value": 1
+        })
+        .to_string();
+        bb.write_node(iri, &json, &config).unwrap();
+        let node = bb.read_node(iri).unwrap().unwrap();
+        assert!(node.dirty);
+        assert_eq!(node.durability_class, DurabilityClass::WriteBack);
+
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(bb.flush_dirty_nodes(&l0).unwrap(), 1);
+        assert_eq!(l0.generation(iri).unwrap(), Some(node.generation));
     }
 }

@@ -74,6 +74,14 @@ impl MemoryScheduler {
             AgentRole::Act => "aa_decision",
         };
 
+        // Read-time generation validation is the correctness backstop. Events
+        // accelerate invalidation, but a missed/lagged event cannot expose a
+        // stale L2/L3 projection through the scheduler.
+        let existing_nodes = self.blackboard.query_nodes(task_iri)?;
+        for node in &existing_nodes {
+            self.consistency.on_l2_read(&node.iri)?;
+        }
+
         let params = HashMap::new();
         let projection_result = self.projection.project(task_iri, frame_name, params).await;
 
@@ -94,9 +102,6 @@ impl MemoryScheduler {
 
         let nodes = self.blackboard.query_nodes(task_iri)?;
         if !nodes.is_empty() {
-            for n in &nodes {
-                let _ = self.consistency.on_l2_read(&n.iri);
-            }
             let contents: Vec<String> = nodes.iter().map(|n| n.json_ld.clone()).collect();
             return Ok(contents.join("\n"));
         }
@@ -108,7 +113,8 @@ impl MemoryScheduler {
                 let window = TimeRange::after(now - chrono::Duration::hours(24));
                 if let Ok(entries) = hs.search_by_time(task_iri, &window, 10).await {
                     if !entries.is_empty() {
-                        let contents: Vec<String> = entries.iter().map(|r| r.text.clone()).collect();
+                        let contents: Vec<String> =
+                            entries.iter().map(|r| r.text.clone()).collect();
                         return Ok(contents.join("\n"));
                     }
                 }
@@ -394,5 +400,46 @@ mod tests {
         let (scheduler, _dir) = setup_scheduler();
         let result = scheduler.on_task_complete("iri://task_complete").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn context_request_repairs_stale_l2_when_invalidation_event_is_missed() {
+        let (scheduler, _dir) = setup_scheduler();
+        let iri = "iri://task/read-repair/node_1";
+        let task = "iri://task/read-repair";
+        let config = crate::CoreConfig::default();
+        let version_one = serde_json::json!({
+            "@id": iri,
+            "@type": "TaskArtifact",
+            "summary": "canonical-version-one"
+        })
+        .to_string();
+        let version_two = serde_json::json!({
+            "@id": iri,
+            "@type": "TaskArtifact",
+            "summary": "canonical-version-two"
+        })
+        .to_string();
+
+        scheduler.l0_store.store(iri, &version_one).unwrap();
+        scheduler
+            .blackboard
+            .write_node(iri, &version_one, &config)
+            .unwrap();
+        assert_eq!(scheduler.blackboard.node_generation(iri), Some(1));
+
+        // Deliberately bypass ConsistencyEngine::on_l0_update to model a
+        // dropped or delayed invalidation event.
+        scheduler.l0_store.store(iri, &version_two).unwrap();
+        let context = scheduler
+            .on_context_request(AgentRole::Do, task)
+            .await
+            .unwrap();
+
+        let repaired = scheduler.blackboard.read_node(iri).unwrap().unwrap();
+        assert_eq!(repaired.generation, 2);
+        assert!(repaired.json_ld.contains("canonical-version-two"));
+        assert!(!repaired.json_ld.contains("canonical-version-one"));
+        assert!(context.contains("canonical-version-two"));
     }
 }

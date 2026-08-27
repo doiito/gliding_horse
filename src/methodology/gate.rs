@@ -416,7 +416,9 @@ impl MethodologyGate {
         let mut samples: std::collections::HashMap<&str, (usize, usize)> =
             std::collections::HashMap::new();
         for record in &self.usage_history {
-            let entry = samples.entry(record.methodology_id.as_str()).or_insert((0, 0));
+            let entry = samples
+                .entry(record.methodology_id.as_str())
+                .or_insert((0, 0));
             entry.0 += 1;
             if record.success {
                 entry.1 += 1;
@@ -830,10 +832,8 @@ impl MethodologyGateHandle {
                 // methodologies can contribute their anti-patterns this turn.
                 let context_clone = ctx.clone();
                 let activated = g.on_hook_trigger(HookPoint::SkillBefore, &context_clone);
-                g.pending_skill_activation = activated
-                    .iter()
-                    .map(|a| a.methodology_id.clone())
-                    .collect();
+                g.pending_skill_activation =
+                    activated.iter().map(|a| a.methodology_id.clone()).collect();
                 if let Some(ref evo) = evo_tool {
                     let inner = evo.inner();
                     let mut e = inner.write();
@@ -1627,7 +1627,8 @@ mod tests {
     fn activate_tool_window(gate: &mut MethodologyGate, tool: &str) -> HookContext {
         let ctx = test_context(HookPoint::SkillBefore, "DA", Some(tool));
         let activated = gate.on_hook_trigger(HookPoint::SkillBefore, &ctx);
-        gate.pending_skill_activation = activated.iter().map(|a| a.methodology_id.clone()).collect();
+        gate.pending_skill_activation =
+            activated.iter().map(|a| a.methodology_id.clone()).collect();
         ctx
     }
 
@@ -1655,12 +1656,15 @@ mod tests {
         let mut error_ctx = test_context(HookPoint::TaskError, "DA", Some("glob"));
         error_ctx.error = Some("boom".to_string());
 
-        let settled = gate.settle_pending_skill_usage(false, error_ctx.error.as_deref(), &error_ctx);
+        let settled =
+            gate.settle_pending_skill_usage(false, error_ctx.error.as_deref(), &error_ctx);
 
         assert!(!settled.is_empty());
         assert!(settled.iter().all(|r| !r.success));
         assert!(
-            settled.iter().all(|r| r.error_message.as_deref() == Some("boom")),
+            settled
+                .iter()
+                .all(|r| r.error_message.as_deref() == Some("boom")),
             "failure settlement should carry the error message"
         );
     }
@@ -1703,7 +1707,10 @@ mod tests {
 
         let suggestions = gate.suggest_methodology_adjustments(3, 0.5);
 
-        assert!(!suggestions.is_empty(), "low-success methodologies must yield suggestions");
+        assert!(
+            !suggestions.is_empty(),
+            "low-success methodologies must yield suggestions"
+        );
         for suggestion in &suggestions {
             assert!(matches!(
                 suggestion.suggestion_type,
@@ -1765,16 +1772,28 @@ mod tests {
                 .any(|a| a.methodology_id == "methodology:index-priority"),
             "archived methodology must not activate"
         );
-        assert_eq!(gate.activate("methodology:index-priority", TriggerSource::Manual), None);
+        assert_eq!(
+            gate.activate("methodology:index-priority", TriggerSource::Manual),
+            None
+        );
     }
 
     #[test]
     fn test_archive_methodologies_ignores_unknown_and_dedups() {
         let mut gate = test_gate();
-        assert_eq!(gate.archive_methodologies(&["methodology:does-not-exist"]), 0);
+        assert_eq!(
+            gate.archive_methodologies(&["methodology:does-not-exist"]),
+            0
+        );
         gate.archive_methodologies(&["methodology:index-priority"]);
-        assert_eq!(gate.archive_methodologies(&["methodology:index-priority"]), 0);
-        assert_eq!(gate.archived_methodologies(), vec!["methodology:index-priority"]);
+        assert_eq!(
+            gate.archive_methodologies(&["methodology:index-priority"]),
+            0
+        );
+        assert_eq!(
+            gate.archived_methodologies(),
+            vec!["methodology:index-priority"]
+        );
     }
 
     #[test]
@@ -1799,7 +1818,8 @@ mod tests {
     #[test]
     fn test_archive_cold_methodologies_via_handle() {
         let gate = test_gate();
-        let evolution = EvolutionEngineHandle::new(crate::methodology::evolution::EvolutionEngine::new());
+        let evolution =
+            EvolutionEngineHandle::new(crate::methodology::evolution::EvolutionEngine::new());
         let handle = MethodologyGateHandle::new(gate).with_evolution(evolution);
 
         let now = SystemTime::now()
@@ -1814,10 +1834,16 @@ mod tests {
         // recently activated methodology is older than the cutoff → cold.
         {
             let engine = handle.evolution_handle().unwrap();
-            engine.inner().write().record_activation("methodology:index-priority");
+            engine
+                .inner()
+                .write()
+                .record_activation("methodology:index-priority");
         }
         let cold = handle.archive_cold_methodologies(now + 100_000);
         assert!(cold.contains(&"methodology:index-priority".to_string()));
-        assert!(handle.inner().read().is_archived("methodology:index-priority"));
+        assert!(handle
+            .inner()
+            .read()
+            .is_archived("methodology:index-priority"));
     }
 }

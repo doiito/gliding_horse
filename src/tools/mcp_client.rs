@@ -489,7 +489,10 @@ impl McpClient {
             });
         }
 
-        process.send_request(request).await.and_then(Self::handle_call_response)
+        process
+            .send_request(request)
+            .await
+            .and_then(Self::handle_call_response)
     }
 
     fn handle_call_response(response: JsonRpcResponse) -> Result<Value, CoreError> {
@@ -581,6 +584,7 @@ impl McpClient {
                     input_mapping: Default::default(),
                     output_mapping: Default::default(),
                     skill_types: vec!["skill-types/MCPOperation".to_string()],
+                    discovery_5w2h: None,
                 };
                 registry.register_skill(skill);
                 debug!(iri = %iri, "MCP tool registered in SkillRegistry");

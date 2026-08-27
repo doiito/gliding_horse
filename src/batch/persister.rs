@@ -185,7 +185,10 @@ impl KnowledgePersister {
         for relation in relations {
             let from_iri = entity_iri(domain, &relation.from);
             let to_iri = entity_iri(domain, &relation.to);
-            let rel_iri = format!("https://agent-os.org/ontology/relation/{}", relation.relation);
+            let rel_iri = format!(
+                "https://agent-os.org/ontology/relation/{}",
+                relation.relation
+            );
 
             quads.push(RdfQuad {
                 subject: from_iri,

@@ -183,7 +183,7 @@ impl WatchEngine {
         root: &str,
         config: &WatchConfig,
         event_bus: Arc<EventBus>,
-        inventory: Option<Arc<RwLock<FileInventory>>>,
+        _inventory: Option<Arc<RwLock<FileInventory>>>,
     ) -> Result<Arc<Mutex<Option<Debouncer<notify::RecommendedWatcher>>>>, String> {
         let debounce = Duration::from_millis(config.debounce_ms);
         let root_owned = root.to_string();
@@ -195,7 +195,8 @@ impl WatchEngine {
         // (e.g. a mirrored log file) lives inside the watched workspace, every
         // emitted event produces new log lines that re-trigger the watcher.
         // Silently skipping the same path within the window breaks the cycle.
-        let last_emit = std::sync::Mutex::new(std::collections::HashMap::<String, std::time::Instant>::new());
+        let last_emit =
+            std::sync::Mutex::new(std::collections::HashMap::<String, std::time::Instant>::new());
 
         // Shared handle so the event callback can install watches on newly
         // created directories (NonRecursive watches do not auto-follow).
@@ -213,7 +214,9 @@ impl WatchEngine {
                     let mut last = last_emit.lock().unwrap();
                     let mut out = Vec::new();
                     for event in events {
-                        let Some(path) = event.path.to_str() else { continue };
+                        let Some(path) = event.path.to_str() else {
+                            continue;
+                        };
                         if Self::is_path_excluded(path, &exclude) {
                             debug!(path = %path, "WatchEngine: excluded event");
                             continue;
@@ -238,14 +241,13 @@ impl WatchEngine {
                 if let Some(ref mut debouncer) = *shared.lock().unwrap() {
                     for event in &approved {
                         let path = &event.path;
-                        if path.is_dir() && !Self::is_path_excluded(&path.to_string_lossy(), &exclude)
+                        if path.is_dir()
+                            && !Self::is_path_excluded(&path.to_string_lossy(), &exclude)
                         {
                             // Watch the new directory itself, then any of its
                             // immediate subdirectories, so writes at every level
                             // below the parent watch keep producing events.
-                            let _ = debouncer
-                                .watcher()
-                                .watch(path, RecursiveMode::NonRecursive);
+                            let _ = debouncer.watcher().watch(path, RecursiveMode::NonRecursive);
                             for dir in walkdir::WalkDir::new(path)
                                 .min_depth(1)
                                 .max_depth(1)
@@ -284,13 +286,9 @@ impl WatchEngine {
                 }
             }
             approved.extend(catch_up);
-            if let Some(ref inv) = inventory {
-                for event in &approved {
-                    if let Some(path) = event.path.to_str() {
-                        inv.read().mark_stale(path);
-                    }
-                }
-            }
+            // Inventory state and change provenance are updated by the EventBus
+            // consumer. Mutating it here made an AgentTool write appear as an
+            // external stale change before provenance could be resolved.
             for event in &approved {
                 let (event_type_str, path_str) = Self::map_event(event);
                 debug!(
@@ -335,10 +333,7 @@ impl WatchEngine {
             .into_iter()
             .filter_entry(|entry| {
                 entry.depth() == 1
-                    || !Self::is_path_excluded(
-                        &entry.path().to_string_lossy(),
-                        &watch_exclude,
-                    )
+                    || !Self::is_path_excluded(&entry.path().to_string_lossy(), &watch_exclude)
             })
             .filter_map(|e| e.ok())
         {
@@ -599,7 +594,11 @@ mod tests {
         let t0 = std::time::Instant::now();
         last_emit.insert("/tmp/ws/a.txt".to_string(), t0);
 
-        assert!(!WatchEngine::within_cooldown(&mut last_emit, "/tmp/ws/b.txt", t0));
+        assert!(!WatchEngine::within_cooldown(
+            &mut last_emit,
+            "/tmp/ws/b.txt",
+            t0
+        ));
     }
 
     #[test]
@@ -617,7 +616,13 @@ mod tests {
             "/repo/node_modules/pkg/index.js",
             &patterns
         ));
-        assert!(!WatchEngine::is_path_excluded("/repo/src/main.rs", &patterns));
-        assert!(!WatchEngine::is_path_excluded("/repo/targeted.rs", &patterns));
+        assert!(!WatchEngine::is_path_excluded(
+            "/repo/src/main.rs",
+            &patterns
+        ));
+        assert!(!WatchEngine::is_path_excluded(
+            "/repo/targeted.rs",
+            &patterns
+        ));
     }
 }

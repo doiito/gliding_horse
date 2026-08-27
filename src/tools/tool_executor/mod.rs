@@ -103,6 +103,11 @@ pub struct ToolExecutor {
     kg_store: Arc<std::sync::RwLock<KnowledgeGraphStore>>,
     projection_engine:
         Arc<parking_lot::RwLock<Option<Arc<crate::memory::l3_projection::ProjectionEngine>>>>,
+    /// Persistent backing for archived tool-result IRIs.  The handle is
+    /// attached by AgentRunner after construction so the generic executor can
+    /// keep its standalone default while `read_agent_output` can resolve both
+    /// agent-turn and tool-result IRIs through one bounded read contract.
+    archived_result_store: Arc<parking_lot::RwLock<Option<Arc<crate::memory::l0_store::L0Store>>>>,
     micro_tool_contexts: Arc<parking_lot::RwLock<HashMap<String, MicroToolContext>>>,
     micro_tool_data: Arc<parking_lot::RwLock<HashMap<String, serde_json::Value>>>,
     syscall_gate: Option<crate::core::syscall_gate::SyscallGate>,
@@ -116,11 +121,16 @@ pub struct ToolExecutor {
     shared_skill_creator_gateway:
         Arc<parking_lot::RwLock<Option<Arc<crate::gateway::unified_gateway::UnifiedGateway>>>>,
     security_engine: Arc<parking_lot::RwLock<Option<Arc<SecurityEngine>>>>,
+    /// Whole-file reads whose content has actually been exposed to one
+    /// BizAgent execution context.  The WorkspaceMonitor cache is shared by
+    /// PA/DA/CA, but their LLM contexts are not; a global cache hit therefore
+    /// cannot imply that a different agent still has the content in context.
+    file_read_exposures: Arc<parking_lot::RwLock<HashSet<String>>>,
+    max_micro_tool_descriptions: usize,
+    micro_tool_page_size: usize,
+    micro_tool_max_page_size: usize,
 }
 
-// Max micro-tool descriptions cap — removes oldest entries when exceeded.
-// Prevents tool_descriptions from inflating indefinitely, avoiding thousands of token overhead per LLM request.
-const MAX_MICRO_TOOL_DESCRIPTIONS: usize = 5;
 const MICRO_TOOL_PREFIXES: &[&str] = &[
     "read_full_result_",
     "query_",
@@ -177,6 +187,7 @@ impl ToolExecutor {
             tool_descriptions: Vec::new(),
             kg_store,
             projection_engine: Arc::new(parking_lot::RwLock::new(None)),
+            archived_result_store: Arc::new(parking_lot::RwLock::new(None)),
             micro_tool_contexts: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             micro_tool_data: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             syscall_gate: None,
@@ -189,9 +200,24 @@ impl ToolExecutor {
             shared_skill_vector_store: Arc::new(parking_lot::RwLock::new(None)),
             shared_skill_creator_gateway: Arc::new(parking_lot::RwLock::new(None)),
             security_engine: Arc::new(parking_lot::RwLock::new(None)),
+            file_read_exposures: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            max_micro_tool_descriptions: 5,
+            micro_tool_page_size: 100,
+            micro_tool_max_page_size: 200,
         };
         exe.register_builtins();
         exe
+    }
+
+    pub fn set_micro_tool_limits(
+        &mut self,
+        max_descriptions: usize,
+        page_size: usize,
+        max_page_size: usize,
+    ) {
+        self.max_micro_tool_descriptions = max_descriptions.max(1);
+        self.micro_tool_page_size = page_size.max(1);
+        self.micro_tool_max_page_size = max_page_size.max(self.micro_tool_page_size);
     }
 
     pub fn set_projection_engine(
@@ -201,8 +227,16 @@ impl ToolExecutor {
         *self.projection_engine.write() = Some(engine);
     }
 
+    pub fn set_archived_result_store(&mut self, store: Arc<crate::memory::l0_store::L0Store>) {
+        *self.archived_result_store.write() = Some(store);
+    }
+
     pub fn set_tool_group_manager(&mut self, manager: ToolGroupManager) {
         self.tool_group_manager = Some(manager);
+    }
+
+    pub fn clear_tool_group_manager(&mut self) {
+        self.tool_group_manager = None;
     }
 
     /// Point the existing shared KG holder at a unified Oxigraph Store.
@@ -376,7 +410,8 @@ impl ToolExecutor {
             all,
         );
         let ws_read = self.workspace_monitor.clone();
-        self.register("file_read", "Read a text file. Reads the entire file by default. On re-read of a changed file, returns a unified diff showing what changed. On re-read of an unchanged file, returns from_cache=true — content already in your context, skip re-reading. Use mode:full to force full content, mode:changed_only to get only the new/changed lines.", json!({
+        let read_exposures = self.file_read_exposures.clone();
+        self.register("file_read", "Read a text file. Reads the entire file by default. On re-read of a changed file, returns a unified diff showing what changed. An unchanged whole-file auto re-read may return from_cache=true. Offset/limit reads always return the requested range, including when the file is cached. Use mode:full when earlier content is no longer visible, or mode:changed_only for changed lines.", json!({
             "properties": {
                 "path": {"type":"string", "description": "File path to read"},
                 "offset": {"type":"integer", "description": "Line offset to start from (0-indexed). Omit to read from beginning."},
@@ -386,41 +421,56 @@ impl ToolExecutor {
             "required": ["path"]
         }), Arc::new(move |input: Value| {
             let ws = ws_read.clone();
+            let read_exposures = read_exposures.clone();
             Box::pin(async move {
                 let mode = input.get("mode")
                     .and_then(|v| v.as_str())
                     .unwrap_or("auto")
                     .to_string();
                 let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let read_session = input.get("__gh_read_session")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let exposure_key = read_session.as_ref()
+                    .map(|session| format!("{session}\n{path}"));
+                // Calls made through the legacy context-free execute() API
+                // retain the historical global-cache behavior. Contextual
+                // BizAgent calls require evidence that this exact agent/task
+                // context has already received the whole file.
+                let already_exposed = exposure_key.as_ref()
+                    .map(|key| read_exposures.read().contains(key))
+                    .unwrap_or(true);
                 // Extract offset/limit before input is moved into execute_file_read
                 let has_offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
                 let has_limit = input.get("limit").is_some();
 
-                // Fast path: check ContentStore + FileInventory cache to skip disk read
-                if !path.is_empty() && mode != "force_refresh" {
+                // Fast path is safe only for a repeated whole-file `auto`
+                // read. A previous implementation returned a cache marker for
+                // offset/limit requests too, making it impossible to read the
+                // second chunk of a large file. Explicit `full` also means the
+                // caller needs content again (for example after context
+                // compression), so it must bypass the marker.
+                if !path.is_empty()
+                    && mode == "auto"
+                    && !has_offset
+                    && !has_limit
+                {
                     let guard = ws.read();
                     if let Some(ref wm) = *guard {
-                        let entry = wm.inventory.read().get_entry(&path);
+                        let normalized_path = wm.normalize_path(&path);
+                        let entry = wm.inventory.read().get_entry(&normalized_path);
                         let should_cache = match entry {
                             Some(ref e) => e.state == crate::tools::workspace_monitor::FileState::ReadFresh
                                 && e.current_version == e.last_read_version
-                                && wm.content().try_get_cached(&path).is_some(),
+                                && wm.content().try_get_cached(&normalized_path).is_some(),
                             None => false,
                         };
-                        if should_cache {
-                            if !has_offset && !has_limit {
-                                return Ok(json!({
-                                    "path": path,
-                                    "from_cache": true,
-                                    "message": "Cache hit: file unchanged since last read. Content already in your context — skip re-reading and proceed with what you have."
-                                }));
-                            } else {
-                                return Ok(json!({
-                                    "path": path,
-                                    "from_cache": true,
-                                    "message": "Cache hit: file unchanged since last read. Content already in your context — skip re-reading."
-                                }));
-                            }
+                        if should_cache && already_exposed {
+                            return Ok(json!({
+                                "path": path,
+                                "from_cache": true,
+                                "message": "Cache hit: file unchanged since the last whole-file read. Use mode:full or an offset/limit range if the earlier content is no longer visible."
+                            }));
                         }
                     }
                     drop(guard);
@@ -428,17 +478,19 @@ impl ToolExecutor {
 
                 // Slow path: read from disk once
                 let result = builtins::execute_file_read(input).await?;
+                let exposed_whole_file = !has_offset && !has_limit && result.get("lines").is_some();
                 let guard = ws.read();
                 if let Some(ref wm) = *guard {
                     if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
                         let read_mode = match mode.as_str() {
                             "force_refresh" => crate::tools::workspace_monitor::ReadMode::ForceRefresh,
+                            "full" => crate::tools::workspace_monitor::ReadMode::Full,
                             "diff" => crate::tools::workspace_monitor::ReadMode::Diff,
                             "changed_only" => crate::tools::workspace_monitor::ReadMode::ChangedOnly,
                             _ => {
                                 // auto: use diff if file is already cached, else full
                                 let inv = wm.inventory.read();
-                                let entry = inv.get_entry(path);
+                                let entry = inv.get_entry(&wm.normalize_path(path));
                                 match entry {
                                     Some(e) if e.read_count > 0 => crate::tools::workspace_monitor::ReadMode::Diff,
                                     _ => crate::tools::workspace_monitor::ReadMode::Full,
@@ -462,13 +514,13 @@ impl ToolExecutor {
                                 if !read_result.changed && read_result.from_cache {
                                     // Cache hit: file unchanged since last read.
                                     // Strip full content to avoid token waste on re-read.
-                                    if !has_offset && !has_limit {
+                                    if mode == "auto" && !has_offset && !has_limit && already_exposed {
                                         result.as_object_mut().map(|obj| {
                                             obj.remove("lines");
                                             obj.remove("returned");
                                             obj.insert("from_cache".to_string(), Value::Bool(true));
                                             obj.insert("message".to_string(), Value::String(
-                                                "Cache hit: file unchanged since last read. Content already in your context from a previous read — skip re-reading and proceed with what you have.".to_string()
+                                                "Cache hit: file unchanged since the last whole-file read. Use mode:full or an offset/limit range if the earlier content is no longer visible.".to_string()
                                             ));
                                         });
                                     } else {
@@ -480,10 +532,20 @@ impl ToolExecutor {
                                         });
                                     }
                                 }
+                                if exposed_whole_file {
+                                    if let Some(key) = exposure_key {
+                                        read_exposures.write().insert(key);
+                                    }
+                                }
                                 return Ok(result);
                             }
                         }
                     }
+                if exposed_whole_file {
+                    if let Some(key) = exposure_key {
+                        read_exposures.write().insert(key);
+                    }
+                }
                 Ok(result)
             })
         }), all);
@@ -499,7 +561,9 @@ impl ToolExecutor {
                 let ws = ws_write.clone();
                 Box::pin(async move {
                     let result = builtins::execute_file_write(input).await?;
-                    if result.get("success") == Some(&Value::Bool(true)) {
+                    if result.get("success") == Some(&Value::Bool(true))
+                        && result.get("changed") != Some(&Value::Bool(false))
+                    {
                         let guard = ws.read();
                         if let Some(ref wm) = *guard {
                             if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
@@ -568,31 +632,76 @@ impl ToolExecutor {
             Arc::new(move |input: Value| {
                 let ws = ws_list.clone();
                 Box::pin(async move {
-                    let mut result = builtins::execute_file_list(input).await?;
-                    let guard = ws.read();
-                    if let Some(ref wm) = *guard {
-                        if let Some(entries) =
-                            result.get_mut("entries").and_then(|e| e.as_array_mut())
-                        {
-                            for entry in entries.iter_mut() {
-                                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                let inv = wm.inventory.read();
-                                if let Some(file_entry) = inv.get_entry(name) {
-                                    entry.as_object_mut().map(|obj| {
-                                        obj.insert(
-                                            "state".to_string(),
-                                            Value::String(file_entry.state.as_str().to_string()),
-                                        );
-                                        obj.insert(
-                                            "language".to_string(),
-                                            Value::String(file_entry.language.clone()),
-                                        );
-                                    });
+                    let monitor = ws.read().clone();
+                    if let Some(ref wm) = monitor {
+                        if wm.scan_complete() {
+                            let requested =
+                                input.get("path").and_then(Value::as_str).unwrap_or(".");
+                            let requested_path = std::path::PathBuf::from(requested);
+                            let directory_candidate = if requested == "." {
+                                wm.config.workspace_root.clone()
+                            } else if requested_path.is_absolute() {
+                                requested_path
+                            } else {
+                                wm.config.workspace_root.join(requested_path)
+                            };
+                            let canonical_root = std::fs::canonicalize(&wm.config.workspace_root)
+                                .unwrap_or_else(|_| wm.config.workspace_root.clone());
+                            let Ok(directory) = std::fs::canonicalize(&directory_candidate) else {
+                                // Preserve built-in validation/error semantics for
+                                // missing or unresolved directories.
+                                return builtins::execute_file_list(input).await;
+                            };
+                            if !directory.starts_with(&canonical_root) {
+                                return Err(format!(
+                                    "Path outside workspace is not allowed: {}",
+                                    requested
+                                ));
+                            }
+                            let mut listed =
+                                std::collections::BTreeMap::<String, serde_json::Value>::new();
+                            for file in wm.inventory.read().list_all() {
+                                let file_path = std::path::Path::new(&file.path);
+                                let Ok(relative) = file_path.strip_prefix(&directory) else {
+                                    continue;
+                                };
+                                let mut components = relative.components();
+                                let Some(first) = components.next() else {
+                                    continue;
+                                };
+                                let name = first.as_os_str().to_string_lossy().to_string();
+                                let is_directory = components.next().is_some();
+                                let value = if is_directory {
+                                    json!({"name": name, "type": "dir"})
+                                } else {
+                                    json!({
+                                        "name": name,
+                                        "type": "file",
+                                        "state": file.state.as_str(),
+                                        "language": file.language,
+                                        "size": file.file_size,
+                                        "version": file.current_version,
+                                    })
+                                };
+                                match listed.get(&name) {
+                                    Some(existing) if existing["type"] == "dir" => {}
+                                    _ => {
+                                        listed.insert(name, value);
+                                    }
                                 }
                             }
+                            let entries = listed.into_values().collect::<Vec<_>>();
+                            let count = entries.len();
+                            return Ok(json!({
+                                "path": requested,
+                                "entries": entries,
+                                "count": count,
+                                "source": "workspace_inventory",
+                                "generation": wm.generation(),
+                            }));
                         }
                     }
-                    Ok(result)
+                    builtins::execute_file_list(input).await
                 })
             }),
             all,
@@ -629,7 +738,9 @@ impl ToolExecutor {
             let ws = ws_edit.clone();
             Box::pin(async move {
                 let result = builtins::execute_file_edit(input).await?;
-                if result.get("success") == Some(&Value::Bool(true)) {
+                if result.get("success") == Some(&Value::Bool(true))
+                    && result.get("changed") != Some(&Value::Bool(false))
+                {
                     let guard = ws.read();
                     if let Some(ref wm) = *guard {
                         if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
@@ -907,18 +1018,59 @@ impl ToolExecutor {
 
         // ========== L3 Projection Query Tool ==========
         let proj_for_tool = self.projection_engine.clone();
-        self.register("read_agent_output", "Read the complete output of a specified agent via L3 projection. Use to view detailed reports from previous agents (PA/DA/CA/AA). node_iri is obtained from task context (format: iri://task/xxx/turn_3).", json!({
+        let archived_store_for_tool = self.archived_result_store.clone();
+        let archived_memory_for_tool = self.micro_tool_data.clone();
+        self.register("read_agent_output", "Read archived output by IRI. Agent report IRIs (iri://task/.../turn_N) are projected from L2; tool-result IRIs (iri://tool-result/...) are returned as a bounded page from the result archive. Prefer the exact read_full_result_* session tool when it is advertised.", json!({
             "properties": {
-                "node_iri": {"type":"string","description":"L2 node IRI to read (e.g. iri://task/xxx/turn_3)."}
+                "node_iri": {"type":"string","description":"Agent report or archived tool-result IRI."},
+                "offset": {"type":"integer","description":"Starting line for a tool-result IRI (default 0)."},
+                "limit": {"type":"integer","description":"Maximum lines for a tool-result IRI (default 100, maximum 200)."}
             },
             "required": ["node_iri"]
         }), Arc::new(move |input: Value| {
             let proj = proj_for_tool.clone();
+            let archived_store = archived_store_for_tool.clone();
+            let archived_memory = archived_memory_for_tool.clone();
             Box::pin(async move {
                 let node_iri = input
                     .get("node_iri")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "Missing node_iri parameter".to_string())?;
+                if node_iri.starts_with("iri://tool-result/") {
+                    let archived = archived_memory.read().get(node_iri).cloned().or_else(|| {
+                        archived_store
+                            .read()
+                            .as_ref()
+                            .and_then(|store| store.retrieve(node_iri).ok().flatten())
+                            .and_then(|entry| serde_json::from_str::<Value>(&entry.content).ok())
+                    });
+                    let archived = archived
+                        .ok_or_else(|| format!("Archived tool result not found: {}", node_iri))?;
+                    let content = archived
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| archived.as_str().unwrap_or_default());
+                    let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let limit = input
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(100)
+                        .min(200) as usize;
+                    let lines = content.lines().collect::<Vec<_>>();
+                    let selected = lines
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    return Ok(json!({
+                        "content": selected.join("\n"),
+                        "total_lines": lines.len(),
+                        "offset": offset,
+                        "returned": selected.len(),
+                        "iri": node_iri,
+                    }));
+                }
                 let guard = proj.read();
                 let engine = guard.as_ref()
                     .ok_or_else(|| "Projection engine not initialized".to_string())?;
@@ -1041,7 +1193,7 @@ impl ToolExecutor {
                     .iter()
                     .filter(|td| Self::is_micro_tool_name(&td.name))
                     .count()
-                    > MAX_MICRO_TOOL_DESCRIPTIONS
+                    > self.max_micro_tool_descriptions
                 {
                     // position() returns the first match (oldest registered)
                     if let Some(pos) = self
@@ -1058,7 +1210,7 @@ impl ToolExecutor {
         }
     }
 
-    fn is_micro_tool_name(name: &str) -> bool {
+    pub(crate) fn is_micro_tool_name(name: &str) -> bool {
         MICRO_TOOL_PREFIXES.iter().any(|p| name.starts_with(p))
     }
 
@@ -1067,6 +1219,8 @@ impl ToolExecutor {
         let contexts = Arc::clone(&self.micro_tool_contexts);
         let data = Arc::clone(&self.micro_tool_data);
         let tool_name_owned = tool_name.to_string();
+        let default_page_size = self.micro_tool_page_size;
+        let max_page_size = self.micro_tool_max_page_size;
 
         contexts
             .write()
@@ -1103,7 +1257,12 @@ impl ToolExecutor {
                 let data = data.clone();
                 Box::pin(async move {
                     let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-                    let limit = input["limit"].as_u64().unwrap_or(100) as usize;
+                    // A result reader is a bounded paging API, not an escape hatch
+                    // that can put the complete archived payload back into one
+                    // model turn.  Large callers can page explicitly.
+                    let limit = (input["limit"].as_u64().unwrap_or(default_page_size as u64)
+                        as usize)
+                        .min(max_page_size);
 
                     let ctx_guard = contexts.read();
                     let ctx = ctx_guard.get(&tool_name_owned).ok_or_else(|| {
@@ -1211,6 +1370,53 @@ impl ToolExecutor {
         self.micro_tool_contexts.read().keys().cloned().collect()
     }
 
+    /// Return only dynamic tools generated for one concrete tool call. This
+    /// lets AgentRunner keep micro-tool visibility scoped to a BizAgent
+    /// execution without deleting globally archived handlers that another
+    /// concurrently running agent may still need.
+    pub fn get_micro_tool_names_for_call(&self, call_id: &str) -> Vec<String> {
+        self.micro_tool_contexts
+            .read()
+            .iter()
+            .filter(|(_, context)| context.call_id == call_id)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Reconstruct one active session micro-tool schema even when its catalog
+    /// description was evicted by the process-wide prompt-size cap.  Handler
+    /// and context lifetime are deliberately longer than catalog visibility;
+    /// AgentRunner still decides which owning BizAgent session may advertise
+    /// this schema.
+    pub fn micro_tool_definition(&self, name: &str) -> Option<Value> {
+        let context = self.micro_tool_contexts.read().get(name)?.clone();
+        self.try_get_handler(name)?;
+        let description = if name.starts_with("read_full_result_") {
+            format!(
+                "Read a bounded page of archived tool result {}",
+                context.call_id
+            )
+        } else if name.starts_with("query_") {
+            format!("Query archived result entities for {}", context.call_id)
+        } else {
+            format!("Read archived result data for {}", context.call_id)
+        };
+        Some(json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "offset": {"type": "integer", "description": "Starting offset"},
+                        "limit": {"type": "integer", "description": "Maximum results to return"}
+                    }
+                }
+            }
+        }))
+    }
+
     pub async fn execute(&self, name: &str, input: Value) -> Result<Value, String> {
         let input_str = input.to_string();
 
@@ -1238,6 +1444,22 @@ impl ToolExecutor {
             if hook_result.is_cancelled() {
                 return Ok(json!({"error": "Pre-tool hook was cancelled"}));
             }
+        }
+
+        // Tool discovery must query the live executor catalog, including MCP
+        // and application tools registered after built-ins. The historical
+        // built-in handler contains only a five-item static fallback and made
+        // on-demand tool groups impossible to activate in practice.
+        if name == "tool_search" {
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let max_results = input
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            return Ok(self.search_tools(query, max_results));
         }
 
         if let Some(ref gate) = self.syscall_gate {
@@ -1288,7 +1510,7 @@ impl ToolExecutor {
         allowed_tools: Option<&[String]>,
     ) -> Result<Value, String> {
         if let Some(ref allowed) = allowed_tools {
-            if !allowed.iter().any(|t| t == name) {
+            if !Self::explicit_allowlist_permits(name, allowed) {
                 return Ok(json!({"error": format!("Tool not allowed: {}", name), "tool": name}));
             }
         }
@@ -1334,7 +1556,32 @@ impl ToolExecutor {
                 }
             }
         }
+        let mut input = input;
+        if name == "file_read" {
+            // Internal-only context tag. serde ignores this extra field in the
+            // built-in FileReadInput; it exists solely to isolate cache
+            // visibility between PA/DA/CA LLM conversations.
+            let task = context.task_iri.as_deref().unwrap_or("no-task");
+            if let Some(object) = input.as_object_mut() {
+                object.insert(
+                    "__gh_read_session".to_string(),
+                    Value::String(format!(
+                        "{}|{}|{}",
+                        task, context.agent_id, context.agent_role
+                    )),
+                );
+            }
+        }
         self.execute(name, input).await
+    }
+
+    /// Exact allowlist matching plus the read-only micro-tools generated by
+    /// result routing.  A caller that grants `file_read` may consume those
+    /// archived read results; no write capability is implied.
+    pub fn explicit_allowlist_permits(name: &str, allowed: &[String]) -> bool {
+        allowed.iter().any(|tool| tool == name)
+            || (allowed.iter().any(|tool| tool == "file_read")
+                && (name == "read_agent_output" || name.starts_with("read_full_result_")))
     }
 
     /// Get tool handler (avoid holding lock across await)
@@ -1368,6 +1615,8 @@ impl ToolExecutor {
         let data_guard = self.micro_tool_data.read();
         let stored_data = data_guard.get(&storage_key)?.clone();
         drop(data_guard);
+        let default_page_size = self.micro_tool_page_size;
+        let max_page_size = self.micro_tool_max_page_size;
 
         Some(Arc::new(move |input: Value| {
             let _storage_key = storage_key.clone();
@@ -1376,7 +1625,8 @@ impl ToolExecutor {
 
             Box::pin(async move {
                 let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-                let limit = input["limit"].as_u64().unwrap_or(100) as usize;
+                let limit = (input["limit"].as_u64().unwrap_or(default_page_size as u64) as usize)
+                    .min(max_page_size);
 
                 if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
                     let lines: Vec<&str> = content.lines().collect();
@@ -1414,6 +1664,12 @@ impl ToolExecutor {
 
     /// Return all tool definitions (LLM autonomously selects based on role description in agent.md)
     pub fn tool_definitions_for_role(&self, role: &str) -> Vec<Value> {
+        if matches!(role, "AA" | "Act") {
+            // AA receives CA evidence through BizAgent context and only emits
+            // a terminal decision. Never advertise tools on a lower-level
+            // Runner path either, so callers cannot bypass the BizAgent rule.
+            return Vec::new();
+        }
         let role_name = match role {
             "PA" | "Plan" => "Plan",
             "DA" | "Do" => "Do",
@@ -1422,37 +1678,25 @@ impl ToolExecutor {
             _ => role,
         };
 
-        let (default_tools, on_demand_tools) = if let Some(ref manager) = self.tool_group_manager {
-            manager.get_tool_names_for_role(role_name)
+        let (default_tools, on_demand_tools) = if self.tool_group_manager.is_some() {
+            // This method is the complete role-authorized catalog. Default
+            // window filtering is applied by visible_tool_definitions_for_role;
+            // keeping the full catalog here allows tool_search to activate
+            // on-demand and late-registered MCP tools.
+            let all: HashSet<String> = self
+                .tool_descriptions
+                .iter()
+                .map(|td| td.name.clone())
+                .collect();
+            (all.clone(), all)
         } else {
             let is_pa = role == "Plan" || role == "PA";
-            let is_aa = role == "Act" || role == "AA";
             if is_pa {
                 let default: HashSet<String> = Self::pa_readonly_tools()
                     .iter()
                     .map(|s| s.to_string())
                     .collect();
                 (default.clone(), default)
-            } else if is_aa {
-                // Design: AA = Core(file_read,file_list) + System(tool_search) by default, Search+Knowledge on demand
-                let aa_tools: HashSet<String> = [
-                    "file_read",
-                    "file_list",
-                    "tool_search",
-                    "grep_search",
-                    "glob_search",
-                    "rag_search",
-                    "kg_search",
-                    "codebase_search",
-                    "knowledge_list",
-                    "knowledge_search",
-                    "knowledge_extract_code",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-                let all = aa_tools.clone();
-                (all, aa_tools)
             } else {
                 let all: HashSet<String> = self
                     .tool_descriptions
@@ -1467,6 +1711,19 @@ impl ToolExecutor {
             .tool_descriptions
             .iter()
             .filter(|td| {
+                let parsed_role = match role_name {
+                    "Plan" => Some(crate::core::agent_instance::AgentRole::Plan),
+                    "Do" => Some(crate::core::agent_instance::AgentRole::Do),
+                    "Check" => Some(crate::core::agent_instance::AgentRole::Check),
+                    "Act" => Some(crate::core::agent_instance::AgentRole::Act),
+                    _ => None,
+                };
+                if parsed_role.map(|role| {
+                    crate::core::tool_controller::business_role_allows_tool(role, &td.name)
+                }) == Some(false)
+                {
+                    return false;
+                }
                 if !td.allowed_roles.is_empty() {
                     return td.allowed_roles.iter().any(|r| r == role || r == role_name);
                 }
@@ -1535,15 +1792,16 @@ impl ToolExecutor {
     }
 
     /// Role-filtered tool definitions intersected with an explicit allowlist.
-    /// `None`/empty keeps the full role-filtered set; non-empty keeps only
-    /// definitions whose name appears in the list (SA `RestrictTools` override).
+    /// `None` keeps the full role-filtered set. `Some(empty)` is an explicit
+    /// deny-all capability set. A non-empty list is intersected with the role
+    /// set (SA/task policy may narrow but never broaden role authority).
     pub fn tool_definitions_for_role_with_allowlist(
         &self,
         role: &str,
         allowlist: Option<&[String]>,
     ) -> Vec<Value> {
         let result = self.tool_definitions_for_role(role);
-        let Some(allowed) = allowlist.filter(|l| !l.is_empty()) else {
+        let Some(allowed) = allowlist else {
             return result;
         };
         let allowed: HashSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
@@ -1572,24 +1830,35 @@ impl ToolExecutor {
             "knowledge_search",
             "kg_search",
             "knowledge_extract_code",
+            "read_agent_output",
             "bash",
         ]
     }
 
     pub fn is_pa_readonly_tool(name: &str) -> bool {
-        Self::pa_readonly_tools().contains(&name)
+        Self::pa_readonly_tools().contains(&name) || Self::is_micro_tool_name(name)
     }
 
     /// ToolSearch needs access to the tool list
     pub fn search_tools(&self, query: &str, max_results: Option<usize>) -> Value {
         let query_lower = query.to_lowercase();
+        let query_terms: Vec<&str> = query_lower
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|term| !term.is_empty())
+            .collect();
         let max = max_results.unwrap_or(10);
         let matches: Vec<Value> = self
             .tool_descriptions
             .iter()
             .filter(|t| {
-                t.name.to_lowercase().contains(&query_lower)
-                    || t.description.to_lowercase().contains(&query_lower)
+                let searchable = format!(
+                    "{} {}",
+                    t.name.to_lowercase().replace('_', " "),
+                    t.description.to_lowercase()
+                );
+                query_lower.is_empty()
+                    || searchable.contains(&query_lower)
+                    || query_terms.iter().all(|term| searchable.contains(term))
             })
             .take(max)
             .map(|t| {

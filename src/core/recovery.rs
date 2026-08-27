@@ -142,12 +142,15 @@ impl AuditReport {
     }
 }
 
-pub fn scope_for_dimension(dimension: &str) -> RepairScope {
-    match dimension {
-        "what" | "why" => RepairScope::Task,
-        "who" | "when" | "where" => RepairScope::Phase,
-        _ => RepairScope::Step,
-    }
+pub fn scope_for_dimension(_dimension: &str) -> RepairScope {
+    // A 5W2H dimension identifies which acceptance boundary failed, not which
+    // business role owns the repair. For example, a `why` failure can simply
+    // mean that DA omitted a required test; sending that directly to PA would
+    // discard a valid plan and waste a complete PDCA cycle. Start with a local
+    // executable repair. `track_non_convergence` promotes repeated identical
+    // failures to task scope, where SA re-enters PA with the accumulated CA
+    // evidence.
+    RepairScope::Step
 }
 
 pub fn select_directive(
@@ -208,10 +211,10 @@ mod tests {
     }
 
     #[test]
-    fn task_scope_escalates_to_replan() {
+    fn acceptance_dimension_does_not_prejudge_repair_owner() {
         let report = AuditReport::from_results(&[finding("why")]);
-        assert_eq!(report.scope, RepairScope::Task);
-        assert_eq!(select_directive(&report, 0, 3), RecoveryDirective::ReplanPa);
+        assert_eq!(report.scope, RepairScope::Step);
+        assert_eq!(select_directive(&report, 0, 3), RecoveryDirective::RetryDa);
     }
 
     #[test]

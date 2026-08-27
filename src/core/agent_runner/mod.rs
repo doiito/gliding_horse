@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use crate::tools::tool_executor::ToolExecutor;
 use crate::tools::tool_guard::ToolGuard;
 
 mod execution;
+pub(crate) use execution::{CA_DA_CORRECTION_MODE, SA_RECOVERY_MODE_CONSTRAINT};
 mod prompt;
 mod utils;
 
@@ -97,6 +98,9 @@ pub struct TaskContext {
     pub workspace_file_summary: Option<String>,
     /// Tool allowlist for this execution (None = all tools allowed)
     pub allowed_tools: Option<Vec<String>>,
+    /// Generic execution-effect contract. Domain applications classify their
+    /// tasks into this protocol; the kernel never infers domain semantics.
+    pub effect_policy: crate::core::effect::EffectPolicy,
 }
 
 impl TaskContext {
@@ -123,6 +127,7 @@ impl TaskContext {
             cycle_id: String::new(),
             workspace_file_summary: None,
             allowed_tools: None,
+            effect_policy: crate::core::effect::EffectPolicy::None,
         }
     }
 
@@ -151,6 +156,32 @@ impl TaskContext {
     pub fn with_original_task(mut self, task: &str) -> Self {
         self.original_task = Some(task.to_string());
         self
+    }
+
+    /// Carry application-declared execution constraints through SA into each
+    /// BizAgent context. The kernel interprets only generic constraint keys;
+    /// domain applications decide when those constraints apply.
+    pub fn with_constraints(mut self, constraints: HashMap<String, String>) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
+    pub fn with_constraint(mut self, key: &str, value: &str) -> Self {
+        self.constraints.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    pub fn with_effect_policy(mut self, policy: crate::core::effect::EffectPolicy) -> Self {
+        self.effect_policy = policy;
+        self
+    }
+
+    pub fn effective_effect_policy(&self) -> crate::core::effect::EffectPolicy {
+        if self.effect_policy != crate::core::effect::EffectPolicy::None {
+            self.effect_policy.clone()
+        } else {
+            crate::core::effect::EffectPolicy::from_legacy_constraints(&self.constraints)
+        }
     }
 
     pub fn with_steps(mut self, completed: Vec<String>, pending: Vec<String>) -> Self {
@@ -199,7 +230,9 @@ impl TaskContext {
     }
 
     pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
-        self.allowed_tools = if tools.is_empty() { None } else { Some(tools) };
+        // None means unrestricted by this layer; Some(empty) is an explicit
+        // deny-all capability set (used by decision-only BizAgents such as AA).
+        self.allowed_tools = Some(tools);
         self
     }
 }
@@ -228,6 +261,7 @@ impl Default for TaskContext {
             cycle_id: String::new(),
             workspace_file_summary: None,
             allowed_tools: None,
+            effect_policy: crate::core::effect::EffectPolicy::None,
         }
     }
 }
@@ -299,6 +333,7 @@ pub struct AgentRunner {
     /// Token-optimization settings (compressor/aging/context-window tuning).
     /// Defaults match the historical hardcoded values when not provided.
     pub token_optimization: crate::config::settings::TokenOptimizationSettings,
+    pub tool_result_router_settings: crate::config::settings::ToolResultRouterSettings,
     pub hook_manager: Arc<HookManager>,
     pub projection: Arc<ProjectionEngine>,
     pub sharing: Arc<SharingProtocol>,
@@ -339,6 +374,9 @@ pub struct AgentRunner {
     pub causal_engine: Option<Arc<crate::causal::CausalEngine>>,
     /// Skill graph store — the cognitive network of registered skills
     pub skill_graph_store: Option<Arc<crate::skill_graph::graph_store::SkillGraphStore>>,
+    /// Continuous-learning experiment arm. This is execution-wide so every
+    /// BizAgent in one SA task observes the same causal treatment.
+    pub learning_mode: crate::core::policy_learning::LearningMode,
 }
 
 impl AgentRunner {
@@ -383,16 +421,19 @@ impl AgentRunner {
             gateway,
             skills,
             blackboard,
-            l0_store,
+            l0_store: l0_store.clone(),
             memory_manager,
             templates,
             tool_executor: {
                 let mut exe = ToolExecutor::new();
                 exe.set_projection_engine(projection.clone());
+                exe.set_archived_result_store(l0_store.clone());
                 Arc::new(parking_lot::RwLock::new(exe))
             },
             agent_settings,
             token_optimization: crate::config::settings::TokenOptimizationSettings::default(),
+            tool_result_router_settings: crate::config::settings::ToolResultRouterSettings::default(
+            ),
             hook_manager,
             projection,
             sharing,
@@ -412,6 +453,7 @@ impl AgentRunner {
             prompt_loader: None,
             application_prompt: None,
             prompt_variant: crate::core::prompt_contract::PromptVariant::from_env(),
+            learning_mode: crate::core::policy_learning::LearningMode::Active,
             methodology_gate,
             root_cause_engine,
             supplement_store: crate::core::supplementary_store::SupplementaryInputStore::new(),
@@ -459,7 +501,48 @@ impl AgentRunner {
         token_optimization: crate::config::settings::TokenOptimizationSettings,
     ) -> Self {
         self.token_optimization = token_optimization;
+        {
+            let mut executor = self.tool_executor.write();
+            if self.token_optimization.enabled && self.token_optimization.tool_groups.enabled {
+                let roles = self
+                    .token_optimization
+                    .tool_groups
+                    .roles
+                    .iter()
+                    .map(|(role, config)| {
+                        (
+                            role.clone(),
+                            crate::tools::tool_groups::RoleToolConfig {
+                                default: config.default.clone(),
+                                on_demand: config.on_demand.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                executor.set_tool_group_manager(crate::tools::tool_groups::ToolGroupManager::new(
+                    Some(crate::tools::tool_groups::ToolGroupSettings {
+                        enabled: true,
+                        roles,
+                    }),
+                ));
+            } else {
+                executor.clear_tool_group_manager();
+            }
+        }
         self.init_context_compressors();
+        self
+    }
+
+    pub fn with_tool_result_router_settings(
+        mut self,
+        settings: crate::config::settings::ToolResultRouterSettings,
+    ) -> Self {
+        self.tool_executor.write().set_micro_tool_limits(
+            settings.max_micro_tools,
+            settings.micro_tool_page_size,
+            settings.micro_tool_max_page_size,
+        );
+        self.tool_result_router_settings = settings;
         self
     }
     pub fn with_prefetch_engine(mut self, prefetch_engine: Arc<PrefetchEngine>) -> Self {
@@ -531,6 +614,11 @@ impl AgentRunner {
         self
     }
 
+    pub fn with_learning_mode(mut self, mode: crate::core::policy_learning::LearningMode) -> Self {
+        self.learning_mode = mode;
+        self
+    }
+
     pub(super) fn tool_definitions_for_agent(&self, role: &str) -> Vec<Value> {
         let executor = self.tool_executor.read();
         match self.prompt_variant {
@@ -541,6 +629,75 @@ impl AgentRunner {
                 executor.visible_tool_definitions_for_role(role)
             }
         }
+    }
+
+    pub(super) fn tool_definitions_for_context(
+        &self,
+        role: &str,
+        allowed_tools: Option<&[String]>,
+    ) -> Vec<Value> {
+        self.tool_definitions_for_context_with_microtools(role, allowed_tools, &HashSet::new())
+    }
+
+    /// Build the tool window for one BizAgent execution. Dynamic result-reader
+    /// tools are process-global handlers because their archived data can
+    /// outlive a turn, but they must not become process-global prompt state.
+    /// Only readers created by this execution are advertised to its model.
+    pub(super) fn tool_definitions_for_context_with_microtools(
+        &self,
+        role: &str,
+        allowed_tools: Option<&[String]>,
+        session_micro_tools: &HashSet<String>,
+    ) -> Vec<Value> {
+        let definitions = match self.prompt_variant {
+            crate::core::prompt_contract::PromptVariant::Baseline => {
+                self.tool_definitions_for_agent(role)
+            }
+            crate::core::prompt_contract::PromptVariant::Optimized => {
+                let executor = self.tool_executor.read();
+                let mut visible = executor.visible_tool_definitions_for_role(role);
+                let mut names: HashSet<String> = visible
+                    .iter()
+                    .filter_map(|definition| {
+                        definition["function"]["name"].as_str().map(str::to_string)
+                    })
+                    .collect();
+                for definition in executor.tool_definitions_for_role(role) {
+                    let Some(name) = definition["function"]["name"].as_str() else {
+                        continue;
+                    };
+                    if session_micro_tools.contains(name) && names.insert(name.to_string()) {
+                        visible.push(definition);
+                    }
+                }
+                // `max_micro_tools` bounds the process-wide catalog, not the
+                // validity of references already present in this BizAgent's
+                // current conversation. Rebuild evicted schemas only for the
+                // owning session; never expose another agent's archived tools.
+                for name in session_micro_tools {
+                    if ToolExecutor::is_micro_tool_name(name) && names.insert(name.clone()) {
+                        if let Some(definition) = executor.micro_tool_definition(name) {
+                            visible.push(definition);
+                        }
+                    }
+                }
+                visible
+            }
+        };
+        definitions
+            .into_iter()
+            .filter(|definition| {
+                let Some(name) = definition["function"]["name"].as_str() else {
+                    return false;
+                };
+                if ToolExecutor::is_micro_tool_name(name) && !session_micro_tools.contains(name) {
+                    return false;
+                }
+                allowed_tools
+                    .map(|allowed| ToolExecutor::explicit_allowlist_permits(name, allowed))
+                    .unwrap_or(true)
+            })
+            .collect()
     }
 
     /// Set the workspace root directory for all agents.

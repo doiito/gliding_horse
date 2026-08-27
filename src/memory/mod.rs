@@ -17,10 +17,10 @@ pub use embedding_service::{
     OneApiEmbeddingService,
 };
 pub use hyperspace_store::{HybridSearchFilter, HyperspaceStore, ScoredEntry};
-pub use l0_store::{L0Store, MesiState};
+pub use l0_store::{L0RecordKind, L0Store, MesiState, RetentionClass};
 pub use l1_session::{cosine_similarity, EvictionConfig, L1Session, L1Turn};
 pub use l2_blackboard::{
-    AgentActivity, AgentStatus, Blackboard, LockType, ResourceLock, TaskTreeNode,
+    AgentActivity, AgentStatus, Blackboard, DurabilityClass, LockType, ResourceLock, TaskTreeNode,
 };
 pub use l3_projection::ProjectionEngine;
 pub use memory_bus::MemoryBus;

@@ -31,49 +31,63 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
                 Ok(())
             })
         })),
-        InterventionAction::ContinueWithMonitor => Some(Box::new(|_sa, cycle, _params, _task_iri| {
-            Box::pin(async move {
-                cycle.intervention.monitor = true;
-                warn!("Intervention: continue with monitoring");
-                Ok(())
-            })
-        })),
-        InterventionAction::IncreaseRetry { .. } => Some(Box::new(|_sa, cycle, params, _task_iri| {
-            Box::pin(async move {
-                let retries = params.additional_retries.unwrap_or(3);
-                cycle.intervention.max_iterations_delta += retries as i32;
-                info!(
-                    "Intervention: increase retries by {} (max_iterations_delta={})",
-                    retries, cycle.intervention.max_iterations_delta
-                );
-                Ok(())
-            })
-        })),
-        InterventionAction::IncreaseTimeout { .. } => Some(Box::new(|_sa, cycle, params, _task_iri| {
-            Box::pin(async move {
-                let secs = params.additional_seconds.unwrap_or(60);
-                cycle.intervention.timeout_delta_secs += secs as i64;
-                info!(
-                    "Intervention: increase timeout by {}s (timeout_delta_secs={})",
-                    secs, cycle.intervention.timeout_delta_secs
-                );
-                Ok(())
-            })
-        })),
-        InterventionAction::ReduceComplexity => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
-            Box::pin(async move {
-                info!("Intervention: reduce complexity expectation");
-                Ok(())
-            })
-        })),
-        InterventionAction::RestrictTools { .. } => Some(Box::new(|_sa, cycle, params, _task_iri| {
-            Box::pin(async move {
-                let tools = params.allowed_tools.clone().unwrap_or_default();
-                cycle.intervention.tool_allowlist_override = Some(tools.clone());
-                info!("Intervention: restrict tools to {:?}", tools);
-                Ok(())
-            })
-        })),
+        InterventionAction::ContinueWithMonitor => {
+            Some(Box::new(|_sa, cycle, _params, _task_iri| {
+                Box::pin(async move {
+                    cycle.intervention.monitor = true;
+                    let now = chrono::Utc::now();
+                    cycle.last_timeout_alert_at = Some(now);
+                    warn!("Intervention: continue with monitoring");
+                    Ok(())
+                })
+            }))
+        }
+        InterventionAction::IncreaseRetry { .. } => {
+            Some(Box::new(|_sa, cycle, params, _task_iri| {
+                Box::pin(async move {
+                    let retries = params.additional_retries.unwrap_or(3);
+                    cycle.intervention.max_iterations_delta += retries as i32;
+                    info!(
+                        "Intervention: increase retries by {} (max_iterations_delta={})",
+                        retries, cycle.intervention.max_iterations_delta
+                    );
+                    Ok(())
+                })
+            }))
+        }
+        InterventionAction::IncreaseTimeout { .. } => {
+            Some(Box::new(|_sa, cycle, params, _task_iri| {
+                Box::pin(async move {
+                    let secs = params.additional_seconds.unwrap_or(60);
+                    cycle.intervention.timeout_delta_secs += secs as i64;
+                    cycle.cycle_deadline_at =
+                        cycle.cycle_deadline_at + chrono::Duration::seconds(secs as i64);
+                    info!(
+                        "Intervention: increase timeout by {}s (timeout_delta_secs={})",
+                        secs, cycle.intervention.timeout_delta_secs
+                    );
+                    Ok(())
+                })
+            }))
+        }
+        InterventionAction::ReduceComplexity => {
+            Some(Box::new(|_sa, _cycle, _params, _task_iri| {
+                Box::pin(async move {
+                    info!("Intervention: reduce complexity expectation");
+                    Ok(())
+                })
+            }))
+        }
+        InterventionAction::RestrictTools { .. } => {
+            Some(Box::new(|_sa, cycle, params, _task_iri| {
+                Box::pin(async move {
+                    let tools = params.allowed_tools.clone().unwrap_or_default();
+                    cycle.intervention.tool_allowlist_override = Some(tools.clone());
+                    info!("Intervention: restrict tools to {:?}", tools);
+                    Ok(())
+                })
+            }))
+        }
         InterventionAction::SkipStep { .. } => Some(Box::new(|_sa, _cycle, params, _task_iri| {
             Box::pin(async move {
                 let step = params.step_id.as_deref().unwrap_or("unknown");
@@ -115,29 +129,33 @@ pub(super) fn get_action_handler(action: &InterventionAction) -> Option<ActionHa
                 })
             }))
         }
-        InterventionAction::FallbackToShallow => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
-            Box::pin(async move {
-                info!("Intervention: fall back to shallow mode");
-                Ok(())
-            })
-        })),
+        InterventionAction::FallbackToShallow => {
+            Some(Box::new(|_sa, _cycle, _params, _task_iri| {
+                Box::pin(async move {
+                    info!("Intervention: fall back to shallow mode");
+                    Ok(())
+                })
+            }))
+        }
         InterventionAction::EmergencyMode => Some(Box::new(|_sa, _cycle, _params, _task_iri| {
             Box::pin(async move {
                 warn!("Intervention: entering emergency mode");
                 Ok(())
             })
         })),
-        InterventionAction::IncreaseBudget { .. } => Some(Box::new(|_sa, _cycle, params, _task_iri| {
-            Box::pin(async move {
-                let tokens = params.additional_tokens.unwrap_or(1000);
-                let secs = params.additional_time_secs.unwrap_or(120);
-                info!(
-                    "Intervention: increase budget {} tokens + {}s (human approved)",
-                    tokens, secs
-                );
-                Ok(())
-            })
-        })),
+        InterventionAction::IncreaseBudget { .. } => {
+            Some(Box::new(|_sa, _cycle, params, _task_iri| {
+                Box::pin(async move {
+                    let tokens = params.additional_tokens.unwrap_or(1000);
+                    let secs = params.additional_time_secs.unwrap_or(120);
+                    info!(
+                        "Intervention: increase budget {} tokens + {}s (human approved)",
+                        tokens, secs
+                    );
+                    Ok(())
+                })
+            }))
+        }
         InterventionAction::FreezeAndReport => {
             Some(Box::new(|sa, _cycle, _params, task_iri| {
                 Box::pin(async move {

@@ -36,6 +36,13 @@ pub struct CliConfig {
     pub workspace: String,
     pub max_iterations: u32,
     pub max_pdca_cycles: u32,
+    /// Controlled continuous-learning treatment for this process.
+    pub learning_mode: glidinghorse::core::policy_learning::LearningMode,
+    /// Optional identifier shared by baseline/shadow/active executions of the
+    /// same controlled task. It never changes model behavior by itself.
+    pub learning_pair_id: Option<String>,
+    /// Audit label for fixed experiment randomness/configuration.
+    pub learning_seed: Option<String>,
     pub max_l1_mb: u64,
     pub max_l2_mb: u64,
     pub max_l3_mb: u64,
@@ -57,6 +64,7 @@ impl CliConfig {
         workspace: String,
         max_iterations: u32,
         max_pdca_cycles: u32,
+        learning_mode: glidinghorse::core::policy_learning::LearningMode,
         workflow_path: Option<String>,
         skill_dir: Option<String>,
     ) -> Self {
@@ -77,8 +85,8 @@ impl CliConfig {
             model
         };
 
-        // Responses API only affects deepseek-v4-flash (the gateway falls back to
-        // chat completions for other models), so it is safe to enable by default.
+        // Endpoint selection is explicit and model-neutral. The configured API
+        // provider, not a client-side model-name allowlist, owns capability.
         let use_responses_api = std::env::var("USE_RESPONSES_API")
             .or_else(|_| std::env::var("AGENT_OS_GATEWAY_USE_RESPONSES_API"))
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -111,6 +119,8 @@ impl CliConfig {
 
         let mcp_servers = Self::load_mcp_servers();
         let mcp_stdio_servers = Self::load_mcp_stdio_servers();
+        let learning_pair_id = std::env::var("GLIDING_LEARNING_PAIR_ID").ok();
+        let learning_seed = std::env::var("GLIDING_LEARNING_SEED").ok();
 
         Self {
             gateway,
@@ -118,14 +128,17 @@ impl CliConfig {
             workspace,
             max_iterations,
             max_pdca_cycles,
-max_l1_mb,
-        max_l2_mb,
-        max_l3_mb,
-        data_dir,
-        skill_dir,
-        workflow_path,
-        mcp_servers,
-        mcp_stdio_servers,
+            learning_mode,
+            learning_pair_id,
+            learning_seed,
+            max_l1_mb,
+            max_l2_mb,
+            max_l3_mb,
+            data_dir,
+            skill_dir,
+            workflow_path,
+            mcp_servers,
+            mcp_stdio_servers,
         }
     }
 
@@ -223,6 +236,9 @@ max_l1_mb,
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
             max_pdca_cycles: self.max_pdca_cycles,
+            learning_mode: self.learning_mode,
+            learning_pair_id: self.learning_pair_id.clone(),
+            learning_seed: self.learning_seed.clone(),
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
@@ -243,6 +259,9 @@ max_l1_mb,
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
             max_pdca_cycles: self.max_pdca_cycles,
+            learning_mode: self.learning_mode,
+            learning_pair_id: self.learning_pair_id.clone(),
+            learning_seed: self.learning_seed.clone(),
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,
@@ -263,6 +282,9 @@ max_l1_mb,
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
             max_pdca_cycles: self.max_pdca_cycles,
+            learning_mode: self.learning_mode,
+            learning_pair_id: self.learning_pair_id.clone(),
+            learning_seed: self.learning_seed.clone(),
             max_l1_mb: self.max_l1_mb,
             max_l2_mb: self.max_l2_mb,
             max_l3_mb: self.max_l3_mb,

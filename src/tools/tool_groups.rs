@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 pub enum ToolGroup {
     Core,
     Write,
+    Verify,
     Search,
     Web,
     Knowledge,
@@ -18,6 +19,7 @@ impl std::fmt::Display for ToolGroup {
         match self {
             ToolGroup::Core => write!(f, "Core"),
             ToolGroup::Write => write!(f, "Write"),
+            ToolGroup::Verify => write!(f, "Verify"),
             ToolGroup::Search => write!(f, "Search"),
             ToolGroup::Web => write!(f, "Web"),
             ToolGroup::Knowledge => write!(f, "Knowledge"),
@@ -35,6 +37,7 @@ impl std::str::FromStr for ToolGroup {
         match s.to_lowercase().as_str() {
             "core" => Ok(ToolGroup::Core),
             "write" => Ok(ToolGroup::Write),
+            "verify" => Ok(ToolGroup::Verify),
             "search" => Ok(ToolGroup::Search),
             "web" => Ok(ToolGroup::Web),
             "knowledge" => Ok(ToolGroup::Knowledge),
@@ -85,10 +88,14 @@ impl Default for ToolGroupSettings {
                 default: vec![
                     "Core".to_string(),
                     "Search".to_string(),
-                    "Knowledge".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Web".to_string(), "Code".to_string(), "Skill".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "Knowledge".to_string(),
+                    "Code".to_string(),
+                    "Skill".to_string(),
+                ],
             },
         );
 
@@ -99,12 +106,14 @@ impl Default for ToolGroupSettings {
                     "Core".to_string(),
                     "Write".to_string(),
                     "Search".to_string(),
-                    "Web".to_string(),
-                    "Code".to_string(),
-                    "Skill".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Knowledge".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "Knowledge".to_string(),
+                    "Code".to_string(),
+                    "Skill".to_string(),
+                ],
             },
         );
 
@@ -114,10 +123,14 @@ impl Default for ToolGroupSettings {
                 default: vec![
                     "Core".to_string(),
                     "Search".to_string(),
-                    "Knowledge".to_string(),
+                    "Verify".to_string(),
                     "System".to_string(),
                 ],
-                on_demand: vec!["Web".to_string(), "Code".to_string()],
+                on_demand: vec![
+                    "Web".to_string(),
+                    "Knowledge".to_string(),
+                    "Code".to_string(),
+                ],
             },
         );
 
@@ -158,16 +171,33 @@ impl ToolGroupManager {
 
         map.insert(
             ToolGroup::Core,
-            HashSet::from(["file_read".to_string(), "file_list".to_string()]),
+            HashSet::from([
+                "file_read".to_string(),
+                "file_list".to_string(),
+                "workspace_status".to_string(),
+                "read_agent_output".to_string(),
+            ]),
         );
 
         map.insert(
             ToolGroup::Write,
             HashSet::from([
                 "file_write".to_string(),
+                "file_edit".to_string(),
                 "file_delete".to_string(),
                 "bash".to_string(),
                 "powershell".to_string(),
+            ]),
+        );
+
+        // Verification is separate from Write so CA receives executable
+        // evidence tools without inheriting file mutation schemas.
+        map.insert(
+            ToolGroup::Verify,
+            HashSet::from([
+                "bash".to_string(),
+                "powershell".to_string(),
+                "jsonld_validate".to_string(),
             ]),
         );
 
@@ -234,6 +264,8 @@ impl ToolGroupManager {
             return (
                 vec![
                     ToolGroup::Core,
+                    ToolGroup::Write,
+                    ToolGroup::Verify,
                     ToolGroup::Search,
                     ToolGroup::Web,
                     ToolGroup::Knowledge,
@@ -350,11 +382,12 @@ mod tests {
 
         assert!(default.contains(&ToolGroup::Core));
         assert!(default.contains(&ToolGroup::Search));
-        assert!(default.contains(&ToolGroup::Knowledge));
         assert!(default.contains(&ToolGroup::System));
         assert!(!default.contains(&ToolGroup::Web));
+        assert!(!default.contains(&ToolGroup::Knowledge));
 
         assert!(on_demand.contains(&ToolGroup::Web));
+        assert!(on_demand.contains(&ToolGroup::Knowledge));
         assert!(on_demand.contains(&ToolGroup::Code));
     }
 
@@ -380,6 +413,19 @@ mod tests {
         assert!(tools.contains("bash"));
         assert!(tools.contains("powershell"));
         assert!(!tools.contains("file_read"));
+    }
+
+    #[test]
+    fn test_check_has_verification_without_file_mutation_tools() {
+        let manager = ToolGroupManager::new(None);
+        let (default, _) = manager.get_groups_for_role("Check");
+        assert!(default.contains(&ToolGroup::Verify));
+        let tools = manager.get_tools_for_groups(&default);
+        assert!(tools.contains("bash"));
+        assert!(tools.contains("jsonld_validate"));
+        assert!(!tools.contains("file_write"));
+        assert!(!tools.contains("file_edit"));
+        assert!(!tools.contains("file_delete"));
     }
 
     #[test]

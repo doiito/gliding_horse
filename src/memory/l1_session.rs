@@ -23,6 +23,28 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     (dot / (norm_a * norm_b)).clamp(-1.0, 1.0) as f64
 }
 
+/// Conservative model-neutral token estimate used for the L1 budget.
+/// CJK characters are typically close to one token each; remaining UTF-8
+/// bytes use the common four-bytes-per-token approximation. Provider-reported
+/// usage remains the authority when it is available at a higher layer.
+fn estimate_summary_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut cjk_chars = 0usize;
+    let mut other_bytes = 0usize;
+    for ch in text.chars() {
+        if matches!(ch as u32,
+            0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+        {
+            cjk_chars += 1;
+        } else {
+            other_bytes += ch.len_utf8();
+        }
+    }
+    (cjk_chars + other_bytes.div_ceil(4)).max(1)
+}
+
 /// L1 eviction policy weight configuration
 ///
 /// Controls the weights of three evaluation metrics in `evict_by_policy()`.
@@ -45,6 +67,11 @@ pub struct EvictionConfig {
     pub safe_window_seconds: i64,
     /// Beta fusion weight: β * query_sim + (1-β) * task_relevance
     pub beta: f64,
+    /// Maximum low-relevance historical summaries exposed as references.
+    pub max_low_relevance_refs: usize,
+    /// Inline preview returned after explicit L0 retrieval. The full archived
+    /// content remains available through its IRI and micro-tool paging.
+    pub reload_preview_chars: usize,
 }
 
 impl EvictionConfig {
@@ -57,6 +84,8 @@ impl EvictionConfig {
             relevance_threshold: 0.3,
             safe_window_seconds: 300,
             beta: 0.7,
+            max_low_relevance_refs: 3,
+            reload_preview_chars: 400,
         }
     }
 
@@ -69,6 +98,8 @@ impl EvictionConfig {
             relevance_threshold: 0.3,
             safe_window_seconds: 300,
             beta: 0.7,
+            max_low_relevance_refs: 3,
+            reload_preview_chars: 400,
         }
     }
 
@@ -81,6 +112,8 @@ impl EvictionConfig {
             relevance_threshold: 0.3,
             safe_window_seconds: 300,
             beta: 0.7,
+            max_low_relevance_refs: 3,
+            reload_preview_chars: 400,
         }
     }
 
@@ -93,6 +126,8 @@ impl EvictionConfig {
             relevance_threshold: 0.3,
             safe_window_seconds: 300,
             beta: 0.7,
+            max_low_relevance_refs: 3,
+            reload_preview_chars: 400,
         }
     }
 
@@ -105,6 +140,8 @@ impl EvictionConfig {
             relevance_threshold: 0.3,
             safe_window_seconds: 300,
             beta: 0.7,
+            max_low_relevance_refs: 3,
+            reload_preview_chars: 400,
         }
     }
 
@@ -148,6 +185,13 @@ pub struct L1Turn {
     /// Supplement flag: true = user mid-turn supplement, not subject to hard threshold eviction
     #[serde(default)]
     pub is_supplement: bool,
+    /// Canonical L0 generation observed when a mutable reference was loaded.
+    #[serde(default)]
+    pub observed_generation: Option<u64>,
+    /// Stale references are excluded from normal context injection until an
+    /// explicit micro-tool reload refreshes them.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// L1 session — single agent summary chain
@@ -279,9 +323,9 @@ impl L1Session {
 
     /// Evict turns exceeding token budget using eviction policy
     ///
-    /// Strategy: keep first turn, evict lowest-scored turns.
-    /// Score = recency_weight * (1 / seconds_since_last_access) + relevance_weight * (1 / semantic_relevance) + cost_weight * token_cost
-    /// Lower score means more likely to be evicted.
+    /// Strategy: keep first turn, evict the lowest retention-score turns.
+    /// retention = recency_weight * freshness + relevance_weight * semantic_relevance
+    ///             - cost_weight * normalized_token_cost
     pub fn evict_by_policy(&mut self) -> usize {
         self.evict_with_query(None)
     }
@@ -319,7 +363,9 @@ impl L1Session {
                     let relevance = t.relevance_score.unwrap_or(0.5);
                     if relevance < cfg.relevance_threshold && time_since > cfg.safe_window_seconds {
                         let removed = self.turns.remove(i);
-                        self.current_tokens -= (removed.summary.len() as f64 * 0.3) as usize;
+                        self.current_tokens = self
+                            .current_tokens
+                            .saturating_sub(estimate_summary_tokens(&removed.summary));
                         if let Some(iri) = removed.l0_archive_iri {
                             self.weak_refs.push(iri);
                         }
@@ -331,28 +377,40 @@ impl L1Session {
             }
         }
 
-        // Phase 2: Scoring eviction — evict lowest score by β fusion
+        // Phase 2: retention scoring — evict the least useful turn.
         while self.current_tokens > self.token_budget && self.turns.len() > 1 {
             let mut min_idx = None;
             let mut min_score = f64::MAX;
+            let max_token_cost = self
+                .turns
+                .iter()
+                .skip(1)
+                .map(|turn| estimate_summary_tokens(&turn.summary))
+                .max()
+                .unwrap_or(1)
+                .max(1) as f64;
             for (i, t) in self.turns.iter().enumerate().skip(1) {
-                let time_since = (now - t.timestamp).num_seconds().max(1) as f64;
-                let token_cost = (t.summary.len() as f64 * 0.3) as f64;
+                let accessed_at = t.last_access.unwrap_or(t.timestamp);
+                let time_since = (now - accessed_at).num_seconds().max(0) as f64;
+                let freshness_window = cfg.safe_window_seconds.max(1) as f64;
+                let freshness = 1.0 / (1.0 + time_since / freshness_window);
+                let token_cost = estimate_summary_tokens(&t.summary) as f64;
 
                 let query_sim = match (query, t.embedding.as_ref()) {
                     (Some(q), Some(e)) if q.len() == e.len() && !q.is_empty() => {
-                        cosine_similarity(q, e).abs().max(0.001)
+                        cosine_similarity(q, e).max(0.0)
                     }
                     _ => 0.5,
                 };
                 // β fusion: query relevance × β + task relevance × (1-β)
-                let task_relevance = t.relevance_score.unwrap_or(query_sim);
+                let task_relevance = t.relevance_score.unwrap_or(query_sim).clamp(0.0, 1.0);
                 let semantic_relevance =
-                    (cfg.beta * query_sim + (1.0 - cfg.beta) * task_relevance).max(0.001);
+                    (cfg.beta * query_sim + (1.0 - cfg.beta) * task_relevance).clamp(0.0, 1.0);
+                let normalized_cost = token_cost / max_token_cost;
 
-                let score = (1.0 / time_since) * cfg.recency_weight
-                    + (1.0 / semantic_relevance) * cfg.relevance_weight
-                    + token_cost * cfg.cost_weight;
+                let score = freshness * cfg.recency_weight
+                    + semantic_relevance * cfg.relevance_weight
+                    - normalized_cost * cfg.cost_weight;
                 if score < min_score {
                     min_score = score;
                     min_idx = Some(i);
@@ -361,7 +419,9 @@ impl L1Session {
 
             if let Some(idx) = min_idx {
                 let removed = self.turns.remove(idx);
-                self.current_tokens -= (removed.summary.len() as f64 * 0.3) as usize;
+                self.current_tokens = self
+                    .current_tokens
+                    .saturating_sub(estimate_summary_tokens(&removed.summary));
 
                 if let Some(iri) = removed.l0_archive_iri {
                     self.weak_refs.push(iri);
@@ -379,20 +439,51 @@ impl L1Session {
     /// Attempt to reload content from L0 into L1 session by IRI
     pub fn try_reload_from_l0(&mut self, l0_store: &L0Store, iri: &str) -> bool {
         if let Ok(Some(entry)) = l0_store.retrieve(iri) {
-            let summary = if entry.content.len() > 200 {
-                entry.content.chars().take(200).collect()
-            } else {
-                entry.content.clone()
-            };
-            self.add_summary(
+            let generation = L0Store::entry_generation(&entry);
+            let extracted = serde_json::from_str::<serde_json::Value>(&entry.content)
+                .ok()
+                .and_then(|payload| payload.get("content").cloned())
+                .map(|content| match content {
+                    serde_json::Value::String(text) => text,
+                    other => other.to_string(),
+                })
+                .unwrap_or(entry.content);
+            let summary: String = extracted
+                .chars()
+                .take(self.eviction_config.reload_preview_chars)
+                .collect();
+            let turn = self.add_summary(
                 "system",
                 &format!("[Reloaded] {}", summary),
                 Some(iri.to_string()),
             );
+            turn.observed_generation = Some(generation);
             true
         } else {
             false
         }
+    }
+
+    /// Validate only mutable references that were explicitly loaded from L0.
+    /// Immutable UUID archives without an observed generation remain untouched.
+    pub fn validate_reference_generations(
+        &mut self,
+        l0_store: &L0Store,
+    ) -> Result<usize, CoreError> {
+        let mut stale = 0;
+        for turn in &mut self.turns {
+            let (Some(iri), Some(observed)) =
+                (turn.l0_archive_iri.as_deref(), turn.observed_generation)
+            else {
+                continue;
+            };
+            let current = l0_store.generation(iri)?;
+            turn.stale = current.is_none_or(|generation| generation > observed);
+            if turn.stale {
+                stale += 1;
+            }
+        }
+        Ok(stale)
     }
 
     /// Store supplement input to L1 (called by AgentRunner on CycleStart injection)
@@ -416,8 +507,10 @@ impl L1Session {
             relevance_score,
             last_access: Some(Utc::now()),
             is_supplement: true,
+            observed_generation: None,
+            stale: false,
         };
-        let token_cost = (summary.len() as f64 * 0.3) as usize;
+        let token_cost = estimate_summary_tokens(summary);
         self.current_tokens += token_cost;
         self.turns.push(turn);
 
@@ -446,8 +539,10 @@ impl L1Session {
             relevance_score: None,
             last_access: Some(Utc::now()),
             is_supplement: false,
+            observed_generation: None,
+            stale: false,
         };
-        let token_cost = (summary.len() as f64 * 0.3) as usize;
+        let token_cost = estimate_summary_tokens(summary);
         self.current_tokens += token_cost;
         self.turns.push(turn);
 
@@ -475,6 +570,8 @@ impl L1Session {
             role,
             uuid::Uuid::new_v4().hyphenated()
         );
+        let archived_content = serde_json::from_str::<serde_json::Value>(content_json)
+            .unwrap_or_else(|_| serde_json::Value::String(content_json.to_string()));
         let payload = serde_json::json!({
             "@id": &iri,
             "@type": "LLMResponse",
@@ -482,7 +579,7 @@ impl L1Session {
             "agent_id": self.agent_id,
             "session_id": self.session_id,
             "thought": thought,
-            "content": serde_json::from_str::<serde_json::Value>(content_json).ok(),
+            "content": archived_content,
             "timestamp": Utc::now().to_rfc3339(),
         });
         l0_store.store(&iri, &payload.to_string())?;
@@ -507,7 +604,9 @@ impl L1Session {
         let main: Vec<String> = self
             .turns
             .iter()
-            .filter(|t| t.is_supplement || t.relevance_score.unwrap_or(0.5) >= threshold)
+            .filter(|t| {
+                !t.stale && (t.is_supplement || t.relevance_score.unwrap_or(0.5) >= threshold)
+            })
             .map(|t| format!("[{}] {}", t.role, t.summary))
             .collect();
 
@@ -519,16 +618,22 @@ impl L1Session {
         );
 
         // Low-relevance turns appended as reference section (only when meaningful and low_rel entries exist)
-        let low: Vec<String> = self
+        let max_low_relevance_refs = self.eviction_config.max_low_relevance_refs;
+        let mut low: Vec<String> = self
             .turns
             .iter()
-            .filter(|t| !t.is_supplement && t.relevance_score.unwrap_or(0.5) < threshold)
+            .filter(|t| {
+                !t.stale && !t.is_supplement && t.relevance_score.unwrap_or(0.5) < threshold
+            })
             .map(|t| {
                 let truncated: String = t.summary.chars().take(80).collect();
                 let score = t.relevance_score.unwrap_or(0.0);
                 format!("[{}] {} (relevance: {:.2})", t.role, truncated, score)
             })
             .collect();
+        if low.len() > max_low_relevance_refs {
+            low = low.split_off(low.len() - max_low_relevance_refs);
+        }
 
         if !low.is_empty() {
             content.push_str("\n\n[Historical Reference - Low Relevance]\n");
@@ -684,6 +789,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_preserves_plain_text_content() {
+        let path = std::env::temp_dir().join(format!(
+            "glidinghorse-l1-archive-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let store = L0Store::new(path.to_string_lossy().as_ref()).unwrap();
+        let session = L1Session::new("agent_1", "CA", "iri://task/plain-archive");
+
+        let iri = session
+            .archive_full_to_l0(&store, "CA", "verified", "plain audit evidence")
+            .unwrap();
+        let entry = store.retrieve(&iri).unwrap().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&entry.content).unwrap();
+
+        assert_eq!(payload["content"], "plain audit evidence");
+    }
+
+    #[test]
     fn test_summary_only_session() {
         let mut session = L1Session::new("agent_1", "DA", "iri://task/abc");
         session.add_summary("assistant", "Found the root cause in config.rs", None);
@@ -695,6 +819,31 @@ mod tests {
         let content = chain[0]["content"].as_str().unwrap();
         assert!(content.contains("Found the root cause"));
         assert!(content.contains("Applied the fix"));
+    }
+
+    #[test]
+    fn historical_context_exposes_summary_and_iri_but_not_archived_body() {
+        let path = std::env::temp_dir().join(format!(
+            "glidinghorse-l1-history-contract-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let store = L0Store::new(path.to_string_lossy().as_ref()).unwrap();
+        let mut session = L1Session::new("agent_1", "DA", "iri://task/history-contract");
+        let archived_body = "FULL_PRIVATE_HISTORY_BODY_MUST_BE_LOADED_ON_DEMAND";
+        let iri = session
+            .archive_full_to_l0(&store, "DA", "private reasoning", archived_body)
+            .unwrap();
+        session.add_summary("DA", "implemented and verified output", Some(iri.clone()));
+
+        let injected = session.get_summary_chain_with_iris(20, 100).join("\n");
+        assert!(injected.contains("implemented and verified output"));
+        assert!(injected.contains(&iri));
+        assert!(!injected.contains(archived_body));
+        assert!(!injected.contains("private reasoning"));
+
+        let archived = store.retrieve(&iri).unwrap().unwrap();
+        assert!(archived.content.contains(archived_body));
     }
 
     #[test]
@@ -725,6 +874,16 @@ mod tests {
         let mut session = L1Session::new("agent_1", "DA", "iri://task/abc");
         session.add_summary("assistant", "Hello world", None);
         assert!(session.estimated_tokens() > 0);
+    }
+
+    #[test]
+    fn test_token_tracking_does_not_undercount_cjk() {
+        let mut session = L1Session::new("agent_1", "DA", "iri://task/abc");
+        session.add_summary("assistant", "你好世界", None);
+        assert!(
+            session.estimated_tokens() >= 4,
+            "CJK text should be budgeted at no less than one token per character"
+        );
     }
 
     #[test]
@@ -952,6 +1111,8 @@ mod tests {
                 relevance_threshold: 0.0,
                 safe_window_seconds: 0,
                 beta: 0.5,
+                max_low_relevance_refs: 3,
+                reload_preview_chars: 400,
             },
         );
         // Keep first turn (always kept), add padding turns to create budget pressure
@@ -965,6 +1126,12 @@ mod tests {
             "second long padding text to generate more cost yyyyyy",
             None,
         );
+        if let Some(t) = session.turns.last_mut() {
+            // Padding creates token pressure but is not one of the relevance
+            // candidates under test.
+            t.embedding = Some(vec![1.0, 0.0]);
+            t.relevance_score = Some(1.0);
+        }
 
         // Two turns: same query_sim but different task_relevance
         let emb = Some(vec![1.0, 0.0]);
@@ -988,18 +1155,86 @@ mod tests {
             "eviction should occur when tokens exceed budget"
         );
 
-        // β=0.5: high_rel semantic = 0.5*1.0+0.5*0.9=0.95, low_rel = 0.5*1.0+0.5*0.1=0.55
-        // score = (1/semantic)*1.0, so high_rel ≈ 1.05, low_rel ≈ 1.82
-        // min score wins eviction → high_rel evicted
+        // β=0.5: high_rel semantic = 0.5*1.0+0.5*0.9=0.95, low_rel = 0.5*1.0+0.5*0.1=0.55.
+        // A retention score must keep the higher-relevance turn.
         let has_low = session.turns.iter().any(|t| t.summary == "low_rel_turn");
-        assert!(
-            has_low,
-            "low relevance turn (higher score) should survive eviction"
-        );
+        assert!(!has_low, "lower-relevance turn should be evicted first");
         let has_high = session.turns.iter().any(|t| t.summary == "high_rel_turn");
-        assert!(
-            !has_high,
-            "high relevance turn (lower score) should be evicted first"
+        assert!(has_high, "higher-relevance turn should survive eviction");
+    }
+
+    #[test]
+    fn opposite_embedding_is_not_treated_as_relevant() {
+        let mut session = L1Session::with_config(
+            "agent_1",
+            "DA",
+            "iri://task/abc",
+            10_000,
+            EvictionConfig {
+                recency_weight: 0.0,
+                relevance_weight: 1.0,
+                cost_weight: 0.0,
+                relevance_threshold: 0.0,
+                safe_window_seconds: 0,
+                beta: 1.0,
+                max_low_relevance_refs: 3,
+                reload_preview_chars: 400,
+            },
         );
+        session.add_summary("assistant", "protected first turn", None);
+        session.add_summary("assistant", "matching", None);
+        session.turns.last_mut().unwrap().embedding = Some(vec![1.0, 0.0]);
+        session.add_summary("assistant", "opposite", None);
+        session.turns.last_mut().unwrap().embedding = Some(vec![-1.0, 0.0]);
+
+        session.token_budget = session.current_tokens - 1;
+        session.evict_with_query(Some(&[1.0, 0.0]));
+
+        assert!(session.turns.iter().any(|turn| turn.summary == "matching"));
+        assert!(!session.turns.iter().any(|turn| turn.summary == "opposite"));
+    }
+
+    #[test]
+    fn weak_reference_reload_extracts_archived_content() {
+        let path = std::env::temp_dir().join(format!(
+            "glidinghorse-l1-reload-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let store = L0Store::new(path.to_string_lossy().as_ref()).unwrap();
+        let mut session = L1Session::new("agent_1", "DA", "iri://task/reload");
+        let iri = session
+            .archive_full_to_l0(&store, "DA", "reasoning", "the useful archived content")
+            .unwrap();
+
+        assert!(session.try_reload_from_l0(&store, &iri));
+        let reloaded = session.turns.last().unwrap();
+        assert!(reloaded.summary.contains("the useful archived content"));
+        assert!(!reloaded.summary.contains("\"@id\""));
+    }
+
+    #[test]
+    fn mutable_l0_reference_is_excluded_after_generation_advances() {
+        let path = std::env::temp_dir().join(format!(
+            "glidinghorse-l1-generation-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().hyphenated()
+        ));
+        let store = L0Store::new(path.to_string_lossy().as_ref()).unwrap();
+        let iri = "iri://knowledge/mutable/context";
+        store.store(iri, r#"{"content":"generation one"}"#).unwrap();
+        let mut session = L1Session::new("agent_1", "DA", "iri://task/generation");
+        assert!(session.try_reload_from_l0(&store, iri));
+        assert!(session
+            .turns
+            .last()
+            .unwrap()
+            .summary
+            .contains("generation one"));
+
+        store.store(iri, r#"{"content":"generation two"}"#).unwrap();
+        assert_eq!(session.validate_reference_generations(&store).unwrap(), 1);
+        let context = serde_json::to_string(&session.get_summary_chain()).unwrap();
+        assert!(!context.contains("generation one"));
     }
 }

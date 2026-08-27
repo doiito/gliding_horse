@@ -26,12 +26,23 @@ use crate::tools::hooks::{FunctionHook, HookManager, HookPoint, HookResult};
 /// - DefenseInDepthManager (defense recommendations)
 ///
 /// Usage:
-/// ```rust,ignore
-/// let engine = RootCauseEngine::new(config);
-/// engine.register_hooks(&hook_manager);
-/// let chain = engine.trace("error msg", "file.rs:42", &context)?;
-/// let report = engine.evidence_report(&chain);
-/// let defenses = engine.defense_recommendations(&chain);
+/// ```no_run
+/// use glidinghorse::root_cause::{
+///     RootCauseConfig, RootCauseEngine, TraceContext,
+/// };
+/// use glidinghorse::tools::hooks::HookManager;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let engine = RootCauseEngine::new(RootCauseConfig::default());
+/// let hook_manager = HookManager::new();
+/// engine.register_hooks(&hook_manager, "agent-1");
+/// let context = TraceContext::default();
+/// let result = engine.trace("error msg", "file.rs:42", &context)?;
+/// let report = engine.evidence_report(&result.chain);
+/// let defenses = engine.defense_recommendations(&result.chain);
+/// # let _ = (report, defenses);
+/// # Ok(())
+/// # }
 /// ```
 pub struct RootCauseEngine {
     tracer: tracer::BackwardTracer,

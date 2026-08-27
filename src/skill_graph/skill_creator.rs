@@ -629,6 +629,7 @@ impl SkillCreator {
             // out of role-based executable skill lists until an explicit,
             // governed activation flow installs a handler.
             skill_types: vec!["definition_only".to_string()],
+            discovery_5w2h: Some(graph_node.w2h.clone()),
         };
 
         if self.config.auto_register {

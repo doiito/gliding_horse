@@ -93,9 +93,10 @@ impl CheckpointManager {
     ) -> Result<CheckpointData, CoreError> {
         let seq = self.counter.fetch_add(1, Ordering::SeqCst);
         let checkpoint_iri = format!(
-            "iri://checkpoint/{}/seq_{}",
+            "iri://checkpoint/{}/seq_{}_{}",
             task_iri.strip_prefix("iri://").unwrap_or(task_iri),
-            seq
+            seq,
+            uuid::Uuid::new_v4().hyphenated(),
         );
 
         let nodes: Vec<serde_json::Value> = serde_json::from_str(nodes_json).unwrap_or_default();
@@ -167,9 +168,10 @@ impl CheckpointManager {
     ) -> Result<CheckpointData, CoreError> {
         let seq = self.counter.fetch_add(1, Ordering::SeqCst);
         let checkpoint_iri = format!(
-            "iri://checkpoint/{}/seq_{}",
+            "iri://checkpoint/{}/seq_{}_{}",
             task_iri.strip_prefix("iri://").unwrap_or(task_iri),
-            seq
+            seq,
+            uuid::Uuid::new_v4().hyphenated(),
         );
 
         let nodes: Vec<serde_json::Value> = serde_json::from_str(nodes_json).unwrap_or_default();
@@ -324,7 +326,7 @@ impl CheckpointManager {
         if let Some(ref l0) = self.l0 {
             let stripped = task_iri.strip_prefix("iri://").unwrap_or(task_iri);
             let prefix = format!("iri://checkpoint/{}/", stripped);
-            if let Ok(entries) = l0.scan_iri_prefix(&prefix, 100) {
+            if let Ok(entries) = l0.scan_iri_prefix(&prefix, 100_000) {
                 let mut results: Vec<CheckpointData> = entries
                     .iter()
                     .filter_map(|e| serde_json::from_str(&e.content).ok())
@@ -364,14 +366,44 @@ impl CheckpointManager {
     }
 
     fn prune_oldest(&self, task_iri: &str) {
-        let mut task_cps = self.task_checkpoints.write();
-        let Some(iris) = task_cps.get_mut(task_iri) else { return };
-        while iris.len() > MAX_CHECKPOINTS_PER_TASK {
-            if let Some(oldest) = iris.first().cloned() {
-                iris.remove(0);
-                if let Some(ref l0) = self.l0 {
-                    let _ = l0.delete(&oldest);
+        {
+            let mut task_cps = self.task_checkpoints.write();
+            if let Some(iris) = task_cps.get_mut(task_iri) {
+                while iris.len() > MAX_CHECKPOINTS_PER_TASK {
+                    iris.remove(0);
                 }
+            }
+        }
+
+        // CheckpointManager instances are intentionally short-lived in some
+        // execution paths. Enforcing retention only through their in-memory
+        // index both leaked old checkpoints and allowed a fresh manager's
+        // `seq_0` to overwrite another BizAgent's evidence. UUID-backed IRIs
+        // prevent collisions; this persisted scan enforces the task-wide cap
+        // across roles and process lifetimes.
+        let Some(ref l0) = self.l0 else {
+            return;
+        };
+        let stripped = task_iri.strip_prefix("iri://").unwrap_or(task_iri);
+        let prefix = format!("iri://checkpoint/{}/", stripped);
+        let Ok(entries) = l0.scan_iri_prefix(&prefix, 100_000) else {
+            return;
+        };
+        let mut checkpoints = entries
+            .into_iter()
+            .filter_map(|entry| {
+                serde_json::from_str::<CheckpointData>(&entry.content)
+                    .ok()
+                    .map(|checkpoint| (entry.iri, checkpoint.created_at))
+            })
+            .collect::<Vec<_>>();
+        checkpoints.sort_by_key(|(_, created_at)| *created_at);
+        let remove_count = checkpoints.len().saturating_sub(MAX_CHECKPOINTS_PER_TASK);
+        for (iri, _) in checkpoints.into_iter().take(remove_count) {
+            let _ = l0.delete(&iri);
+            let mut task_cps = self.task_checkpoints.write();
+            for iris in task_cps.values_mut() {
+                iris.retain(|candidate| candidate != &iri);
             }
         }
     }
@@ -563,17 +595,38 @@ mod tests {
         assert_eq!(mgr.checkpoint_count() as usize, MAX_CHECKPOINTS_PER_TASK);
 
         // Oldest entry physically evicted from L0
-        let pruned_iri = "iri://checkpoint/task/retention/seq_0".to_string();
-        assert!(l0.retrieve(&pruned_iri).unwrap().is_none());
+        let persisted = l0
+            .scan_iri_prefix("iri://checkpoint/task/retention/", 100)
+            .unwrap();
+        assert_eq!(persisted.len(), MAX_CHECKPOINTS_PER_TASK);
+        assert!(persisted.iter().all(|entry| !entry.iri.contains("/seq_0_")));
 
-        // Latest entry still present and restorable
-        let latest_iri = format!(
-            "iri://checkpoint/task/retention/seq_{}",
-            total - 1
-        );
-        assert!(l0.retrieve(&latest_iri).unwrap().is_some());
+        // Latest entry still present and restorable.
         let cp = mgr.restore_latest("iri://task/retention").unwrap();
         assert_eq!(cp.unwrap().name, format!("turn_Plan_{}", total - 1));
+    }
+
+    #[test]
+    fn separate_managers_do_not_overwrite_the_same_task_checkpoint() {
+        use crate::memory::l0_store::L0Store;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let first = CheckpointManager::with_persistence(l0.clone())
+            .create("iri://task/shared", "finish_DA", "[]", "[]", "{}", &[])
+            .unwrap();
+        let second = CheckpointManager::with_persistence(l0.clone())
+            .create("iri://task/shared", "finish_CA", "[]", "[]", "{}", &[])
+            .unwrap();
+
+        assert_ne!(first.checkpoint_iri, second.checkpoint_iri);
+        assert_eq!(
+            l0.scan_iri_prefix("iri://checkpoint/task/shared/", 10)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

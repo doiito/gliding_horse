@@ -279,14 +279,23 @@ mod tests {
         let bus = crate::core::event_bus::EventBus::new(64);
 
         system.listen_to(&bus, vec!["custom.alert".to_string()]);
-        bus.emit("iri://task/t1", "custom.alert", "iri://agent/a1", "payload-1")
-            .await;
+        bus.emit(
+            "iri://task/t1",
+            "custom.alert",
+            "iri://agent/a1",
+            "payload-1",
+        )
+        .await;
 
         // Give the spawned listener a moment to drain the broadcast channel.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let win = window.read();
-        assert_eq!(win.len(), 1, "custom event must be enqueued into the window");
+        assert_eq!(
+            win.len(),
+            1,
+            "custom event must be enqueued into the window"
+        );
         let entry = win.entries().back().unwrap();
         assert_eq!(entry.role, "event");
         assert_eq!(entry.content, "payload-1");

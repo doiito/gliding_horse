@@ -78,11 +78,18 @@ impl From<oxigraph::sparql::QueryEvaluationError> for CoreError {
 pub struct CoreConfig {
     pub max_node_size: usize,
     pub max_projection_size: usize,
+    /// Per-BizAgent L1 summary/reference budget. Active-session message
+    /// content remains governed by ContextWindowManager separately.
+    pub l1_token_budget: usize,
     pub l0_storage_path: String,
     pub event_buffer_size: usize,
     pub enable_metrics: bool,
     /// Global L1 eviction policy config (None = auto-select by Agent Role)
     pub eviction_config: Option<EvictionConfig>,
+    /// Role-preserving overrides that do not replace the role-specific
+    /// eviction weights.
+    pub l1_max_low_relevance_refs: Option<usize>,
+    pub l1_reload_preview_chars: Option<usize>,
 }
 
 impl Default for CoreConfig {
@@ -90,10 +97,13 @@ impl Default for CoreConfig {
         Self {
             max_node_size: 5_242_880, // 5MB: agent full content can reach hundreds of KB
             max_projection_size: 500,
+            l1_token_budget: 4000,
             l0_storage_path: "./data/l0".to_string(),
             event_buffer_size: 1000,
             enable_metrics: true,
             eviction_config: None,
+            l1_max_low_relevance_refs: None,
+            l1_reload_preview_chars: None,
         }
     }
 }
@@ -109,6 +119,10 @@ impl CoreConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
+            l1_token_budget: std::env::var("PDCA_L1_TOKEN_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4000),
             l0_storage_path: std::env::var("PDCA_L0_STORAGE_PATH")
                 .unwrap_or_else(|_| "./data/l0".to_string()),
             event_buffer_size: std::env::var("PDCA_EVENT_BUFFER_SIZE")
@@ -120,6 +134,8 @@ impl CoreConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(true),
             eviction_config: None,
+            l1_max_low_relevance_refs: None,
+            l1_reload_preview_chars: None,
         }
     }
 }

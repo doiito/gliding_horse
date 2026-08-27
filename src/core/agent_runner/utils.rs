@@ -12,9 +12,34 @@ use crate::tools::hooks::{HookContext, HookPoint, HookResult};
 use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
+use super::execution::{
+    advertised_tool_names, ca_evidence_close_tool_definitions, ca_evidence_focus_tool_definitions,
+    effective_effect_block_turns, effective_role_max_turns, evidence_key, initial_execution_phase,
+    is_substantive_workspace_effect, is_workspace_mutation_candidate,
+    mutation_recovery_tool_definitions, pa_planning_focus_tool_definitions, phase_tool_definitions,
+    record_workspace_effect_turn, refresh_execution_ledger, requires_workspace_effect,
+    unadvertised_tool_call_result, workspace_effect_recovery_active,
+    workspace_inventory_complete_and_bounded, workspace_inventory_coverage,
+    workspace_inventory_tool_definitions, ExecutionPhase,
+};
 use super::{LlmParsedResponse, TaskContext, TaskResult};
 
 impl super::AgentRunner {
+    pub(super) fn effective_response_content(
+        content: &str,
+        reasoning_content: Option<&str>,
+        finish_reason: &str,
+        has_tool_calls: bool,
+    ) -> String {
+        if content.trim().is_empty()
+            && !has_tool_calls
+            && matches!(finish_reason, "stop" | "end_turn")
+        {
+            return reasoning_content.unwrap_or_default().to_string();
+        }
+        content.to_string()
+    }
+
     /// Utility: extract summary from agent output.
     /// Unused — kept for future SA result summarization.
     #[allow(dead_code)]
@@ -112,6 +137,29 @@ impl super::AgentRunner {
             if let Some(action) = parsed.get("action").and_then(|a| a.as_str()) {
                 response.action = Some(action.to_string());
             }
+
+            // Responses-API-compatible reasoning models may return a valid
+            // ReAct envelope whose `content` field is null (or the literal
+            // string "null") while the terminal evidence is present only in
+            // `reasoning_content`. Preserve the envelope's summary/action, but
+            // make the substantive terminal evidence available to downstream
+            // agents and quality gates. This is intentionally limited to a
+            // nullish content field; normal content always remains authoritative.
+            let envelope_content_is_nullish = parsed
+                .get("content")
+                .map(|value| {
+                    value.is_null()
+                        || value
+                            .as_str()
+                            .map(|text| text.trim().is_empty() || text.trim() == "null")
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if envelope_content_is_nullish {
+                if let Some(reasoning) = reasoning_content.filter(|text| !text.trim().is_empty()) {
+                    response.content = reasoning.to_string();
+                }
+            }
         } else {
             if let Some(extracted) = Self::try_extract_json_from_markdown(content) {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&extracted) {
@@ -129,6 +177,23 @@ impl super::AgentRunner {
                     }
                     if let Some(action) = parsed.get("action").and_then(|a| a.as_str()) {
                         response.action = Some(action.to_string());
+                    }
+                    let envelope_content_is_nullish = parsed
+                        .get("content")
+                        .map(|value| {
+                            value.is_null()
+                                || value
+                                    .as_str()
+                                    .map(|text| text.trim().is_empty() || text.trim() == "null")
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if envelope_content_is_nullish {
+                        if let Some(reasoning) =
+                            reasoning_content.filter(|text| !text.trim().is_empty())
+                        {
+                            response.content = reasoning.to_string();
+                        }
                     }
                 } else {
                     response.summary = Some(Self::generate_auto_summary(content));
@@ -181,6 +246,22 @@ impl super::AgentRunner {
             "blocked, cannot",
         ];
         if BLOCKER_MARKERS.iter().any(|m| s.contains(m)) {
+            return Some("failed");
+        }
+        let explicit_failed_line = s.lines().map(str::trim).any(|line| {
+            line.starts_with("failed:")
+                || line.starts_with("blocked:")
+                || line.starts_with("partial_success:")
+        });
+        let explicit_partial_statement = s.contains("honest status is partial")
+            || s.contains("status is partial/blocked")
+            || s.contains("status: partial/blocked")
+            || s.contains("诚实状态是 partial")
+            || s.contains("诚实声明 partial");
+        let explicit_unmet_statement = (summary.contains("未达成") || summary.contains("未完成"))
+            && (summary.contains("不得") && summary.contains("成功")
+                || s.contains("partial/blocked"));
+        if explicit_failed_line || explicit_partial_statement || explicit_unmet_statement {
             return Some("failed");
         }
         None
@@ -645,7 +726,8 @@ impl super::AgentRunner {
             },
         ];
 
-        let tools = self.tool_definitions_for_agent(&agent.role.to_string());
+        let tools = self
+            .tool_definitions_for_context(&agent.role.to_string(), ctx.allowed_tools.as_deref());
 
         info!(
             "AgentRunner streaming started: role={}, model={}, tools={}",
@@ -655,18 +737,80 @@ impl super::AgentRunner {
         );
 
         let mut running_messages = messages;
-        let max_turns = 10u32;
+        let execution_budget = &self.agent_settings.execution_budget;
+        let max_turns = effective_role_max_turns(agent.role, ctx.max_iterations, execution_budget);
+        let effect_warning_turns = execution_budget.effect_progress_warning_turns;
         let mut tc = 0u32;
         let mut turn = 0u32;
         let mut errs = Vec::new();
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
+        let mut session_micro_tools = std::collections::HashSet::<String>::new();
         let mut tool_error_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
         let mut last_content = String::new();
         let mut last_thought = String::new();
         let mut last_summary = String::new();
+        let workspace_effect_required = requires_workspace_effect(&ctx, agent.role);
+        let workspace_effect_tracked = agent.role == AgentRole::Do
+            && ctx
+                .effective_effect_policy()
+                .may_require_workspace_mutation();
+        let mut workspace_effect_observed = false;
+        let mut consecutive_effectless_tool_turns = 0u32;
+        let mut workspace_generation = self
+            .tool_executor
+            .read()
+            .get_workspace_monitor()
+            .map(|monitor| monitor.generation())
+            .unwrap_or(0);
+        let workspace_delta_limit = self
+            .token_optimization
+            .prompt_optimization
+            .max_workspace_manifest_files;
+        let mut execution_phase = initial_execution_phase(agent.role, &ctx.constraints);
+        let effect_block_turns = effective_effect_block_turns(
+            execution_phase,
+            execution_budget.effect_progress_block_turns,
+            execution_budget.da_repair_effect_block_turns,
+        );
+        if let Some(coverage) =
+            workspace_inventory_coverage(&self.tool_executor, workspace_delta_limit)
+        {
+            info!(
+                role = %agent.role,
+                scan_complete = coverage.scan_complete,
+                truncated = coverage.truncated,
+                total_files = coverage.total_files,
+                max_manifest_files = workspace_delta_limit,
+                broad_inventory_tools_needed = !(coverage.scan_complete && !coverage.truncated),
+                "Workspace inventory coverage resolved"
+            );
+        }
+        let mut evidence_keys = std::collections::HashSet::<String>::new();
+        let mut low_novelty_turns = 0u32;
+        let mut substantive_effect_count = 0u32;
+        let mut verification_turns = 0u32;
+        let mut planning_tool_turns = 0u32;
+        let mut action_tracker =
+            crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string());
 
         loop {
+            super::execution::refresh_workspace_delta_message(
+                &self.tool_executor,
+                &mut running_messages,
+                &mut workspace_generation,
+                workspace_delta_limit,
+            );
+            refresh_execution_ledger(
+                &mut running_messages,
+                agent.role,
+                execution_phase,
+                &ctx.effective_effect_policy(),
+                substantive_effect_count,
+                verification_turns,
+                low_novelty_turns,
+                workspace_generation,
+            );
             if !guard_pending_pre_injections.is_empty() {
                 let prompt = format!(
                     "\n\n[ToolGuard Constraint Directive]\n{}\nNote: The above constraints only apply to the upcoming tool call with the same name. Strictly comply.",
@@ -680,25 +824,118 @@ impl super::AgentRunner {
                 guard_pending_pre_injections.clear();
             }
 
+            let mutation_recovery_active = workspace_effect_recovery_active(
+                workspace_effect_tracked,
+                consecutive_effectless_tool_turns,
+                low_novelty_turns,
+                effect_block_turns,
+            );
+            let mut request_messages = running_messages.clone();
+            let ca_evidence_focus_active = agent.role == AgentRole::Check
+                && execution_budget.ca_evidence_focus_turns > 0
+                && verification_turns >= execution_budget.ca_evidence_focus_turns;
+            let ca_evidence_close_active = agent.role == AgentRole::Check
+                && execution_budget.ca_evidence_close_turns > 0
+                && verification_turns >= execution_budget.ca_evidence_close_turns;
+            let pa_planning_focus_active = agent.role == AgentRole::Plan
+                && execution_budget.pa_planning_focus_turns > 0
+                && planning_tool_turns >= execution_budget.pa_planning_focus_turns;
+            if ca_evidence_focus_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[CA Evidence Convergence] Multiple verification tool turns have already completed. Finish now with PASS/FAIL and criterion-linked evidence unless one named acceptance criterion is still unverified. If one remains, perform only the single targeted check needed for that criterion; do not repeat broad discovery or already-passing checks.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if ca_evidence_close_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[CA Evidence Close Gate] The configured evidence window is exhausted. Do not call another tool. Return the final criterion-linked PASS/FAIL audit now. Any criterion lacking evidence must be marked FAIL; uncertainty is not a reason for more discovery.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if pa_planning_focus_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[PA Planning Convergence] The configured inspection window is complete. Use the objective, workspace manifest, retrieved evidence, and prior-cycle feedback already supplied. Emit the executable plan now; do not request more tools. Preserve explicit acceptance criteria and name the checks DA/CA must run.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if mutation_recovery_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "[DA Mutation Recovery Mode] The last {} tool turns made no substantive workspace change. Inspection/search tools are temporarily unavailable. Make the highest-priority pending change now with an advertised mutation-capable tool, or finish with `FAILED:` and the exact blocker.",
+                        consecutive_effectless_tool_turns
+                    ),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+
+            // Keep the exact advertised tool window so streaming execution
+            // cannot invoke a tool withdrawn by phase or inventory policy.
+            let current_tools = {
+                let active_session_tools = super::execution::active_session_tool_names(
+                    &request_messages,
+                    &session_micro_tools,
+                );
+                let current_tools = self.tool_definitions_for_context_with_microtools(
+                    &agent.role.to_string(),
+                    ctx.allowed_tools.as_deref(),
+                    &active_session_tools,
+                );
+                let current_tools =
+                    phase_tool_definitions(current_tools, agent.role, execution_phase);
+                let current_tools = workspace_inventory_tool_definitions(
+                    current_tools,
+                    workspace_inventory_complete_and_bounded(
+                        &self.tool_executor,
+                        workspace_delta_limit,
+                    ),
+                );
+                let current_tools = ca_evidence_focus_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    ca_evidence_focus_active,
+                );
+                let current_tools = ca_evidence_close_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    ca_evidence_close_active,
+                );
+                let current_tools = pa_planning_focus_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    pa_planning_focus_active,
+                );
+                if mutation_recovery_active {
+                    mutation_recovery_tool_definitions(current_tools)
+                } else {
+                    current_tools
+                }
+            };
+            let advertised_tools = advertised_tool_names(&current_tools);
+            let current_tool_schema_token_reserve =
+                crate::core::context_compressor::ContextWindowManager::estimate_tool_schema_tokens(
+                    &current_tools,
+                );
+            let request_tools = (!current_tools.is_empty()).then_some(current_tools);
+
             let mut stream = match self
                 .gateway
-                .stream_chat_with_params(
-                    &model,
-                    running_messages.clone(),
-                    None,
-                    None,
-                    {
-                        // Refresh the tools list before each call to include newly registered micro-tools
-                        let current_tools =
-                            self.tool_definitions_for_agent(&agent.role.to_string());
-                        if current_tools.is_empty() {
-                            None
-                        } else {
-                            Some(current_tools)
-                        }
-                    },
-                    None,
-                )
+                .stream_chat_with_params(&model, request_messages, None, None, request_tools, None)
                 .await
             {
                 Ok(s) => s,
@@ -752,6 +989,39 @@ impl super::AgentRunner {
                 Some("tool_call") => {
                     if !stream_response.tool_calls.is_empty() {
                         let tool_calls = &stream_response.tool_calls;
+                        let has_effect_candidate = tool_calls.iter().any(|call| {
+                            is_substantive_workspace_effect(&call.name, &call.arguments)
+                        });
+                        let block_effectless_calls =
+                            mutation_recovery_active && !has_effect_candidate;
+                        let mut effect_succeeded_this_turn = false;
+                        let mut verification_failed_this_turn = false;
+                        let mut evidence_calls = 0usize;
+                        let mut novel_evidence_calls = 0usize;
+                        for call in tool_calls {
+                            if let Some(key) =
+                                evidence_key(&call.name, &call.arguments, workspace_generation)
+                            {
+                                evidence_calls += 1;
+                                novel_evidence_calls += evidence_keys.insert(key) as usize;
+                            }
+                        }
+                        if evidence_calls > 0 {
+                            let duplicate_evidence_calls =
+                                evidence_calls.saturating_sub(novel_evidence_calls);
+                            if duplicate_evidence_calls == 0 {
+                                low_novelty_turns = 0;
+                            } else {
+                                low_novelty_turns = low_novelty_turns
+                                    .saturating_add(duplicate_evidence_calls as u32);
+                            }
+                        }
+                        if agent.role == AgentRole::Check && !tool_calls.is_empty() {
+                            verification_turns = verification_turns.saturating_add(1);
+                        }
+                        if agent.role == AgentRole::Plan && !tool_calls.is_empty() {
+                            planning_tool_turns = planning_tool_turns.saturating_add(1);
+                        }
                         if agent.role == AgentRole::Plan {
                             let write_tools: Vec<&str> = tool_calls
                                 .iter()
@@ -808,6 +1078,50 @@ impl super::AgentRunner {
                             let name = &c.name;
                             let args: Value = c.arguments.clone();
 
+                            if !ctx.effective_effect_policy().permits_mutation()
+                                && is_workspace_mutation_candidate(name, &args)
+                            {
+                                let message = format!(
+                                    "EffectPolicy {:?} rejected mutating tool call {}",
+                                    ctx.effective_effect_policy(),
+                                    name
+                                );
+                                warn!("{}", message);
+                                errs.push(message.clone());
+                                running_messages.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: message,
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(c.id.clone()),
+                                    reasoning_content: None,
+                                });
+                                continue;
+                            }
+
+                            // Keep provider hallucinations of a withdrawn
+                            // tool out of the skill lifecycle.  This is a
+                            // handled protocol mismatch, not a file/tool
+                            // execution failure, so it must not reach
+                            // ToolGuard, the action ledger, or learning.
+                            if let Some(rejection) =
+                                unadvertised_tool_call_result(&advertised_tools, name)
+                            {
+                                info!(
+                                    "[Streaming] ignored unadvertised call {} for current turn",
+                                    name
+                                );
+                                running_messages.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: serde_json::to_string(&rejection).unwrap_or_default(),
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(c.id.clone()),
+                                    reasoning_content: None,
+                                });
+                                continue;
+                            }
+
                             // SkillBefore hook
                             {
                                 let mut hook_ctx = HookContext::new(
@@ -838,23 +1152,80 @@ impl super::AgentRunner {
                             // shared lock is not held across handler I/O.
                             // This path enforces ToolExecutor policies/gates
                             // while retaining micro-tool fallback behavior.
-                            let executor = self.tool_executor.read().clone();
-                            let result = executor
-                                .execute_with_security_context(
-                                    name,
-                                    args,
-                                    crate::skill_graph::security::SecurityContext::new(
-                                        &agent.agent_id,
-                                        &agent.role.to_string(),
+                            let effect_snapshot = (is_substantive_workspace_effect(name, &args)
+                                && !matches!(name.as_str(), "file_write" | "file_edit"))
+                            .then(|| {
+                                super::execution::capture_workspace_effect_snapshot(
+                                    &self.tool_executor,
+                                )
+                            })
+                            .flatten();
+                            let started_at = std::time::Instant::now();
+                            let result = if block_effectless_calls {
+                                json!({
+                                    "error": "DA execution-progress guard blocked another inspection-only turn",
+                                    "required_next_action": "Create or modify a substantive artifact; otherwise finish with FAILED and the exact blocker."
+                                })
+                            } else {
+                                let executor = self.tool_executor.read().clone();
+                                executor
+                                    .execute_with_security_context(
+                                        name,
+                                        args,
+                                        crate::skill_graph::security::SecurityContext::new(
+                                            &agent.agent_id,
+                                            &agent.role.to_string(),
+                                        )
+                                        .with_task(&ctx.task_iri),
+                                        ctx.allowed_tools.as_deref(),
                                     )
-                                    .with_task(&ctx.task_iri),
-                                    ctx.allowed_tools.as_deref(),
+                                    .await
+                                    .unwrap_or_else(|e| json!({"error": e}))
+                            };
+                            action_tracker.record(
+                                name,
+                                &c.arguments,
+                                &result,
+                                started_at.elapsed().as_secs_f64(),
+                            );
+                            if agent.role == AgentRole::Do
+                                && matches!(name.as_str(), "bash" | "powershell" | "code_execute")
+                                && crate::core::tracked_action::tool_result_failed(&result)
+                            {
+                                verification_failed_this_turn = true;
+                            }
+                            if !block_effectless_calls
+                                && super::execution::confirmed_workspace_effect(
+                                    &self.tool_executor,
+                                    name,
+                                    &c.arguments,
+                                    &result,
+                                    effect_snapshot.as_ref(),
                                 )
                                 .await
-                                .unwrap_or_else(|e| json!({"error": e}));
+                            {
+                                effect_succeeded_this_turn = true;
+                                action_tracker.mark_last_substantive_effect();
+                            }
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
                             let mut result_str =
                                 self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            session_micro_tools.extend(
+                                self.tool_executor
+                                    .read()
+                                    .get_micro_tool_names_for_call(&c.id),
+                            );
+                            if name == "tool_search" {
+                                session_micro_tools.extend(
+                                    result
+                                        .get("matches")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|item| item.get("name").and_then(Value::as_str))
+                                        .map(str::to_string),
+                                );
+                            }
 
                             // SkillAfter hook
                             let guard_aborted = {
@@ -961,6 +1332,94 @@ impl super::AgentRunner {
                             });
                         }
 
+                        if workspace_effect_tracked {
+                            record_workspace_effect_turn(
+                                &mut workspace_effect_observed,
+                                &mut consecutive_effectless_tool_turns,
+                                effect_succeeded_this_turn,
+                            );
+                            if effect_succeeded_this_turn {
+                                substantive_effect_count =
+                                    substantive_effect_count.saturating_add(1);
+                                low_novelty_turns = 0;
+                                execution_phase = super::execution::da_phase_after_tool_turn(
+                                    execution_phase,
+                                    true,
+                                    verification_failed_this_turn,
+                                );
+                                verification_turns = 0;
+                                info!(
+                                    "[DA Streaming progress] substantive workspace effect observed; no-change tail reset"
+                                );
+                            }
+                            if verification_failed_this_turn {
+                                execution_phase = super::execution::da_phase_after_tool_turn(
+                                    execution_phase,
+                                    effect_succeeded_this_turn,
+                                    true,
+                                );
+                                verification_turns = 0;
+                                running_messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: "[DA Verification Failure] An execution/verification command returned a failure signal. Repair the concrete reported defect before more broad inspection or completion, then rerun the targeted verification.".to_string(),
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                    reasoning_content: None,
+                                });
+                                info!("[DA Streaming progress] failed verification moved execution phase to Repair");
+                            } else if !effect_succeeded_this_turn {
+                                if matches!(
+                                    execution_phase,
+                                    ExecutionPhase::Verify | ExecutionPhase::Repair
+                                ) {
+                                    verification_turns = verification_turns.saturating_add(1);
+                                } else if effect_warning_turns > 0
+                                    && (consecutive_effectless_tool_turns >= effect_warning_turns
+                                        || low_novelty_turns >= effect_warning_turns)
+                                {
+                                    execution_phase = ExecutionPhase::Implement;
+                                }
+                                if effect_warning_turns > 0
+                                    && (consecutive_effectless_tool_turns == effect_warning_turns
+                                        || (effect_block_turns > 0
+                                            && consecutive_effectless_tool_turns
+                                                == effect_block_turns))
+                                {
+                                    let recovery_now = workspace_effect_recovery_active(
+                                        workspace_effect_tracked,
+                                        consecutive_effectless_tool_turns,
+                                        low_novelty_turns,
+                                        effect_block_turns,
+                                    );
+                                    if recovery_now
+                                        && consecutive_effectless_tool_turns == effect_block_turns
+                                    {
+                                        warn!(
+                                            "[DA Streaming progress] mutation recovery activated after {} consecutive no-change tool turns; inspection/search schemas withheld",
+                                            consecutive_effectless_tool_turns
+                                        );
+                                    }
+                                    let urgency = if recovery_now {
+                                        "Inspection/search tool schemas are now withheld until a substantive mutation succeeds."
+                                    } else {
+                                        "Stop broad inspection."
+                                    };
+                                    running_messages.push(ChatMessage {
+                                        role: "user".to_string(),
+                                        content: format!(
+                                            "[DA Execution Progress Contract] {} consecutive tool turns produced no substantive workspace change. {} Execute file_write/file_edit or a genuinely mutating command next; otherwise finish with `FAILED:` and the exact blocker.",
+                                            consecutive_effectless_tool_turns, urgency
+                                        ),
+                                        name: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        reasoning_content: None,
+                                    });
+                                }
+                            }
+                        }
+
                         turn += 1;
 
                         // Check if compression is needed after each tool call (consistent with exec() behavior)
@@ -970,10 +1429,11 @@ impl super::AgentRunner {
                                     let model = self
                                         .gateway
                                         .get_model(&agent.role.to_string().to_lowercase());
-                                    if cwm.should_compress_for_model(
+                                    if cwm.should_compress_for_model_with_reserve(
                                         running_messages.len(),
                                         &running_messages,
                                         &model,
+                                        current_tool_schema_token_reserve,
                                     ) {
                                         let (compressed, _summary) =
                                             cwm.compress_messages(&running_messages);
@@ -1092,7 +1552,7 @@ impl super::AgentRunner {
             }
         }
 
-        let final_summary = if last_summary.is_empty() {
+        let mut final_summary = if last_summary.is_empty() {
             Self::generate_auto_summary(&last_content)
         } else {
             last_summary.clone()
@@ -1139,12 +1599,21 @@ impl super::AgentRunner {
         let output_value = Value::String(last_content.clone());
         let jsonld_output = self.apply_output_mapping(&output_value, &agent.role, &ctx.task_iri);
 
+        let final_status = if workspace_effect_required && !workspace_effect_observed {
+            let detail = "DA finished without creating or modifying substantive workspace content";
+            errs.push(detail.to_string());
+            final_summary = format!("FAILED: {}. {}", detail, final_summary);
+            "failed"
+        } else {
+            "success"
+        };
+
         info!("AgentRunner streaming finished: {} tools", tc);
 
         (
             Ok(TaskResult {
                 task_iri: ctx.task_iri,
-                status: "success".to_string(),
+                status: final_status.to_string(),
                 summary: final_summary,
                 output: Some(output_value),
                 jsonld_output,
@@ -1153,7 +1622,7 @@ impl super::AgentRunner {
                 turn_count: turn,
                 tool_call_count: tc,
                 five_w2h_updates: None,
-                tracked_actions: Vec::new(),
+                tracked_actions: action_tracker.actions,
                 verdict: None,
                 archive_iri: None,
             }),
@@ -1185,16 +1654,25 @@ impl super::AgentRunner {
         use crate::tools::result_router::RouteDecision;
         use crate::tools::tool_executor::MicroToolContext;
 
-        let settings = crate::config::settings::ToolResultRouterSettings::default();
-        let router = ResultRouter::new(&settings);
+        // Dynamic result readers already return a caller-selected, bounded
+        // page. Routing that page again can create read_full_result_<new id>,
+        // producing an unbounded "read an archived read" chain and needless
+        // context growth. Keep this terminal read result inline.
+        if ToolExecutor::is_micro_tool_name(tool_name) {
+            return result_str.to_string();
+        }
+
+        let settings = &self.tool_result_router_settings;
+        let router = ResultRouter::new(settings);
 
         let decision = router.route(result_str, tool_name, call_id);
         let iri = format!("iri://tool-result/{}", call_id);
 
         match decision {
             RouteDecision::PassThrough => {
-                // Small result: pass through but attach IRI metadata
-                // Pre-register micro-tool for results exceeding prepare_threshold, in preparation for reference compression
+                // Small results stay inline. Pre-register a resolvable IRI and
+                // micro-tool only above prepare_threshold, in preparation for
+                // reference compression.
                 if result_str.len() > settings.prepare_threshold {
                     self.store_micro_tool_data_persistent(
                         &iri,
@@ -1223,8 +1701,14 @@ impl super::AgentRunner {
                             }
                         }
                     }
+                    format!("{}\nIRI: {}", result_str, iri)
+                } else {
+                    // An IRI is a query contract, not decorative metadata.
+                    // Small inline results are deliberately not archived, so
+                    // advertising an unresolvable IRI only induces wasted
+                    // read_agent_output calls in later turns.
+                    result_str.to_string()
                 }
-                format!("{}\nIRI: {}", result_str, iri)
             }
 
             RouteDecision::Truncate { max_chars } => {

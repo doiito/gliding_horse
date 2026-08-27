@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use crate::core::agent_runner::AgentRunner;
 use crate::core::event_bus::{Event, EventBus};
 use crate::core::perception_store::PerceptionStore;
+use crate::core::policy_learning::ConstrainedPolicy;
 use crate::core::relevance_tracker::RelevanceTracker;
 use crate::core::supplementary_store::SupplementaryInputStore;
 use crate::jsonld::type_router::TypeRouter;
@@ -22,7 +23,6 @@ use crate::templates::template_engine::TemplateEngine;
 use crate::tools::sharing::SharingProtocol;
 use crate::tools::skill_registry::SkillRegistry;
 use crate::tools::tool_executor::ToolExecutor;
-use crate::core::policy_learning::ConstrainedPolicy;
 
 use super::types::CycleState;
 
@@ -62,6 +62,9 @@ pub struct SupervisorAgent {
     /// Constrained contextual policy; it may rank hints but never overrides
     /// CA/AA, governance, security, or terminal-state rules.
     pub(super) policy_learning: ConstrainedPolicy,
+    /// Whether accumulated experience is injected and allowed to update the
+    /// online policy for this execution.
+    pub(super) learning_mode: crate::core::policy_learning::LearningMode,
 }
 
 impl SupervisorAgent {
@@ -126,6 +129,7 @@ impl SupervisorAgent {
             approval_wait_secs: 5,
             discovery_engine: None,
             policy_learning: ConstrainedPolicy::default().with_persistence(runner.l0_store.clone()),
+            learning_mode: crate::core::policy_learning::LearningMode::Active,
         }
     }
 
@@ -186,6 +190,11 @@ impl SupervisorAgent {
     /// When set, the SA will enrich the agent's context with relevant skill suggestions.
     pub fn with_discovery_engine(mut self, engine: Arc<SkillDiscoveryEngine>) -> Self {
         self.discovery_engine = Some(engine);
+        self
+    }
+
+    pub fn with_learning_mode(mut self, mode: crate::core::policy_learning::LearningMode) -> Self {
+        self.learning_mode = mode;
         self
     }
 

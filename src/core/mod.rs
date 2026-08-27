@@ -5,15 +5,16 @@ pub mod checkpoint;
 pub mod constitution;
 pub mod context_compressor;
 pub mod core_types;
+pub mod effect;
 pub mod event_bus;
 pub mod execution_event;
 pub mod five_w2h;
 pub mod perception_store;
 pub mod policy_learning;
-pub mod prompt_loader;
 pub mod prompt_contract;
-pub mod relevance_tracker;
+pub mod prompt_loader;
 pub mod recovery;
+pub mod relevance_tracker;
 pub mod sa;
 pub mod supplementary_store;
 pub mod syscall_gate;
@@ -37,18 +38,18 @@ pub use execution_event::{
 };
 pub use five_w2h::*;
 pub use perception_store::{PerceptionEntry, PerceptionSource, PerceptionStore};
-pub use prompt_loader::{PromptConfig, PromptLoader};
-pub use prompt_contract::{ApplicationPromptProfile, PromptAssemblyReport, PromptVariant};
 pub use policy_learning::{
-    ArmStats, ConstrainedPolicy, PolicyChoice, PolicyObservation, PolicyState,
-    PolicyDriftReport, PolicyEvaluation, PolicyGate, PolicyVersion, TrainablePolicyModel,
+    ArmStats, ConstrainedPolicy, LearningMode, PolicyChoice, PolicyDriftReport, PolicyEvaluation,
+    PolicyGate, PolicyObservation, PolicyState, PolicyVersion, TrainablePolicyModel,
     TrainingMetrics, TrajectoryStep,
 };
-pub use relevance_tracker::RelevanceTracker;
+pub use prompt_contract::{ApplicationPromptProfile, PromptAssemblyReport, PromptVariant};
+pub use prompt_loader::{PromptConfig, PromptLoader};
 pub use recovery::{
     AuditReport, AuditVerdict, DecisionReport, OrchestrationMode, RecoveryDirective,
     RecoveryReason, RepairScope,
 };
+pub use relevance_tracker::RelevanceTracker;
 pub use sa::SupervisorAgent;
 pub use supplementary_store::{SupplementEntry, SupplementaryInputStore};
 pub use syscall_gate::{SyscallGate, WhitelistManager};

@@ -10,9 +10,50 @@ use super::actions::parse_or_repair_json;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
-/// Single source of truth for the LLM plan step limit.
-/// The planning prompt advertises this exact cap; parse_llm_plan truncates to it.
-pub const MAX_PLAN_STEPS: usize = 6;
+/// A token budget extracted from an LLM is only a rough estimate. Treating it
+/// as a hard task limit makes an otherwise normal task fail when the model
+/// happens to emit a small number such as 5000. Only a budget explicitly
+/// requested by the user is authoritative.
+pub(crate) fn user_explicitly_requested_token_budget(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    let markers = [
+        "token budget",
+        "token_budget",
+        "token_limit",
+        "tokenbudget",
+        "token limit",
+        "tokens limit",
+        "令牌预算",
+        "token上限",
+    ];
+    markers.iter().any(|marker| {
+        lower.find(marker).is_some_and(|pos| {
+            lower[pos + marker.len()..]
+                .chars()
+                .take(40)
+                .any(|ch| ch.is_ascii_digit())
+        })
+    })
+}
+
+#[cfg(test)]
+mod token_budget_tests {
+    use super::user_explicitly_requested_token_budget;
+
+    #[test]
+    fn only_explicit_budget_markers_are_authoritative() {
+        assert!(user_explicitly_requested_token_budget(
+            "Run the task with token budget 50000"
+        ));
+        assert!(user_explicitly_requested_token_budget("token_limit: 12000"));
+        assert!(!user_explicitly_requested_token_budget(
+            "Inspect the code and report the relevant test command"
+        ));
+        assert!(!user_explicitly_requested_token_budget(
+            "The model may estimate token budget"
+        ));
+    }
+}
 
 impl SupervisorAgent {
     pub async fn start_cycle(
@@ -22,7 +63,18 @@ impl SupervisorAgent {
     ) -> Result<String, CoreError> {
         let cycle_id = format!("cycle_{}", uuid::Uuid::new_v4().hyphenated());
 
-        let perception_result = self.perception.on_task_start(user_input, task_iri).await?;
+        let perception_result = self
+            .perception
+            .on_task_start_with_history_limit(
+                user_input,
+                task_iri,
+                self.learning_mode.retrieves_history(),
+                self.runner
+                    .token_optimization
+                    .prompt_optimization
+                    .max_learning_hints,
+            )
+            .await?;
         info!(
             cycle_id = %cycle_id,
             task_iri = %task_iri,
@@ -31,16 +83,41 @@ impl SupervisorAgent {
             "Perception analysis complete"
         );
 
+        let observed_experience_hint_count = perception_result.relevant_experience_hints.len();
+        let observed_experience_hint_fingerprints = perception_result
+            .relevant_experience_hints
+            .iter()
+            .map(|hint| {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(hint.as_bytes());
+                format!("sha256:{}", hex::encode(&digest[..8]))
+            })
+            .collect();
+        let now = chrono::Utc::now();
         let cycle = CycleState {
             cycle_id: cycle_id.clone(),
             task_iri: task_iri.to_string(),
             phase: CyclePhase::Analyzing,
             iteration: 0,
             max_iterations: self.max_iterations,
-            started_at: chrono::Utc::now(),
+            started_at: now,
+            pdca_started_at: now,
+            cycle_deadline_at: now
+                + chrono::Duration::seconds(self.perception.cycle_timeout_secs().max(1)),
+            last_progress_at: now,
+            last_timeout_alert_at: None,
+            next_timeout_alert_at: None,
+            timeout_alert_count: 0,
+            outer_cycle_number: 0,
             phase_history: vec!["Created".to_string()],
             task_completed: false,
-            experience_hints: perception_result.relevant_experience_hints.clone(),
+            observed_experience_hint_count,
+            observed_experience_hint_fingerprints,
+            experience_hints: if self.learning_mode.injects_history() {
+                perception_result.relevant_experience_hints.clone()
+            } else {
+                Vec::new()
+            },
             intervention: InterventionState::default(),
         };
 
@@ -234,6 +311,13 @@ impl SupervisorAgent {
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: match role {
+                        AgentRole::Plan | AgentRole::Check => {
+                            crate::core::effect::EffectPolicy::EvidenceOnly
+                        }
+                        AgentRole::Act => crate::core::effect::EffectPolicy::DecisionOnly,
+                        AgentRole::Do => crate::core::effect::EffectPolicy::None,
+                    },
                 }
             })
             .collect()
@@ -241,9 +325,25 @@ impl SupervisorAgent {
 
     pub(super) async fn extract_5w2h_from_input(
         &self,
+        task_iri: &str,
         user_input: &str,
+        prefer_exact_contract: bool,
     ) -> crate::core::five_w2h::Task5W2H {
         use crate::core::five_w2h::*;
+
+        // When the caller has already declared that an observable effect is
+        // required, the user's text is the authoritative acceptance contract.
+        // An additional model call adds latency and can silently paraphrase or
+        // invent quantities. PA can still enrich the remaining 5W2H dimensions
+        // later through `five_w2h_updates`.
+        if prefer_exact_contract {
+            let mut w2h = Task5W2H::new(
+                user_input,
+                "Fulfil the explicit user contract and verify the required effect.",
+            );
+            w2h.why.success_criteria = vec![user_input.to_string()];
+            return w2h;
+        }
 
         if user_input.len() < 20 && !user_input.contains(' ') {
             let mut w2h = Task5W2H::new(user_input, "User task");
@@ -285,9 +385,14 @@ Output only JSON, no other content."#,
         }];
 
         match self
-            .runner
-            .gateway
-            .chat_with_params(&model, messages, Some(0.3), Some(4096), None, None)
+            .chat_sa_streaming(
+                task_iri,
+                "5w2h_extraction",
+                &model,
+                messages,
+                Some(0.3),
+                Some(4096),
+            )
             .await
         {
             Ok(response) => {
@@ -400,14 +505,18 @@ Output only JSON, no other content."#,
                         }
 
                         // ── how_much (token_budget) ──
-                        if let Some(budget) = parsed.get("token_budget").and_then(|v| v.as_u64()) {
-                            w2h = w2h.with_how_much(HowMuchDetail {
-                                token_budget: Some(budget),
-                                max_sub_agents: None,
-                                max_pdca_cycles: None,
-                                expected_quality: None,
-                                actual_cost: None,
-                            });
+                        if user_explicitly_requested_token_budget(user_input) {
+                            if let Some(budget) =
+                                parsed.get("token_budget").and_then(|v| v.as_u64())
+                            {
+                                w2h = w2h.with_how_much(HowMuchDetail {
+                                    token_budget: Some(budget),
+                                    max_sub_agents: None,
+                                    max_pdca_cycles: None,
+                                    expected_quality: None,
+                                    actual_cost: None,
+                                });
+                            }
                         }
 
                         return w2h;
@@ -424,6 +533,7 @@ Output only JSON, no other content."#,
 
     pub async fn analyze_task_with_llm(
         &self,
+        task_iri: &str,
         user_input: &str,
         five_w2h: &crate::core::five_w2h::Task5W2H,
         experience_hints: &[String],
@@ -447,9 +557,9 @@ Output only JSON, no other content."#,
         };
 
         let complexity = match keyword_complexity {
-            TaskComplexity::Recursive
-            | TaskComplexity::Exploratory
-            | TaskComplexity::Emergency => keyword_complexity,
+            TaskComplexity::Recursive | TaskComplexity::Exploratory | TaskComplexity::Emergency => {
+                keyword_complexity
+            }
             _ => match five_w2h.why.priority {
                 crate::core::five_w2h::Priority::High => TaskComplexity::Complex,
                 crate::core::five_w2h::Priority::Medium => TaskComplexity::Standard,
@@ -458,7 +568,7 @@ Output only JSON, no other content."#,
         };
 
         match self
-            .generate_detailed_plan_with_llm(&enhanced_input, five_w2h)
+            .generate_detailed_plan_with_llm(task_iri, &enhanced_input, five_w2h)
             .await
         {
             Ok(mut plan) => {
@@ -492,6 +602,7 @@ Output only JSON, no other content."#,
 
     async fn generate_detailed_plan_with_llm(
         &self,
+        task_iri: &str,
         user_input: &str,
         five_w2h: &crate::core::five_w2h::Task5W2H,
     ) -> Result<ExecutionPlan, CoreError> {
@@ -566,8 +677,7 @@ Output only JSON, no other content."#,
         let sa_constitution_prompt = {
             use crate::core::constitution::{ConstitutionRegistry, ConstitutionRole};
             let registry = ConstitutionRegistry::new();
-            let constitution_text =
-                registry.build_prompt_for_role(ConstitutionRole::Supervisor);
+            let constitution_text = registry.build_prompt_for_role(ConstitutionRole::Supervisor);
             // Inject methodology layer discipline (includes auto-trigger protocol, always-active methodology)
             let methodology_text =
                 crate::methodology::integration::MethodologyPromptInjector::build_for_sa();
@@ -626,7 +736,10 @@ As the Supervisor Agent, you must follow these guidelines:
 {}
 
 Output only JSON, no other content."#,
-            user_input, w2h_block, sa_constitution_prompt, MAX_PLAN_STEPS
+            user_input,
+            w2h_block,
+            sa_constitution_prompt,
+            self.runner.agent_settings.execution_budget.max_plan_steps
         );
 
         let model = self.runner.gateway.get_model("default");
@@ -640,9 +753,14 @@ Output only JSON, no other content."#,
         }];
 
         let response = self
-            .runner
-            .gateway
-            .chat_with_params(&model, messages, Some(0.3), Some(8192), None, None)
+            .chat_sa_streaming(
+                task_iri,
+                "plan_generation",
+                &model,
+                messages,
+                Some(0.3),
+                Some(8192),
+            )
             .await?;
 
         let content = response
@@ -727,11 +845,18 @@ Output only JSON, no other content."#,
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: match role {
+                        AgentRole::Plan | AgentRole::Check => {
+                            crate::core::effect::EffectPolicy::EvidenceOnly
+                        }
+                        AgentRole::Act => crate::core::effect::EffectPolicy::DecisionOnly,
+                        AgentRole::Do => crate::core::effect::EffectPolicy::None,
+                    },
                 }
             })
             .collect();
 
-        let max_plan_steps = MAX_PLAN_STEPS;
+        let max_plan_steps = self.runner.agent_settings.execution_budget.max_plan_steps;
         let steps = if steps.len() > max_plan_steps {
             warn!(
                 "Plan step count {} exceeds limit {}, truncating to first {} steps",
@@ -873,12 +998,17 @@ Complexity definitions:
         // containing "error" must not be misclassified as emergency.
         let emergency_strong = ["fix", "bug", "urgent", "repair"];
         let emergency_weak = ["error", "crash", "broken", "fault"];
-        let emergency_reinforced =
-            ["critical", "security", "production", "immediately", "outage"];
+        let emergency_reinforced = [
+            "critical",
+            "security",
+            "production",
+            "immediately",
+            "outage",
+        ];
         let has_strong = emergency_strong.iter().any(|k| lower.contains(k));
         let has_weak = emergency_weak.iter().any(|k| lower.contains(k));
-        let reinforced = user_input.len() < 200
-            || emergency_reinforced.iter().any(|k| lower.contains(k));
+        let reinforced =
+            user_input.len() < 200 || emergency_reinforced.iter().any(|k| lower.contains(k));
         if has_strong || (has_weak && reinforced) {
             return TaskComplexity::Emergency;
         }

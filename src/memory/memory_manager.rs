@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::core::tracked_action::TrackedAction;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l0_store::L0Store;
-use crate::memory::l1_session::{L1Session, SessionSummary};
+use crate::memory::l1_session::{EvictionConfig, L1Session, SessionSummary};
 use crate::memory::l2_blackboard::Blackboard;
 use crate::memory::l3_projection::ProjectionEngine;
 use crate::memory::scheduler::MemoryScheduler;
@@ -28,6 +28,7 @@ pub struct MemoryManager {
     sessions: HashMap<String, L1Session>,
     scheduler: Option<Arc<MemoryScheduler>>,
     l1_active_count: AtomicU64,
+    active_session_ids: std::collections::HashSet<String>,
     /// HyperspaceEngine-backed vector store for semantic search.
     /// Available to all memory layers for embedding-based retrieval.
     vector_store: Option<Arc<HyperspaceStore>>,
@@ -63,6 +64,7 @@ impl MemoryManager {
             sessions: HashMap::new(),
             scheduler: None,
             l1_active_count: AtomicU64::new(0),
+            active_session_ids: std::collections::HashSet::new(),
             vector_store,
             #[cfg(feature = "ontology")]
             ontology_bridge: None,
@@ -100,6 +102,7 @@ impl MemoryManager {
             sessions: HashMap::new(),
             scheduler: Some(scheduler),
             l1_active_count: AtomicU64::new(0),
+            active_session_ids: std::collections::HashSet::new(),
             vector_store,
             #[cfg(feature = "ontology")]
             ontology_bridge: None,
@@ -147,11 +150,25 @@ impl MemoryManager {
         agent_role: &str,
         task_iri: &str,
     ) -> L1Session {
-        let session = match self.config.eviction_config {
-            Some(cfg) => L1Session::with_config(agent_id, agent_role, task_iri, 2000, cfg),
-            None => L1Session::new(agent_id, agent_role, task_iri),
-        };
-        self.l1_active_count.fetch_add(1, Ordering::Relaxed);
+        let budget = self.config.l1_token_budget.max(1);
+        let mut eviction_config = self
+            .config
+            .eviction_config
+            .unwrap_or_else(|| EvictionConfig::for_role(agent_role));
+        if let Some(value) = self.config.l1_max_low_relevance_refs {
+            eviction_config.max_low_relevance_refs = value;
+        }
+        if let Some(value) = self.config.l1_reload_preview_chars {
+            eviction_config.reload_preview_chars = value;
+        }
+        let session =
+            L1Session::with_config(agent_id, agent_role, task_iri, budget, eviction_config);
+        if self
+            .active_session_ids
+            .insert(session.session_id().to_string())
+        {
+            self.l1_active_count.fetch_add(1, Ordering::Relaxed);
+        }
         debug!(
             session_id = %session.session_id(),
             agent_id = %agent_id,
@@ -170,7 +187,9 @@ impl MemoryManager {
         } else {
             self.sessions.insert(id.clone(), session);
         }
-        self.l1_active_count.fetch_add(1, Ordering::Relaxed);
+        if self.active_session_ids.insert(id.clone()) {
+            self.l1_active_count.fetch_add(1, Ordering::Relaxed);
+        }
         id
     }
 
@@ -215,7 +234,7 @@ impl MemoryManager {
             );
             Ok(summary)
         };
-        if result.is_ok() {
+        if result.is_ok() && self.active_session_ids.remove(session_id) {
             self.l1_active_count.fetch_sub(1, Ordering::Relaxed);
         }
         result
@@ -290,7 +309,10 @@ impl MemoryManager {
         self.l2.write_node(&task_id, &json_ld, &self.config)
     }
 
-    pub fn archive_experience(
+    /// Preserve one BizAgent's tool-level execution trace for diagnostics.
+    /// This is deliberately not tagged as a reusable task `experience`:
+    /// only SA's terminal user-task outcome may enter that retrieval pool.
+    pub fn archive_agent_execution(
         &self,
         task_iri: &str,
         agent_role: &str,
@@ -298,16 +320,20 @@ impl MemoryManager {
         success_rate: f32,
     ) -> Result<(), CoreError> {
         let exp = serde_json::json!({
+            "@type": "AgentExecutionTrace",
             "experience_id": format!("exp_{}", uuid::Uuid::new_v4().hyphenated()),
             "scenario": summary,
             "pattern": if success_rate < 0.5 { "had_failures" } else { "all_success" },
             "success_rating": success_rate,
-            "tags": ["experience", agent_role],
+            "tags": ["agent_execution", agent_role],
             "task_iri": task_iri,
             "created_at": chrono::Utc::now().to_rfc3339(),
         })
         .to_string();
-        let iri = format!("iri://experience/{}", uuid::Uuid::new_v4().hyphenated());
+        let iri = format!(
+            "iri://execution-trace/{}",
+            uuid::Uuid::new_v4().hyphenated()
+        );
         self.l0.store(&iri, &exp)
     }
 
@@ -468,8 +494,9 @@ impl MemoryManager {
         let session_id = session.session_id().to_string();
         self.track_session(session);
         let summary = self.close_session(&session_id)?;
-        self.archive_to_l2(task_iri, &summary)?;
+        // Durable archive first; L2 is a rebuildable active projection.
         self.archive_to_l0(&summary)?;
+        self.archive_to_l2(task_iri, &summary)?;
         info!(
             session_id = %session_id,
             task_iri = %task_iri,
@@ -543,5 +570,74 @@ impl MemoryManager {
     /// Get Blackboard reference
     pub fn blackboard(&self) -> &Arc<Blackboard> {
         &self.l2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::EvictionConfig;
+
+    fn manager_with_config(config: CoreConfig) -> (MemoryManager, Arc<L0Store>, Arc<Blackboard>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep();
+        let l0 = Arc::new(L0Store::new(path.to_string_lossy().as_ref()).unwrap());
+        let l2 = Arc::new(Blackboard::new().unwrap());
+        let projection = Arc::new(ProjectionEngine::new(l2.clone(), 4096));
+        (
+            MemoryManager::new(l0.clone(), l2.clone(), projection, config),
+            l0,
+            l2,
+        )
+    }
+
+    #[test]
+    fn configured_l1_budget_is_used_with_and_without_custom_eviction() {
+        let mut config = CoreConfig::default();
+        config.l1_token_budget = 321;
+        let (mut manager, _, _) = manager_with_config(config.clone());
+        assert_eq!(
+            manager
+                .create_session("da", "DA", "iri://task/budget")
+                .token_budget(),
+            321
+        );
+
+        config.eviction_config = Some(EvictionConfig::default_sa());
+        let (mut manager, _, _) = manager_with_config(config);
+        assert_eq!(
+            manager
+                .create_session("ca", "CA", "iri://task/budget")
+                .token_budget(),
+            321
+        );
+    }
+
+    #[test]
+    fn l1_reference_overrides_preserve_role_specific_weights() {
+        let mut config = CoreConfig::default();
+        config.l1_max_low_relevance_refs = Some(9);
+        config.l1_reload_preview_chars = Some(777);
+        let (mut manager, _, _) = manager_with_config(config);
+        let session = manager.create_session("ca", "CA", "iri://task/l1-overrides");
+        assert!(session.eviction_config().relevance_weight > 0.6);
+        assert_eq!(session.eviction_config().max_low_relevance_refs, 9);
+        assert_eq!(session.eviction_config().reload_preview_chars, 777);
+    }
+
+    #[test]
+    fn finalize_does_not_leak_active_session_count() {
+        let (mut manager, l0, l2) = manager_with_config(CoreConfig::default());
+        let mut session = manager.create_session("da", "DA", "iri://task/finalize-count");
+        session.add_summary("DA", "compact historical summary", None);
+        assert_eq!(manager.l1_session_count(), 1);
+
+        manager
+            .finalize_session(session, "iri://task/finalize-count")
+            .unwrap();
+        assert_eq!(manager.l1_session_count(), 0);
+        assert_eq!(manager.session_count(), 0);
+        assert_eq!(l0.count().unwrap(), 1);
+        assert_eq!(l2.get_task_nodes("iri://task/finalize-count").len(), 1);
     }
 }

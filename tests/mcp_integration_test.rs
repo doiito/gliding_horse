@@ -344,7 +344,11 @@ async fn test_mcp_integration_invoke_tool_real_dispatch() {
     };
     registry.register_server(server_config).await.unwrap();
     registry
-        .register_tool(MCPToolInfo::new("chrome", "browser_navigate", "Navigate to a URL"))
+        .register_tool(MCPToolInfo::new(
+            "chrome",
+            "browser_navigate",
+            "Navigate to a URL",
+        ))
         .await
         .unwrap();
 

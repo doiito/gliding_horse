@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use glidinghorse::causal::engine::CausalEngine;
 use glidinghorse::causal::fused::FusedRootCauseEngine;
@@ -46,9 +47,36 @@ use glidinghorse::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorC
 use glidinghorse::CoreConfig;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::CliConfig;
+
+pub type StartupReporter = Arc<dyn Fn(&str, Option<f64>) + Send + Sync>;
+
+fn report_startup(reporter: &Option<StartupReporter>, stage: &str, progress: Option<f64>) {
+    if let Some(reporter) = reporter {
+        reporter(stage, progress);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_kb() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_kb() -> Option<u64> {
+    None
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentEvent {
@@ -105,6 +133,8 @@ pub struct CodeCliEngine {
     /// Stable code-scan exclusions compiled from built-ins, workspace settings,
     /// and the supported subset of the workspace `.gitignore`.
     code_scan_exclude_patterns: Vec<String>,
+    learning_snapshot_max_files: usize,
+    learning_snapshot_max_bytes: u64,
 }
 
 const DEFAULT_CODE_SCAN_EXCLUSIONS: &[&str] = &[
@@ -116,11 +146,36 @@ const DEFAULT_CODE_SCAN_EXCLUSIONS: &[&str] = &[
     "dist/",
     "build/",
     "__pycache__/",
+    ".pytest_cache/",
     ".venv/",
     "venv/",
     ".next/",
     ".gliding_horse/",
 ];
+
+const GLIDINGCODE_WORKFLOW_SKILL_IRI: &str = "iri://skills/glidingcode-workflow";
+
+fn glidingcode_learning_skill_node() -> glidinghorse::skill_graph::types::SkillGraphNode {
+    use glidinghorse::skill_graph::types::{Skill5W2H, SkillGraphNode};
+
+    SkillGraphNode::new(
+        GLIDINGCODE_WORKFLOW_SKILL_IRI,
+        "glidingcode software delivery workflow",
+        "Application-level planning, implementation, executable verification, and acceptance workflow for software tasks.",
+    )
+    .with_5w2h(
+        Skill5W2H::new(
+            "software task delivery workflow",
+            "Reuse CA-validated implementation and verification knowledge without bypassing current-task audit",
+        )
+        .with_phase("Plan")
+        .with_phase("Do")
+        .with_agent_role("PA"),
+    )
+    .with_tag("glidingcode")
+    .with_tag("application-workflow")
+    .with_tag("non-executable-learning-skill")
+}
 
 fn load_code_scan_exclusions(root: &std::path::Path, configured: &[String]) -> Vec<String> {
     let mut patterns: Vec<String> = DEFAULT_CODE_SCAN_EXCLUSIONS
@@ -241,8 +296,85 @@ fn collect_workspace_code_files(
     Ok(files)
 }
 
+/// Hash the substantive workspace state for controlled replay comparability.
+/// This deliberately runs only when a learning pair ID is supplied; normal
+/// interactive tasks retain the constant-time workspace identity fingerprint.
+fn workspace_state_fingerprint(
+    root: &std::path::Path,
+    exclusion_patterns: &[String],
+    max_files: usize,
+    max_bytes: u64,
+) -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let mut entries = std::fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let relative = path.strip_prefix(root).unwrap_or(path.as_path());
+            if file_type.is_dir() {
+                if !code_path_is_excluded(relative, true, exclusion_patterns) {
+                    pending.push(path);
+                }
+            } else if file_type.is_file()
+                && !code_path_is_excluded(relative, false, exclusion_patterns)
+            {
+                files.push(path);
+                if files.len() > max_files {
+                    anyhow::bail!("workspace snapshot exceeds {max_files} files");
+                }
+            }
+        }
+    }
+    files.sort();
+
+    let mut total_bytes = 0u64;
+    let mut digest = Sha256::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let metadata = std::fs::metadata(&path)?;
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > max_bytes {
+            anyhow::bail!("workspace snapshot exceeds {max_bytes} bytes");
+        }
+        digest.update((relative.len() as u64).to_le_bytes());
+        digest.update(relative.as_bytes());
+        digest.update(metadata.len().to_le_bytes());
+        let mut file = std::fs::File::open(&path)?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+    }
+    Ok(format!("sha256:{}", hex::encode(&digest.finalize()[..12])))
+}
+
 impl CodeCliEngine {
-    pub fn new(mut config: CliConfig) -> anyhow::Result<Self> {
+    pub fn new(config: CliConfig) -> anyhow::Result<Self> {
+        Self::new_with_startup_reporter(config, None)
+    }
+
+    pub fn new_with_startup_reporter(
+        mut config: CliConfig,
+        startup_reporter: Option<StartupReporter>,
+    ) -> anyhow::Result<Self> {
+        let startup_started = Instant::now();
+        report_startup(&startup_reporter, "Resolving workspace", None);
         // Set the process working directory to the configured workspace so that
         // agent_os tool handlers (execute_file_read/write/edit, execute_bash, …)
         // resolve relative paths against the correct root. Without this they
@@ -258,6 +390,10 @@ impl CodeCliEngine {
 
         let gateway = Arc::new(UnifiedGateway::new(&config.gateway)?);
         let dir = tempfile::TempDir::new()?;
+        // Load agent-os config before constructing memory layers so their
+        // storage and capacity settings are effective from the first write.
+        let loaded_settings = glidinghorse::config::Settings::load().ok();
+        let settings = loaded_settings.clone().unwrap_or_default();
 
         // A configured data directory is a shared root, not a workspace
         // identity. Keep state from separate repositories isolated below a
@@ -281,13 +417,41 @@ impl CodeCliEngine {
             .map(|d| d.join("l0").to_string_lossy().to_string())
             .unwrap_or_else(|| dir.path().join("l0").to_string_lossy().to_string());
 
+        let l0_file = std::path::Path::new(&l0_path).join("l0.redb");
+        let l0_size_gib = std::fs::metadata(&l0_file)
+            .map(|metadata| metadata.len() as f64 / (1024.0 * 1024.0 * 1024.0))
+            .unwrap_or(0.0);
+        report_startup(
+            &startup_reporter,
+            &format!("Opening L0 memory ({l0_size_gib:.1} GiB)"),
+            None,
+        );
+        let l0_repair_callback = startup_reporter.as_ref().map(|reporter| {
+            let reporter = reporter.clone();
+            Arc::new(move |progress: f64| {
+                reporter("Recovering L0 after an unclean exit", Some(progress));
+            }) as Arc<dyn Fn(f64) + Send + Sync>
+        });
+
         let l0 = Arc::new(
-            L0Store::new(&l0_path).map_err(|e| anyhow::anyhow!("L0Store 创建失败: {}", e))?,
+            L0Store::with_config_and_repair_callback(
+                glidinghorse::memory::l0_store::L0Config {
+                    path: l0_path,
+                    max_entries: settings.memory.l0.max_entries as usize,
+                    compression: settings.memory.l0.compression,
+                    blob_inline_threshold: settings.memory.l0.blob_inline_threshold,
+                    cache_size_bytes: settings.memory.l0.cache_size_bytes,
+                    quick_repair: settings.memory.l0.quick_repair,
+                },
+                l0_repair_callback,
+            )
+            .map_err(|e| anyhow::anyhow!("L0Store 创建失败: {}", e))?,
         );
 
         // ── Unified Oxigraph Store — shared across Blackboard, SkillGraphStore,
         //    ToolExecutor (KnowledgeGraphStore), and KnowledgeBridge so that all
         //    subsystems operate on the same RDF store via named-graph isolation.
+        report_startup(&startup_reporter, "Opening unified knowledge graph", None);
         let unified = Arc::new(
             match &persistent_root {
                 Some(root) => UnifiedGraphStore::new_persistent(root.join("unified-graph")),
@@ -297,14 +461,13 @@ impl CodeCliEngine {
         );
 
         let l2 = Arc::new(
-            Blackboard::with_store(unified.store())
-                .map_err(|e| anyhow::anyhow!("Blackboard 创建失败: {}", e))?,
+            Blackboard::with_store_and_queue_capacity(
+                unified.store(),
+                settings.memory.l2.sync_queue_capacity,
+            )
+            .map_err(|e| anyhow::anyhow!("Blackboard 创建失败: {}", e))?,
         );
-
-        // Load agent-os config (config.yaml + AGENT_OS_* env vars) for tunable
-        // parameters; fall back to Defaults when no config file is present.
-        let loaded_settings = glidinghorse::config::Settings::load().ok();
-        let settings = loaded_settings.clone().unwrap_or_default();
+        l2.set_max_memory_mb(settings.memory.l2.max_memory_mb);
 
         // Initialize HyperspaceEngine-backed vector store for semantic search
         let embed: Arc<dyn glidinghorse::memory::embedding_service::EmbeddingService> =
@@ -320,6 +483,7 @@ impl CodeCliEngine {
             .map(|d| d.join("hyperspace").to_string_lossy().to_string())
             .unwrap_or_else(|| dir.path().join("hyperspace").to_string_lossy().to_string());
         let _ = std::fs::create_dir_all(&hyperspace_path);
+        report_startup(&startup_reporter, "Opening semantic vector memory", None);
         let vector_store = Arc::new(
             HyperspaceStore::open(std::path::Path::new(&hyperspace_path), embed.clone())
                 .map_err(|e| anyhow::anyhow!("HyperspaceStore 初始化失败: {}", e))?,
@@ -341,6 +505,7 @@ impl CodeCliEngine {
         // Reuse the same text embedding service; structural uses its own.
         let struct_embed_svc: Arc<dyn glidinghorse::ontology_bridge::StructuralEmbeddingService> =
             Arc::new(FallbackStructuralEmbeddingService::new());
+        report_startup(&startup_reporter, "Opening ontology memory", None);
         let mut ontology_bridge = OntologyBridgeManager::open(OntologyBridgeConfig {
             text_dir,
             struct_dir,
@@ -375,9 +540,11 @@ impl CodeCliEngine {
             agent_settings.max_projection_size,
             Some(vector_store.clone()),
         ));
+        proj.set_max_memory_mb(settings.memory.l3.max_memory_mb);
         let core_config = CoreConfig {
             max_node_size: settings.memory.l2.max_node_size,
             max_projection_size: agent_settings.max_projection_size,
+            l1_token_budget: settings.memory.l1.max_tokens.max(1),
             l0_storage_path: settings.memory.l0.path.clone(),
             event_buffer_size: settings.agents.event_bus_capacity,
             enable_metrics: true,
@@ -394,11 +561,15 @@ impl CodeCliEngine {
                         relevance_threshold: l1.eviction_relevance_threshold.unwrap_or(0.3),
                         safe_window_seconds: l1.eviction_safe_window_seconds.unwrap_or(300),
                         beta: l1.eviction_beta.unwrap_or(0.7),
+                        max_low_relevance_refs: l1.max_low_relevance_refs,
+                        reload_preview_chars: l1.reload_preview_chars,
                     })
                 } else {
                     None
                 }
             },
+            l1_max_low_relevance_refs: Some(settings.memory.l1.max_low_relevance_refs),
+            l1_reload_preview_chars: Some(settings.memory.l1.reload_preview_chars),
         };
         let mm = Arc::new(tokio::sync::Mutex::new(MemoryManager::with_vector_store(
             l0.clone(),
@@ -444,6 +615,7 @@ impl CodeCliEngine {
         // ── TimelineStore (temporal event recording for graph mutations) ──
         // Created before SkillGraphStore so the store can attach it and record
         // every structural mutation (otherwise TL: pending stays at 0).
+        report_startup(&startup_reporter, "Restoring timeline metadata", None);
         let timeline = Arc::new(
             TimelineStore::new(
                 agent_settings.snapshot_frequency,
@@ -456,6 +628,11 @@ impl CodeCliEngine {
         }
 
         // ── Skill Graph Store — cognitive network ──
+        report_startup(
+            &startup_reporter,
+            "Restoring skill and knowledge graphs",
+            None,
+        );
         let skill_graph = Arc::new(
             SkillGraphStore::new()
                 .with_blackboard(l2.clone())
@@ -466,6 +643,18 @@ impl CodeCliEngine {
 
         if let Err(error) = skill_graph.hydrate_from_l0() {
             tracing::warn!(%error, "Failed to hydrate persisted skill graph; continuing with bootstrap skills");
+        }
+
+        // This is application workflow knowledge, not an executable kernel
+        // tool. Keeping it outside SkillRegistry prevents accidental syscall
+        // authority while giving validated fragments one stable graph home.
+        if skill_graph
+            .get_skill(GLIDINGCODE_WORKFLOW_SKILL_IRI)
+            .is_none()
+        {
+            if let Err(error) = skill_graph.register_skill(glidingcode_learning_skill_node()) {
+                warn!(%error, "Failed to register glidingcode learning workflow skill");
+            }
         }
 
         // Bootstrap the SkillGraphStore with default skills from SkillRegistry
@@ -503,7 +692,20 @@ impl CodeCliEngine {
         // This gives the skill graph non-zero edge count (SG: N E) from startup
         // and makes the cognitive network navigable from the beginning.
         {
-            let nodes = skill_graph.list_all_skills();
+            // Restrict this bootstrap heuristic to the registered application
+            // tool skills. Learned/generalized nodes are linked by governed
+            // evolution; including the whole accumulated graph here made each
+            // startup O(total_skill_count^2).
+            let registered_iris = skills
+                .list_all_skills()
+                .into_iter()
+                .map(|skill| skill.skill_iri)
+                .collect::<std::collections::HashSet<_>>();
+            let nodes = skill_graph
+                .list_all_skills()
+                .into_iter()
+                .filter(|skill| registered_iris.contains(&skill.skill_iri))
+                .collect::<Vec<_>>();
             let mut link_count = 0usize;
             for i in 0..nodes.len() {
                 for j in (i + 1)..nodes.len() {
@@ -527,14 +729,25 @@ impl CodeCliEngine {
                             LinkStrength::Navigation
                         };
                         let desc = format!("Related via: {}", shared.join(", "));
-                        let _ = skill_graph.add_link(
-                            &a.skill_iri,
-                            &b.skill_iri,
-                            SkillLinkType::Related,
-                            strength,
-                            &desc,
-                        );
-                        link_count += 1;
+                        let already_linked = a.links.iter().any(|link| {
+                            link.target_iri == b.skill_iri
+                                && link.link_type == SkillLinkType::Related
+                                && link.strength == strength
+                                && link.description == desc
+                        });
+                        if !already_linked
+                            && skill_graph
+                                .add_link(
+                                    &a.skill_iri,
+                                    &b.skill_iri,
+                                    SkillLinkType::Related,
+                                    strength,
+                                    &desc,
+                                )
+                                .is_ok()
+                        {
+                            link_count += 1;
+                        }
                     }
                 }
             }
@@ -568,7 +781,8 @@ impl CodeCliEngine {
             tmpl.clone(),
         ))
         .with_workspace_root(workspace_root.clone())
-        .with_token_optimization(settings.token_optimization.clone());
+        .with_token_optimization(settings.token_optimization.clone())
+        .with_tool_result_router_settings(settings.tool_result_router.clone());
 
         // Create FusedRootCauseEngine backed by the shared unified Oxigraph store
         let unified_kg_store = unified.store();
@@ -605,6 +819,8 @@ impl CodeCliEngine {
         ));
 
         let event_bus = Arc::new(EventBus::new(100));
+        // The mature Runner emits tool-call/result events through this bus.
+        runner.set_event_bus(event_bus.clone());
 
         // ── MemoryScheduler with HyperspaceStore: activates context_request_with_decay ──
         let memory_bus = Arc::new(MemoryBus::new(event_bus.clone()));
@@ -631,6 +847,7 @@ impl CodeCliEngine {
         // Subscribe via start_async_components() in process_task().
 
         // 初始化 WorkspaceMonitor — 从 settings.workspace 读取配置
+        report_startup(&startup_reporter, "Opening workspace monitor", None);
         let workspace_monitor: Option<Arc<WorkspaceMonitor>> = {
             let ws_db_path = {
                 let mut p = workspace_root.clone();
@@ -642,9 +859,17 @@ impl CodeCliEngine {
                 content_store_max_bytes: settings.workspace.content_store_max_bytes,
                 content_cache_capacity: settings.workspace.content_cache_capacity,
                 watch_enabled: settings.workspace.watch_enabled,
+                // Show the TUI before walking and indexing a large workspace.
+                // The generic monitor starts the metadata-only scan when the
+                // first async task context becomes available.
+                defer_initial_scan: true,
                 poll_interval_ms: settings.workspace.poll_interval_ms,
                 debounce_ms: settings.workspace.debounce_ms,
                 max_debounce_wait_ms: settings.workspace.max_debounce_wait_ms,
+                initial_scan_wait_ms: settings.workspace.initial_scan_wait_ms,
+                change_history_capacity: settings.workspace.change_history_capacity,
+                effect_snapshot_max_files: settings.workspace.effect_snapshot_max_files,
+                effect_snapshot_max_bytes: settings.workspace.effect_snapshot_max_bytes,
                 exclude_patterns: settings.workspace.exclude_patterns.clone(),
                 db_path: Some(ws_db_path),
                 ..Default::default()
@@ -702,7 +927,8 @@ impl CodeCliEngine {
         runner = runner
             .with_causal_engine(causal_engine.clone())
             .with_skill_graph_store(skill_graph.clone())
-            .with_unified_graph_store(unified_kg_store);
+            .with_unified_graph_store(unified_kg_store)
+            .with_learning_mode(config.learning_mode);
 
         // 完成 AgentRunner 初始化接线：perception_store → WorkspaceMonitor
         runner.finalize_setup();
@@ -724,6 +950,7 @@ impl CodeCliEngine {
         .with_perception_hyperspace(vector_store.clone())
         .with_perception_store(Arc::new(runner_perception))
         .with_discovery_engine(discovery_engine.clone())
+        .with_learning_mode(config.learning_mode)
         .with_perception_ontology_bridge(ontology_bridge.clone());
 
         let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) =
@@ -753,11 +980,14 @@ impl CodeCliEngine {
             None
         };
 
+        report_startup(&startup_reporter, "Finalizing TUI services", None);
         info!(
             model = %config.model,
             workspace = %config.workspace,
             max_iterations = config.max_iterations,
             mcp_servers = config.mcp_servers.len(),
+            startup_ms = startup_started.elapsed().as_millis(),
+            rss_kb = current_rss_kb().unwrap_or(0),
             "Code CLI 引擎初始化完成"
         );
 
@@ -794,6 +1024,8 @@ impl CodeCliEngine {
             core_config,
             oxi_store: unified.store(),
             code_scan_exclude_patterns,
+            learning_snapshot_max_files: settings.workspace.learning_snapshot_max_files,
+            learning_snapshot_max_bytes: settings.workspace.learning_snapshot_max_bytes,
         })
     }
 
@@ -935,9 +1167,17 @@ impl CodeCliEngine {
         // 首次进入 async 上下文时完成 WorkspaceMonitor 的异步初始化
         if let Some(ref wm) = self.workspace_monitor {
             wm.start_async_components();
-            // Trigger rescan when WatchEngine is not active to catch files
-            // created between tasks (e.g. by git clones, dependency installs).
-            wm.rescan();
+            // On first use, scan and watcher installation are already running
+            // in the background. Later, rescan only as a watcher fallback.
+            if wm.scan_complete() && !wm.watch_engine_active() {
+                wm.rescan();
+            }
+            let indexed = wm.wait_for_initial_scan().await;
+            debug!(
+                indexed,
+                generation = wm.generation(),
+                "Workspace metadata readiness checked"
+            );
         }
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -959,7 +1199,13 @@ impl CodeCliEngine {
                 user_input,
                 self.config.max_iterations,
             )
-            .with_original_task(user_input)
+            .with_original_task(user_input);
+            let ctx = with_learning_experiment_constraints(
+                with_glidingcode_task_constraints(ctx, user_input),
+                &self.config,
+                self.learning_snapshot_max_files,
+                self.learning_snapshot_max_bytes,
+            )
             .with_workflow(&wf_jsonld);
             let ctx = if let Some(ref summary) = ws_summary {
                 ctx.with_workspace_summary(summary)
@@ -976,6 +1222,12 @@ impl CodeCliEngine {
                 self.config.max_iterations,
             )
             .with_original_task(user_input);
+            let ctx = with_learning_experiment_constraints(
+                with_glidingcode_task_constraints(ctx, user_input),
+                &self.config,
+                self.learning_snapshot_max_files,
+                self.learning_snapshot_max_bytes,
+            );
             let ctx = if let Some(ref summary) = ws_summary {
                 ctx.with_workspace_summary(summary)
             } else {
@@ -1001,7 +1253,10 @@ impl CodeCliEngine {
             .await;
 
         // Record post-task metrics for skill evolution + causal analysis
-        if let Ok(mut ee) = self.evolution_engine.try_lock() {
+        if let (true, Ok(mut ee)) = (
+            self.config.learning_mode.updates_learning(),
+            self.evolution_engine.try_lock(),
+        ) {
             let success = result.status == "completed" || result.status == "success";
             let mut affected_skill_iris = Vec::new();
             let mut skill_outcomes = Vec::new();
@@ -1032,6 +1287,10 @@ impl CodeCliEngine {
                 )
                 .with_context_tag(&result.status)
                 .with_context_tag(&format!("tool:{}", action.tool_name))
+                .with_context_tag(&format!(
+                    "task-family:{}",
+                    glidinghorse::core::policy_learning::learning_policy_context(user_input)
+                ))
                 .with_duration(action.duration_secs.ceil().min(u32::MAX as f64) as u32);
 
                 if let Some(error) = action.error.as_deref() {
@@ -1262,8 +1521,18 @@ impl CodeCliEngine {
         // Phase 4: Periodic suggest_improvements & health snapshot after each task
         // (runs unlocked so async calls are safe)
         {
-            if let Ok(mut ee) = self.evolution_engine.try_lock() {
-                let improvements = ee.suggest_improvements().await;
+            if let (true, Ok(mut ee)) = (
+                self.config.learning_mode.updates_learning(),
+                self.evolution_engine.try_lock(),
+            ) {
+                let affected_skill_iris = result
+                    .tracked_actions
+                    .iter()
+                    .filter_map(|action| self.skills.skill_iri_for_tool_name(&action.tool_name))
+                    .collect::<Vec<_>>();
+                let improvements = ee
+                    .suggest_improvements_for_skills(&affected_skill_iris)
+                    .await;
                 if !improvements.is_empty() {
                     // Persist only typed proposals. This makes suggestions
                     // reviewable across restart while deliberately avoiding
@@ -1498,7 +1767,7 @@ impl CodeCliEngine {
         &self,
     ) -> anyhow::Result<Vec<glidinghorse::core::checkpoint::CheckpointData>> {
         let prefix = "iri://checkpoint/";
-        let entries = self.l0.scan_iri_prefix(prefix, 100)?;
+        let entries = self.l0.scan_iri_prefix(prefix, 100_000)?;
         let mut results: Vec<glidinghorse::core::checkpoint::CheckpointData> = entries
             .iter()
             .filter_map(|e| serde_json::from_str(&e.content).ok())
@@ -1506,6 +1775,232 @@ impl CodeCliEngine {
         results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         results.truncate(20);
         Ok(results)
+    }
+
+    /// Return task-level treatment evidence used to audit whether accumulated
+    /// knowledge/skills helped a later task. Intermediate BizAgent traces are
+    /// intentionally excluded from this prefix.
+    pub fn list_learning_evaluations(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut results = self
+            .l0
+            .scan_iri_prefix("iri://learning/evaluations/", 10_000)?
+            .into_iter()
+            .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+            .collect::<Vec<serde_json::Value>>();
+        results.sort_by(|left, right| {
+            left.get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("timestamp").and_then(serde_json::Value::as_str))
+        });
+        Ok(results)
+    }
+
+    /// Management-command fast path: open only the workspace's durable L0
+    /// database. This avoids constructing embeddings, graph stores, templates,
+    /// watchers and the complete TUI engine merely to read audit records.
+    pub fn list_learning_evaluations_from_config(
+        config: &CliConfig,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let Some(base) = config.data_dir.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let workspace = std::fs::canonicalize(&config.workspace)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace));
+        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+        let l0_path = std::path::Path::new(base)
+            .join(format!("workspace-{}", hex::encode(&digest[..12])))
+            .join("l0");
+        if !l0_path.exists() {
+            return Ok(Vec::new());
+        }
+        let l0 = L0Store::new(&l0_path.to_string_lossy())?;
+        let mut results = l0
+            .scan_iri_prefix("iri://learning/evaluations/", 10_000)?
+            .into_iter()
+            .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+            .collect::<Vec<serde_json::Value>>();
+        results.sort_by(|left, right| {
+            left.get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("timestamp").and_then(serde_json::Value::as_str))
+        });
+        Ok(results)
+    }
+
+    /// Aggregate treatment evidence by normalized family/mode/action and
+    /// audit controlled replay pairs. Percentiles are reported only from
+    /// observed samples; no counterfactual value is synthesized.
+    pub fn summarize_learning_evaluations(&self) -> anyhow::Result<serde_json::Value> {
+        let evaluations = self.list_learning_evaluations()?;
+        Ok(Self::summarize_learning_evaluation_values(evaluations))
+    }
+
+    pub fn summarize_learning_evaluation_values(
+        evaluations: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let percentile = |mut values: Vec<f64>, quantile: f64| -> Option<f64> {
+            if values.is_empty() {
+                return None;
+            }
+            values.sort_by(|left, right| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let index = ((values.len() as f64 * quantile).ceil() as usize)
+                .saturating_sub(1)
+                .min(values.len() - 1);
+            Some(values[index])
+        };
+
+        let mut groups: std::collections::BTreeMap<
+            (String, String, String),
+            Vec<&serde_json::Value>,
+        > = std::collections::BTreeMap::new();
+        for evaluation in &evaluations {
+            let family = evaluation
+                .get("policy_context")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let mode = evaluation
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let action = evaluation
+                .get("policy_action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            groups
+                .entry((family.to_string(), mode.to_string(), action.to_string()))
+                .or_default()
+                .push(evaluation);
+        }
+        let arms = groups
+            .into_iter()
+            .map(|((family, mode, action), samples)| {
+                let number = |sample: &&serde_json::Value, field: &str| {
+                    sample.get(field).and_then(serde_json::Value::as_f64)
+                };
+                let rewards = samples
+                    .iter()
+                    .filter_map(|sample| {
+                        sample
+                            .get("reward")
+                            .and_then(|reward| reward.get("total"))
+                            .and_then(serde_json::Value::as_f64)
+                    })
+                    .collect::<Vec<_>>();
+                let success_count = samples
+                    .iter()
+                    .filter(|sample| {
+                        sample
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|status| matches!(status, "success" | "completed"))
+                    })
+                    .count();
+                let metric = |field: &str| {
+                    let values = samples
+                        .iter()
+                        .filter_map(|sample| number(sample, field))
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "p50": percentile(values.clone(), 0.50),
+                        "p95": percentile(values, 0.95),
+                    })
+                };
+                serde_json::json!({
+                    "family": family,
+                    "mode": mode,
+                    "action": action,
+                    "samples": samples.len(),
+                    "success_rate": if samples.is_empty() { 0.0 } else { success_count as f64 / samples.len() as f64 },
+                    "reward": {
+                        "p50": percentile(rewards.clone(), 0.50),
+                        "p95": percentile(rewards, 0.95),
+                    },
+                    "elapsed_ms": metric("elapsed_ms"),
+                    "prompt_tokens": metric("prompt_tokens"),
+                    "turn_count": metric("turn_count"),
+                    "tool_call_count": metric("tool_call_count"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut pair_groups: std::collections::BTreeMap<String, Vec<&serde_json::Value>> =
+            std::collections::BTreeMap::new();
+        for evaluation in &evaluations {
+            if let Some(pair_id) = evaluation
+                .pointer("/treatment/experiment_pair_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                pair_groups
+                    .entry(pair_id.to_string())
+                    .or_default()
+                    .push(evaluation);
+            }
+        }
+        let pairs = pair_groups
+            .into_iter()
+            .map(|(pair_id, samples)| {
+                let mut modes = samples
+                    .iter()
+                    .filter_map(|sample| sample.get("mode").and_then(serde_json::Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                modes.sort();
+                modes.dedup();
+                let stable_field = |pointer: &str| {
+                    let values = samples
+                        .iter()
+                        .filter_map(|sample| sample.pointer(pointer))
+                        .map(serde_json::Value::to_string)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    values.len() == 1
+                        && values.iter().next().is_some_and(|value| {
+                            value != "null" && !value.trim_matches('"').starts_with("unavailable:")
+                        })
+                };
+                let mut issues = Vec::new();
+                for (pointer, label) in [
+                    ("/treatment/objective_fingerprint", "objective"),
+                    ("/treatment/workspace_fingerprint", "workspace"),
+                    ("/treatment/experiment_model", "model"),
+                    ("/treatment/experiment_seed", "seed"),
+                    ("/treatment/orchestration_mode", "orchestration_mode"),
+                ] {
+                    if !stable_field(pointer) {
+                        issues.push(format!("missing_or_mismatched_{label}"));
+                    }
+                }
+                let required_modes = ["active", "baseline", "shadow"];
+                let missing_modes = required_modes
+                    .iter()
+                    .filter(|required| !modes.iter().any(|mode| mode == **required))
+                    .copied()
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "pair_id": pair_id,
+                    "samples": samples.len(),
+                    "modes": modes,
+                    "comparable": issues.is_empty() && modes.len() >= 2,
+                    "complete_three_arm_replay": issues.is_empty() && missing_modes.is_empty(),
+                    "missing_modes": missing_modes,
+                    "issues": issues,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "evaluation_count": evaluations.len(),
+            "arms": arms,
+            "pairs": pairs,
+            "gate": {
+                "same_family_only": true,
+                "candidate_trial_after_same_family_baseline_samples": 1,
+                "promotion_minimum_baseline_samples": 5,
+                "promotion_minimum_candidate_samples": 5,
+                "unpromoted_model_role": "shadow_or_bounded_candidate",
+            }
+        })
     }
 
     /// List durable, human-reviewable evolution proposals for this workspace.
@@ -1591,6 +2086,14 @@ impl CodeCliEngine {
     ) -> anyhow::Result<TaskResult> {
         self.ensure_embedding_healthy().await;
         self.ensure_skill_vectors_indexed().await;
+        // Match the normal task path: TUI/resume must populate the inventory
+        // before SA decides between direct execution and verify-first routing.
+        if let Some(ref wm) = self.workspace_monitor {
+            wm.start_async_components();
+            if wm.scan_complete() && !wm.watch_engine_active() {
+                wm.rescan();
+            }
+        }
         // Keep the code-KG precondition equivalent to the CLI task path.
         // Scan failure is surfaced rather than silently claiming an updated
         // code graph for a TUI/resume task.
@@ -1631,6 +2134,12 @@ impl CodeCliEngine {
 
         let ctx = TaskContext::new(task_iri, user_input, self.config.max_iterations)
             .with_original_task(user_input);
+        let ctx = with_learning_experiment_constraints(
+            with_glidingcode_task_constraints(ctx, user_input),
+            &self.config,
+            self.learning_snapshot_max_files,
+            self.learning_snapshot_max_bytes,
+        );
         let ctx = if let Some(ref summary) = ws_summary {
             ctx.with_workspace_summary(summary)
         } else {
@@ -1674,14 +2183,39 @@ impl CodeCliEngine {
         glidinghorse::core::TaskFinalizer::new(self.event_bus.clone())
             .finalize(task_iri, &result)
             .await;
-        self.record_tui_task_evolution(task_iri, &result).await;
+        let post_task_started = Instant::now();
+        self.record_tui_task_evolution(task_iri, user_input, &result)
+            .await;
+        let evolution_ms = post_task_started.elapsed().as_millis();
         self.write_task_metadata(task_iri, user_input, &result);
+        let metadata_ms = post_task_started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(evolution_ms);
+        let checkpoint_started = Instant::now();
+        if let Err(error) = self.vector_store.checkpoint().await {
+            warn!(task_iri = %task_iri, %error, "Failed to checkpoint TUI hyperspace store after task");
+        }
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
 
-        // Snapshot the skill graph to the TimelineStore after each task,
-        // enabling temporal rollback and traceability of graph evolution.
-        let backend = SkillGraphSnapshotBackend::new(self.skill_graph.clone());
-        self.timeline
-            .create_snapshot(&backend, &format!("task:{}", result.status.as_str()));
+        // A timeline snapshot represents graph evolution, not merely task
+        // completion. Avoid serializing an identical full skill graph after
+        // every TUI task when no governed graph mutation occurred.
+        if self.timeline.pending_mutations() > 0 || self.timeline.snapshot_count() == 0 {
+            let backend = SkillGraphSnapshotBackend::new(self.skill_graph.clone());
+            self.timeline
+                .create_snapshot(&backend, &format!("task:{}", result.status.as_str()));
+        } else {
+            debug!(task_iri = %task_iri, "Skipped unchanged skill-graph timeline snapshot");
+        }
+        info!(
+            task_iri = %task_iri,
+            evolution_ms,
+            metadata_ms,
+            checkpoint_ms,
+            post_task_ms = post_task_started.elapsed().as_millis(),
+            "Completed TUI post-task persistence"
+        );
 
         Ok(result)
     }
@@ -1716,7 +2250,15 @@ impl CodeCliEngine {
     /// contribute real tool outcomes to the shared skill graph and preserve
     /// typed suggestions for review. This deliberately has no approval or
     /// commit side effect.
-    async fn record_tui_task_evolution(&self, task_iri: &str, result: &TaskResult) {
+    async fn record_tui_task_evolution(
+        &self,
+        task_iri: &str,
+        user_input: &str,
+        result: &TaskResult,
+    ) {
+        if !self.config.learning_mode.updates_learning() {
+            return;
+        }
         let Ok(mut evolution) = self.evolution_engine.try_lock() else {
             return;
         };
@@ -1740,6 +2282,10 @@ impl CodeCliEngine {
             )
             .with_context_tag(&result.status)
             .with_context_tag(&format!("tool:{}", action.tool_name))
+            .with_context_tag(&format!(
+                "task-family:{}",
+                glidinghorse::core::policy_learning::learning_policy_context(user_input)
+            ))
             .with_duration(action.duration_secs.ceil().min(u32::MAX as f64) as u32);
             if let Some(error) = action.error.as_deref() {
                 usage = usage.with_error(error);
@@ -1865,7 +2411,9 @@ impl CodeCliEngine {
             }
         }
 
-        let improvements = evolution.suggest_improvements().await;
+        let improvements = evolution
+            .suggest_improvements_for_skills(&affected_skill_iris)
+            .await;
         if improvements.is_empty() {
             return;
         }
@@ -1909,48 +2457,190 @@ fn glidingcode_prompt_profile() -> ApplicationPromptProfile {
         "v1",
         r#"Software-engineering application rules:
 - Treat the configured workspace as the only project scope. Ignore .git, .gliding_horse, caches, generated binaries, and unrelated projects unless the task explicitly names them.
-- Prefer targeted reads and minimal changes. Preserve existing public behavior unless the task requires a change.
+- For maintenance, prefer targeted reads and minimal changes. For greenfield or broad feature work, do not use minimal-change guidance to reduce requested scope.
+- DA must move from targeted inspection to incremental artifact creation early enough to leave time for executable verification; a read-only diagnosis is not a completed implementation or correction.
+- Before writing or replacing tests, inspect the existing public API, fixtures, and test conventions and run the relevant baseline command. Extend the real interface; do not invent incompatible constructors, method names, or CLI wiring.
+- Treat every non-zero build/test exit as an immediate repair signal. Fix the concrete failure before broad reading or adding more speculative tests.
 - For code changes, identify affected files and the relevant test command before claiming completion.
 - DA must report changed file paths, commands run, and command results. CA must verify the declared acceptance criteria with direct evidence.
 - PA application extension: identify the smallest relevant code scope, target files, dependencies, and executable acceptance checks.
-- DA application extension: make the smallest scoped code change, preserve existing behavior, and record changed artifacts plus verification commands.
+- DA application extension: implement the full declared scope, preserve unrelated behavior, and record changed artifacts plus verification commands. If blocked, report `FAILED:` instead of claiming a no-change fix.
 - CA application extension: verify each declared acceptance criterion with concrete file or command evidence; do not invent coverage, performance, or security requirements.
 - AA application extension: decide from the structured CA evidence. Do not modify code or explore files unless the runtime explicitly enables correction or challenge mode.
 - Test failures, build failures, incomplete code analysis, or unavailable external services are evidence to report; do not hide them or claim success without a valid fallback.
 - Code AST/knowledge-graph information is auxiliary evidence. Its absence or partial failure does not fail an ordinary file-editing task unless graph analysis is an explicit requirement.
-- Do not modify repository metadata, internal runtime state, or generated artifacts unless explicitly requested."#,
+- Do not modify repository metadata, internal runtime state, backup copies, or diagnostic-output files unless explicitly requested."#,
     )
     .with_optimized_contract(
         r#"Software-engineering application contract:
 
 Scope
 - Treat the configured workspace as the only project scope. Ignore .git, .gliding_horse, caches, generated binaries, and unrelated projects unless explicitly named.
-- Prefer targeted reads and the smallest sufficient change. Preserve existing public behavior unless the task requires a change.
+- For maintenance, prefer targeted reads and the smallest sufficient change. For greenfield or explicitly broad feature work, "smallest change" must not reduce requested scope: implement every acceptance criterion with a coherent architecture.
+- DA should establish the relevant file shape quickly, then create or modify artifacts incrementally. Do not spend an implementation pass only researching or repeatedly reading files.
+- For tasks requiring tests or runnable acceptance checks, first inspect the existing public interfaces, fixtures, CLI parser, and test conventions and run the relevant baseline command. Then create a compatible test/check skeleton early and run a representative check before the midpoint of the execution budget; reserve the remaining budget for implementation, full verification, and repair.
+- New tests must exercise the repository's real constructors, field names, methods, persistence model, and CLI entry point. Do not invent a parallel API merely to satisfy a guessed test shape.
+- A non-zero build/test exit immediately moves work into repair: use its concrete traceback or diagnostic, fix that defect, and rerun the focused check before unrelated inspection or additional speculative tests.
+- Do not re-read an entire file that DA just wrote when the needed facts are already in the active context; use targeted ranges or search for later inspection.
+- Reserve enough execution budget for build/test and repair. If a recursive sub-task requests implementation, inspection alone is not completion.
 
 Execution evidence
 - PA identifies target files, dependencies, risks, and executable acceptance checks.
 - DA reports changed paths, commands run, exit results, and any unverified assumption.
+- A corrective DA is an executor, not another auditor: implement the identified gap, then verify it. If no change can be made, begin the final result with `FAILED:` and state the blocker; never report a read-only diagnosis as a completed fix.
 - CA verifies every declared criterion with direct file or command evidence. A failed, skipped, unavailable, or incomplete check remains visible as such.
 - AA decides only from structured CA evidence and the declared criteria. It does not silently repair, explore, or expand scope.
 
 Engineering boundaries
 - AST/knowledge-graph information is auxiliary evidence. Missing or partial graph data does not fail ordinary file-editing unless graph analysis is explicitly required.
-- Do not invent coverage, performance, or security requirements. Do not modify repository metadata, runtime state, or generated artifacts unless explicitly requested.
+- Do not invent coverage, performance, or security requirements. Do not modify repository metadata, runtime state, backup copies, or diagnostic-output files unless explicitly requested.
 - If tests/builds/external services fail, report the exact failure and distinguish it from a code defect.
 
 Required handoff shape
+- `completion_state`: `complete`, `incomplete`, or `blocked`
 - `criteria`: each declared criterion and status (`pass`, `fail`, `blocked`, or `unverified`)
 - `evidence`: file paths, relevant excerpts, commands, and exit results
 - `changes`: files actually changed (empty for read-only work)
-- `remaining`: unresolved risks or follow-up work
+- `verification`: checks actually executed and their results
+- `pending_effects`: unresolved executable work as objects with `objective`, optional `target`, `reason`, and `effect_policy`
+- `blockers`: exact external or capability blockers
+- Put these fields in a machine-readable JSON object named `completion`; use an empty `pending_effects` array only when execution is complete.
 - Final status must be supported by the evidence; never claim success from an absent check."#,
     )
+}
+
+/// Declare when the software application expects DA to leave concrete
+/// workspace effects. The kernel consumes the generic `required_effect`
+/// contract, while this application owns the domain/language classification.
+fn with_glidingcode_task_constraints(
+    ctx: glidinghorse::core::agent_runner::TaskContext,
+    user_input: &str,
+) -> glidinghorse::core::agent_runner::TaskContext {
+    let normalized = user_input.to_lowercase();
+    let explicitly_read_only = [
+        "不要修改",
+        "不修改任何文件",
+        "只读分析",
+        "仅分析",
+        "do not modify",
+        "without modifying",
+        "read-only review",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let requests_change = [
+        "创建",
+        "编写",
+        "实现",
+        "修复",
+        "修改",
+        "开发",
+        "优化",
+        "重构",
+        "新增",
+        "增加",
+        "删除",
+        "生成",
+        "搭建",
+        "完善",
+        "解决",
+        "implement",
+        "create",
+        "build",
+        "fix",
+        "modify",
+        "develop",
+        "optimize",
+        "refactor",
+        "add",
+        "remove",
+        "generate",
+        "write",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+
+    let conditional_change = [
+        "检查并修复",
+        "确认并修复",
+        "核对并补齐",
+        "验证并修复",
+        "测试并修复",
+        "分析并修复",
+        "check and fix",
+        "verify and repair",
+        "validate and fix",
+        "test and fix",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+
+    if explicitly_read_only {
+        ctx.with_effect_policy(glidinghorse::core::effect::EffectPolicy::EvidenceOnly)
+            .with_constraint("effect_policy", "evidence_only")
+    } else if requests_change && conditional_change {
+        ctx.with_effect_policy(
+            glidinghorse::core::effect::EffectPolicy::conditional_workspace_mutation(
+                "mutate only when verification finds a task-relevant defect",
+            ),
+        )
+        .with_constraint("effect_policy", "conditional_workspace_mutation")
+    } else if requests_change {
+        ctx.with_effect_policy(
+            glidinghorse::core::effect::EffectPolicy::required_workspace_mutation(),
+        )
+        // Preserve compatibility with checkpoints and older skill discovery.
+        .with_constraint("required_effect", "workspace_mutation")
+        .with_constraint("effect_policy", "required_workspace_mutation")
+    } else {
+        ctx
+    }
+}
+
+fn with_learning_experiment_constraints(
+    mut ctx: glidinghorse::core::agent_runner::TaskContext,
+    config: &CliConfig,
+    snapshot_max_files: usize,
+    snapshot_max_bytes: u64,
+) -> glidinghorse::core::agent_runner::TaskContext {
+    let workspace_identity = std::fs::canonicalize(&config.workspace)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace))
+        .to_string_lossy()
+        .to_string();
+    let workspace_identity_fingerprint = format!(
+        "sha256:{}",
+        hex::encode(&Sha256::digest(workspace_identity.as_bytes())[..12])
+    );
+    let workspace_fingerprint = if config.learning_pair_id.is_some() {
+        let root = std::path::Path::new(&config.workspace);
+        let exclusions = load_code_scan_exclusions(root, &[]);
+        workspace_state_fingerprint(root, &exclusions, snapshot_max_files, snapshot_max_bytes)
+            .unwrap_or_else(|error| {
+                let error_digest = Sha256::digest(error.to_string().as_bytes());
+                format!("unavailable:sha256:{}", hex::encode(&error_digest[..12]))
+            })
+    } else {
+        workspace_identity_fingerprint
+    };
+    ctx = ctx
+        .with_constraint("learning_skill_iri", GLIDINGCODE_WORKFLOW_SKILL_IRI)
+        .with_constraint("learning_model", &config.model)
+        .with_constraint("learning_workspace_fingerprint", &workspace_fingerprint);
+    if let Some(pair_id) = config.learning_pair_id.as_deref() {
+        ctx = ctx.with_constraint("learning_pair_id", pair_id);
+    }
+    if let Some(seed) = config.learning_seed.as_deref() {
+        ctx = ctx.with_constraint("learning_seed", seed);
+    }
+    ctx
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_workspace_code_files, glidingcode_prompt_profile, load_code_scan_exclusions,
+        collect_workspace_code_files, glidingcode_learning_skill_node, glidingcode_prompt_profile,
+        load_code_scan_exclusions, with_glidingcode_task_constraints, workspace_state_fingerprint,
+        GLIDINGCODE_WORKFLOW_SKILL_IRI,
     };
 
     #[test]
@@ -1961,8 +2651,144 @@ mod tests {
         assert!(prompt.contains("tests/builds") || prompt.contains("test command"));
         assert!(prompt.contains("AST/knowledge-graph"));
         assert!(prompt.contains("criteria"));
+        assert!(prompt.contains("existing public interfaces"));
+        assert!(prompt.contains("non-zero build/test exit"));
         assert!(!prompt.contains("Constitution"));
         assert!(!prompt.contains("PDCA"));
+    }
+
+    #[test]
+    fn glidingcode_declares_workspace_effect_only_for_change_tasks() {
+        let change = glidinghorse::core::agent_runner::TaskContext::new("t", "x", 10);
+        let change = with_glidingcode_task_constraints(change, "实现一个可运行的功能并测试");
+        assert_eq!(
+            change
+                .constraints
+                .get("required_effect")
+                .map(String::as_str),
+            Some("workspace_mutation")
+        );
+        assert_eq!(
+            change.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::required_workspace_mutation()
+        );
+
+        let review = glidinghorse::core::agent_runner::TaskContext::new("t", "x", 10);
+        let review = with_glidingcode_task_constraints(review, "只读分析当前实现，不修改任何文件");
+        assert!(!review.constraints.contains_key("required_effect"));
+        assert_eq!(
+            review.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::EvidenceOnly
+        );
+
+        let conditional = glidinghorse::core::agent_runner::TaskContext::new("t", "x", 10);
+        let conditional =
+            with_glidingcode_task_constraints(conditional, "检查并修复发现的实现问题");
+        assert!(matches!(
+            conditional.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::Conditional { .. }
+        ));
+    }
+
+    #[test]
+    fn validated_knowledge_has_a_non_executable_application_skill_home() {
+        let node = glidingcode_learning_skill_node();
+        assert_eq!(node.skill_iri, GLIDINGCODE_WORKFLOW_SKILL_IRI);
+        assert!(node.tags.iter().any(|tag| tag == "application-workflow"));
+        assert!(node
+            .tags
+            .iter()
+            .any(|tag| tag == "non-executable-learning-skill"));
+    }
+
+    #[test]
+    fn learning_summary_reports_percentiles_and_controlled_pair_comparability() {
+        let sample = |mode: &str, elapsed_ms: u64, reward: f64| {
+            serde_json::json!({
+                "policy_context": "planning:v2:ops=test;kinds=data",
+                "policy_action": if mode == "active" { "knowledge_first" } else { "baseline" },
+                "mode": mode,
+                "status": "success",
+                "elapsed_ms": elapsed_ms,
+                "prompt_tokens": 1000,
+                "turn_count": 5,
+                "tool_call_count": 3,
+                "reward": {"total": reward},
+                "treatment": {
+                    "experiment_pair_id": "pair-1",
+                    "experiment_seed": "fixed-42",
+                    "experiment_model": "deepseek-test",
+                    "workspace_fingerprint": "sha256:workspace",
+                    "objective_fingerprint": "sha256:objective",
+                    "orchestration_mode": "pdca"
+                }
+            })
+        };
+        let summary = super::CodeCliEngine::summarize_learning_evaluation_values(vec![
+            sample("baseline", 300, 0.6),
+            sample("shadow", 250, 0.7),
+            sample("active", 200, 0.9),
+        ]);
+
+        assert_eq!(summary["evaluation_count"], 3);
+        assert_eq!(summary["arms"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["pairs"][0]["comparable"], true);
+        assert_eq!(summary["pairs"][0]["complete_three_arm_replay"], true);
+        assert!(summary["pairs"][0]["issues"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn controlled_replay_fingerprint_tracks_content_but_ignores_runtime_state() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(workspace.path().join("main.py"), "print('one')\n").unwrap();
+        let exclusions = load_code_scan_exclusions(workspace.path(), &[]);
+        let first =
+            workspace_state_fingerprint(workspace.path(), &exclusions, 100, 1_000_000).unwrap();
+
+        std::fs::create_dir_all(workspace.path().join(".gliding_horse")).unwrap();
+        std::fs::write(
+            workspace.path().join(".gliding_horse/runtime-state"),
+            "changes between executions",
+        )
+        .unwrap();
+        let runtime_changed =
+            workspace_state_fingerprint(workspace.path(), &exclusions, 100, 1_000_000).unwrap();
+        assert_eq!(first, runtime_changed);
+
+        std::fs::write(workspace.path().join("main.py"), "print('two')\n").unwrap();
+        let source_changed =
+            workspace_state_fingerprint(workspace.path(), &exclusions, 100, 1_000_000).unwrap();
+        assert_ne!(first, source_changed);
+    }
+
+    #[test]
+    fn controlled_pair_rejects_unavailable_workspace_snapshot() {
+        let sample = |mode: &str| {
+            serde_json::json!({
+                "policy_context": "planning:v2:ops=test;kinds=code",
+                "policy_action": "baseline",
+                "mode": mode,
+                "status": "success",
+                "reward": {"total": 1.0},
+                "treatment": {
+                    "experiment_pair_id": "pair-unavailable",
+                    "experiment_seed": "42",
+                    "experiment_model": "deepseek-test",
+                    "workspace_fingerprint": "unavailable:sha256:reason",
+                    "objective_fingerprint": "sha256:objective",
+                    "orchestration_mode": "pdca"
+                }
+            })
+        };
+        let summary = super::CodeCliEngine::summarize_learning_evaluation_values(vec![
+            sample("baseline"),
+            sample("active"),
+        ]);
+        assert_eq!(summary["pairs"][0]["comparable"], false);
+        assert_eq!(
+            summary["pairs"][0]["issues"][0],
+            "missing_or_mismatched_workspace"
+        );
     }
 
     #[test]

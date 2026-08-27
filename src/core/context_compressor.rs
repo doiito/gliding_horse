@@ -94,10 +94,7 @@ impl ToolResultCompressor {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("(unknown path)");
-                let total = val
-                    .get("total_lines")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let total = val.get("total_lines").and_then(|v| v.as_u64()).unwrap_or(0);
                 let lines = val
                     .get("lines")
                     .and_then(|v| v.as_array())
@@ -271,11 +268,13 @@ impl ContextWindowManager {
     }
 
     /// Effective compression budget for the given model.
-    /// With `model_aware` enabled the budget scales with the model's context
-    /// window; otherwise the configured `max_tokens` is used.
+    /// Model awareness protects smaller model windows, but never expands past
+    /// the configured cost ceiling. Expanding 16K to 80% of a 128K model made
+    /// cumulative multi-turn prompt usage grow dramatically.
     pub fn budget_for_model(&self, model: &str) -> usize {
         if self.model_aware() {
-            ((model_context_window(model) as f32) * MODEL_AWARE_BUDGET_RATIO) as usize
+            self.max_tokens
+                .min(((model_context_window(model) as f32) * MODEL_AWARE_BUDGET_RATIO) as usize)
         } else {
             self.max_tokens
         }
@@ -307,6 +306,16 @@ impl ContextWindowManager {
             .sum()
     }
 
+    /// Estimate the request-side token cost of tool schemas. Providers count
+    /// these definitions on every turn even though they are not represented
+    /// as chat messages, so omitting them defeats the configured cost ceiling.
+    pub fn estimate_tool_schema_tokens(tools: &[serde_json::Value]) -> usize {
+        tools
+            .iter()
+            .map(|tool| estimate_text_tokens(&tool.to_string()))
+            .sum()
+    }
+
     /// Determine whether compression is needed. Checks both message count and estimated token count.
     pub fn should_compress(&self, message_count: usize, messages: &[ChatMessage]) -> bool {
         if message_count > self.max_messages {
@@ -335,8 +344,27 @@ impl ContextWindowManager {
         false
     }
 
+    pub fn should_compress_for_model_with_reserve(
+        &self,
+        message_count: usize,
+        messages: &[ChatMessage],
+        model: &str,
+        request_reserve_tokens: usize,
+    ) -> bool {
+        if message_count > self.max_messages {
+            return true;
+        }
+        Self::estimate_tokens(messages).saturating_add(request_reserve_tokens)
+            > self.budget_for_model(model)
+    }
+
     pub fn compress_messages(&self, messages: &[ChatMessage]) -> (Vec<ChatMessage>, String) {
-        if messages.len() <= self.max_messages {
+        // `should_compress*` can trigger on either message count or token
+        // count.  Do not turn the token branch into a no-op merely because a
+        // few very large messages are still below max_messages.  We only need
+        // enough history to preserve the system message and recent tool-call
+        // group intact.
+        if messages.len() <= self.preserve_recent.saturating_add(1) {
             return (messages.to_vec(), String::new());
         }
 
@@ -582,7 +610,10 @@ mod tests {
         let first = &results[0];
         assert!(first.is_compressed);
         assert!(first.content.contains("/tmp/game.js"), "summary keeps path");
-        assert!(first.content.contains("800 lines total"), "summary keeps line count");
+        assert!(
+            first.content.contains("800 lines total"),
+            "summary keeps line count"
+        );
         assert!(
             first.content.contains("read_full_result_call_f1"),
             "summary points to the matching micro-tool"
@@ -605,7 +636,10 @@ mod tests {
         let first = &compressor.get_results()[0];
         assert!(first.is_compressed);
         assert!(first.content.starts_with("[Summary"));
-        assert!(first.content.contains("alpha line"), "plain preview keeps text");
+        assert!(
+            first.content.contains("alpha line"),
+            "plain preview keeps text"
+        );
         assert!(
             first.content.contains("read_full_result_call_t1"),
             "plain summary also points to the micro-tool"
@@ -696,10 +730,9 @@ mod tests {
         settings.model_aware = true;
         let manager = ContextWindowManager::new(&settings);
 
-        // 128K model → 0.8 * 128K budget
-        assert_eq!(manager.budget_for_model("deepseek-v4-flash"), 102_400);
-        // Unknown model → 0.8 * 64K fallback
-        assert_eq!(manager.budget_for_model("mystery-model"), 51_200);
+        // A large model window must not override the configured cost ceiling.
+        assert_eq!(manager.budget_for_model("deepseek-v4-flash"), 16_000);
+        assert_eq!(manager.budget_for_model("mystery-model"), 16_000);
     }
 
     #[test]
@@ -710,9 +743,7 @@ mod tests {
         settings.max_messages = 5000;
         let manager = ContextWindowManager::new(&settings);
 
-        // Build a message payload that exceeds the 16K static budget but stays
-        // well under the 102K model-aware budget: must NOT compress on a 128K
-        // model, while a legacy non-model-aware manager WOULD compress.
+        // Build a message payload that exceeds the configured 16K ceiling.
         let mut msgs = Vec::new();
         // 2000 x 100-char ASCII messages ≈ 50K tokens: above the 16K static
         // budget yet below the 102K model-aware budget.
@@ -727,13 +758,164 @@ mod tests {
             });
         }
         assert!(ContextWindowManager::estimate_tokens(&msgs) > 16_000);
-        assert!(!manager.should_compress_for_model(msgs.len(), &msgs, "deepseek-v4-flash"));
+        assert!(manager.should_compress_for_model(msgs.len(), &msgs, "deepseek-v4-flash"));
 
         // Same payload on a legacy manager (model_aware=false) triggers compression.
         let mut legacy_settings = default_context_settings();
         legacy_settings.max_messages = 5000;
         let legacy = ContextWindowManager::new(&legacy_settings);
         assert!(legacy.should_compress_for_model(msgs.len(), &msgs, "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn tool_schema_reserve_is_part_of_the_request_budget() {
+        let mut settings = default_context_settings();
+        settings.max_messages = 100;
+        settings.max_tokens = 100;
+        let manager = ContextWindowManager::new(&settings);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "small request".to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "large_tool",
+                "description": "x".repeat(500),
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let reserve = ContextWindowManager::estimate_tool_schema_tokens(&tools);
+        assert!(reserve > 100);
+        assert!(!manager.should_compress_for_model(messages.len(), &messages, "deepseek-v4-flash"));
+        assert!(manager.should_compress_for_model_with_reserve(
+            messages.len(),
+            &messages,
+            "deepseek-v4-flash",
+            reserve,
+        ));
+    }
+
+    #[test]
+    fn token_trigger_compresses_even_below_message_count_limit() {
+        let mut settings = default_context_settings();
+        settings.max_messages = 100;
+        settings.max_tokens = 100;
+        settings.preserve_recent = 2;
+        let manager = ContextWindowManager::new(&settings);
+
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: "system contract".to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        for index in 0..7 {
+            messages.push(ChatMessage {
+                role: if index % 2 == 0 { "assistant" } else { "user" }.to_string(),
+                content: format!("history-{index}-{}", "x".repeat(180)),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
+
+        assert!(messages.len() < settings.max_messages);
+        assert!(manager.should_compress(messages.len(), &messages));
+        let (compressed, _) = manager.compress_messages(&messages);
+        assert!(compressed.len() < messages.len());
+        assert_eq!(compressed.first().unwrap().role, "system");
+        assert_eq!(
+            compressed.last().unwrap().content,
+            messages.last().unwrap().content
+        );
+    }
+
+    #[test]
+    fn active_session_stays_full_before_compression_boundary() {
+        let settings = default_context_settings();
+        let manager = ContextWindowManager::new(&settings);
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "system contract".to_string(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "CURRENT_SESSION_FULL_ASSISTANT_CONTENT".to_string(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: Some("CURRENT_SESSION_REASONING".to_string()),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "CURRENT_SESSION_FULL_TOOL_RESULT".to_string(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call-current".to_string()),
+                reasoning_content: None,
+            },
+        ];
+
+        assert!(!manager.should_compress_for_model(messages.len(), &messages, "deepseek-v3"));
+        assert_eq!(
+            messages[1].content,
+            "CURRENT_SESSION_FULL_ASSISTANT_CONTENT"
+        );
+        assert_eq!(messages[2].content, "CURRENT_SESSION_FULL_TOOL_RESULT");
+    }
+
+    #[test]
+    fn compression_preserves_recent_current_session_messages_verbatim() {
+        let mut settings = default_context_settings();
+        settings.max_messages = 4;
+        settings.max_tokens = usize::MAX;
+        settings.preserve_recent = 2;
+        let manager = ContextWindowManager::new(&settings);
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: "system contract".to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        for index in 0..6 {
+            messages.push(ChatMessage {
+                role: if index % 2 == 0 { "assistant" } else { "user" }.to_string(),
+                content: format!(
+                    "full-current-session-message-{index}-{}",
+                    "payload".repeat(8)
+                ),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: Some(format!("reasoning-{index}")),
+            });
+        }
+        let expected_recent = messages[messages.len() - 2..].to_vec();
+
+        assert!(manager.should_compress(messages.len(), &messages));
+        let (compressed, summary) = manager.compress_messages(&messages);
+        assert!(!summary.is_empty());
+        let actual_recent = &compressed[compressed.len() - 2..];
+        for (actual, expected) in actual_recent.iter().zip(expected_recent.iter()) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.reasoning_content, expected.reasoning_content);
+        }
     }
 
     #[test]

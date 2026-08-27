@@ -37,6 +37,27 @@ struct Cli {
     max_pdca_cycles: u32,
 
     #[arg(
+        long = "learning-mode",
+        value_name = "MODE",
+        help = "Continuous learning treatment: active, baseline, or shadow (env: GLIDING_LEARNING_MODE)"
+    )]
+    learning_mode: Option<String>,
+
+    #[arg(
+        long = "learning-pair-id",
+        value_name = "ID",
+        help = "Controlled replay pair identifier shared by baseline/shadow/active runs"
+    )]
+    learning_pair_id: Option<String>,
+
+    #[arg(
+        long = "learning-seed",
+        value_name = "LABEL",
+        help = "Audit label for fixed randomness/configuration in a controlled replay"
+    )]
+    learning_seed: Option<String>,
+
+    #[arg(
         long = "api-key",
         help = "API key (takes precedence over DEEPSEEK_API_KEY env var)"
     )]
@@ -62,6 +83,18 @@ struct Cli {
 
     #[arg(long = "list-checkpoints", help = "List all checkpoints")]
     list_checkpoints: bool,
+
+    #[arg(
+        long = "list-learning-evaluations",
+        help = "List durable continuous-learning treatment outcomes as JSON"
+    )]
+    list_learning_evaluations: bool,
+
+    #[arg(
+        long = "summarize-learning-evaluations",
+        help = "Report same-family P50/P95 treatment metrics and paired replay comparability"
+    )]
+    summarize_learning_evaluations: bool,
 
     #[arg(
         long = "list-evolution-proposals",
@@ -213,14 +246,28 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = code_cli::config::CliConfig::from_env_and_args(
+    let learning_mode = cli
+        .learning_mode
+        .or_else(|| std::env::var("GLIDING_LEARNING_MODE").ok())
+        .unwrap_or_else(|| "active".to_string())
+        .parse::<glidinghorse::core::policy_learning::LearningMode>()
+        .map_err(anyhow::Error::msg)?;
+
+    let mut config = code_cli::config::CliConfig::from_env_and_args(
         cli.model,
         cli.workspace.clone(),
         cli.max_iterations,
         cli.max_pdca_cycles,
+        learning_mode,
         cli.workflow,
         cli.skill_dir,
     );
+    if cli.learning_pair_id.is_some() {
+        config.learning_pair_id = cli.learning_pair_id.clone();
+    }
+    if cli.learning_seed.is_some() {
+        config.learning_seed = cli.learning_seed.clone();
+    }
 
     if cli.daemon {
         return run_daemon();
@@ -228,6 +275,16 @@ fn main() -> anyhow::Result<()> {
 
     if cli.list_checkpoints {
         list_checkpoints(&config)?;
+        return Ok(());
+    }
+
+    if cli.list_learning_evaluations {
+        list_learning_evaluations(&config)?;
+        return Ok(());
+    }
+
+    if cli.summarize_learning_evaluations {
+        summarize_learning_evaluations(&config)?;
         return Ok(());
     }
 
@@ -442,6 +499,22 @@ fn list_evolution_proposals(config: &code_cli::config::CliConfig) -> anyhow::Res
     Ok(())
 }
 
+fn list_learning_evaluations(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let evaluations =
+        code_cli::engine::CodeCliEngine::list_learning_evaluations_from_config(config)?;
+    println!("{}", serde_json::to_string_pretty(&evaluations)?);
+    Ok(())
+}
+
+fn summarize_learning_evaluations(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let evaluations =
+        code_cli::engine::CodeCliEngine::list_learning_evaluations_from_config(config)?;
+    let summary =
+        code_cli::engine::CodeCliEngine::summarize_learning_evaluation_values(evaluations);
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
 fn approve_evolution_proposal(
     config: &code_cli::config::CliConfig,
     proposal_id: &str,
@@ -523,6 +596,36 @@ mod tests {
         assert!(cli.list_evolution_proposals);
         assert!(cli.approve_evolution_proposal.is_none());
         assert!(cli.commit_evolution_proposal.is_none());
+    }
+
+    #[test]
+    fn parses_controlled_learning_treatment() {
+        let cli = Cli::try_parse_from(["glidingcode", "--learning-mode", "shadow"])
+            .expect("learning treatment should be registered");
+        assert_eq!(cli.learning_mode.as_deref(), Some("shadow"));
+    }
+
+    #[test]
+    fn parses_learning_evaluation_audit_command() {
+        let cli = Cli::try_parse_from(["glidingcode", "--list-learning-evaluations"])
+            .expect("learning evaluation command should be registered");
+        assert!(cli.list_learning_evaluations);
+    }
+
+    #[test]
+    fn parses_paired_learning_summary_command() {
+        let cli = Cli::try_parse_from([
+            "glidingcode",
+            "--summarize-learning-evaluations",
+            "--learning-pair-id",
+            "pair-17",
+            "--learning-seed",
+            "fixed-42",
+        ])
+        .expect("paired learning audit options should be registered");
+        assert!(cli.summarize_learning_evaluations);
+        assert_eq!(cli.learning_pair_id.as_deref(), Some("pair-17"));
+        assert_eq!(cli.learning_seed.as_deref(), Some("fixed-42"));
     }
 }
 

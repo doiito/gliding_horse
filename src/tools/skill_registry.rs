@@ -80,6 +80,11 @@ pub struct SkillMeta {
     pub output_mapping: HashMap<String, String>,
     #[serde(default)]
     pub skill_types: Vec<String>,
+    /// Discovery semantics from the application skill's JSON-LD 5W2H block.
+    /// Execution metadata and graph retrieval metadata stay in one canonical
+    /// registry record so bootstrap does not silently replace them with name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_5w2h: Option<crate::skill_graph::types::Skill5W2H>,
 }
 
 /// Cached skill with disclosure level
@@ -93,6 +98,7 @@ struct CachedSkill {
     input_mapping: HashMap<String, String>,
     output_mapping: HashMap<String, String>,
     skill_types: Vec<String>,
+    discovery_5w2h: Option<crate::skill_graph::types::Skill5W2H>,
 }
 
 /// Skill registry with progressive disclosure
@@ -138,33 +144,106 @@ impl SkillRegistry {
         // canonical registry so tracked tool outcomes can feed the skill
         // graph and evolution engine instead of being silently discarded.
         for tool_name in [
-            "file_list",
             "glob_search",
             "grep_search",
-            "kg_search",
-            "knowledge_query",
-            "knowledge_neighbors",
+            "web_fetch",
+            "web_search",
             "tool_search",
-            "codebase_search",
+            "file_read",
+            "file_write",
             "workspace_status",
+            "file_list",
+            "bash",
+            "file_edit",
+            "powershell",
             "rag_search",
+            "rag_index",
+            "rag_chunk",
+            "knowledge_import_file",
+            "knowledge_import_url",
+            "knowledge_import_directory",
+            "knowledge_list",
+            "knowledge_delete",
+            "knowledge_search",
+            "knowledge_update",
+            "create_skill",
+            "convert_skill",
+            "knowledge_extract",
+            "knowledge_query",
+            "kg_search",
+            "knowledge_neighbors",
+            "knowledge_import_json",
+            "ontology_register",
+            "knowledge_bridge",
+            "knowledge_extract_code",
+            "read_agent_output",
+            "ontology_validate_turtle",
+            "ontology_lint_turtle",
+            "ontology_diff_turtle",
+            "ontology_validate_shacl",
+            "ontology_reason",
+            "codebase_search",
         ] {
-            self.register_skill(Self::builtin_tool_skill(tool_name));
+            // Preserve richer first-class definitions (file_read/file_write,
+            // create_skill, etc.); only fill gaps for executable built-ins.
+            if self.skill_iri_for_tool_name(tool_name).is_none() {
+                self.register_skill(Self::builtin_tool_skill(tool_name));
+            }
         }
     }
 
     fn builtin_tool_skill(tool_name: &str) -> SkillMeta {
+        let category = if matches!(tool_name, "bash" | "powershell") {
+            "execution"
+        } else if tool_name.starts_with("web_") {
+            "network"
+        } else if tool_name.starts_with("rag_") {
+            "retrieval"
+        } else if tool_name.starts_with("ontology_") {
+            "ontology"
+        } else if tool_name.starts_with("knowledge_") || tool_name == "kg_search" {
+            "knowledge"
+        } else if tool_name == "tool_search" {
+            "discovery"
+        } else {
+            "file"
+        };
+        let allowed_roles = [
+            (crate::core::agent_instance::AgentRole::Plan, "PA"),
+            (crate::core::agent_instance::AgentRole::Do, "DA"),
+            (crate::core::agent_instance::AgentRole::Check, "CA"),
+            (crate::core::agent_instance::AgentRole::Act, "AA"),
+        ]
+        .into_iter()
+        .filter(|(role, _)| {
+            crate::core::tool_controller::business_role_allows_tool(*role, tool_name)
+        })
+        .map(|(_, name)| name.to_string())
+        .collect();
         SkillMeta {
             skill_iri: format!("iri://skills/{tool_name}"),
             name: tool_name.to_string(),
             description: format!("Built-in executable tool: {tool_name}"),
             version: "1.0.0".to_string(),
-            category: "builtin".to_string(),
-            security_level: "normal".to_string(),
-            allowed_roles: ["PA", "DA", "CA", "AA"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            category: category.to_string(),
+            security_level: match tool_name {
+                "bash" | "powershell" | "knowledge_delete" => "critical",
+                "file_write"
+                | "file_edit"
+                | "rag_index"
+                | "knowledge_import_file"
+                | "knowledge_import_url"
+                | "knowledge_import_directory"
+                | "knowledge_update"
+                | "knowledge_extract"
+                | "knowledge_import_json"
+                | "ontology_register"
+                | "knowledge_bridge"
+                | "knowledge_extract_code" => "high",
+                _ => "normal",
+            }
+            .to_string(),
+            allowed_roles,
             input_schema: json!({"type": "object"}),
             output_schema: json!({"type": "object"}),
             compiled_template: "{}".to_string(),
@@ -172,7 +251,8 @@ impl SkillRegistry {
             signature_algorithm: None,
             input_mapping: HashMap::new(),
             output_mapping: HashMap::new(),
-            skill_types: vec!["iri://skill-types/BuiltinTool".to_string()],
+            skill_types: vec![format!("iri://skill-types/{category}-operation")],
+            discovery_5w2h: None,
         }
     }
 
@@ -185,7 +265,7 @@ impl SkillRegistry {
                 version: "1.0.0".to_string(),
                 category: "file".to_string(),
                 security_level: "normal".to_string(),
-                allowed_roles: vec!["PA","DA","CA","AA"].into_iter().map(String::from).collect(),
+                allowed_roles: vec!["PA","DA","CA"].into_iter().map(String::from).collect(),
                 input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"encoding":{"type":"string","default":"utf-8"}},"required":["path"]}),
                 output_schema: json!({"type":"object","properties":{"content":{"type":"string"},"size":{"type":"integer"}}}),
                 compiled_template: r#"{"path":"___","encoding":"utf-8"}"#.into(),
@@ -204,6 +284,7 @@ impl SkillRegistry {
                     "iri://skill-types/ReadOperation".to_string(),
                     "iri://skill-types/IOOperation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/file_write".to_string(),
@@ -232,6 +313,7 @@ impl SkillRegistry {
                     "iri://skill-types/WriteOperation".to_string(),
                     "iri://skill-types/IOOperation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/http_request".to_string(),
@@ -240,7 +322,7 @@ impl SkillRegistry {
                 version: "1.0.0".to_string(),
                 category: "network".to_string(),
                 security_level: "normal".to_string(),
-                allowed_roles: vec!["DA","CA"].into_iter().map(String::from).collect(),
+                allowed_roles: vec!["DA"].into_iter().map(String::from).collect(),
                 input_schema: json!({"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","enum":["GET","POST","PUT","DELETE","PATCH"],"default":"GET"},"headers":{"type":"object"},"body":{"type":"object"},"timeout":{"type":"integer","default":30}},"required":["url"]}),
                 output_schema: json!({"type":"object","properties":{"status_code":{"type":"integer"},"headers":{"type":"object"},"body":{"type":"string"}}}),
                 compiled_template: r#"{"url":"___","method":"GET","headers":{},"body":null}"#.into(),
@@ -263,6 +345,7 @@ impl SkillRegistry {
                     "iri://skill-types/HTTPOperation".to_string(),
                     "iri://skill-types/RemoteOperation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/llm_chat".to_string(),
@@ -292,6 +375,7 @@ impl SkillRegistry {
                     "iri://skill-types/LLMOperation".to_string(),
                     "iri://skill-types/ChatOperation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/code_execute".to_string(),
@@ -321,6 +405,7 @@ impl SkillRegistry {
                     "iri://skill-types/CodeExecution".to_string(),
                     "iri://skill-types/SandboxedOperation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/jsonld_validate".to_string(),
@@ -348,6 +433,7 @@ impl SkillRegistry {
                     "iri://skill-types/JSONLDOperation".to_string(),
                     "iri://skill-types/SchemaValidation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/create_skill".to_string(),
@@ -374,6 +460,7 @@ impl SkillRegistry {
                     "iri://skill-types/MetaOperation".to_string(),
                     "iri://skill-types/SkillCreation".to_string(),
                 ],
+                discovery_5w2h: None,
             },
             SkillMeta {
                 skill_iri: "iri://skills/convert_skill".to_string(),
@@ -382,7 +469,7 @@ impl SkillRegistry {
                 version: "1.0.0".to_string(),
                 category: "meta".to_string(),
                 security_level: "normal".to_string(),
-                allowed_roles: vec!["DA".to_string(), "CA".to_string()],
+                allowed_roles: vec!["DA".to_string()],
                 input_schema: json!({"type":"object","properties":{"markdown_content":{"type":"string","description":"Markdown formatted Skill description content"},"source_path":{"type":"string","description":"Source file path (optional)"}},"required":["markdown_content"]}),
                 output_schema: json!({"type":"object","properties":{"skill_iri":{"type":"string"},"name":{"type":"string"},"json_ld":{"type":"object"},"registered":{"type":"boolean"}}}),
                 compiled_template: r#"{"markdown_content":"___"}"#.into(),
@@ -400,6 +487,7 @@ impl SkillRegistry {
                     "iri://skill-types/MetaOperation".to_string(),
                     "iri://skill-types/SkillConversion".to_string(),
                 ],
+                discovery_5w2h: None,
             },
         ]
     }
@@ -603,6 +691,48 @@ impl SkillRegistry {
             })
             .unwrap_or_default();
 
+        let discovery_5w2h = json
+            .get("skill:5W2H")
+            .or_else(|| json.get("5W2H"))
+            .map(|value| {
+                let what = value
+                    .get("skill:what")
+                    .or_else(|| value.get("what"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&name);
+                let why = value
+                    .get("skill:why")
+                    .or_else(|| value.get("why"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&description);
+                let mut w2h = crate::skill_graph::types::Skill5W2H::new(what, why);
+                if let Some(role) = value
+                    .get("skill:who")
+                    .or_else(|| value.get("who"))
+                    .and_then(|who| {
+                        who.get("skill:requiredRole")
+                            .or_else(|| who.get("requiredRole"))
+                    })
+                    .and_then(serde_json::Value::as_str)
+                {
+                    w2h = w2h.with_agent_role(role);
+                }
+                if let Some(phases) = value
+                    .get("skill:when")
+                    .or_else(|| value.get("when"))
+                    .and_then(|when| {
+                        when.get("skill:applicablePhase")
+                            .or_else(|| when.get("applicablePhase"))
+                    })
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for phase in phases.iter().filter_map(serde_json::Value::as_str) {
+                        w2h = w2h.with_phase(phase);
+                    }
+                }
+                w2h
+            });
+
         Ok(SkillMeta {
             skill_iri,
             name,
@@ -619,6 +749,7 @@ impl SkillRegistry {
             input_mapping,
             output_mapping,
             skill_types,
+            discovery_5w2h,
         })
     }
 
@@ -750,6 +881,7 @@ impl SkillRegistry {
             input_mapping: skill.input_mapping.clone(),
             output_mapping: skill.output_mapping.clone(),
             skill_types: skill.skill_types.clone(),
+            discovery_5w2h: skill.discovery_5w2h.clone(),
         };
 
         let iri = skill.skill_iri.clone();
@@ -836,6 +968,7 @@ impl SkillRegistry {
             input_mapping: cached.input_mapping.clone(),
             output_mapping: cached.output_mapping.clone(),
             skill_types: cached.skill_types.clone(),
+            discovery_5w2h: cached.discovery_5w2h.clone(),
         })
     }
 
@@ -845,11 +978,25 @@ impl SkillRegistry {
     /// the graph/evolution protocol. Keeping this lookup in the registry
     /// prevents callers from manufacturing a second IRI namespace.
     pub fn skill_iri_for_tool_name(&self, tool_name: &str) -> Option<String> {
-        self.skills
-            .read()
+        let skills = self.skills.read();
+        if let Some(skill) = skills
             .values()
             .find(|cached| cached.basic.name == tool_name)
-            .map(|cached| cached.basic.skill_iri.clone())
+        {
+            return Some(skill.basic.skill_iri.clone());
+        }
+
+        // Result-router micro-tools are ephemeral runtime aliases, not new
+        // business capabilities. Attribute their read-only outcome to the
+        // canonical file-read skill so execution security and evolution use
+        // the same IRI without manufacturing one node per tool call.
+        if tool_name.starts_with("read_full_result_") || tool_name.starts_with("query_") {
+            return skills
+                .get("iri://skills/file_read")
+                .map(|cached| cached.basic.skill_iri.clone());
+        }
+
+        None
     }
 
     pub fn get_skill_basic(&self, skill_iri: &str) -> Option<SkillBasic> {
@@ -875,12 +1022,15 @@ impl SkillRegistry {
 
     pub fn list_skills_for_role(&self, role: &str) -> Vec<SkillMeta> {
         let by_role = self.skills_by_role.read();
-        let _skills = self.skills.read();
 
         by_role
             .get(role)
             .map(|iris| {
+                // Built-ins are registered first and application/evolved
+                // skills later. Prompt caps must not consistently truncate
+                // the very skills that continuous learning just added.
                 iris.iter()
+                    .rev()
                     .filter_map(|iri| self.get_skill(iri))
                     .filter(|skill| {
                         !skill
@@ -1308,14 +1458,52 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_ephemeral_read_micro_tools_to_canonical_skill() {
+        let registry = SkillRegistry::new();
+
+        for tool in ["read_full_result_call_123", "query_call_456"] {
+            assert_eq!(
+                registry.skill_iri_for_tool_name(tool).as_deref(),
+                Some("iri://skills/file_read")
+            );
+        }
+        assert_eq!(registry.skill_iri_for_tool_name("unknown_call_123"), None);
+    }
+
+    #[test]
     fn test_builtin_observability_tools_are_evolution_skills() {
         let registry = SkillRegistry::new();
-        for tool in ["file_list", "glob_search", "kg_search", "knowledge_neighbors"] {
+        let executor = crate::tools::tool_executor::ToolExecutor::new();
+        for tool in executor.list_tools("DA") {
             let iri = registry
-                .skill_iri_for_tool_name(tool)
+                .skill_iri_for_tool_name(&tool)
                 .expect("built-in tool must resolve to a canonical skill IRI");
             assert_eq!(iri, format!("iri://skills/{tool}"));
         }
+    }
+
+    #[test]
+    fn executable_skill_metadata_matches_business_role_boundaries() {
+        let registry = SkillRegistry::new();
+        let aa: std::collections::HashSet<String> = registry
+            .list_skills_for_role("AA")
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert!(!aa.contains("file_read"));
+        assert!(!aa.contains("file_write"));
+        assert!(!aa.contains("bash"));
+
+        let ca: std::collections::HashSet<String> = registry
+            .list_skills_for_role("CA")
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert!(ca.contains("file_read"));
+        assert!(ca.contains("jsonld_validate"));
+        assert!(!ca.contains("file_write"));
+        assert!(!ca.contains("http_request"));
+        assert!(!ca.contains("convert_skill"));
     }
 
     #[test]

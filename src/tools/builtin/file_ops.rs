@@ -798,7 +798,11 @@ mod tests {
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(paths.len(), 1, "only source file should be collected: {paths:?}");
+        assert_eq!(
+            paths.len(),
+            1,
+            "only source file should be collected: {paths:?}"
+        );
         assert!(paths[0].ends_with("src.rs"));
 
         let grep_output = grep_search(&GrepSearchInput {

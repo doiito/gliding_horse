@@ -152,6 +152,10 @@ impl ProactiveEngine {
         self.config.cycle_timeout_secs
     }
 
+    pub fn anomaly_dedup_window_seconds(&self) -> i64 {
+        self.config.anomaly_dedup_window_seconds.max(1)
+    }
+
     pub fn with_config(
         config: PerceptionConfig,
         l0: Arc<L0Store>,
@@ -235,7 +239,11 @@ impl ProactiveEngine {
         }
     }
 
-    async fn query_relevant_experiences(&self, query: &str) -> Vec<serde_json::Value> {
+    async fn query_relevant_experiences(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Vec<serde_json::Value> {
         // When HyperspaceStore is available, use semantic search with time decay
         if let Some(ref hs) = self.hyperspace {
             // Wrap query to give the embedding model more context
@@ -247,7 +255,12 @@ impl ProactiveEngine {
                 .with_jsonld_types(vec!["Experience".to_string()])
                 .with_min_importance(0.05);
             match hs
-                .search_with_time_decay(&augmented_query, &filter, 0.5, 5)
+                .search_with_time_decay(
+                    &augmented_query,
+                    &filter,
+                    0.5,
+                    u64::try_from(max_results).unwrap_or(u64::MAX),
+                )
                 .await
             {
                 Ok(entries) => {
@@ -267,7 +280,7 @@ impl ProactiveEngine {
                             }
                             None
                         })
-                        .take(5)
+                        .take(max_results)
                         .collect();
                     if !experiences.is_empty() {
                         return experiences;
@@ -283,13 +296,13 @@ impl ProactiveEngine {
         // it never performs invalid text/structural cross-space projection.
         #[cfg(feature = "ontology")]
         if let Some(ref ontology) = self.ontology_bridge {
-            match ontology.search_text(query, 5).await {
+            match ontology.search_text(query, max_results).await {
                 Ok(hits) => {
                     let experiences: Vec<serde_json::Value> = hits
                         .iter()
                         .filter_map(|hit| self.l0.retrieve(&hit.iri).ok().flatten())
                         .filter_map(|entry| serde_json::from_str(&entry.content).ok())
-                        .take(5)
+                        .take(max_results)
                         .collect();
                     if !experiences.is_empty() {
                         return experiences;
@@ -298,14 +311,16 @@ impl ProactiveEngine {
                     // the top hit's structural vector (cross_search guards
                     // against invalid cross-space projection).
                     if let Some(seed) = hits.first() {
-                        if let Ok(struct_hits) =
-                            ontology.embed_store().cross_search(&seed.iri, 5).await
+                        if let Ok(struct_hits) = ontology
+                            .embed_store()
+                            .cross_search(&seed.iri, max_results)
+                            .await
                         {
                             let struct_experiences: Vec<serde_json::Value> = struct_hits
                                 .iter()
                                 .filter_map(|hit| self.l0.retrieve(&hit.iri).ok().flatten())
                                 .filter_map(|entry| serde_json::from_str(&entry.content).ok())
-                                .take(5)
+                                .take(max_results)
                                 .collect();
                             if !struct_experiences.is_empty() {
                                 return struct_experiences;
@@ -334,7 +349,7 @@ impl ProactiveEngine {
                         .iter()
                         .any(|t| query_lower.contains(&t.to_lowercase()))
             })
-            .take(5)
+            .take(max_results)
             .filter_map(|entry| serde_json::from_str(&entry.content).ok())
             .collect()
     }
@@ -388,6 +403,31 @@ impl ProactiveEngine {
         user_input: &str,
         task_iri: &str,
     ) -> Result<TaskAnalysis, CoreError> {
+        self.on_task_start_with_history(user_input, task_iri, true)
+            .await
+    }
+
+    /// Analyze a task while allowing callers to exclude durable experience
+    /// retrieval for a controlled learning ablation. Current workspace events
+    /// remain visible because they describe the present environment, not a
+    /// learned outcome from a previous task.
+    pub async fn on_task_start_with_history(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+        include_history: bool,
+    ) -> Result<TaskAnalysis, CoreError> {
+        self.on_task_start_with_history_limit(user_input, task_iri, include_history, 5)
+            .await
+    }
+
+    pub async fn on_task_start_with_history_limit(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+        include_history: bool,
+        max_experiences: usize,
+    ) -> Result<TaskAnalysis, CoreError> {
         let key = Self::cache_key("task_start", task_iri);
         if self.is_cached(&key) {
             return Ok(serde_json::from_value(self.cache[&key].1.clone())
@@ -411,16 +451,21 @@ impl ProactiveEngine {
             }
         }
 
-        let experiences = self.query_relevant_experiences(user_input).await;
-        let experience_hints: Vec<String> = experiences
-            .iter()
-            .filter_map(|e| {
-                e.get("scenario")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-            })
-            .take(5)
-            .collect();
+        let experience_hints: Vec<String> = if include_history {
+            self.query_relevant_experiences(user_input, max_experiences)
+                .await
+                .iter()
+                .filter_map(|experience| {
+                    experience
+                        .get("scenario")
+                        .and_then(|scenario| scenario.as_str())
+                        .map(str::to_string)
+                })
+                .take(max_experiences)
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Merge (not overwrite): perception/workspace events pushed above must
         // survive alongside semantic experience hints.
         analysis.relevant_experience_hints.extend(experience_hints);
@@ -510,7 +555,10 @@ impl ProactiveEngine {
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        if matches!(status, "success" | "completed" | "partial_success" | "failed" | "timeout") {
+        if matches!(
+            status,
+            "success" | "completed" | "partial_success" | "failed" | "timeout"
+        ) {
             debug!(task = %task_iri, status = %status, "Extracting experience");
 
             let cache_key = Self::cache_key("task_start", task_iri);
@@ -931,8 +979,8 @@ mod tests {
             PerceptionSource::WorkspaceMonitor,
             "file changed: src/main.rs modified",
         ));
-        let mut engine = ProactiveEngine::new(l0, test_event_bus())
-            .with_perception_store(perception_store);
+        let mut engine =
+            ProactiveEngine::new(l0, test_event_bus()).with_perception_store(perception_store);
         let analysis = engine
             .on_task_start("Write a hello world program", "iri://task/ws_events")
             .await
@@ -1113,12 +1161,13 @@ mod tests {
             "errors": [],
             "tracked_actions": [{"tool_name": "file_write", "status": "success"}]
         });
-        let experience = engine.on_task_end(&task_result, "iri://task/completed").await;
+        let experience = engine
+            .on_task_end(&task_result, "iri://task/completed")
+            .await;
         assert_eq!(experience.as_ref().map(|e| e.success_rating), Some(0.9));
         let entries = l0.search_by_tags(&["experience".to_string()]).unwrap();
         assert!(entries.iter().any(|entry| {
-            entry.content.contains("tracked_actions")
-                && entry.content.contains("file_write")
+            entry.content.contains("tracked_actions") && entry.content.contains("file_write")
         }));
     }
 
@@ -1132,6 +1181,28 @@ mod tests {
             .on_task_end(&task_result, "iri://task/3")
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_execution_traces_do_not_pollute_task_experience_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        l0.store(
+            "iri://execution-trace/da-1",
+            &serde_json::json!({
+                "@type": "AgentExecutionTrace",
+                "scenario": "create result probe",
+                "tags": ["agent_execution", "DA"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let engine = ProactiveEngine::new(l0, test_event_bus());
+
+        assert!(engine
+            .query_relevant_experiences("create result probe", 5)
+            .await
+            .is_empty());
     }
 
     #[cfg(feature = "ontology")]
@@ -1164,7 +1235,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let experiences = engine.query_relevant_experiences("rust ownership").await;
+        let experiences = engine.query_relevant_experiences("rust ownership", 5).await;
 
         assert_eq!(experiences.len(), 1);
         assert_eq!(

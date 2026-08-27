@@ -14,11 +14,53 @@ use crate::tools::skill_registry::SkillRegistry;
 
 use super::{TaskContext, LLM_RESPONSE_FORMAT_NO_THOUGHT, LLM_RESPONSE_FORMAT_WITH_THOUGHT};
 
-/// Maximum number of role-visible skills injected into the `available_skills`
-/// template variable, mirroring MAX_ALL_HINTS to prevent prompt bloat.
-const MAX_INJECTED_SKILLS: usize = 10;
-
 impl super::AgentRunner {
+    /// Assemble the business prompt that SA supplies when constructing a
+    /// BizAgent.  This method only owns prompt/context mechanics; it must not
+    /// construct or execute a BizAgent (the business abstraction points from
+    /// SA -> BizAgent -> AgentRunner, never in the reverse direction).
+    pub(crate) async fn build_biz_agent_md(
+        &self,
+        role: AgentRole,
+        ctx: &TaskContext,
+        plan_step: Option<&PlanStep>,
+    ) -> String {
+        let context_data = self.gather_context_data_async(role, ctx).await;
+        let mut agent_md = if let Some(step) = plan_step {
+            self.build_agent_md_from_step(role, step, &context_data)
+        } else {
+            let model = self.gateway.get_model(&role.to_string().to_lowercase());
+            self.build_agent_md(role, &ctx.objective, &context_data, &model)
+        };
+        if let Some(allowed) = ctx.allowed_tools.as_ref() {
+            if allowed.is_empty() {
+                agent_md.push_str(
+                    "\n\n## Enforced Runtime Tool Policy\nNo tools are available for this role. Complete the task only from supplied evidence; do not request or invoke tools.",
+                );
+            } else {
+                agent_md.push_str(&format!(
+                    "\n\n## Enforced Runtime Tool Policy\nThe runtime permits only these tools: {}. This list is a hard capability ceiling.",
+                    allowed.join(", ")
+                ));
+            }
+        }
+        match role {
+            AgentRole::Plan => agent_md.push_str(
+                "\n\n## Planning Convergence Contract\nUse only a small number of targeted inspection rounds unless a specifically named information gap blocks planning. The runtime applies a configurable evidence window. Once objective, boundaries, and acceptance evidence are clear, stop exploring and emit the executable plan; verification belongs to CA and implementation belongs to DA.",
+            ),
+            AgentRole::Check => agent_md.push_str(
+                "\n\n## Required CA Verdict Contract\nIf DA supplied an explicit acceptance command, rerun that command first. Then inspect only criteria that command does not cover; do not begin with a generic directory listing. Batch independent checks and map every success criterion to concrete evidence. Once every criterion has evidence, stop exploring. The final summary must begin with exactly one of `PASS:`, `CONDITIONAL_PASS:`, or `FAIL:`. Put concrete evidence after the prefix, and put the complete audit evidence in `content` (never null).",
+            ),
+            AgentRole::Act => agent_md.push_str(
+                "\n\n## Required AA Verdict Contract\nThe final summary must begin with exactly one of `SUCCESS:`, `PARTIAL_SUCCESS:`, or `FAILED:` and must follow the latest CA verdict.",
+            ),
+            AgentRole::Do => agent_md.push_str(
+                "\n\n## Execution Convergence Contract\nAfter a declared full acceptance command succeeds, finish without re-reading unchanged outputs or adding redundant smoke checks unless its output reveals a defect or an explicit criterion remains uncovered. Report the successful command and result as evidence.",
+            ),
+        }
+        agent_md
+    }
+
     pub(super) fn build_agent_md_from_step(
         &self,
         role: AgentRole,
@@ -347,10 +389,10 @@ impl super::AgentRunner {
             }
         }
 
-        // DA: inject the workspace file manifest so the executor does not need
-        // to discover the file list via file_list + per-file reads on turn one.
-        if role == AgentRole::Do {
-            let manifest = self.build_workspace_file_manifest();
+        // Planning, execution and independent verification share the bounded
+        // metadata manifest. File contents remain lazy and targeted.
+        if matches!(role, AgentRole::Plan | AgentRole::Do | AgentRole::Check) {
+            let manifest = self.build_workspace_file_manifest(&ctx.objective);
             if !manifest.is_empty() {
                 context_data.insert("workspace_files".to_string(), manifest);
             }
@@ -361,7 +403,10 @@ impl super::AgentRunner {
 
     /// Render a workspace file manifest for the DA: path + size + line count
     /// when the line count is known from the content cache.
-    fn build_workspace_file_manifest(&self) -> String {
+    fn build_workspace_file_manifest(&self, objective: &str) -> String {
+        let prompt_settings = &self.token_optimization.prompt_optimization;
+        let max_manifest_files = prompt_settings.max_workspace_manifest_files;
+        let max_manifest_chars = prompt_settings.max_workspace_manifest_chars;
         let workspace_monitor = {
             let executor = self.tool_executor.read();
             executor.get_workspace_monitor()
@@ -369,12 +414,9 @@ impl super::AgentRunner {
         let Some(wm) = workspace_monitor else {
             return String::new();
         };
-        let entries = wm.inventory.read().list_all();
-        if entries.is_empty() {
-            return String::new();
-        }
-
-        let mut files: Vec<String> = entries
+        let view = wm.workspace_view(None, Some(objective), max_manifest_files);
+        let mut files: Vec<String> = view
+            .files
             .iter()
             .filter(|e| {
                 !e.path.split('/').any(|part| {
@@ -388,15 +430,41 @@ impl super::AgentRunner {
                     .map(|c| c.len())
                     .unwrap_or(0);
                 if line_count > 0 {
-                    format!("- {} ({} bytes, {} lines)", e.path, e.file_size, line_count)
+                    format!(
+                        "- {} ({} bytes, {} lines, state={}, version={})",
+                        e.path, e.file_size, line_count, e.state, e.version
+                    )
                 } else {
-                    format!("- {} ({} bytes)", e.path, e.file_size)
+                    format!(
+                        "- {} ({} bytes, state={}, version={})",
+                        e.path, e.file_size, e.state, e.version
+                    )
                 }
             })
             .collect();
-        files.sort();
-        let mut lines = vec![format!("{} files in workspace:", entries.len())];
-        lines.extend(files);
+
+        let eligible_count = view.total_files;
+        let mut lines = vec![format!(
+            "{} files in workspace inventory (generation={}, scan_complete={}):",
+            eligible_count, view.generation, view.scan_complete
+        )];
+        let mut rendered_chars = lines[0].chars().count();
+        let mut included = 0usize;
+        for line in files.drain(..) {
+            let line_chars = line.chars().count() + 1;
+            if rendered_chars + line_chars > max_manifest_chars {
+                break;
+            }
+            rendered_chars += line_chars;
+            lines.push(line);
+            included += 1;
+        }
+        if included < eligible_count {
+            lines.push(format!(
+                "- ... {} files omitted; use targeted file_list/glob_search when needed",
+                eligible_count - included
+            ));
+        }
         lines.join("\n")
     }
 
@@ -407,6 +475,7 @@ impl super::AgentRunner {
         tools_list: &[String],
         skills: &Arc<SkillRegistry>,
         role_name: &str,
+        max_injected_skills: usize,
     ) -> String {
         let mut output = tools_list.join(", ");
         let tool_names: std::collections::HashSet<&str> =
@@ -414,7 +483,7 @@ impl super::AgentRunner {
         let role_skills = skills.list_skills_for_role(role_name);
         let mut injected = 0usize;
         for skill in role_skills {
-            if injected >= MAX_INJECTED_SKILLS {
+            if injected >= max_injected_skills {
                 break;
             }
             if tool_names.contains(skill.name.as_str()) {
@@ -461,6 +530,9 @@ impl super::AgentRunner {
                 &tools_list,
                 &self.skills,
                 &role_name,
+                self.token_optimization
+                    .prompt_optimization
+                    .max_injected_skills,
             )),
         );
         vars.insert(
@@ -510,8 +582,14 @@ impl super::AgentRunner {
                 // PromptLoader's template/builtin fallback may not consume the
                 // `available_skills` var, so append the role skills explicitly
                 // when the rendered result does not already contain them.
-                let skills_text =
-                    Self::build_available_skills(&tools_list, &self.skills, &role_name);
+                let skills_text = Self::build_available_skills(
+                    &tools_list,
+                    &self.skills,
+                    &role_name,
+                    self.token_optimization
+                        .prompt_optimization
+                        .max_injected_skills,
+                );
                 let mut md = format!("# {} Agent.md\n\n{}", role_name, result);
                 if !skills_text.trim().is_empty() && !md.contains(&skills_text) {
                     md.push_str(&format!("\n\n## Available Skills\n{}", skills_text));
@@ -633,7 +711,14 @@ impl super::AgentRunner {
             sections.join("\n\n")
         };
 
-        let skills_text = Self::build_available_skills(&tools_list, &self.skills, &role_name);
+        let skills_text = Self::build_available_skills(
+            &tools_list,
+            &self.skills,
+            &role_name,
+            self.token_optimization
+                .prompt_optimization
+                .max_injected_skills,
+        );
         let skills_section = if skills_text.trim().is_empty() {
             String::new()
         } else {
@@ -721,13 +806,16 @@ impl super::AgentRunner {
             policy_text.push_str("- Irrelevant files or directories (e.g. other projects, test artifacts, unrelated codebases) must be directly ignored — do not explore or process them\n");
             policy_text.push_str("- When using glob_search, file_list or similar tools, if results contain irrelevant content, automatically filter it out — do not get distracted\n");
             policy_text.push_str("- If you encounter files/directories not belonging to the current task, skip them and continue executing the current task — do not change direction due to irrelevant content\n");
-            policy_text.push_str("- Check Agent (CA) special note: your audit report may only contain content related to the current task. Irrelevant files found must be ignored and not written into the report\n");
-            policy_text.push_str("- Decision Agent (AA) special note: do NOT proactively explore files. Your decisions must be based solely on CA audit results, ignoring any irrelevant content in the audit\n");
+            match agent.role {
+                AgentRole::Check => policy_text.push_str("- CA audit reports may contain only task-relevant evidence; ignore unrelated files\n"),
+                AgentRole::Act => policy_text.push_str("- AA must decide only from supplied task and CA evidence; do not explore files or execute repairs\n"),
+                _ => {}
+            }
             policy_text.push_str("\n### 📖 File Reading Efficiency Principles (Mandatory)\n");
             policy_text.push_str("- Only read files relevant to the current task. Files that have been 'written but not re-read' are output from other agents — only read them when you need to reference their content\n");
-            policy_text.push_str("- Do not re-read the same file. If file_read returns from_cache=true, the content is unchanged and was already provided — skip re-reading and continue with what you have\n");
-            policy_text.push_str("- Do NOT try mode:force_refresh just because file_read returns from_cache=true — this only wastes tokens reading unchanged content\n");
-            policy_text.push_str("- For files already read, their content is already in your context. No need to re-confirm or re-verify\n");
+            policy_text.push_str("- Avoid redundant whole-file reads. If file_read returns from_cache=true and the earlier content is still visible, continue with it\n");
+            policy_text.push_str("- If context compression removed content you genuinely need, request only the missing offset/limit range or use mode:full once; do not loop on cache markers\n");
+            policy_text.push_str("- Prefer targeted ranges for large files and move from inspection to execution as soon as the relevant section is understood\n");
 
             if let Some(methodology_addendum) =
                 MethodologyPromptInjector::build_for_role(agent.role)
@@ -757,7 +845,36 @@ impl super::AgentRunner {
             prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
         }
 
-        let emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
+        let mut emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
+        let effect_policy = ctx.effective_effect_policy();
+        let effect_contract = match &effect_policy {
+            crate::core::effect::EffectPolicy::None => None,
+            crate::core::effect::EffectPolicy::Required { effect } => Some(format!(
+                "[EffectPolicy Required] Completion requires concrete {:?} evidence; diagnosis alone is incomplete.",
+                effect
+            )),
+            crate::core::effect::EffectPolicy::Conditional { effect, condition } => Some(format!(
+                "[EffectPolicy Conditional] Verify condition `{}`. If it holds, produce {:?}; otherwise finish without mutation and provide concrete verification evidence.",
+                condition, effect
+            )),
+            crate::core::effect::EffectPolicy::EvidenceOnly => Some(
+                "[EffectPolicy EvidenceOnly] Gather and report evidence only; do not create external effects or mutate workspace state."
+                    .to_string(),
+            ),
+            crate::core::effect::EffectPolicy::DecisionOnly => Some(
+                "[EffectPolicy DecisionOnly] Decide only from supplied evidence; do not call execution or mutation tools."
+                    .to_string(),
+            ),
+        };
+        if let Some(effect_contract) = effect_contract {
+            emphasis_items.push(effect_contract);
+        }
+        if agent.role == AgentRole::Do {
+            emphasis_items.push(
+                "[CompletionProtocol] Return `completion_state`, `changes`, `verification`, `pending_effects`, and `blockers` in a JSON object named `completion`. An empty pending_effects array is authoritative only when completion_state is complete."
+                    .to_string(),
+            );
+        }
         if !emphasis_items.is_empty() {
             let emphasis_content = emphasis_items
                 .iter()
@@ -779,7 +896,7 @@ impl super::AgentRunner {
             crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
         );
 
-        let tool_menu = self.build_readable_tool_menu(&agent.role);
+        let tool_menu = self.build_readable_tool_menu(&agent.role, ctx.allowed_tools.as_deref());
         if !tool_menu.is_empty() {
             prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
         }
@@ -817,9 +934,13 @@ impl super::AgentRunner {
         prompt
     }
 
-    pub(super) fn build_readable_tool_menu(&self, role: &AgentRole) -> String {
+    pub(super) fn build_readable_tool_menu(
+        &self,
+        role: &AgentRole,
+        allowed_tools: Option<&[String]>,
+    ) -> String {
         let role_str = role.to_string();
-        let tool_defs = self.tool_definitions_for_agent(&role_str);
+        let tool_defs = self.tool_definitions_for_context(&role_str, allowed_tools);
 
         if tool_defs.is_empty() {
             return String::new();
@@ -832,15 +953,13 @@ impl super::AgentRunner {
         } else {
             "[Platform: Linux]"
         };
-        let mut lines = vec![os_hint.to_string(), "Available tools list:".to_string()];
+        let mut lines = vec![
+            os_hint.to_string(),
+            "Available tool IDs (the API schemas are authoritative):".to_string(),
+        ];
         for tool_def in &tool_defs {
             let name = tool_def["function"]["name"].as_str().unwrap_or("");
-            let desc = tool_def["function"]["description"].as_str().unwrap_or("");
-            if desc.is_empty() {
-                lines.push(format!("- ID: {}", name));
-            } else {
-                lines.push(format!("- ID: {} | Purpose: {}", name, desc));
-            }
+            lines.push(format!("- {}", name));
         }
         lines.join("\n")
     }

@@ -227,8 +227,10 @@ impl GraphifyEngine {
                             if nodes.len() < max_entities {
                                 let child_id = format!("{}_{}", id, key);
                                 let child_label = Self::extract_label(child, &child_id);
-                                let child_type =
-                                    format!("https://agent-os.org/ontology/tool-result/Child_{}", key);
+                                let child_type = format!(
+                                    "https://agent-os.org/ontology/tool-result/Child_{}",
+                                    key
+                                );
 
                                 let mut child_props = HashMap::new();
                                 for (ck, cv) in child {

@@ -6,6 +6,275 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn workspace_effect_progress_detects_a_late_read_only_stall() {
+    use super::execution::{record_workspace_effect_turn, workspace_effect_recovery_active};
+
+    let mut observed = false;
+    let mut effectless_tail = 0;
+
+    // Early implementation progress must not permanently disable monitoring.
+    record_workspace_effect_turn(&mut observed, &mut effectless_tail, true);
+    assert!(observed);
+    assert_eq!(effectless_tail, 0);
+
+    for _ in 0..12 {
+        record_workspace_effect_turn(&mut observed, &mut effectless_tail, false);
+    }
+    assert!(observed, "all-time mutation evidence must be retained");
+    assert_eq!(effectless_tail, 12);
+    assert!(workspace_effect_recovery_active(
+        true,
+        effectless_tail,
+        0,
+        12
+    ));
+
+    // A later successful edit restores the normal tool window.
+    record_workspace_effect_turn(&mut observed, &mut effectless_tail, true);
+    assert_eq!(effectless_tail, 0);
+    assert!(!workspace_effect_recovery_active(
+        true,
+        effectless_tail,
+        0,
+        12
+    ));
+    assert!(
+        workspace_effect_recovery_active(true, 2, 12, 12),
+        "repeated evidence must activate recovery even when mixed with nominally new reads"
+    );
+}
+
+#[test]
+fn implementation_phase_withholds_broad_discovery_but_keeps_targeted_read_and_write() {
+    let definition = |name: &str| serde_json::json!({"type":"function","function":{"name":name,"parameters":{}}});
+    let filtered = super::execution::phase_tool_definitions(
+        vec![
+            definition("file_list"),
+            definition("glob_search"),
+            definition("file_read"),
+            definition("file_write"),
+            definition("bash"),
+        ],
+        crate::core::agent_instance::AgentRole::Do,
+        super::execution::ExecutionPhase::Implement,
+    );
+    let names = filtered
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"file_list"));
+    assert!(!names.contains(&"glob_search"));
+    assert!(names.contains(&"file_read"));
+    assert!(names.contains(&"file_write"));
+    assert!(names.contains(&"bash"));
+}
+
+#[test]
+fn complete_bounded_inventory_withholds_only_redundant_broad_discovery() {
+    let definition = |name: &str| serde_json::json!({"type":"function","function":{"name":name,"parameters":{}}});
+    let filtered = super::execution::workspace_inventory_tool_definitions(
+        vec![
+            definition("file_list"),
+            definition("glob_search"),
+            definition("workspace_status"),
+            definition("grep_search"),
+            definition("file_read"),
+            definition("file_write"),
+        ],
+        true,
+    );
+    let names = filtered
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["grep_search", "file_read", "file_write"]);
+}
+
+#[test]
+fn execution_rejects_a_tool_not_advertised_in_the_current_turn() {
+    let definitions = vec![
+        json!({"type":"function","function":{"name":"file_read","parameters":{}}}),
+        json!({"type":"function","function":{"name":"bash","parameters":{}}}),
+    ];
+    let advertised = super::execution::advertised_tool_names(&definitions);
+
+    assert!(super::execution::unadvertised_tool_call_result(&advertised, "file_read").is_none());
+    let rejection = super::execution::unadvertised_tool_call_result(&advertised, "file_list")
+        .expect("a withdrawn broad inventory tool must be rejected at execution time");
+    assert_eq!(rejection["status"], "not_executed");
+    assert_eq!(rejection["reason"], "tool_not_advertised");
+    assert!(rejection.get("error").is_none());
+    assert!(rejection["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("was not executed")));
+    assert!(
+        !crate::core::tracked_action::tool_result_failed(&rejection),
+        "protocol feedback must not be learned as a failed skill execution"
+    );
+}
+
+#[test]
+fn ca_evidence_focus_keeps_independent_checks_but_drops_new_discovery() {
+    let definition = |name: &str| serde_json::json!({"type":"function","function":{"name":name,"parameters":{}}});
+    let filtered = super::execution::ca_evidence_focus_tool_definitions(
+        vec![
+            definition("file_list"),
+            definition("grep_search"),
+            definition("file_read"),
+            definition("bash"),
+            definition("read_agent_output"),
+        ],
+        AgentRole::Check,
+        true,
+    );
+    let names = filtered
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["file_read", "bash", "read_agent_output"]);
+}
+
+#[test]
+fn ca_evidence_close_gate_removes_tools_only_for_ca() {
+    let definition = |name: &str| serde_json::json!({"type":"function","function":{"name":name,"parameters":{}}});
+    let ca_tools = super::execution::ca_evidence_close_tool_definitions(
+        vec![definition("file_read"), definition("bash")],
+        AgentRole::Check,
+        true,
+    );
+    assert!(ca_tools.is_empty());
+
+    let da_tools = super::execution::ca_evidence_close_tool_definitions(
+        vec![definition("file_write")],
+        AgentRole::Do,
+        true,
+    );
+    assert_eq!(da_tools.len(), 1);
+}
+
+#[test]
+fn ca_da_correction_starts_in_repair_with_its_configured_guard() {
+    let mut constraints = std::collections::HashMap::new();
+    constraints.insert(
+        super::SA_RECOVERY_MODE_CONSTRAINT.to_string(),
+        super::CA_DA_CORRECTION_MODE.to_string(),
+    );
+    let phase = super::execution::initial_execution_phase(AgentRole::Do, &constraints);
+    assert_eq!(phase, super::execution::ExecutionPhase::Repair);
+    assert_eq!(
+        super::execution::effective_effect_block_turns(phase, 12, 4),
+        4
+    );
+    assert_eq!(
+        super::execution::effective_effect_block_turns(phase, 12, 0),
+        12,
+        "zero repair guard inherits the general configured threshold"
+    );
+}
+
+#[test]
+fn pa_planning_focus_closes_tools_after_configured_evidence_window() {
+    let definition = |name: &str| serde_json::json!({"type":"function","function":{"name":name,"parameters":{}}});
+    let filtered = super::execution::pa_planning_focus_tool_definitions(
+        vec![definition("file_read"), definition("grep_search")],
+        AgentRole::Plan,
+        true,
+    );
+    assert!(filtered.is_empty());
+
+    let da_tools = super::execution::pa_planning_focus_tool_definitions(
+        vec![definition("file_read")],
+        AgentRole::Do,
+        true,
+    );
+    assert_eq!(da_tools.len(), 1);
+}
+
+#[test]
+fn evidence_keys_change_with_workspace_generation() {
+    let args = serde_json::json!({"path":"src/lib.rs"});
+    let first = super::execution::evidence_key("file_read", &args, 1).unwrap();
+    let same = super::execution::evidence_key("file_read", &args, 1).unwrap();
+    let changed = super::execution::evidence_key("file_read", &args, 2).unwrap();
+    assert_eq!(first, same);
+    assert_ne!(first, changed);
+}
+
+#[test]
+fn replaceable_execution_ledger_never_accumulates_prompt_state() {
+    use crate::gateway::unified_gateway::ChatMessage;
+
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: "stable application prompt".to_string(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    for generation in 1..=25 {
+        super::execution::refresh_execution_ledger(
+            &mut messages,
+            AgentRole::Do,
+            super::execution::ExecutionPhase::Implement,
+            &crate::core::effect::EffectPolicy::required_workspace_mutation(),
+            generation,
+            0,
+            0,
+            generation as u64,
+        );
+    }
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.name.as_deref() == Some("execution_ledger"))
+            .count(),
+        1
+    );
+    assert!(messages
+        .iter()
+        .any(|message| message.content == "stable application prompt"));
+    assert!(messages
+        .iter()
+        .find(|message| message.name.as_deref() == Some("execution_ledger"))
+        .unwrap()
+        .content
+        .contains("workspace_generation: 25"));
+}
+
+#[test]
+fn mutation_recovery_window_keeps_only_effect_capable_authorized_tools() {
+    use super::execution::mutation_recovery_tool_definitions;
+
+    let definitions = vec![
+        json!({"type":"function","function":{"name":"file_read"}}),
+        json!({"type":"function","function":{"name":"grep_search"}}),
+        json!({"type":"function","function":{"name":"file_write"}}),
+        json!({"type":"function","function":{"name":"file_edit"}}),
+        json!({"type":"function","function":{"name":"bash"}}),
+    ];
+    let names: Vec<String> = mutation_recovery_tool_definitions(definitions)
+        .iter()
+        .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert_eq!(names, vec!["file_write", "file_edit", "bash"]);
+}
+
+#[test]
+fn da_final_turn_notice_still_allows_required_implementation() {
+    use super::execution::final_turn_limit_notice;
+
+    let notice = final_turn_limit_notice(AgentRole::Do, true, true, 7);
+    assert!(notice.contains("file_write/file_edit"));
+    assert!(notice.contains("no-change tail is 7"));
+    assert!(!notice.contains("Do not initiate new tool calls"));
+
+    let ca_notice = final_turn_limit_notice(AgentRole::Check, false, false, 0);
+    assert!(ca_notice.contains("Do not initiate new tool calls"));
+}
+
 fn create_test_runner() -> AgentRunner {
     use crate::config::settings::AgentSettings;
     use crate::config::settings::GatewaySettings;
@@ -154,10 +423,7 @@ fn test_token_optimization_settings_wired() {
     assert_eq!(aging.keep_full(), 4);
     assert_eq!(aging.try_microtool(), 8);
 
-    let cwm = runner
-        .context_window_manager
-        .as_ref()
-        .expect("cwm created");
+    let cwm = runner.context_window_manager.as_ref().expect("cwm created");
     let cwm = cwm.lock().unwrap();
     assert_eq!(cwm.max_tokens(), 8888);
 }
@@ -439,7 +705,405 @@ fn test_detect_blocker_verdict() {
         AgentRunner::detect_blocker_verdict("Task status: success, all requirements met"),
         None
     );
+    assert_eq!(
+        AgentRunner::detect_blocker_verdict(
+            "成功标准『浏览器端到端验证通过』未达成。不得转化为成功，status is partial/blocked."
+        ),
+        Some("failed")
+    );
+    assert_eq!(
+        AgentRunner::detect_blocker_verdict("FAILED: implementation was not completed"),
+        Some("failed")
+    );
     assert_eq!(AgentRunner::detect_blocker_verdict(""), None);
+}
+
+#[test]
+fn terminal_reasoning_is_not_lost_when_responses_content_is_null() {
+    assert_eq!(
+        AgentRunner::effective_response_content(
+            "",
+            Some("FAILED: acceptance criteria were not met"),
+            "stop",
+            false,
+        ),
+        "FAILED: acceptance criteria were not met"
+    );
+    assert_eq!(
+        AgentRunner::effective_response_content("", Some("calling a tool"), "tool_calls", true),
+        ""
+    );
+}
+
+#[test]
+fn nullish_react_content_uses_terminal_reasoning_as_evidence() {
+    let runner = create_test_runner();
+    let parsed = runner.parse_llm_response(
+        r#"{"content":"null","summary":"Cleanup verified","action":"finish"}"#,
+        Some("All success criteria independently verified; 19/19 tests pass."),
+        true,
+    );
+
+    assert_eq!(parsed.summary.as_deref(), Some("Cleanup verified"));
+    assert_eq!(parsed.action.as_deref(), Some("finish"));
+    assert_eq!(
+        parsed.content,
+        "All success criteria independently verified; 19/19 tests pass."
+    );
+}
+
+#[test]
+fn decision_only_context_exposes_no_tools_to_aa() {
+    let runner = create_test_runner();
+    let definitions = runner.tool_definitions_for_context("AA", Some(&[]));
+    assert!(
+        definitions.is_empty(),
+        "AA deny-all context must not advertise tools to the model"
+    );
+}
+
+#[test]
+fn dynamic_result_readers_are_visible_only_to_the_owning_execution() {
+    let runner = create_test_runner();
+    let tool_name = "read_full_result_call_session_a";
+    let evicted_tool_name = "read_full_result_call_session_old";
+    {
+        let mut executor = runner.tool_executor.write();
+        executor.set_micro_tool_limits(1, 100, 200);
+        for (name, call_id) in [
+            (evicted_tool_name, "call_session_old"),
+            (tool_name, "call_session_a"),
+        ] {
+            executor.register_micro_tool(
+                name,
+                crate::tools::tool_executor::MicroToolContext {
+                    call_id: call_id.to_string(),
+                    storage_key: format!("iri://tool-result/{call_id}"),
+                    tool_name: "file_read".to_string(),
+                    entity_types: vec![],
+                    preview_size: 100,
+                },
+            );
+        }
+    }
+
+    let names = |definitions: Vec<Value>| {
+        definitions
+            .into_iter()
+            .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    assert!(!names(runner.tool_definitions_for_context("DA", None)).contains(tool_name));
+
+    let session_tools =
+        std::collections::HashSet::from([tool_name.to_string(), evicted_tool_name.to_string()]);
+    let owning_names =
+        names(runner.tool_definitions_for_context_with_microtools("DA", None, &session_tools));
+    assert!(owning_names.contains(tool_name));
+    assert!(
+        owning_names.contains(evicted_tool_name),
+        "an owning session must retain a reconstructable schema after global catalog eviction"
+    );
+}
+
+#[test]
+fn only_currently_referenced_dynamic_readers_stay_in_the_tool_window() {
+    use super::execution::active_session_tool_names;
+    use crate::gateway::unified_gateway::ChatMessage;
+
+    let active = "read_full_result_call_active".to_string();
+    let stale = "read_full_result_call_stale".to_string();
+    let discovered = "knowledge_import_directory".to_string();
+    let session = std::collections::HashSet::from([active.clone(), stale, discovered.clone()]);
+    let messages = vec![ChatMessage {
+        role: "tool".to_string(),
+        content: format!("Full result available via `{active}`"),
+        name: None,
+        tool_calls: None,
+        tool_call_id: Some("call_active".to_string()),
+        reasoning_content: None,
+    }];
+
+    let names = active_session_tool_names(&messages, &session);
+    assert!(names.contains(&active));
+    assert!(names.contains(&discovered));
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn da_verification_failure_enters_repair_and_mutation_requires_reverification() {
+    use super::execution::{da_phase_after_tool_turn, ExecutionPhase};
+
+    assert_eq!(
+        da_phase_after_tool_turn(ExecutionPhase::Verify, false, true),
+        ExecutionPhase::Repair
+    );
+    assert_eq!(
+        da_phase_after_tool_turn(ExecutionPhase::Repair, true, false),
+        ExecutionPhase::Verify
+    );
+    assert_eq!(
+        da_phase_after_tool_turn(ExecutionPhase::Verify, true, false),
+        ExecutionPhase::Verify,
+        "a mutation made during verification must be verified, not left in repair"
+    );
+}
+
+#[tokio::test]
+async fn read_agent_output_reads_archived_tool_result_iri_with_a_bound() {
+    let runner = create_test_runner();
+    let iri = "iri://tool-result/archived-test";
+    runner
+        .l0_store
+        .store(
+            iri,
+            &serde_json::json!({"content": "one\ntwo\nthree", "tool_name": "file_read"})
+                .to_string(),
+        )
+        .unwrap();
+
+    let executor = runner.tool_executor.read().clone();
+    let result = executor
+        .execute(
+            "read_agent_output",
+            serde_json::json!({"node_iri": iri, "offset": 1, "limit": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["content"], "two");
+    assert_eq!(result["returned"], 1);
+    assert_eq!(result["total_lines"], 3);
+}
+
+#[tokio::test]
+async fn pass_through_result_advertises_an_iri_only_when_it_is_resolvable() {
+    let runner = create_test_runner();
+    let small = runner
+        .route_tool_result("small inline result", "file_read", "small-call")
+        .await;
+    assert!(!small.contains("iri://tool-result/"));
+
+    let large_payload =
+        "line\n".repeat(runner.tool_result_router_settings.prepare_threshold / "line\n".len() + 2);
+    let large = runner
+        .route_tool_result(&large_payload, "file_read", "large-call")
+        .await;
+    assert!(large.contains("iri://tool-result/large-call"));
+
+    let executor = runner.tool_executor.read().clone();
+    let archived = executor
+        .execute(
+            "read_agent_output",
+            serde_json::json!({
+                "node_iri": "iri://tool-result/large-call",
+                "offset": 0,
+                "limit": 1
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived["content"], "line");
+}
+
+#[test]
+fn optimized_tool_window_is_small_and_can_activate_discovered_tools() {
+    let runner = create_test_runner()
+        .with_token_optimization(crate::config::settings::TokenOptimizationSettings::default())
+        .with_prompt_variant(crate::core::prompt_contract::PromptVariant::Optimized);
+    let names = |definitions: Vec<Value>| {
+        definitions
+            .into_iter()
+            .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+            .collect::<std::collections::HashSet<_>>()
+    };
+
+    let initial = names(runner.tool_definitions_for_context("DA", None));
+    let full = names(runner.tool_executor.read().tool_definitions_for_role("DA"));
+    assert!(initial.len() < full.len());
+    assert!(initial.contains("tool_search"));
+    assert!(!initial.contains("knowledge_import_directory"));
+
+    let activated = std::collections::HashSet::from(["knowledge_import_directory".to_string()]);
+    let after_search =
+        names(runner.tool_definitions_for_context_with_microtools("DA", None, &activated));
+    assert!(after_search.contains("knowledge_import_directory"));
+}
+
+#[test]
+fn role_turn_budgets_inherit_task_budget_unless_configured() {
+    use super::execution::effective_role_max_turns;
+
+    let mut budget = crate::config::settings::AgentExecutionBudgetSettings::default();
+    for role in [
+        AgentRole::Plan,
+        AgentRole::Do,
+        AgentRole::Check,
+        AgentRole::Act,
+    ] {
+        assert_eq!(effective_role_max_turns(role, 50, &budget), 50);
+    }
+
+    budget.role_max_turns.plan = Some(12);
+    budget.role_max_turns.check = Some(24);
+    budget.role_max_turns.act = Some(8);
+    assert_eq!(effective_role_max_turns(AgentRole::Plan, 50, &budget), 12);
+    assert_eq!(effective_role_max_turns(AgentRole::Do, 50, &budget), 50);
+    assert_eq!(effective_role_max_turns(AgentRole::Check, 50, &budget), 24);
+    assert_eq!(effective_role_max_turns(AgentRole::Check, 10, &budget), 10);
+    assert_eq!(effective_role_max_turns(AgentRole::Act, 50, &budget), 8);
+}
+
+#[test]
+fn short_role_budget_never_emits_colliding_warning_phases() {
+    use super::execution::turn_warning_thresholds;
+
+    assert_eq!(turn_warning_thresholds(50, 8, 3), (Some(42), Some(47)));
+    assert_eq!(turn_warning_thresholds(5, 8, 3), (None, Some(2)));
+    assert_eq!(turn_warning_thresholds(2, 8, 3), (None, None));
+}
+
+#[test]
+fn da_effect_guard_distinguishes_inspection_from_substantive_changes() {
+    use super::execution::is_substantive_workspace_effect;
+
+    assert!(is_substantive_workspace_effect(
+        "file_write",
+        &json!({"path": "src/new.rs", "content": "fn main() {}"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "printf 'x' > src/generated.txt"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "python -m pytest -q > pytest_run_now.txt 2>&1"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "python -m pytest -q | tee pytest_run_now.txt"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "sed -n '1,200p' src/lib.rs"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "mkdir -p empty_only"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "cp taskqueue.py taskqueue.py.bak"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "cp -a 'taskqueue.py' 'taskqueue.py.orig'"})
+    ));
+    assert!(is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "cp taskqueue.py generated/taskqueue.py"})
+    ));
+    assert!(is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "cp taskqueue.py.bak taskqueue.py"})
+    ));
+    assert!(is_substantive_workspace_effect(
+        "bash",
+        &json!({"command": "cp taskqueue.py taskqueue.py.bak && sed -i 's/old/new/' taskqueue.py"})
+    ));
+    assert!(!is_substantive_workspace_effect(
+        "file_read",
+        &json!({"path": "src/lib.rs"})
+    ));
+}
+
+#[test]
+fn shell_effect_confirmation_rejects_noop_and_accepts_content_change() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use super::execution::{capture_workspace_effect_snapshot, confirmed_workspace_effect};
+            use crate::tools::tool_executor::ToolExecutor;
+            use crate::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
+            use std::sync::Arc;
+
+            let dir = tempfile::Builder::new()
+                .prefix(".semantic-effect-test-")
+                .tempdir_in(std::env::current_dir().unwrap())
+                .unwrap();
+            let path = dir.path().join("source.txt");
+            std::fs::write(&path, "old\n").unwrap();
+            let monitor = WorkspaceMonitor::initialize(
+                WorkspaceMonitorConfig {
+                    workspace_root: dir.path().to_path_buf(),
+                    watch_enabled: false,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let mut executor = ToolExecutor::new();
+            executor.set_workspace_monitor(Arc::new(monitor));
+            let executor = parking_lot::RwLock::new(executor);
+
+            let noop_args = json!({
+                "command": format!("sed -i 's/missing/replacement/' '{}'", path.display())
+            });
+            let before = capture_workspace_effect_snapshot(&executor).unwrap();
+            let noop_result = executor
+                .read()
+                .clone()
+                .execute("bash", noop_args.clone())
+                .await
+                .unwrap();
+            assert!(
+                !confirmed_workspace_effect(
+                    &executor,
+                    "bash",
+                    &noop_args,
+                    &noop_result,
+                    Some(&before),
+                )
+                .await
+            );
+
+            let change_args = json!({
+                "command": format!("sed -i 's/old/new/' '{}'", path.display())
+            });
+            let before = capture_workspace_effect_snapshot(&executor).unwrap();
+            let change_result = executor
+                .read()
+                .clone()
+                .execute("bash", change_args.clone())
+                .await
+                .unwrap();
+            assert!(
+                confirmed_workspace_effect(
+                    &executor,
+                    "bash",
+                    &change_args,
+                    &change_result,
+                    Some(&before),
+                )
+                .await
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
+        });
+}
+
+#[test]
+fn workspace_effect_guard_is_enabled_only_by_generic_task_constraint() {
+    use super::execution::requires_workspace_effect;
+
+    let plain = TaskContext::new("iri://task/plain", "analyze", 10);
+    assert!(!requires_workspace_effect(&plain, AgentRole::Do));
+
+    let change = TaskContext::new("iri://task/change", "execute", 10)
+        .with_constraint("required_effect", "workspace_mutation");
+    assert!(requires_workspace_effect(&change, AgentRole::Do));
+    assert!(!requires_workspace_effect(&change, AgentRole::Check));
 }
 
 #[test]
@@ -472,13 +1136,11 @@ fn test_build_agent_md_da_renders_workspace_files_section() {
         "workspace_files".to_string(),
         "3 files in workspace:\n- /tmp/a.js (200 bytes, 50 lines)\n- /tmp/b.js (1000 bytes, 120 lines)".to_string(),
     );
-    let md = runner.build_agent_md(
-        AgentRole::Do,
-        "objective",
-        &context_data,
-        "deepseek-v4-pro",
+    let md = runner.build_agent_md(AgentRole::Do, "objective", &context_data, "deepseek-v4-pro");
+    assert!(
+        md.contains("## Workspace Files"),
+        "DA prompt renders file manifest"
     );
-    assert!(md.contains("## Workspace Files"), "DA prompt renders file manifest");
     assert!(md.contains("/tmp/a.js"));
     assert!(
         md.contains("use file_read with offset/limit"),
@@ -520,10 +1182,11 @@ fn test_available_skills_injects_role_skills() {
         input_mapping: std::collections::HashMap::new(),
         output_mapping: std::collections::HashMap::new(),
         skill_types: vec![],
+        discovery_5w2h: None,
     });
 
     let tools = vec!["file_read".to_string(), "file_write".to_string()];
-    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA");
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA", 10);
     assert!(
         skills_text.contains("analyze_output: Deep analysis of execution results"),
         "role-visible skill should be injected, got: {}",
@@ -553,6 +1216,7 @@ fn test_agent_md_fallback_includes_injected_skills() {
         input_mapping: std::collections::HashMap::new(),
         output_mapping: std::collections::HashMap::new(),
         skill_types: vec![],
+        discovery_5w2h: None,
     });
 
     let context_data = std::collections::HashMap::new();
@@ -586,10 +1250,11 @@ fn test_available_skills_dedupes_tool_names() {
         input_mapping: std::collections::HashMap::new(),
         output_mapping: std::collections::HashMap::new(),
         skill_types: vec![],
+        discovery_5w2h: None,
     });
 
     let tools = vec!["file_read".to_string()];
-    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA");
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA", 10);
     let occurrences = skills_text.matches("file_read").count();
     assert_eq!(
         occurrences, 1,
@@ -619,10 +1284,11 @@ fn test_available_skills_skips_other_roles() {
         input_mapping: std::collections::HashMap::new(),
         output_mapping: std::collections::HashMap::new(),
         skill_types: vec![],
+        discovery_5w2h: None,
     });
 
     let tools = vec!["file_read".to_string()];
-    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA");
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "DA", 10);
     assert!(
         !skills_text.contains("plan_strategy"),
         "PA-only skill must not appear for DA, got: {}",
@@ -660,6 +1326,7 @@ fn test_agent_md_prompt_loader_fallback_injects_skills() {
         input_mapping: std::collections::HashMap::new(),
         output_mapping: std::collections::HashMap::new(),
         skill_types: vec![],
+        discovery_5w2h: None,
     });
 
     let context_data = std::collections::HashMap::new();

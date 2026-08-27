@@ -102,9 +102,7 @@ pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
 
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|entry| {
-            entry.depth() == 0 || !is_build_or_vendored_dir(entry.path())
-        })
+        .filter_entry(|entry| entry.depth() == 0 || !is_build_or_vendored_dir(entry.path()))
         .filter_map(|e| e.ok())
     {
         if !entry.file_type().is_file() {
@@ -760,8 +758,20 @@ pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
     if let Some(parent) = std::path::Path::new(&params.path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
     }
-    std::fs::write(&params.path, &params.content).map_err(|e| format!("Write error: {}", e))?;
-    Ok(json!({"path": params.path, "bytes_written": params.content.len(), "success": true}))
+    let existed = std::path::Path::new(&params.path).exists();
+    let changed = std::fs::read(&params.path)
+        .map(|existing| existing != params.content.as_bytes())
+        .unwrap_or(true);
+    if changed {
+        std::fs::write(&params.path, &params.content).map_err(|e| format!("Write error: {}", e))?;
+    }
+    Ok(json!({
+        "path": params.path,
+        "bytes_written": if changed { params.content.len() } else { 0 },
+        "success": true,
+        "changed": changed,
+        "created": changed && !existed,
+    }))
 }
 
 pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
@@ -820,8 +830,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         use std::sync::{Arc, Mutex};
         use std::thread;
         let timeout_ms = params.timeout.unwrap_or(60_000);
-        let cwd = std::env::current_dir()
-            .map_err(|e| format!("Current dir error: {}", e))?;
+        let cwd = std::env::current_dir().map_err(|e| format!("Current dir error: {}", e))?;
         let sandbox_status = sandbox_status_for_input(&params, &cwd);
         let sandbox_status_json = serde_json::to_value(&sandbox_status)
             .map_err(|e| format!("Sandbox status serialize error: {}", e))?;
@@ -1177,12 +1186,16 @@ pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
         1
     };
 
-    std::fs::write(&params.path, &new_content).map_err(|e| format!("Write error: {}", e))?;
+    let changed = new_content != content;
+    if changed {
+        std::fs::write(&params.path, &new_content).map_err(|e| format!("Write error: {}", e))?;
+    }
 
     Ok(json!({
         "path": params.path,
         "success": true,
-        "replacements": replacements,
+        "changed": changed,
+        "replacements": if changed { replacements } else { 0 },
         "diff": diff,
     }))
 }

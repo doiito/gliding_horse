@@ -10,6 +10,272 @@ use super::agent::SupervisorAgent;
 use super::types::*;
 
 impl SupervisorAgent {
+    /// Stream an SA-only, tool-free LLM request while retaining the same
+    /// completed response shape consumed by planning code. This must never be
+    /// used for PA/DA/CA/AA execution: those agents require BizAgent + the full
+    /// ReAct runner to preserve tool and checkpoint semantics.
+    pub(super) async fn chat_sa_streaming(
+        &self,
+        task_iri: &str,
+        stage: &str,
+        model: &str,
+        messages: Vec<crate::gateway::unified_gateway::ChatMessage>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Result<crate::gateway::unified_gateway::ChatCompletionResponse, CoreError> {
+        use crate::llm::stream_types::ContentBlockDelta;
+        use crate::llm::{StreamAccumulator, StreamEvent};
+
+        self.event_bus
+            .emit(
+                task_iri,
+                "SA_STREAM_START",
+                "SA",
+                &serde_json::json!({"stage": stage}).to_string(),
+            )
+            .await;
+
+        let stream = self
+            .runner
+            .gateway
+            .stream_chat_with_params(model, messages.clone(), temperature, max_tokens, None, None)
+            .await;
+
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(task_iri = %task_iri, stage, %error, "SA stream request failed; using non-streaming fallback");
+                let response = self
+                    .runner
+                    .gateway
+                    .chat_with_params(model, messages, temperature, max_tokens, None, None)
+                    .await?;
+                self.account_sa_usage(response.usage.as_ref());
+                self.emit_sa_stream_fallback(task_iri, stage, &response, "request_failed")
+                    .await;
+                return Ok(response);
+            }
+        };
+
+        let mut accumulator = StreamAccumulator::new();
+        let mut delta_buffer = String::new();
+        let mut delta_kind = "content";
+        let mut last_emit = std::time::Instant::now();
+        let mut stream_error = None;
+
+        loop {
+            match stream.next_event().await {
+                Ok(Some(event)) => {
+                    accumulator.process_event(&event);
+                    let delta = match &event {
+                        StreamEvent::ContentBlockDelta(event) => match &event.delta {
+                            ContentBlockDelta::TextDelta { text } => {
+                                Some(("content", text.as_str()))
+                            }
+                            ContentBlockDelta::ThinkingDelta { thinking } => {
+                                Some(("thinking", thinking.as_str()))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((kind, text)) = delta {
+                        if !delta_buffer.is_empty() && delta_kind != kind {
+                            self.event_bus
+                                .emit(
+                                    task_iri,
+                                    "SA_STREAM_DELTA",
+                                    "SA",
+                                    &serde_json::json!({
+                                        "stage": stage,
+                                        "kind": delta_kind,
+                                        "delta": delta_buffer,
+                                    })
+                                    .to_string(),
+                                )
+                                .await;
+                            delta_buffer = String::new();
+                            last_emit = std::time::Instant::now();
+                        }
+                        delta_kind = kind;
+                        delta_buffer.push_str(text);
+                        let execution_budget = &self.runner.agent_settings.execution_budget;
+                        if delta_buffer.chars().count() >= execution_budget.sa_stream_emit_min_chars
+                            || last_emit.elapsed()
+                                >= std::time::Duration::from_millis(
+                                    execution_budget.sa_stream_emit_interval_ms,
+                                )
+                        {
+                            self.event_bus
+                                .emit(
+                                    task_iri,
+                                    "SA_STREAM_DELTA",
+                                    "SA",
+                                    &serde_json::json!({
+                                        "stage": stage,
+                                        "kind": delta_kind,
+                                        "delta": delta_buffer,
+                                    })
+                                    .to_string(),
+                                )
+                                .await;
+                            delta_buffer = String::new();
+                            last_emit = std::time::Instant::now();
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = stream_error {
+            warn!(task_iri = %task_iri, stage, %error, "SA stream decode failed; retrying through non-streaming gateway");
+            let response = self
+                .runner
+                .gateway
+                .chat_with_params(model, messages, temperature, max_tokens, None, None)
+                .await?;
+            self.account_sa_usage(response.usage.as_ref());
+            self.emit_sa_stream_fallback(task_iri, stage, &response, "decode_failed")
+                .await;
+            return Ok(response);
+        }
+
+        if !delta_buffer.is_empty() {
+            self.event_bus
+                .emit(
+                    task_iri,
+                    "SA_STREAM_DELTA",
+                    "SA",
+                    &serde_json::json!({
+                        "stage": stage,
+                        "kind": delta_kind,
+                        "delta": delta_buffer,
+                    })
+                    .to_string(),
+                )
+                .await;
+        }
+
+        let usage =
+            accumulator
+                .usage
+                .as_ref()
+                .map(|usage| crate::gateway::unified_gateway::Usage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                });
+        self.account_sa_usage(usage.as_ref());
+
+        let tool_calls: Vec<crate::gateway::unified_gateway::ResponseToolCall> = accumulator
+            .get_tool_calls()
+            .into_iter()
+            .map(
+                |(id, name, arguments)| crate::gateway::unified_gateway::ResponseToolCall {
+                    id,
+                    call_type: "function".to_string(),
+                    function: crate::gateway::unified_gateway::ResponseToolCallFunction {
+                        name,
+                        arguments: arguments.to_string(),
+                    },
+                },
+            )
+            .collect();
+        let content = accumulator.get_text();
+        let reasoning_content =
+            (!accumulator.thinking.is_empty()).then(|| accumulator.thinking.clone());
+        let finish_reason = accumulator.finish_reason.clone();
+
+        self.event_bus
+            .emit(
+                task_iri,
+                "SA_STREAM_END",
+                "SA",
+                &serde_json::json!({"stage": stage, "finish_reason": finish_reason}).to_string(),
+            )
+            .await;
+
+        Ok(crate::gateway::unified_gateway::ChatCompletionResponse {
+            id: accumulator.message_id.clone(),
+            choices: vec![crate::gateway::unified_gateway::Choice {
+                index: 0,
+                message: crate::gateway::unified_gateway::ResponseMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    reasoning_content,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                },
+                finish_reason,
+            }],
+            usage,
+        })
+    }
+
+    fn account_sa_usage(&self, usage: Option<&crate::gateway::unified_gateway::Usage>) {
+        use std::sync::atomic::Ordering;
+        if let Some(usage) = usage {
+            self.runner
+                .total_prompt_tokens
+                .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+            self.runner
+                .total_completion_tokens
+                .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+            self.runner
+                .last_prompt_tokens
+                .store(usage.prompt_tokens as u64, Ordering::Relaxed);
+            self.runner
+                .last_completion_tokens
+                .store(usage.completion_tokens as u64, Ordering::Relaxed);
+        }
+    }
+
+    async fn emit_sa_stream_fallback(
+        &self,
+        task_iri: &str,
+        stage: &str,
+        response: &crate::gateway::unified_gateway::ChatCompletionResponse,
+        reason: &str,
+    ) {
+        if let Some(content) = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_deref())
+            .filter(|content| !content.is_empty())
+        {
+            self.event_bus
+                .emit(
+                    task_iri,
+                    "SA_STREAM_DELTA",
+                    "SA",
+                    &serde_json::json!({
+                        "stage": stage,
+                        "kind": "fallback",
+                        "delta": content,
+                    })
+                    .to_string(),
+                )
+                .await;
+        }
+        self.event_bus
+            .emit(
+                task_iri,
+                "SA_STREAM_END",
+                "SA",
+                &serde_json::json!({
+                    "stage": stage,
+                    "finish_reason": "fallback",
+                    "reason": reason,
+                })
+                .to_string(),
+            )
+            .await;
+    }
+
     /// Execute an intervention plan against the active cycle for `task_iri`.
     ///
     /// The cycle is temporarily removed from `active_cycles` so the handler
@@ -105,7 +371,7 @@ impl SupervisorAgent {
     async fn analyze_anomaly_with_llm(
         &self,
         plan: &crate::perception::proactive_engine::InterventionPlan,
-        _task_iri: &str,
+        task_iri: &str,
     ) -> Result<(InterventionAction, ActionParams), CoreError> {
         use crate::gateway::unified_gateway::ChatMessage;
 
@@ -176,13 +442,13 @@ Notes:
         }];
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(self.execution_timeout_secs),
-            self.runner.gateway.chat_with_params(
+            self.chat_sa_streaming(
+                task_iri,
+                "intervention_analysis",
                 &model,
                 messages,
                 Some(0.1),
                 Some(1000),
-                None,
-                None,
             ),
         )
         .await
@@ -277,7 +543,8 @@ Notes:
 
         // Wait briefly for any instant approval result
         let mut receiver = self.event_bus.subscribe();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.approval_wait_secs);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(self.approval_wait_secs);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(event) = receiver.try_recv() {
@@ -300,10 +567,7 @@ Notes:
         }
 
         info!(request_id = %request_id, "Human confirmation wait timed out, defaulting to approved (harmless), task continuing");
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(request_id, true);
+        self.pending_approvals.lock().await.insert(request_id, true);
         Ok(true)
     }
 
@@ -346,7 +610,8 @@ Notes:
 
         // Wait briefly for any instant approval result
         let mut receiver = self.event_bus.subscribe();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(self.approval_wait_secs);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(self.approval_wait_secs);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Ok(event) = receiver.try_recv() {
@@ -377,10 +642,7 @@ Notes:
         }
 
         info!(request_id = %request_id, "HumanApprovalNode: wait timed out, defaulting to approved (harmless)");
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(request_id, true);
+        self.pending_approvals.lock().await.insert(request_id, true);
         Ok(HumanApprovalNodeResult {
             node_id: node_id.to_string(),
             approved: true,
@@ -416,13 +678,19 @@ Notes:
                     "USER_SUPPLEMENTARY_INPUT" => {
                         supp_payloads.push(event.payload.clone());
                     }
-                    "AGENT_ERROR" => {
+                    event_type if super::event_requires_blocked_intervention(event_type) => {
                         let plan = self
                             .perception
                             .on_agent_blocked(&event.source_agent_iri, task_iri);
                         if plan.should_interrupt {
                             pending_interventions.push(plan);
                         }
+                    }
+                    "AGENT_ERROR" => {
+                        info!(
+                            agent = %event.source_agent_iri,
+                            "Recoverable agent/tool error retained as evidence; no SA blocked intervention"
+                        );
                     }
                     "THRESHOLD_EXCEEDED" => {
                         if let Ok(payload) =
@@ -476,7 +744,7 @@ Notes:
         for supplement in &pending {
             let context = format!("Current step: {:?} - {}", step_role, step_objective);
             match self
-                .classify_supplementary_input_with_llm(supplement, &context)
+                .classify_supplementary_input_with_llm(task_iri, supplement, &context)
                 .await
             {
                 Ok((action, params)) => {
@@ -504,6 +772,7 @@ Notes:
     /// LLM classification: map user supplementary input to predefined action
     async fn classify_supplementary_input_with_llm(
         &self,
+        task_iri: &str,
         user_supplement: &str,
         task_context: &str,
     ) -> Result<(SupplementaryInputAction, ActionParams), CoreError> {
@@ -566,9 +835,14 @@ Notes:
             reasoning_content: None,
         }];
         let response = self
-            .runner
-            .gateway
-            .chat_with_params(&model, messages, Some(0.1), Some(4096), None, None)
+            .chat_sa_streaming(
+                task_iri,
+                "supplementary_input_classification",
+                &model,
+                messages,
+                Some(0.1),
+                Some(4096),
+            )
             .await?;
         let content = response
             .choices

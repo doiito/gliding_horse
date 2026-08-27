@@ -5,6 +5,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, instrument, warn};
 use walkdir::WalkDir;
 
@@ -182,15 +183,7 @@ impl FileInventory {
     #[instrument(skip(self))]
     pub fn full_scan(&self, root: &str) -> usize {
         let mut count = 0;
-
-        // Check if inventory is already full before scanning
-        {
-            let mem = self.mem_cache.read();
-            if mem.len() >= MAX_INVENTORY_ENTRIES {
-                enforce_max_entries(mem.len());
-                return 0;
-            }
-        }
+        let mut seen = std::collections::HashSet::new();
 
         for entry in WalkDir::new(root)
             .into_iter()
@@ -206,15 +199,108 @@ impl FileInventory {
             }
 
             let path = entry.path().to_string_lossy().to_string();
-            // Only add if not already tracked
-            if self.get_entry(&path).is_none() {
-                self.add_entry(&path);
+            seen.insert(path.clone());
+            if let Some(existing) = self.get_entry(&path) {
+                // Reconcile files modified while the process/watch service was
+                // offline using metadata only. Content and hashes stay lazy.
+                if let Ok(metadata) = entry.metadata() {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis() as i64)
+                        .unwrap_or(0);
+                    if existing.file_size != metadata.len() || existing.mtime != mtime {
+                        self.mark_stale(&path);
+                    }
+                }
+            } else if self.add_entry(&path).is_some() {
+                // add_entry owns the capacity check. Even when no new entry
+                // can be admitted, the scan must continue so persisted files
+                // modified/deleted while the watcher was offline are still
+                // reconciled.
                 count += 1;
             }
         }
 
+        // Remove persisted inventory entries deleted while no watcher was
+        // running. Restrict reconciliation to this scan root.
+        let root_path = Path::new(root);
+        let removed = self
+            .list_all()
+            .into_iter()
+            .filter(|entry| {
+                Path::new(&entry.path).starts_with(root_path) && !seen.contains(&entry.path)
+            })
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        for path in removed {
+            self.remove(&path);
+        }
+
         debug!(root = %root, discovered = count, "FileInventory: full scan completed");
         count
+    }
+
+    /// Hash the visible workspace paths and file contents under explicit
+    /// resource limits.  The result is used only to confirm an actual tool
+    /// effect; it is not persisted as memory or injected into an LLM prompt.
+    pub fn semantic_fingerprint(
+        &self,
+        root: &Path,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> Result<String, String> {
+        use std::io::Read;
+
+        let mut files = Vec::new();
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !self.is_excluded(entry.path()))
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_type().is_file() {
+                files.push(entry.into_path());
+                if files.len() > max_files {
+                    return Err(format!(
+                        "semantic effect snapshot exceeds configured file limit {max_files}"
+                    ));
+                }
+            }
+        }
+        files.sort();
+
+        let mut total_bytes = 0u64;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        for path in files {
+            let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if total_bytes > max_bytes {
+                return Err(format!(
+                    "semantic effect snapshot exceeds configured byte limit {max_bytes}"
+                ));
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            digest.update((relative.len() as u64).to_le_bytes());
+            digest.update(relative.as_bytes());
+            digest.update(metadata.len().to_le_bytes());
+
+            let mut file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+            loop {
+                let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+        }
+        Ok(format!("sha256:{}", hex::encode(digest.finalize())))
     }
 
     /// Add or update a single file entry by scanning the file on disk.
@@ -248,8 +334,11 @@ impl FileInventory {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let content_hash = hash_content(&content);
+        // Discovery is metadata-only. Reading and hashing every file during
+        // workspace initialization delayed TUI startup and duplicated the
+        // ContentStore's lazy read path. The hash is populated when content is
+        // actually consumed or when a change requires verification.
+        let content_hash = String::new();
 
         let ext = path_obj
             .extension()
@@ -287,10 +376,9 @@ impl FileInventory {
         let mut mem = self.mem_cache.write();
         if let Some(entry) = mem.get_mut(path) {
             entry.state = FileState::ReadStale;
-            // Update content hash & mtime from disk
-            if let Ok(content) = std::fs::read_to_string(path) {
-                entry.content_hash = hash_content(&content);
-            }
+            // Keep invalidation metadata-only. ContentStore computes the hash
+            // lazily on the next targeted read.
+            entry.content_hash.clear();
             if let Ok(meta) = std::fs::metadata(path) {
                 if let Ok(t) = meta.modified() {
                     if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
@@ -310,6 +398,10 @@ impl FileInventory {
 
     /// Mark a file as read (fresh).
     pub fn mark_read(&self, path: &str, version: u64) {
+        self.mark_read_with_hash(path, version, None);
+    }
+
+    pub fn mark_read_with_hash(&self, path: &str, version: u64, content_hash: Option<String>) {
         let mut mem = self.mem_cache.write();
         if let Some(entry) = mem.get_mut(path) {
             entry.state = FileState::ReadFresh;
@@ -320,6 +412,9 @@ impl FileInventory {
                     .as_millis() as i64,
             );
             entry.last_read_version = version;
+            if let Some(content_hash) = content_hash {
+                entry.content_hash = content_hash;
+            }
             entry.read_count += 1;
             let cloned = entry.clone();
             drop(mem);
@@ -505,8 +600,9 @@ impl FileInventory {
         }
 
         let path_obj = Path::new(path);
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let content_hash = hash_content(&content);
+        // Initial discovery is metadata-only; ContentStore hashes lazily on
+        // the first task-relevant read.
+        let content_hash = String::new();
         let metadata = std::fs::metadata(path).ok()?;
 
         let mtime = metadata
@@ -644,14 +740,6 @@ impl FileInventory {
     }
 }
 
-fn hash_content(content: &str) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(content.as_bytes());
-    let result = hasher.finalize();
-    format!("sha256:{}", hex::encode(result))
-}
-
 /// Match a path against a gitignore-style glob pattern.
 ///
 /// Supports:
@@ -729,6 +817,26 @@ mod tests {
         let inventory = FileInventory::new(None, None, vec![]);
         let count = inventory.full_scan(&dir.path().to_string_lossy());
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn full_scan_reconciles_offline_modification_and_deletion_without_reading_content() {
+        let dir = TempDir::new().unwrap();
+        create_workspace(&dir, &[("changed.rs", "v1"), ("deleted.rs", "gone")]);
+        let changed = dir.path().join("changed.rs");
+        let deleted = dir.path().join("deleted.rs");
+        let inventory = FileInventory::new(None, None, vec![]);
+        assert_eq!(inventory.full_scan(&dir.path().to_string_lossy()), 2);
+        inventory.mark_read(&changed.to_string_lossy(), 0);
+
+        std::fs::write(&changed, "version two is larger").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        assert_eq!(inventory.full_scan(&dir.path().to_string_lossy()), 0);
+
+        let changed_entry = inventory.get_entry(&changed.to_string_lossy()).unwrap();
+        assert_eq!(changed_entry.state, FileState::ReadStale);
+        assert!(changed_entry.content_hash.is_empty());
+        assert!(inventory.get_entry(&deleted.to_string_lossy()).is_none());
     }
 
     #[test]

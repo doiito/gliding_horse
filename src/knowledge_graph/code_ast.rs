@@ -502,7 +502,8 @@ impl CodeAstExtractor {
                             relations.push(AstRelation {
                                 source: type_id,
                                 target: trait_id,
-                                relation: "https://agent-os.org/ontology/code/implements".to_string(),
+                                relation: "https://agent-os.org/ontology/code/implements"
+                                    .to_string(),
                             });
                             entities.push(AstEntity {
                                 id: impl_id,
@@ -533,7 +534,8 @@ impl CodeAstExtractor {
                                 entities.push(AstEntity {
                                     id: id.clone(),
                                     label: name.clone(),
-                                    entity_type: "https://agent-os.org/ontology/code/Method".to_string(),
+                                    entity_type: "https://agent-os.org/ontology/code/Method"
+                                        .to_string(),
                                     description: Some(format!("method {}", name)),
                                     properties: HashMap::new(),
                                     source_location: Some(format!(
@@ -899,7 +901,8 @@ impl CodeAstExtractor {
                             entities.push(AstEntity {
                                 id: id.clone(),
                                 label: name.clone(),
-                                entity_type: "https://agent-os.org/ontology/code/Function".to_string(),
+                                entity_type: "https://agent-os.org/ontology/code/Function"
+                                    .to_string(),
                                 description: Some(format!("const {} = () => ...", name)),
                                 properties: HashMap::new(),
                                 source_location: Some(format!(
@@ -1059,7 +1062,9 @@ impl CodeAstExtractor {
                                     .unwrap_or_default();
                                 let entity_type = match type_kind.as_str() {
                                     "struct_type" => "https://agent-os.org/ontology/code/Struct",
-                                    "interface_type" => "https://agent-os.org/ontology/code/Interface",
+                                    "interface_type" => {
+                                        "https://agent-os.org/ontology/code/Interface"
+                                    }
                                     _ => "https://agent-os.org/ontology/code/Type",
                                 };
                                 let id = Self::make_id(

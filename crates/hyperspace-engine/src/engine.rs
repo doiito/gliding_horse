@@ -196,11 +196,7 @@ impl Searcher {
                     {
                         let mut id_vecs: Vec<(u32, EmbeddingVector)> = allowed
                             .iter()
-                            .filter_map(|id| {
-                                self.vectors
-                                    .get(&id)
-                                    .map(|v| (id, v.clone()))
-                            })
+                            .filter_map(|id| self.vectors.get(&id).map(|v| (id, v.clone())))
                             .collect();
                         id_vecs.sort_by_key(|(id, _)| *id);
                         let ids: Vec<u32> = id_vecs.iter().map(|(id, _)| *id).collect();
@@ -211,9 +207,9 @@ impl Searcher {
                             .search_with_pruning(query, &ids, top_k, 2)
                             .into_iter()
                             .filter_map(|id| {
-                                self.vectors.get(&id).map(|vector| {
-                                    (id, self.index.metric().distance(query, vector))
-                                })
+                                self.vectors
+                                    .get(&id)
+                                    .map(|vector| (id, self.index.metric().distance(query, vector)))
                             })
                             .collect::<Vec<_>>()
                     } else {

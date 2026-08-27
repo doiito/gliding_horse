@@ -97,11 +97,7 @@ fn unified_graph_path(settings: &Settings) -> PathBuf {
 fn node_iri_from_invalidate_event(payload: &str, fallback: &str) -> String {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
-        .and_then(|v| {
-            v.get("node_iri")
-                .and_then(|n| n.as_str())
-                .map(String::from)
-        })
+        .and_then(|v| v.get("node_iri").and_then(|n| n.as_str()).map(String::from))
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -345,8 +341,7 @@ impl AgentOSService {
             move |event| {
                 let bb = bb_inv.clone();
                 async move {
-                    let node_iri =
-                        node_iri_from_invalidate_event(&event.payload, &event.task_iri);
+                    let node_iri = node_iri_from_invalidate_event(&event.payload, &event.task_iri);
                     if evict_stale_l2_line(&bb, &node_iri) {
                         tracing::debug!(
                             node_iri = %node_iri,
@@ -584,6 +579,14 @@ impl AgentOSService {
                     exclude_patterns: settings.workspace.exclude_patterns.clone(),
                     watch_enabled: settings.workspace.watch_enabled,
                     content_store_max_bytes: settings.workspace.content_store_max_bytes,
+                    content_cache_capacity: settings.workspace.content_cache_capacity,
+                    poll_interval_ms: settings.workspace.poll_interval_ms,
+                    debounce_ms: settings.workspace.debounce_ms,
+                    max_debounce_wait_ms: settings.workspace.max_debounce_wait_ms,
+                    initial_scan_wait_ms: settings.workspace.initial_scan_wait_ms,
+                    change_history_capacity: settings.workspace.change_history_capacity,
+                    effect_snapshot_max_files: settings.workspace.effect_snapshot_max_files,
+                    effect_snapshot_max_bytes: settings.workspace.effect_snapshot_max_bytes,
                     ..Default::default()
                 };
                 match WorkspaceMonitor::initialize(
@@ -1427,16 +1430,13 @@ mod tests {
         let json_ld = r#"{"@id":"iri://test/1","@type":"Test"}"#;
 
         // Clean line: first write leaves dirty=false → evictable.
-        bb.write_node("iri://test/clean", json_ld, &config)
-            .unwrap();
+        bb.write_node("iri://test/clean", json_ld, &config).unwrap();
         assert!(evict_stale_l2_line(&bb, "iri://test/clean"));
         assert!(bb.read_node("iri://test/clean").unwrap().is_none());
 
         // Dirty line: second write marks dirty=true → must be retained.
-        bb.write_node("iri://test/dirty", json_ld, &config)
-            .unwrap();
-        bb.write_node("iri://test/dirty", json_ld, &config)
-            .unwrap();
+        bb.write_node("iri://test/dirty", json_ld, &config).unwrap();
+        bb.write_node("iri://test/dirty", json_ld, &config).unwrap();
         assert!(!evict_stale_l2_line(&bb, "iri://test/dirty"));
         assert!(bb.read_node("iri://test/dirty").unwrap().is_some());
 

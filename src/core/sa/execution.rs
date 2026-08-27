@@ -5,6 +5,75 @@ use tracing::{info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::core::agent_runner::{TaskContext, TaskResult, TaskVerdict};
+use crate::core::biz_agent::{AgentConfig, BizAgent};
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str("\n...[CA evidence truncated; durable archive retains the full report]");
+    truncated
+}
+
+/// Build the evidence passed from one business agent to the next.
+///
+/// AA intentionally has no execution tools: it decides from CA's evidence and
+/// must not mutate the task.  Therefore CA→AA cannot rely on a
+/// `read_agent_output` instruction.  Keep the detailed CA result inline and
+/// bounded, with the durable archive IRI retained only for traceability.
+pub(super) fn result_handoff(
+    result: &TaskResult,
+    role: AgentRole,
+    ca_handoff_max_chars: usize,
+) -> String {
+    if role != AgentRole::Check {
+        let summary = truncate_chars(&result.summary, ca_handoff_max_chars.max(1));
+        return match result.archive_iri.as_ref() {
+            Some(iri) => format!(
+                "{}\n\nFor the full report, use read_agent_output tool to query: {}",
+                summary, iri
+            ),
+            None => summary,
+        };
+    }
+
+    let detailed = result
+        .output
+        .as_ref()
+        .filter(|value| !value.is_null())
+        .map(|value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| truncate_chars(&text, ca_handoff_max_chars.max(1)));
+
+    let mut handoff = format!(
+        "{}\n\n## CA Verification Metadata\n- status: {}\n- verification tool calls: {}\n- verification turns: {}\n- reported artifacts: {}",
+        result.summary,
+        result.status,
+        result.tool_call_count,
+        result.turn_count,
+        result.artifacts.len()
+    );
+    if let Some(detailed) = detailed {
+        handoff.push_str("\n\n## Detailed CA Evidence (directly supplied)\n");
+        handoff.push_str(&detailed);
+    }
+    if let Some(iri) = result.archive_iri.as_ref() {
+        handoff.push_str("\n\n## Trace Reference (not required for this decision)\n");
+        handoff.push_str(iri);
+    }
+    let bounded = truncate_chars(&handoff, ca_handoff_max_chars.max(1));
+    match result.archive_iri.as_ref() {
+        Some(iri) if !bounded.contains(iri) => format!(
+            "{}\n\n## Trace Reference (not required for this decision)\n{}",
+            bounded, iri
+        ),
+        _ => bounded,
+    }
+}
 
 /// Apply the CA 5W2H audit to a result and return whether any dimension failed.
 ///
@@ -17,12 +86,8 @@ fn apply_ca_dimension_audit(
     task_iri: &str,
     causal_engine: Option<&crate::causal::CausalEngine>,
 ) -> crate::core::recovery::AuditReport {
-    let audit_results = crate::core::five_w2h::audit_dimensions(
-        five_w2h,
-        result,
-        task_iri,
-        causal_engine,
-    );
+    let audit_results =
+        crate::core::five_w2h::audit_dimensions(five_w2h, result, task_iri, causal_engine);
     let report = crate::core::recovery::AuditReport::from_results(&audit_results);
     let failures: Vec<&crate::core::five_w2h::DimensionAuditResult> = audit_results
         .iter()
@@ -47,10 +112,11 @@ fn apply_ca_dimension_audit(
             )
         })
         .collect();
-    warn!(
+    info!(
         task_iri = %task_iri,
         dimensions = ?failures.iter().map(|r| &r.dimension).collect::<Vec<_>>(),
-        "Dimension audit: {} dimension(s) failed — causal observations recorded",
+        recovery_scope = ?report.scope,
+        "CA quality gate requires correction: {} dimension(s) not satisfied (task audit, not a runtime error); findings attached for recovery/final-status handling",
         failures.len()
     );
     if result.summary.len() < 4000 {
@@ -71,12 +137,324 @@ fn enforce_ca_audit_terminal_status(result: &mut TaskResult, ca_audit_failed: bo
     if ca_audit_failed && result.status != "failed" {
         result.status = "failed".to_string();
         result.verdict = Some(TaskVerdict::Failed);
-        result.errors.push(
-            "CA dimension audit failed; task cannot be reported as successful".to_string(),
-        );
+        result
+            .errors
+            .push("CA dimension audit failed; task cannot be reported as successful".to_string());
         result.summary.push_str(
             "\n\nFinal status forced to failed because the latest CA dimension audit failed.",
         );
+    }
+}
+
+fn failed_business_role_recovery(role: AgentRole) -> (&'static str, &'static str) {
+    match role {
+        AgentRole::Plan | AgentRole::Act => ("ReplanPa", "Task"),
+        AgentRole::Do | AgentRole::Check => ("RetryDa", "Step"),
+    }
+}
+
+fn bounded_action_evidence(action: &crate::core::tracked_action::TrackedAction) -> String {
+    let detail = action
+        .tool_args
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            action
+                .tool_args
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("");
+    let detail = truncate_chars(detail, 300)
+        .replace('\n', " ")
+        .replace('\r', " ");
+    if detail.is_empty() {
+        action.tool_name.clone()
+    } else {
+        format!("{}: {}", action.tool_name, detail)
+    }
+}
+
+fn dedup_bounded(items: impl IntoIterator<Item = String>, limit: usize) -> Vec<String> {
+    let mut output = Vec::new();
+    for item in items {
+        if output.len() >= limit {
+            break;
+        }
+        if !item.trim().is_empty() && !output.contains(&item) {
+            output.push(item);
+        }
+    }
+    output
+}
+
+/// Persist the latest CA audit independently from AA's prose and compact it
+/// into the application-nominated workflow skill. This is deliberately
+/// generic: applications choose the skill IRI; SA supplies only task-family,
+/// action and audit evidence.
+fn persist_ca_validated_knowledge(
+    supervisor: &super::agent::SupervisorAgent,
+    task_iri: &str,
+    user_input: &str,
+    task_constraints: &std::collections::HashMap<String, String>,
+    report: Option<&crate::core::recovery::AuditReport>,
+    result: &TaskResult,
+) {
+    use sha2::{Digest, Sha256};
+
+    if !supervisor.learning_mode.updates_learning() {
+        return;
+    }
+    let Some(report) = report else {
+        return;
+    };
+    let context = crate::core::policy_learning::learning_task_context(user_input);
+    let is_ca = |action: &&crate::core::tracked_action::TrackedAction| {
+        matches!(action.agent_role.as_str(), "CA" | "Check")
+    };
+    let is_da = |action: &&crate::core::tracked_action::TrackedAction| {
+        matches!(action.agent_role.as_str(), "DA" | "Do")
+    };
+    let succeeded = |action: &&crate::core::tracked_action::TrackedAction| {
+        matches!(
+            action.status,
+            crate::core::tracked_action::ActionStatus::Success
+        )
+    };
+    let procedure = dedup_bounded(
+        result
+            .tracked_actions
+            .iter()
+            .filter(is_da)
+            .filter(succeeded)
+            .filter(|action| {
+                action.tool_name != "file_read"
+                    && action.tool_name != "grep_search"
+                    && action.tool_name != "glob_search"
+                    && action.tool_name != "file_list"
+            })
+            .map(bounded_action_evidence),
+        8,
+    );
+    let successful_checks = dedup_bounded(
+        result
+            .tracked_actions
+            .iter()
+            .filter(is_ca)
+            .filter(succeeded)
+            .map(bounded_action_evidence),
+        8,
+    );
+    let failed_checks = dedup_bounded(
+        result
+            .tracked_actions
+            .iter()
+            .filter(is_ca)
+            .filter(|action| !succeeded(action))
+            .map(|action| {
+                format!(
+                    "{} ({})",
+                    bounded_action_evidence(action),
+                    action.error.as_deref().unwrap_or("failed")
+                )
+            }),
+        8,
+    );
+    let findings = dedup_bounded(
+        report.findings.iter().map(|finding| {
+            format!(
+                "{}: {} [{}]",
+                finding.dimension, finding.message, finding.evidence
+            )
+        }),
+        8,
+    );
+    let ca_verdict = match report.verdict {
+        crate::core::recovery::AuditVerdict::Pass => "pass",
+        crate::core::recovery::AuditVerdict::Conditional => "conditional",
+        crate::core::recovery::AuditVerdict::Fail => "fail",
+    }
+    .to_string();
+    let attached_skill_iri = task_constraints.get("learning_skill_iri").cloned();
+    let evidence = crate::core::policy_learning::TaskAuditKnowledgeEvidence {
+        task_iri: task_iri.to_string(),
+        task_family: context.family.clone(),
+        raw_features: context.raw_features,
+        objective: truncate_chars(user_input, 600),
+        terminal_status: result.status.clone(),
+        ca_verdict,
+        failed_dimensions: report.failed_dimensions.clone(),
+        findings,
+        procedure,
+        successful_checks,
+        failed_checks,
+        attached_skill_iri: attached_skill_iri.clone(),
+        created_at: chrono::Utc::now(),
+    };
+    let evidence_content = match serde_json::to_string(&evidence) {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(task_iri = %task_iri, %error, "Unable to serialize CA learning evidence");
+            return;
+        }
+    };
+    if let Err(error) = supervisor
+        .runner
+        .l0_store
+        .store(&evidence.storage_iri(), &evidence_content)
+    {
+        warn!(task_iri = %task_iri, %error, "Unable to persist CA learning evidence");
+        return;
+    }
+
+    let (Some(attached_to), Some(graph)) = (
+        attached_skill_iri,
+        supervisor.runner.skill_graph_store.as_ref(),
+    ) else {
+        return;
+    };
+    if graph.get_skill(&attached_to).is_none() {
+        warn!(task_iri = %task_iri, skill_iri = %attached_to, "Learning skill does not exist; evidence retained without graph fragment");
+        return;
+    }
+    let digest = Sha256::digest(format!("{}\x1f{}", attached_to, context.family).as_bytes());
+    let fragment_iri = format!("iri://learning/fragments/{}", hex::encode(&digest[..16]));
+    let previous = graph
+        .list_fragments()
+        .into_iter()
+        .find(|fragment| fragment.fragment_iri == fragment_iri);
+    let mut fragment = previous.unwrap_or_else(|| {
+        crate::skill_graph::types::KnowledgeFragment::new(
+            &fragment_iri,
+            &attached_to,
+            &format!("Applicable to task family {}", context.family),
+            "Reuse only with current-task verification.",
+        )
+    });
+    fragment.kind = "ca_validated_task_knowledge".to_string();
+    fragment.name = format!("CA-validated knowledge: {}", context.family);
+    fragment.description = evidence.objective.clone();
+    fragment.attached_to = attached_to;
+    fragment.problem = format!(
+        "family={}; latest_objective={}",
+        context.family, evidence.objective
+    );
+    fragment.task_family = Some(context.family);
+    fragment.source_task_iri = Some(task_iri.to_string());
+    fragment.ca_verdict = Some(evidence.ca_verdict.clone());
+    fragment.evidence_count = fragment.evidence_count.saturating_add(1);
+    fragment.last_verified_at = Some(evidence.created_at);
+    if evidence.reusable_success() {
+        fragment.success_count = fragment.success_count.saturating_add(1);
+        fragment.procedure = evidence.procedure.clone();
+        fragment.successful_checks = evidence.successful_checks.clone();
+        fragment.recommendation =
+            "Reuse the recorded procedure as a candidate, then repeat the recorded checks and run a fresh CA audit."
+                .to_string();
+    } else {
+        fragment.failure_count = fragment.failure_count.saturating_add(1);
+        fragment.counterexamples = dedup_bounded(
+            fragment
+                .counterexamples
+                .into_iter()
+                .chain(evidence.findings.clone())
+                .chain(evidence.failed_checks.clone()),
+            12,
+        );
+        if fragment.success_count == 0 {
+            fragment.recommendation =
+                "Do not reuse as a successful procedure; resolve the recorded boundary first."
+                    .to_string();
+        }
+    }
+    if let Err(error) = graph.register_fragment(fragment) {
+        warn!(task_iri = %task_iri, %error, "Unable to materialize CA-validated knowledge fragment");
+    }
+}
+
+/// AA decides the terminal business outcome; Runner success only means the AA
+/// invocation itself completed. Convert AA's explicit decision contract into
+/// TaskResult status before SA performs failure routing.
+fn apply_aa_declared_verdict(
+    result: &mut TaskResult,
+    latest_ca_report: Option<&crate::core::recovery::AuditReport>,
+) {
+    let output = result
+        .output
+        .as_ref()
+        .map(|value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    let evidence = format!("{}\n{}", result.summary, output).to_lowercase();
+    // Runner summaries are model-generated condensations and may legitimately
+    // omit AA's required verdict prefix even when the full AA response keeps
+    // it.  Treat either channel as the declaration source.  CA remains the
+    // fallback only when AA did not declare a verdict in either channel.
+    let declared_lines = evidence.lines().map(str::trim).collect::<Vec<_>>();
+
+    let failed = declared_lines
+        .iter()
+        .any(|line| line.starts_with("failed:") || line.starts_with("aa failed:"))
+        || evidence.lines().any(|line| {
+            (line.contains("task_verdict")
+                || line.contains("task status")
+                || line.contains("任务状态"))
+                && (line.contains("failed") || line.contains("失败"))
+        })
+        || evidence.contains("判定 failed");
+    let partial = declared_lines.iter().any(|line| {
+        line.starts_with("partial_success:") || line.starts_with("aa partial_success:")
+    }) || evidence.lines().any(|line| {
+        (line.contains("task_verdict") || line.contains("task status") || line.contains("任务状态"))
+            && (line.contains("partial_success") || line.contains("部分成功"))
+    });
+    let success = declared_lines
+        .iter()
+        .any(|line| line.starts_with("success:") || line.starts_with("aa success:"))
+        || evidence.lines().any(|line| {
+            (line.contains("task_verdict")
+                || line.contains("task status")
+                || line.contains("任务状态"))
+                && (line.contains("success") || line.contains("成功"))
+        });
+
+    if failed {
+        result.status = "failed".to_string();
+        result.verdict = Some(TaskVerdict::Failed);
+    } else if partial {
+        result.status = "partial_success".to_string();
+        result.verdict = Some(TaskVerdict::PartialSuccess);
+    } else if success {
+        result.status = "success".to_string();
+        result.verdict = Some(TaskVerdict::Success);
+    } else {
+        // Models occasionally omit the required AA prefix. Runner success is
+        // only an invocation result, so converge from the latest structured
+        // CA evidence instead of silently accepting that transport status.
+        match latest_ca_report.map(|report| report.verdict) {
+            Some(crate::core::recovery::AuditVerdict::Pass) => {
+                result.status = "success".to_string();
+                result.verdict = Some(TaskVerdict::Success);
+            }
+            Some(crate::core::recovery::AuditVerdict::Conditional) => {
+                result.status = "partial_success".to_string();
+                result.verdict = Some(TaskVerdict::PartialSuccess);
+            }
+            Some(crate::core::recovery::AuditVerdict::Fail) => {
+                result.status = "failed".to_string();
+                result.verdict = Some(TaskVerdict::Failed);
+            }
+            None => {
+                result.status = "failed".to_string();
+                result.verdict = Some(TaskVerdict::Failed);
+                result.errors.push(
+                    "AA omitted a structured verdict and no CA audit report was available"
+                        .to_string(),
+                );
+            }
+        }
     }
 }
 
@@ -86,9 +464,228 @@ use crate::CoreError;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
-/// Code-level fan-out cap for recursive sub-task decomposition.
-/// Matches the "Maximum of 3 sub-tasks" constraint in the decomposition prompt.
-const MAX_RECURSIVE_SUB_TASKS: usize = 3;
+/// Preserve the user's acceptance boundary across PA summaries and PDCA
+/// retries. Plans may operationalize this contract, but may not silently
+/// strengthen, weaken, or reinterpret it.
+pub(super) fn authoritative_task_contract(
+    user_input: &str,
+    five_w2h: &crate::core::five_w2h::Task5W2H,
+) -> String {
+    let criteria = if five_w2h.why.success_criteria.is_empty() {
+        "- Use the original request as the complete acceptance boundary.".to_string()
+    } else {
+        five_w2h
+            .why
+            .success_criteria
+            .iter()
+            .map(|criterion| format!("- {criterion}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "## Authoritative Task Contract\nOriginal user request (verbatim):\n{user_input}\n\nDeclared success criteria:\n{criteria}\n\nContract rule: planning and recovery may clarify execution steps, but must not add, remove, strengthen, weaken, or reinterpret requirements. Preserve exact quantities and scope."
+    )
+}
+
+#[derive(Default)]
+struct RecursiveSubCycleOutcome {
+    summary: String,
+    failed_count: usize,
+    partial_count: usize,
+}
+
+/// One budget is shared by the entire residual tree.  A per-node limit alone
+/// permits exponential work as each child creates another bounded list.
+#[derive(Debug)]
+pub(super) struct RecursiveExecutionBudget {
+    remaining_tasks: usize,
+    remaining_turns: u32,
+    seen_residuals: std::collections::HashSet<String>,
+}
+
+impl RecursiveExecutionBudget {
+    pub(super) fn new(max_tasks: usize, max_turns: u32) -> Self {
+        Self {
+            remaining_tasks: max_tasks,
+            remaining_turns: max_turns,
+            seen_residuals: std::collections::HashSet::new(),
+        }
+    }
+
+    fn reserve(&mut self, desired_turns: u32) -> Option<u32> {
+        if self.remaining_tasks == 0 || self.remaining_turns == 0 {
+            return None;
+        }
+        self.remaining_tasks = self.remaining_tasks.saturating_sub(1);
+        Some(desired_turns.max(1).min(self.remaining_turns))
+    }
+
+    fn record_turns(&mut self, actual_turns: u32) {
+        self.remaining_turns = self.remaining_turns.saturating_sub(actual_turns);
+    }
+
+    fn claim_residual(&mut self, task: &ResidualTaskDef) -> bool {
+        let key = residual_task_key(task);
+        key.is_empty() || self.seen_residuals.insert(key)
+    }
+}
+
+#[derive(Deserialize)]
+struct ResidualWorkPlan {
+    has_sub_tasks: bool,
+    sub_tasks: Vec<ResidualTaskDef>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ResidualTaskDef {
+    objective: String,
+    #[serde(default = "default_residual_role")]
+    role: String,
+    success_criteria: String,
+    #[serde(default)]
+    effect_policy: crate::core::effect::EffectPolicy,
+}
+
+fn default_residual_role() -> String {
+    "Do".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum TimeoutDecision {
+    None,
+    ExtendedWithProgress,
+    NeedsIntervention { elapsed_seconds: f64 },
+}
+
+pub(super) fn evaluate_cycle_timeout(
+    cycle: &mut super::types::CycleState,
+    now: chrono::DateTime<chrono::Utc>,
+    cycle_timeout_seconds: i64,
+    cooldown_seconds: i64,
+) -> TimeoutDecision {
+    let cooldown_seconds = cooldown_seconds.max(1);
+    let alert_due = now > cycle.cycle_deadline_at
+        && cycle
+            .next_timeout_alert_at
+            .is_none_or(|next_alert| now >= next_alert);
+    if !alert_due {
+        return TimeoutDecision::None;
+    }
+    cycle.timeout_alert_count = cycle.timeout_alert_count.saturating_add(1);
+    cycle.last_timeout_alert_at = Some(now);
+    cycle.next_timeout_alert_at = Some(now + chrono::Duration::seconds(cooldown_seconds));
+    let progress_age = now
+        .signed_duration_since(cycle.last_progress_at)
+        .num_seconds();
+    if progress_age < cooldown_seconds {
+        cycle.intervention.monitor = true;
+        cycle.cycle_deadline_at = now + chrono::Duration::seconds(cycle_timeout_seconds.max(1));
+        TimeoutDecision::ExtendedWithProgress
+    } else {
+        TimeoutDecision::NeedsIntervention {
+            elapsed_seconds: now
+                .signed_duration_since(cycle.pdca_started_at)
+                .num_seconds() as f64,
+        }
+    }
+}
+
+/// Recursive work needs a bounded share of the parent budget, but an
+/// unconditional eight-turn ceiling is too small for implementation tasks:
+/// the early warning fired at turn zero and force-finish arrived before a
+/// sub-agent could inspect, modify, and verify. Deeper levels receive smaller
+/// shares while retaining a useful execution window.
+fn recursive_subtask_turn_budget(parent_max: u32, depth: u32) -> u32 {
+    let parent_max = parent_max.max(1);
+    let divisor = depth.saturating_add(1).max(2);
+    (parent_max / divisor).max(12).min(parent_max)
+}
+
+/// Residual requirements are revalidated at execution time because an earlier
+/// sibling may already have satisfied them.  Mutation remains permitted and
+/// anti-stall tracking remains active, but a stale item may complete with
+/// concrete evidence instead of manufacturing an unnecessary change.
+fn recursive_effect_policy(
+    residual: &crate::core::effect::EffectPolicy,
+    task: &crate::core::effect::EffectPolicy,
+) -> crate::core::effect::EffectPolicy {
+    use crate::core::effect::EffectPolicy;
+    let resolved = if *residual == EffectPolicy::None {
+        task.clone()
+    } else {
+        residual.clone()
+    };
+    match resolved {
+        EffectPolicy::Required { effect } => EffectPolicy::Conditional {
+            effect,
+            condition: "the residual effect is not already satisfied in current state".to_string(),
+        },
+        EffectPolicy::Conditional { effect, condition } if condition.trim().is_empty() => {
+            EffectPolicy::Conditional {
+                effect,
+                condition: "the residual effect is not already satisfied in current state"
+                    .to_string(),
+            }
+        }
+        policy => policy,
+    }
+}
+
+fn residual_task_key(task: &ResidualTaskDef) -> String {
+    let source = if task.objective.trim().is_empty() {
+        &task.success_criteria
+    } else {
+        &task.objective
+    };
+    source
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
+}
+
+/// Task-wide execution facts collected across PA/DA/CA/AA, parallel agents,
+/// correction passes, and recursive sub-agents. `last_result` remains the
+/// semantic terminal answer, while this accumulator prevents earlier tool
+/// evidence from disappearing when a later CA/AA result becomes terminal.
+#[derive(Default)]
+pub(super) struct TaskExecutionFacts {
+    turn_count: u32,
+    tool_call_count: u32,
+    artifacts: Vec<serde_json::Value>,
+    errors: Vec<String>,
+    tracked_actions: Vec<crate::core::tracked_action::TrackedAction>,
+}
+
+impl TaskExecutionFacts {
+    pub(super) fn record(&mut self, result: &TaskResult) {
+        self.turn_count = self.turn_count.saturating_add(result.turn_count);
+        self.tool_call_count = self.tool_call_count.saturating_add(result.tool_call_count);
+        self.artifacts.extend(result.artifacts.iter().cloned());
+        for error in &result.errors {
+            if !self.errors.contains(error) {
+                self.errors.push(error.clone());
+            }
+        }
+        for action in &result.tracked_actions {
+            if !self
+                .tracked_actions
+                .iter()
+                .any(|existing| existing.action_id == action.action_id)
+            {
+                self.tracked_actions.push(action.clone());
+            }
+        }
+    }
+
+    pub(super) fn apply_to(&self, result: &mut TaskResult) {
+        result.turn_count = self.turn_count;
+        result.tool_call_count = self.tool_call_count;
+        result.artifacts = self.artifacts.clone();
+        result.errors = self.errors.clone();
+        result.tracked_actions = self.tracked_actions.clone();
+    }
+}
 
 /// Re-dispatch on failure up to `retry_count` times, sleeping `retry_delay_secs`
 /// between attempts. Returns the final result after retries are exhausted.
@@ -104,14 +701,73 @@ where
     let mut remaining = retry_count;
     let mut dispatch = dispatch;
     let mut result = dispatch().await?;
+    let mut execution_facts = TaskExecutionFacts::default();
+    execution_facts.record(&result);
     while result.status == "failed" && remaining > 0 {
         remaining -= 1;
         if retry_delay_secs > 0 {
             tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
         }
         result = dispatch().await?;
+        execution_facts.record(&result);
     }
+    execution_facts.apply_to(&mut result);
     Ok(result)
+}
+
+/// Construct and run one real business agent.
+///
+/// SA owns dispatch and prompt selection, BizAgent owns the PA/DA/CA/AA
+/// identity and execution mode, and AgentRunner is only BizAgent's low-level
+/// execution engine.  Keeping this boundary here prevents SA from bypassing
+/// BizAgent and prevents AgentRunner from constructing its business owner.
+async fn run_biz_agent(
+    runner: std::sync::Arc<crate::core::agent_runner::AgentRunner>,
+    agent: AgentInstance,
+    context: TaskContext,
+    plan_step: Option<PlanStep>,
+) -> TaskResult {
+    let requested_tools = plan_step
+        .as_ref()
+        .and_then(|step| (!step.tools_allowed.is_empty()).then(|| step.tools_allowed.clone()))
+        .or_else(|| context.allowed_tools.clone());
+    let mut context = context;
+    context.allowed_tools = enforce_business_role_tool_policy(agent.role, requested_tools);
+    let agent_md = runner
+        .build_biz_agent_md(agent.role, &context, plan_step.as_ref())
+        .await;
+    let config = AgentConfig {
+        orchestrator_mode: false,
+        max_sub_agents: runner.agent_settings.execution_budget.max_sub_agents,
+        max_iterations: context.max_iterations,
+        parallel_sub_agents: true,
+    };
+    let mut biz_agent = BizAgent::new(agent.agent_id, agent.role, &agent_md, runner, config);
+    biz_agent.execute(context).await
+}
+
+/// Kernel-enforced capability ceiling for each BizAgent role.  Plan-generated
+/// tool lists are model output and therefore cannot grant broader authority.
+fn enforce_business_role_tool_policy(
+    role: AgentRole,
+    requested: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let ceiling = crate::core::tool_controller::business_role_tool_ceiling(role);
+    let Some(ceiling) = ceiling else {
+        return requested;
+    };
+    Some(
+        ceiling
+            .iter()
+            .filter(|tool| {
+                requested
+                    .as_ref()
+                    .map(|tools| tools.iter().any(|candidate| candidate == **tool))
+                    .unwrap_or(true)
+            })
+            .map(|tool| (*tool).to_string())
+            .collect(),
+    )
 }
 
 impl SupervisorAgent {
@@ -163,7 +819,10 @@ impl SupervisorAgent {
         // Query context from L2 blackboard (replaces prev_summary)
         // Use query_nodes_filtered for role/cycle-aware context (AA uses prev_summary)
         let prev_agent_summary = context.prev_agent_summary.clone();
-        let prev_summary = if role == AgentRole::Act {
+        // An explicit handoff is already bounded and points to its L0 archive.
+        // Never replace it with an unbounded L2 body; L2 is only a fallback for
+        // callers that did not supply a current-task handoff.
+        let prev_summary = if prev_agent_summary.is_some() {
             prev_agent_summary.clone()
         } else if let Some(blackboard) = &self.blackboard {
             let prev_role = match role {
@@ -210,10 +869,16 @@ impl SupervisorAgent {
                     }
                 }
                 // Prefer content with substance
+                let max_chars = self
+                    .runner
+                    .agent_settings
+                    .execution_budget
+                    .ca_handoff_max_chars
+                    .max(1);
                 if !contents.is_empty() {
-                    Some(contents.join("\n\n---\n\n"))
+                    Some(truncate_chars(&contents.join("\n\n---\n\n"), max_chars))
                 } else if !summaries.is_empty() {
-                    Some(summaries.join("\n"))
+                    Some(truncate_chars(&summaries.join("\n"), max_chars))
                 } else {
                     prev_agent_summary.clone()
                 }
@@ -248,7 +913,6 @@ impl SupervisorAgent {
         } else {
             context
         };
-
         info!(agent_id = %agent.agent_id, role = ?role, task = %context.task_iri, "Dispatching agent with isolation");
 
         self.event_bus
@@ -260,15 +924,15 @@ impl SupervisorAgent {
             )
             .await;
 
-        // Execute with independent BizAgent instance (agent isolation), with optional per-node timeout
+        // Every real PA/DA/CA/AA is a BizAgent. BizAgent owns the business
+        // identity and role prompt; its Runner owns the mature ReAct/tool path.
         let iri = context.task_iri.clone();
-        let exec_fut = self
-            .runner
-            .execute_with_biz_agent(&agent, context, plan_step);
+        let agent_id = agent.agent_id.clone();
+        let exec_fut = run_biz_agent(self.runner.clone(), agent, context, plan_step);
         let result = if timeout_secs > 0 {
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), exec_fut).await
             {
-                Ok(r) => r?,
+                Ok(r) => r,
                 Err(_) => {
                     warn!(role = ?role, timeout = timeout_secs, "Agent dispatch timed out");
                     return Ok(TaskResult {
@@ -292,31 +956,14 @@ impl SupervisorAgent {
                 }
             }
         } else {
-            exec_fut.await?
+            exec_fut.await
         };
-
-        match result.status.as_str() {
-            "success" | "completed" | "partial_success" | "failed" | "timeout" => {
-                let task_result = serde_json::json!({
-                    "status": &result.status,
-                    "summary": &result.summary,
-                    "turn_count": result.turn_count,
-                    "tool_call_count": result.tool_call_count,
-                    "errors": &result.errors,
-                    "tracked_actions": &result.tracked_actions,
-                });
-                self.perception
-                    .on_task_end(&task_result, &result.task_iri)
-                    .await;
-            }
-            _ => {}
-        }
 
         self.event_bus
             .emit(
                 &result.task_iri,
                 &format!("{:?}_COMPLETED", role),
-                &agent.agent_id,
+                &agent_id,
                 &serde_json::json!({"status": &result.status, "summary": &result.summary})
                     .to_string(),
             )
@@ -335,6 +982,8 @@ impl SupervisorAgent {
         max_iterations: u32,
         timeout_secs: u64,
         tools_allowed: &[String],
+        task_constraints: &std::collections::HashMap<String, String>,
+        effect_policy: crate::core::effect::EffectPolicy,
     ) -> Result<Vec<TaskResult>, CoreError> {
         let _ = self
             .event_bus
@@ -358,8 +1007,12 @@ impl SupervisorAgent {
             let objective = format!("[{}-{}] {}", role, i + 1, base_objective);
             let ctx = if tools_allowed.is_empty() {
                 TaskContext::new(task_iri, &objective, max_iterations)
+                    .with_constraints(task_constraints.clone())
+                    .with_effect_policy(effect_policy.clone())
             } else {
                 TaskContext::new(task_iri, &objective, max_iterations)
+                    .with_constraints(task_constraints.clone())
+                    .with_effect_policy(effect_policy.clone())
                     .with_allowed_tools(tools_allowed.to_vec())
             };
             let tid = cycle_id.to_string();
@@ -367,17 +1020,17 @@ impl SupervisorAgent {
 
             handles.push(tokio::spawn(async move {
                 let agent_id = format!("{}_{}_{}", tid, role, uuid::Uuid::new_v4().hyphenated());
-                let mut agent = AgentInstance::new(agent_id, role);
+                let agent = AgentInstance::new(agent_id, role);
                 let iri = ctx.task_iri.clone();
                 if timeout_secs > 0 {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(timeout_secs),
-                        runner_clone.execute(&mut agent, ctx),
+                        run_biz_agent(runner_clone, agent, ctx, None),
                     )
                     .await
                     {
                         Ok(r) => r,
-                        Err(_) => Ok(TaskResult {
+                        Err(_) => TaskResult {
                             task_iri: iri,
                             status: "timeout".to_string(),
                             summary: format!(
@@ -394,10 +1047,10 @@ impl SupervisorAgent {
                             tracked_actions: vec![],
                             verdict: Some(TaskVerdict::Timeout),
                             archive_iri: None,
-                        }),
+                        },
                     }
                 } else {
-                    runner_clone.execute(&mut agent, ctx).await
+                    run_biz_agent(runner_clone, agent, ctx, None).await
                 }
             }));
         }
@@ -405,8 +1058,7 @@ impl SupervisorAgent {
         let mut results = Vec::new();
         for h in handles {
             match h.await {
-                Ok(Ok(res)) => results.push(res),
-                Ok(Err(e)) => warn!("Parallel agent failed: {}", e),
+                Ok(res) => results.push(res),
                 Err(e) => warn!("Parallel agent panicked: {}", e),
             }
         }
@@ -439,6 +1091,8 @@ impl SupervisorAgent {
         five_w2h_iri: &str,
         resumed_messages: Option<Vec<crate::gateway::unified_gateway::ChatMessage>>,
         initial_prev_summary: Option<String>,
+        task_effect_policy: crate::core::effect::EffectPolicy,
+        task_constraints: std::collections::HashMap<String, String>,
     ) -> Result<TaskResult, CoreError> {
         let cycle_id = self
             .active_cycles
@@ -476,6 +1130,17 @@ impl SupervisorAgent {
         }
 
         let mut last_result: Option<TaskResult> = None;
+        let mut execution_facts = TaskExecutionFacts::default();
+        let mut recursive_budget = RecursiveExecutionBudget::new(
+            self.runner
+                .agent_settings
+                .execution_budget
+                .max_recursive_task_executions,
+            self.runner
+                .agent_settings
+                .execution_budget
+                .max_recursive_total_turns,
+        );
         let mut prev_summary: Option<String> = initial_prev_summary;
         // Track the Do agent's output separately so AA can access it alongside CA's evaluation.
         let mut da_output: Option<String> = None;
@@ -485,6 +1150,7 @@ impl SupervisorAgent {
         let mut local_repairs_used = 0u32;
         let mut previous_ca_signature: Option<Vec<String>> = None;
         let mut repeated_ca_failures = 0u32;
+        let authoritative_contract = authoritative_task_contract(user_input, &five_w2h);
 
         // Resume mode: determine which phase to start from
         // Load latest checkpoint from L0 to resolve phase tags
@@ -647,6 +1313,21 @@ impl SupervisorAgent {
                     continue;
                 }
 
+                // AA must evaluate the latest CA evidence.  CA failures are
+                // repaired after the first DAG pass, so do not let AA make a
+                // terminal decision against the pre-repair result.
+                if step.role == AgentRole::Act
+                    && latest_ca_report
+                        .as_ref()
+                        .is_some_and(|report| report.failed())
+                {
+                    info!(
+                        node_id = %nd.id,
+                        "Deferring AA until CA evidence has converged"
+                    );
+                    continue;
+                }
+
                 // Resume mode: skip completed phases
                 if resume_skip_phases.contains(&step.role) {
                     info!(role = ?step.role, "[resume] skipping completed phase");
@@ -764,22 +1445,35 @@ impl SupervisorAgent {
                     .await?;
                 // Cycle timeout check
                 {
-                    let cycle_start = self.active_cycles.get(&cycle_id).map(|c| c.started_at);
-                    if let Some(started_at) = cycle_start {
-                        let elapsed = chrono::Utc::now().signed_duration_since(started_at);
-                        if elapsed.num_seconds() > self.perception.cycle_timeout_secs() {
-                            let intervention = self.perception.on_cycle_timeout(
-                                &cycle_id,
-                                task_iri,
-                                elapsed.num_seconds() as f64,
-                            );
-                            if intervention.should_interrupt {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(self.execution_timeout_secs),
-                                    self.execute_intervention_for_cycle(intervention, task_iri),
-                                )
-                                .await;
+                    let now = chrono::Utc::now();
+                    let cooldown = self.perception.anomaly_dedup_window_seconds();
+                    let cycle_timeout = self.perception.cycle_timeout_secs().max(1);
+                    let mut ambiguous_timeout_elapsed = None;
+                    if let Some(cycle) = self.active_cycles.get_mut(&cycle_id) {
+                        match evaluate_cycle_timeout(cycle, now, cycle_timeout, cooldown) {
+                            TimeoutDecision::ExtendedWithProgress => {
+                                info!(
+                                    cycle_id = %cycle_id,
+                                    alert_count = cycle.timeout_alert_count,
+                                    "PDCA deadline crossed with recent progress; monitoring window extended deterministically"
+                                );
                             }
+                            TimeoutDecision::NeedsIntervention { elapsed_seconds } => {
+                                ambiguous_timeout_elapsed = Some(elapsed_seconds);
+                            }
+                            TimeoutDecision::None => {}
+                        }
+                    }
+                    if let Some(elapsed) = ambiguous_timeout_elapsed {
+                        let intervention = self
+                            .perception
+                            .on_cycle_timeout(&cycle_id, task_iri, elapsed);
+                        if intervention.should_interrupt {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(self.execution_timeout_secs),
+                                self.execute_intervention_for_cycle(intervention, task_iri),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -847,13 +1541,30 @@ impl SupervisorAgent {
                             self.effective_max_iterations(&cycle_id),
                             self.effective_timeout_secs(&cycle_id, nd.timeout_secs),
                             &step.tools_allowed,
+                            &task_constraints,
+                            match &step.effect_policy {
+                                crate::core::effect::EffectPolicy::None => match step.role {
+                                    AgentRole::Plan | AgentRole::Check => {
+                                        crate::core::effect::EffectPolicy::EvidenceOnly
+                                    }
+                                    AgentRole::Act => {
+                                        crate::core::effect::EffectPolicy::DecisionOnly
+                                    }
+                                    AgentRole::Do => task_effect_policy.clone(),
+                                },
+                                policy => policy.clone(),
+                            },
                         )
                         .await?;
+
+                    for result in &results {
+                        execution_facts.record(result);
+                    }
 
                     let failed = results.iter().find(|r| r.status == "failed");
                     if let Some(f) = failed {
                         warn!(role = ?step.role, step_id = %step.step_id, "Parallel agent failed");
-                        return Ok(TaskResult {
+                        let mut failed_result = TaskResult {
                             task_iri: task_iri.to_string(),
                             status: "partial_failure".to_string(),
                             summary: format!("Some parallel {:?} agents failed", step.role),
@@ -867,22 +1578,31 @@ impl SupervisorAgent {
                             tracked_actions: Vec::new(),
                             verdict: Some(TaskVerdict::Failed),
                             archive_iri: None,
-                        });
+                        };
+                        execution_facts.apply_to(&mut failed_result);
+                        return Ok(failed_result);
                     }
 
+                    let ca_handoff_max_chars = self
+                        .runner
+                        .agent_settings
+                        .execution_budget
+                        .ca_handoff_max_chars;
                     let combined_summary: String = results
                         .iter()
                         .map(|r| {
-                            let iri_part = r
-                                .archive_iri
-                                .as_ref()
-                                .map(|iri| format!(" | read_agent_output query: {}", iri))
-                                .unwrap_or_default();
-                            format!("[{}] {}{}", r.task_iri, r.summary, iri_part)
+                            format!(
+                                "[{}] {}",
+                                r.task_iri,
+                                result_handoff(r, step.role, ca_handoff_max_chars)
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    prev_summary = Some(combined_summary);
+                    prev_summary = Some(truncate_chars(
+                        &combined_summary,
+                        ca_handoff_max_chars.max(1),
+                    ));
                     last_result = results.into_iter().last();
                     continue;
                 }
@@ -894,7 +1614,13 @@ impl SupervisorAgent {
                     .find(|c| c.task_iri == task_iri)
                     .map(|c| c.experience_hints.clone())
                     .unwrap_or_default();
-                let hints_block = if cycle_hints.is_empty() {
+                // Historical outcomes may guide planning, and may guide DA
+                // only when no PA handoff exists (Simple/Emergency plans).
+                // CA and AA must remain independent evidence-based auditors;
+                // injecting a prior success conclusion would bias both gates.
+                let role_may_use_history = matches!(step.role, AgentRole::Plan)
+                    || (matches!(step.role, AgentRole::Do) && prev_summary.is_none());
+                let hints_block = if cycle_hints.is_empty() || !role_may_use_history {
                     String::new()
                 } else {
                     format!(
@@ -908,24 +1634,29 @@ impl SupervisorAgent {
                 };
                 let objective = match (&prev_summary, step.role) {
                     (Some(summary), AgentRole::Plan) => {
-                        format!("{}\n\n## User Task\n{}{}\n\n## Feedback from Previous PDCA Cycle\n{}\n\nPlease create a detailed execution plan for the above user task, addressing all feedback from the previous cycle.", step.objective, user_input, hints_block, summary)
+                        // PA has no predecessor-content slot in its generic
+                        // role template, so feedback is embedded here exactly
+                        // once. Other roles consume their typed handoff slot.
+                        format!("{}\n\n{}{}\n\n## Feedback from Previous PDCA Cycle\n{}\n\nPlease create a detailed execution plan for the task contract, addressing the feedback without changing the acceptance boundary.", step.objective, authoritative_contract, hints_block, summary)
                     }
-                    (Some(summary), AgentRole::Do) => {
-                        format!("{}\n\nUpper PA's Plan:\n{}{}\n\nPlease execute the task according to the plan.", step.objective, summary, hints_block)
+                    (Some(_), AgentRole::Do) => {
+                        format!("{}\n\n{}{}\n\nThe upper PA plan is supplied once in the bounded previous-agent handoff. Execute it only within the authoritative contract; if it conflicts, the contract wins.", step.objective, authoritative_contract, hints_block)
                     }
-                    (Some(summary), AgentRole::Check) => {
-                        format!("{}\n\nExecution Results:\n{}{}\n\nPlease verify whether the execution results are correct and complete.", step.objective, summary, hints_block)
+                    (Some(_), AgentRole::Check) => {
+                        format!("{}{}\n\nExecution results are supplied once in the bounded previous-agent handoff. Please independently verify whether they are correct and complete.", step.objective, hints_block)
                     }
-                    (Some(summary), AgentRole::Act) => {
+                    (Some(_), AgentRole::Act) => {
                         let da_context = da_output
                             .as_ref()
-                            .filter(|_| da_output.as_ref().map_or(false, |da| da != summary))
                             .map(|da| format!("\n\n## Execution Results\n{}", da))
                             .unwrap_or_default();
-                        format!("{}\n\n## Original Task\n{}{}\n\n## Check Conclusions\n{}{}\n\nPlease make final decisions and summarize.", step.objective, user_input, da_context, summary, hints_block)
+                        format!("{}\n\n## Original Task\n{}{}{}\n\nThe latest CA conclusions are supplied once in the bounded previous-agent handoff. Please make the final decision and summarize.", step.objective, user_input, da_context, hints_block)
                     }
                     (None, AgentRole::Plan) => {
-                        format!("{}\n\n## User Task\n{}{}\n\nPlease create a detailed execution plan for the above user task.", step.objective, user_input, hints_block)
+                        format!("{}\n\n{}{}\n\nPlease create a detailed execution plan for the task contract.", step.objective, authoritative_contract, hints_block)
+                    }
+                    (None, AgentRole::Do) => {
+                        format!("{}\n\n{}{}\n\nExecute every requirement in the authoritative contract and verify the declared criteria.", step.objective, authoritative_contract, hints_block)
                     }
                     _ => step.objective.clone(),
                 };
@@ -937,8 +1668,19 @@ impl SupervisorAgent {
                     self.effective_max_iterations(&cycle_id),
                 )
                 .with_original_task(user_input)
-                    .with_step_info(&step.expected_output, &step.success_criteria)
-                    .with_cycle_id(&cycle_id);
+                .with_constraints(task_constraints.clone())
+                .with_effect_policy(match &step.effect_policy {
+                    crate::core::effect::EffectPolicy::None => match step.role {
+                        AgentRole::Plan | AgentRole::Check => {
+                            crate::core::effect::EffectPolicy::EvidenceOnly
+                        }
+                        AgentRole::Act => crate::core::effect::EffectPolicy::DecisionOnly,
+                        AgentRole::Do => task_effect_policy.clone(),
+                    },
+                    policy => policy.clone(),
+                })
+                .with_step_info(&step.expected_output, &step.success_criteria)
+                .with_cycle_id(&cycle_id);
                 context = context.with_five_w2h(five_w2h_iri, five_w2h.clone());
 
                 // Resume mode: history messages on first executed step
@@ -1027,31 +1769,44 @@ impl SupervisorAgent {
 
                 let dispatch_results = futures::future::join_all(futs).await;
 
+                if let Some(error) = dispatch_results
+                    .iter()
+                    .find_map(|(_, result)| result.as_ref().err())
+                {
+                    // Other nodes in the same wave may already have completed
+                    // successfully. Preserve their observable facts even when
+                    // one sibling fails at the dispatch boundary.
+                    for (_, result) in &dispatch_results {
+                        if let Ok(result) = result {
+                            execution_facts.record(result);
+                        }
+                    }
+                    warn!(error = %error, "Wave node dispatch error");
+                    let mut failed = TaskResult {
+                        task_iri: task_iri.to_string(),
+                        status: "failed".to_string(),
+                        summary: format!("Wave node dispatch failed: {}", error),
+                        output: None,
+                        jsonld_output: None,
+                        artifacts: vec![],
+                        errors: vec![error.to_string()],
+                        turn_count: 0,
+                        tool_call_count: 0,
+                        five_w2h_updates: None,
+                        tracked_actions: vec![],
+                        verdict: Some(TaskVerdict::Failed),
+                        archive_iri: None,
+                    };
+                    execution_facts.record(&failed);
+                    execution_facts.apply_to(&mut failed);
+                    return Ok(failed);
+                }
+
                 for (result_wi, result_res) in dispatch_results {
                     let task_ni = order[result_wi];
                     let task_nd = &dag.graph[task_ni].def;
                     let task_step = crate::core::workflow::adapter::node_to_planstep(task_nd);
-                    let result = match result_res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(error = %e, "Wave node dispatch error");
-                            return Ok(TaskResult {
-                                task_iri: task_iri.to_string(),
-                                status: "failed".to_string(),
-                                summary: format!("Wave node dispatch failed: {}", e),
-                                output: None,
-                                jsonld_output: None,
-                                artifacts: vec![],
-                                errors: vec![],
-                                turn_count: 0,
-                                tool_call_count: 0,
-                                five_w2h_updates: None,
-                                tracked_actions: vec![],
-                                verdict: None,
-                                archive_iri: None,
-                            });
-                        }
-                    };
+                    let result = result_res.expect("wave errors handled before result processing");
                     if let Some(failed_task) = self
                         .handle_step_result(
                             result,
@@ -1064,6 +1819,7 @@ impl SupervisorAgent {
                             &mut previous_ca_signature,
                             &mut repeated_ca_failures,
                             &mut last_result,
+                            &mut execution_facts,
                             &mut completed_node_results,
                             &mut skip_nodes,
                             &mut five_w2h,
@@ -1073,6 +1829,9 @@ impl SupervisorAgent {
                             &dag,
                             &order,
                             five_w2h_iri,
+                            &task_effect_policy,
+                            &task_constraints,
+                            &mut recursive_budget,
                         )
                         .await?
                     {
@@ -1081,10 +1840,8 @@ impl SupervisorAgent {
                 }
             } else if num_tasks == 1 {
                 let wt = agent_tasks.into_iter().next().unwrap();
-                let result = dispatch_with_retry(
-                    wt.step.retry_count,
-                    wt.step.retry_delay_secs,
-                    || {
+                let result =
+                    dispatch_with_retry(wt.step.retry_count, wt.step.retry_delay_secs, || {
                         self.dispatch_agent(
                             wt.step.role,
                             wt.ctx.clone(),
@@ -1092,9 +1849,8 @@ impl SupervisorAgent {
                             Some(wt.step.clone()),
                             wt.timeout_secs,
                         )
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 if let Some(failed_task) = self
                     .handle_step_result(
                         result,
@@ -1107,6 +1863,7 @@ impl SupervisorAgent {
                         &mut previous_ca_signature,
                         &mut repeated_ca_failures,
                         &mut last_result,
+                        &mut execution_facts,
                         &mut completed_node_results,
                         &mut skip_nodes,
                         &mut five_w2h,
@@ -1116,6 +1873,9 @@ impl SupervisorAgent {
                         &dag,
                         &order,
                         five_w2h_iri,
+                        &task_effect_policy,
+                        &task_constraints,
+                        &mut recursive_budget,
                     )
                     .await?
                 {
@@ -1127,7 +1887,9 @@ impl SupervisorAgent {
         // ── CA→DA correction loop ──
         // When CA's dimension audit detects failures in DA's work, re-dispatch DA
         // with corrective feedback instead of immediately proceeding to AA.
-        const MAX_CA_DA_CORRECTIONS: usize = 3;
+        let execution_budget = &self.runner.agent_settings.execution_budget;
+        let max_ca_da_corrections = execution_budget.max_ca_da_corrections;
+        let correction_handoff_max_chars = execution_budget.ca_correction_handoff_max_chars;
         let mut correction_count = 0;
         loop {
             let ca_summary = prev_summary.clone();
@@ -1135,7 +1897,7 @@ impl SupervisorAgent {
                 crate::core::recovery::select_directive(
                     report,
                     local_repairs_used,
-                    MAX_CA_DA_CORRECTIONS as u32,
+                    max_ca_da_corrections as u32,
                 )
             });
             let has_local_ca_failures = matches!(
@@ -1143,7 +1905,7 @@ impl SupervisorAgent {
                 Some(crate::core::recovery::RecoveryDirective::RetryDa)
             ) && ca_summary.is_some();
 
-            if !has_local_ca_failures || correction_count >= MAX_CA_DA_CORRECTIONS {
+            if !has_local_ca_failures || correction_count >= max_ca_da_corrections {
                 break;
             }
 
@@ -1162,7 +1924,16 @@ impl SupervisorAgent {
                  Previous audit found gaps:\n\n{}\n\n\
                  Fix ALL identified issues. Output what was fixed.",
                 correction_count,
-                &ca_text[..ca_text.len().min(4000)]
+                ca_text
+                    .chars()
+                    .take(correction_handoff_max_chars)
+                    .collect::<String>()
+            );
+
+            let mut correction_constraints = task_constraints.clone();
+            correction_constraints.insert(
+                crate::core::agent_runner::SA_RECOVERY_MODE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::CA_DA_CORRECTION_MODE.to_string(),
             );
 
             let da_ctx = TaskContext::new(
@@ -1171,6 +1942,12 @@ impl SupervisorAgent {
                 self.effective_max_iterations(&cycle_id),
             )
             .with_original_task(user_input)
+            .with_constraints(correction_constraints)
+            .with_effect_policy(if task_effect_policy.may_require_workspace_mutation() {
+                crate::core::effect::EffectPolicy::required_workspace_mutation()
+            } else {
+                task_effect_policy.clone()
+            })
             .with_cycle_id(&cycle_id);
 
             match self
@@ -1178,6 +1955,7 @@ impl SupervisorAgent {
                 .await
             {
                 Ok(da_result) => {
+                    execution_facts.record(&da_result);
                     let ca_objective = format!(
                         "Re-evaluate corrected execution:\n\n\
                          Corrected Output (iteration {}):\n{}\n\n\
@@ -1191,6 +1969,8 @@ impl SupervisorAgent {
                         self.effective_max_iterations(&cycle_id),
                     )
                     .with_original_task(user_input)
+                    .with_constraints(task_constraints.clone())
+                    .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly)
                     .with_cycle_id(&cycle_id);
 
                     match self
@@ -1210,20 +1990,26 @@ impl SupervisorAgent {
                                 &mut previous_ca_signature,
                                 &mut repeated_ca_failures,
                             );
+                            execution_facts.record(&ca_result);
                             latest_ca_report = Some(ca_report);
-                            let archive_ref = ca_result
-                                .archive_iri
-                                .as_ref()
-                                .map(|iri| {
-                                    format!(
-                                        "\n\nFor detailed report, use read_agent_output: {}",
-                                        iri
-                                    )
-                                })
-                                .unwrap_or_default();
-                            prev_summary = Some(format!(
-                                "## Corrected Execution (iter {})\n{}\n\n## CA Re-Evaluation\n{}{}",
-                                correction_count, da_result.summary, ca_result.summary, archive_ref
+                            let ca_evidence = result_handoff(
+                                &ca_result,
+                                AgentRole::Check,
+                                self.runner
+                                    .agent_settings
+                                    .execution_budget
+                                    .ca_handoff_max_chars,
+                            );
+                            prev_summary = Some(truncate_chars(
+                                &format!(
+                                "## Corrected Execution (iter {})\n{}\n\n## CA Re-Evaluation\n{}",
+                                correction_count, da_result.summary, ca_evidence
+                            ),
+                                self.runner
+                                    .agent_settings
+                                    .execution_budget
+                                    .ca_handoff_max_chars
+                                    .max(1),
                             ));
                             last_result = Some(ca_result);
 
@@ -1243,6 +2029,124 @@ impl SupervisorAgent {
                 Err(e) => {
                     warn!(error = %e, "DA corrective re-dispatch failed");
                     break;
+                }
+            }
+        }
+
+        // AA is a decision role, not a repair role. Never ask it to reconsider
+        // evidence while the latest CA audit is still failed. SA first routes
+        // unresolved executable gaps back to DA; repeated/non-convergent gaps
+        // are promoted to PA by the outer PDCA controller.
+        if let Some(report) = latest_ca_report.as_ref().filter(|report| report.failed()) {
+            let directive = crate::core::recovery::select_directive(
+                report,
+                local_repairs_used,
+                max_ca_da_corrections as u32,
+            );
+            let (scope, failed_step) = match directive {
+                crate::core::recovery::RecoveryDirective::RetryDa => (
+                    crate::core::recovery::RepairScope::Step,
+                    plan.steps
+                        .iter()
+                        .find(|step| step.role == AgentRole::Do)
+                        .map(|step| step.step_id.as_str()),
+                ),
+                _ => (
+                    crate::core::recovery::RepairScope::Task,
+                    plan.steps
+                        .iter()
+                        .find(|step| step.role == AgentRole::Plan)
+                        .map(|step| step.step_id.as_str()),
+                ),
+            };
+            if let Some(result) = last_result.as_mut() {
+                result.status = "failed".to_string();
+                result.verdict = Some(TaskVerdict::Failed);
+                result.summary.push_str(&format!(
+                    "\n\n[Recovery] directive={:?} scope={:?} failed_step={}",
+                    directive,
+                    scope,
+                    failed_step.unwrap_or("unresolved_ca_audit")
+                ));
+                result.errors.push(format!(
+                    "latest CA audit remains failed; SA routed recovery to {:?}",
+                    directive
+                ));
+            }
+        }
+
+        // A correction invalidates any earlier AA evidence. Once CA has
+        // converged, make one fresh final decision from the latest audit.
+        if correction_count > 0
+            && latest_ca_report
+                .as_ref()
+                .is_some_and(|report| !report.failed())
+        {
+            if let Some((aa_index, aa_step)) = plan
+                .steps
+                .iter()
+                .enumerate()
+                .rfind(|(_, step)| step.role == AgentRole::Act)
+                .map(|(idx, step)| (idx, step.clone()))
+            {
+                let aa_objective = format!(
+                    "{}\n\n## Original Task\n{}\n\n## Latest CA/DA Evidence\n{}\n\nMake the final acceptance decision using only the latest evidence.",
+                    aa_step.objective,
+                    user_input,
+                    prev_summary.as_deref().unwrap_or("No execution summary available")
+                );
+                let aa_ctx = TaskContext::new(
+                    task_iri,
+                    &aa_objective,
+                    self.effective_max_iterations(&cycle_id),
+                )
+                .with_original_task(user_input)
+                .with_constraints(task_constraints.clone())
+                .with_effect_policy(crate::core::effect::EffectPolicy::DecisionOnly)
+                .with_step_info(&aa_step.expected_output, &aa_step.success_criteria)
+                .with_cycle_id(&cycle_id)
+                .with_five_w2h(five_w2h_iri, five_w2h.clone());
+                let aa_result = self
+                    .dispatch_agent(
+                        AgentRole::Act,
+                        aa_ctx,
+                        &cycle_id,
+                        Some(aa_step.clone()),
+                        self.effective_timeout_secs(&cycle_id, 0),
+                    )
+                    .await?;
+                if let Some(failed_task) = self
+                    .handle_step_result(
+                        aa_result,
+                        aa_step,
+                        order
+                            .get(aa_index)
+                            .copied()
+                            .unwrap_or_else(|| order[order.len() - 1]),
+                        order.len().saturating_sub(1),
+                        &mut prev_summary,
+                        &mut da_output,
+                        &mut latest_ca_report,
+                        &mut previous_ca_signature,
+                        &mut repeated_ca_failures,
+                        &mut last_result,
+                        &mut execution_facts,
+                        &mut completed_node_results,
+                        &mut skip_nodes,
+                        &mut five_w2h,
+                        task_iri,
+                        &cycle_id,
+                        &plan,
+                        &dag,
+                        &order,
+                        five_w2h_iri,
+                        &task_effect_policy,
+                        &task_constraints,
+                        &mut recursive_budget,
+                    )
+                    .await?
+                {
+                    return Ok(failed_task);
                 }
             }
         }
@@ -1277,9 +2181,20 @@ impl SupervisorAgent {
             verdict: None,
             archive_iri: None,
         });
+        execution_facts.apply_to(&mut final_result);
         enforce_ca_audit_terminal_status(
             &mut final_result,
-            latest_ca_report.as_ref().is_some_and(|report| report.failed()),
+            latest_ca_report
+                .as_ref()
+                .is_some_and(|report| report.failed()),
+        );
+        persist_ca_validated_knowledge(
+            self,
+            task_iri,
+            user_input,
+            &task_constraints,
+            latest_ca_report.as_ref(),
+            &final_result,
         );
         Ok(final_result)
     }
@@ -1295,12 +2210,13 @@ impl SupervisorAgent {
             .first()
             .map(|e| format!("\n\n**Error details**: {}", e))
             .unwrap_or_default();
+        let (directive, scope) = failed_business_role_recovery(step.role);
         TaskResult {
             task_iri: task_iri.to_string(),
             status: "failed".to_string(),
             summary: format!(
-                "Agent {:?} failed at step {}{}",
-                step.role, step.step_id, error_detail
+                "Agent {:?} failed at step {}{}\n\n[Recovery] directive={} scope={} failed_step={}",
+                step.role, step.step_id, error_detail, directive, scope, step.step_id,
             ),
             output: None,
             jsonld_output: None,
@@ -1321,7 +2237,7 @@ impl SupervisorAgent {
     /// `Ok(None)` to continue normally.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_step_result(
-        &self,
+        &mut self,
         mut result: TaskResult,
         step: PlanStep,
         _node_idx: NodeIndex,
@@ -1332,6 +2248,7 @@ impl SupervisorAgent {
         previous_ca_signature: &mut Option<Vec<String>>,
         repeated_ca_failures: &mut u32,
         last_result: &mut Option<TaskResult>,
+        execution_facts: &mut TaskExecutionFacts,
         completed_node_results: &mut std::collections::HashMap<
             String,
             crate::core::workflow::NodeResult,
@@ -1344,7 +2261,19 @@ impl SupervisorAgent {
         dag: &crate::core::workflow::loader::WorkflowDag,
         order: &[NodeIndex],
         five_w2h_iri: &str,
+        task_effect_policy: &crate::core::effect::EffectPolicy,
+        task_constraints: &std::collections::HashMap<String, String>,
+        recursive_budget: &mut RecursiveExecutionBudget,
     ) -> Result<Option<TaskResult>, CoreError> {
+        if step.role == AgentRole::Act {
+            apply_aa_declared_verdict(&mut result, latest_ca_report.as_ref());
+        }
+        if result.turn_count > 0 || result.tool_call_count > 0 || result.status == "success" {
+            if let Some(cycle) = self.active_cycles.get_mut(cycle_id) {
+                cycle.last_progress_at = chrono::Utc::now();
+            }
+        }
+        execution_facts.record(&result);
         let task_id = task_iri
             .strip_prefix("iri://task/")
             .unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
@@ -1367,27 +2296,21 @@ impl SupervisorAgent {
                         warn!(role = ?step.role, step_id = %step.step_id, target = %target, "Agent failed, branching to fallback step");
                     } else {
                         warn!(role = ?step.role, step_id = %step.step_id, target = %target, "Agent failed, branch target not in remaining order, aborting plan");
-                        return Ok(Some(self.build_failed_step_result(
-                            task_iri,
-                            &step,
-                            &result,
-                        )));
+                        let mut failed = self.build_failed_step_result(task_iri, &step, &result);
+                        execution_facts.apply_to(&mut failed);
+                        return Ok(Some(failed));
                     }
                 } else {
                     warn!(role = ?step.role, step_id = %step.step_id, "Agent failed, no branch fallback target, aborting plan");
-                    return Ok(Some(self.build_failed_step_result(
-                        task_iri,
-                        &step,
-                        &result,
-                    )));
+                    let mut failed = self.build_failed_step_result(task_iri, &step, &result);
+                    execution_facts.apply_to(&mut failed);
+                    return Ok(Some(failed));
                 }
             } else {
                 warn!(role = ?step.role, step_id = %step.step_id, "Agent failed, aborting plan");
-                return Ok(Some(self.build_failed_step_result(
-                    task_iri,
-                    &step,
-                    &result,
-                )));
+                let mut failed = self.build_failed_step_result(task_iri, &step, &result);
+                execution_facts.apply_to(&mut failed);
+                return Ok(Some(failed));
             }
         }
 
@@ -1522,9 +2445,18 @@ impl SupervisorAgent {
             }
         }
 
-        // Recursive sub-cycle for Do agents
+        // Recursive sub-cycle for Do agents. A successful DA now proceeds
+        // directly to the independent CA unless its completion envelope says
+        // executable work remains. This removes the former unconditional LLM
+        // decomposition after every successful DA and every successful child.
+        let completion_envelope = crate::core::effect::CompletionEnvelope::from_result(
+            &result.status,
+            result.output.as_ref(),
+            &result.summary,
+        );
         if step.role == AgentRole::Do
             && (result.status == "success" || result.status == "partial_success")
+            && completion_envelope.needs_follow_up_execution()
             && plan.max_recursion_depth > 0
             && (plan.task_complexity == crate::core::sa::types::TaskComplexity::Recursive
                 || plan.task_complexity == crate::core::sa::types::TaskComplexity::Complex)
@@ -1532,6 +2464,7 @@ impl SupervisorAgent {
             let sub_results = self
                 .execute_recursive_sub_cycle(
                     &result.summary,
+                    &completion_envelope,
                     task_iri,
                     cycle_id,
                     &step.step_id,
@@ -1539,35 +2472,69 @@ impl SupervisorAgent {
                     1,
                     five_w2h,
                     five_w2h_iri,
+                    execution_facts,
+                    task_effect_policy,
+                    task_constraints,
+                    recursive_budget,
                 )
                 .await;
 
             match sub_results {
-                Ok(sub_summary) => {
-                    *prev_summary = Some(format!(
-                        "{}\n\n## Sub-task Execution Results\n{}",
-                        result.summary, sub_summary
+                Ok(sub_outcome) => {
+                    *prev_summary = Some(truncate_chars(
+                        &format!(
+                            "{}\n\n## Sub-task Execution Results\n{}",
+                            result.summary, sub_outcome.summary
+                        ),
+                        self.runner
+                            .agent_settings
+                            .execution_budget
+                            .ca_handoff_max_chars
+                            .max(1),
                     ));
+                    if sub_outcome.failed_count > 0 {
+                        result.status = "failed".to_string();
+                        result.verdict = Some(TaskVerdict::Failed);
+                        result.errors.push(format!(
+                            "{} recursive sub-task(s) failed",
+                            sub_outcome.failed_count
+                        ));
+                        let mut failed = self.build_failed_step_result(task_iri, &step, &result);
+                        failed.summary = prev_summary.clone().unwrap_or(failed.summary);
+                        execution_facts.apply_to(&mut failed);
+                        return Ok(Some(failed));
+                    }
+                    if sub_outcome.partial_count > 0 && result.status == "success" {
+                        result.status = "partial_success".to_string();
+                        result.verdict = Some(TaskVerdict::PartialSuccess);
+                    }
                 }
                 Err(e) => {
-                    warn!(error = %e, "Recursive sub-cycle execution failed, using DA original result");
-                    *prev_summary = Some(match result.archive_iri {
-                        Some(ref iri) => format!(
-                            "{}\n\nFor the full report, use read_agent_output tool to query: {}",
-                            result.summary, iri
-                        ),
-                        None => result.summary.clone(),
-                    });
+                    warn!(error = %e, "Required recursive sub-cycle execution failed");
+                    result.status = "failed".to_string();
+                    result.verdict = Some(TaskVerdict::Failed);
+                    result
+                        .errors
+                        .push(format!("Recursive sub-cycle failed: {e}"));
+                    *prev_summary = Some(format!(
+                        "{}\n\nRecursive sub-cycle failed: {}",
+                        result.summary, e
+                    ));
+                    let mut failed = self.build_failed_step_result(task_iri, &step, &result);
+                    failed.summary = prev_summary.clone().unwrap_or(failed.summary);
+                    execution_facts.apply_to(&mut failed);
+                    return Ok(Some(failed));
                 }
             }
         } else {
-            *prev_summary = Some(match result.archive_iri {
-                Some(ref iri) => format!(
-                    "{}\n\nFor the full report, use read_agent_output tool to query: {}",
-                    result.summary, iri
-                ),
-                None => result.summary.clone(),
-            });
+            *prev_summary = Some(result_handoff(
+                &result,
+                step.role,
+                self.runner
+                    .agent_settings
+                    .execution_budget
+                    .ca_handoff_max_chars,
+            ));
         }
 
         *last_result = Some(result);
@@ -1707,6 +2674,7 @@ impl SupervisorAgent {
     fn execute_recursive_sub_cycle<'a>(
         &'a self,
         da_summary: &'a str,
+        completion_envelope: &'a crate::core::effect::CompletionEnvelope,
         task_iri: &'a str,
         cycle_id: &'a str,
         parent_step_id: &'a str,
@@ -1714,15 +2682,27 @@ impl SupervisorAgent {
         current_depth: u32,
         five_w2h: &'a crate::core::five_w2h::Task5W2H,
         five_w2h_iri: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, CoreError>> + Send + 'a>>
-    {
+        execution_facts: &'a mut TaskExecutionFacts,
+        task_effect_policy: &'a crate::core::effect::EffectPolicy,
+        task_constraints: &'a std::collections::HashMap<String, String>,
+        recursive_budget: &'a mut RecursiveExecutionBudget,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<RecursiveSubCycleOutcome, CoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             if current_depth > max_depth {
                 info!(
                     depth = current_depth,
                     max_depth, "Recursive depth limit reached, stopping sub-cycle"
                 );
-                return Ok("Recursive depth limit reached".to_string());
+                return Ok(RecursiveSubCycleOutcome {
+                    summary: "Recursive depth limit reached".to_string(),
+                    ..Default::default()
+                });
             }
 
             self.emit_sa_thought(
@@ -1761,8 +2741,29 @@ impl SupervisorAgent {
             )
             .await;
 
-            let decompose_prompt = format!(
-                r#"You are a task decomposition expert. Below is an execution result summary of a DA (Do Agent). Analyze whether there are sub-tasks that need further execution.
+            let parsed = if completion_envelope.structured {
+                // Structured DA handoff is authoritative and avoids another
+                // LLM call. This is the fast path for optimized prompts.
+                ResidualWorkPlan {
+                    has_sub_tasks: !completion_envelope.pending_effects.is_empty(),
+                    sub_tasks: completion_envelope
+                        .pending_effects
+                        .iter()
+                        .map(|pending| ResidualTaskDef {
+                            objective: pending.objective.clone(),
+                            role: "Do".to_string(),
+                            success_criteria: if pending.reason.trim().is_empty() {
+                                format!("Complete and verify: {}", pending.objective)
+                            } else {
+                                pending.reason.clone()
+                            },
+                            effect_policy: pending.effect_policy.clone(),
+                        })
+                        .collect(),
+                }
+            } else {
+                let decompose_prompt = format!(
+                    r#"You are a task decomposition expert. Below is an execution result summary of a DA (Do Agent). Analyze whether there are sub-tasks that need further execution.
 
 ## DA Execution Result
 {}
@@ -1781,7 +2782,8 @@ Output the list of sub-tasks that need further execution in JSON format. If no f
     {{
       "objective": "Sub-task objective description",
       "role": "Do",
-      "success_criteria": "Success criteria"
+      "success_criteria": "Success criteria",
+      "effect_policy": {{"mode":"none"}}
     }}
   ]
 }}
@@ -1790,73 +2792,73 @@ Output the list of sub-tasks that need further execution in JSON format. If no f
 ## Evaluation Criteria
 1. If the DA result explicitly mentions "still needs...", "next step needs...", etc., there are sub-tasks
 2. If the DA result has fully completed the goal with no remaining work, there are no sub-tasks
-3. Sub-tasks should be concrete and executable, not abstract
-4. Maximum of 3 sub-tasks
+3. Sub-tasks must be concrete residual execution work, not review, testing-only, acceptance, or final-decision work; those belong to the normal Check/Act phases
+4. Use role `Do` only. Use `none` to inherit the original task effect contract. If you emit `conditional`, include both its generic effect and a concrete `condition`
+5. Maximum of {} sub-tasks
 
 Output only JSON."#,
-                da_summary, five_w2h.what, current_depth, max_depth,
-            );
+                    da_summary,
+                    five_w2h.what,
+                    current_depth,
+                    max_depth,
+                    self.runner
+                        .agent_settings
+                        .execution_budget
+                        .max_recursive_sub_tasks,
+                );
 
-            let model = self.runner.gateway.get_model("default");
-            let messages = vec![crate::gateway::unified_gateway::ChatMessage {
-                role: "user".to_string(),
-                content: decompose_prompt,
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            }];
+                let model = self.runner.gateway.get_model("default");
+                let messages = vec![crate::gateway::unified_gateway::ChatMessage {
+                    role: "user".to_string(),
+                    content: decompose_prompt,
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }];
 
-            let response = self
-                .runner
-                .gateway
-                .chat_with_params(&model, messages, Some(0.3), Some(8192), None, None)
-                .await
-                .map_err(|e| CoreError::Internal {
-                    message: format!("Recursive decomposition LLM call failed: {}", e),
-                })?;
+                let response = self
+                    .chat_sa_streaming(
+                        task_iri,
+                        "recursive_decomposition",
+                        &model,
+                        messages,
+                        Some(0.3),
+                        Some(8192),
+                    )
+                    .await
+                    .map_err(|e| CoreError::Internal {
+                        message: format!("Recursive decomposition LLM call failed: {}", e),
+                    })?;
 
-            let content = response
-                .choices
-                .first()
-                .and_then(|c| c.message.content.clone())
-                .unwrap_or_default();
+                let content = response
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.content.clone())
+                    .unwrap_or_default();
 
-            let json_str = if content.starts_with('{') {
-                content.clone()
-            } else if let Some(start) = content.find('{') {
-                if let Some(end) = content.rfind('}') {
-                    content[start..=end].to_string()
-                } else {
+                let json_str = if content.starts_with('{') {
                     content.clone()
-                }
-            } else {
-                return Ok("LLM did not return valid decomposition result".to_string());
+                } else if let Some(start) = content.find('{') {
+                    if let Some(end) = content.rfind('}') {
+                        content[start..=end].to_string()
+                    } else {
+                        content.clone()
+                    }
+                } else {
+                    return Ok(RecursiveSubCycleOutcome {
+                        summary: "Recursive decomposition failed: LLM did not return valid JSON"
+                            .to_string(),
+                        failed_count: 1,
+                        partial_count: 0,
+                    });
+                };
+                serde_json::from_str::<ResidualWorkPlan>(&json_str).map_err(|e| {
+                    CoreError::Internal {
+                        message: format!("Recursive decomposition JSON parse failed: {}", e),
+                    }
+                })?
             };
-
-            #[derive(Deserialize)]
-            struct DecomposeResult {
-                has_sub_tasks: bool,
-                sub_tasks: Vec<SubTaskDef>,
-            }
-
-            #[derive(Deserialize)]
-            struct SubTaskDef {
-                objective: String,
-                #[serde(default = "default_role")]
-                #[allow(dead_code)]
-                role: String,
-                success_criteria: String,
-            }
-
-            fn default_role() -> String {
-                "Do".to_string()
-            }
-
-            let parsed: DecomposeResult =
-                serde_json::from_str(&json_str).map_err(|e| CoreError::Internal {
-                    message: format!("Recursive decomposition JSON parse failed: {}", e),
-                })?;
 
             if !parsed.has_sub_tasks || parsed.sub_tasks.is_empty() {
                 info!(
@@ -1866,7 +2868,10 @@ Output only JSON."#,
                 self.emit_sa_thought(task_iri,
                 &format!("Sub-task decomposition complete: no further decomposition needed (depth {}/{})", current_depth, max_depth),
                 "recursive_no_tasks").await;
-                return Ok("No further decomposition needed".to_string());
+                return Ok(RecursiveSubCycleOutcome {
+                    summary: "No further decomposition needed".to_string(),
+                    ..Default::default()
+                });
             }
 
             self.emit_sa_thought(
@@ -1881,19 +2886,103 @@ Output only JSON."#,
             )
             .await;
 
+            let mut outcome = RecursiveSubCycleOutcome::default();
             let mut sub_summaries = Vec::new();
 
-            for (idx, sub_def) in parsed.sub_tasks.iter().take(MAX_RECURSIVE_SUB_TASKS).enumerate() {
+            for (idx, sub_def) in parsed
+                .sub_tasks
+                .iter()
+                .take(
+                    self.runner
+                        .agent_settings
+                        .execution_budget
+                        .max_recursive_sub_tasks,
+                )
+                .enumerate()
+            {
+                if !sub_def.role.eq_ignore_ascii_case("do")
+                    || matches!(
+                        sub_def.effect_policy,
+                        crate::core::effect::EffectPolicy::EvidenceOnly
+                            | crate::core::effect::EffectPolicy::DecisionOnly
+                    )
+                {
+                    sub_summaries.push(format!(
+                        "### Residual item {} deferred to normal Check/Act phase\n{}",
+                        idx + 1,
+                        sub_def.objective
+                    ));
+                    continue;
+                }
+                if !recursive_budget.claim_residual(sub_def) {
+                    sub_summaries.push(format!(
+                        "### Residual item {} skipped as task-wide duplicate\n{}",
+                        idx + 1,
+                        sub_def.objective
+                    ));
+                    continue;
+                }
+                let sub_effect_policy =
+                    recursive_effect_policy(&sub_def.effect_policy, task_effect_policy);
                 let sub_objective =
                     format!("[recursive depth={}] {}", current_depth, sub_def.objective);
                 info!(sub_idx = idx, objective = %sub_def.objective, "Executing recursive sub-task");
 
-                let mut sub_ctx = TaskContext::new(
-                    task_iri,
-                    &sub_objective,
-                    self.effective_max_iterations(cycle_id).min(8),
-                )
-                .with_original_task(&sub_def.objective);
+                let desired_turn_budget = recursive_subtask_turn_budget(
+                    self.effective_max_iterations(cycle_id),
+                    current_depth,
+                );
+                let Some(sub_turn_budget) = recursive_budget.reserve(desired_turn_budget) else {
+                    outcome.partial_count = outcome.partial_count.saturating_add(1);
+                    sub_summaries.push(format!(
+                        "### Residual execution budget exhausted\nDeferred to independent Check/recovery: {}",
+                        sub_def.objective
+                    ));
+                    info!(
+                        depth = current_depth,
+                        remaining_tasks = recursive_budget.remaining_tasks,
+                        remaining_turns = recursive_budget.remaining_turns,
+                        "Task-wide recursive execution budget exhausted"
+                    );
+                    break;
+                };
+
+                let sibling_evidence = if sub_summaries.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\nEarlier residual outcomes (revalidate against current state):\n{}",
+                        truncate_chars(
+                            &sub_summaries.join("\n"),
+                            self.runner
+                                .agent_settings
+                                .execution_budget
+                                .recursive_handoff_max_chars
+                                .max(1),
+                        )
+                    )
+                };
+
+                let mut sub_ctx = TaskContext::new(task_iri, &sub_objective, sub_turn_budget)
+                    .with_original_task(&format!(
+                        "{}\n\nSub-task: {}\nSub-task success criteria: {}",
+                        five_w2h.what, sub_def.objective, sub_def.success_criteria
+                    ))
+                    .with_constraints(task_constraints.clone())
+                    .with_effect_policy(sub_effect_policy.clone())
+                    .with_prev_summary(&format!(
+                        "Parent DA evidence:\n{}{}",
+                        da_summary
+                            .chars()
+                            .take(
+                                self.runner
+                                    .agent_settings
+                                    .execution_budget
+                                    .recursive_handoff_max_chars,
+                            )
+                            .collect::<String>(),
+                        sibling_evidence
+                    ));
 
                 sub_ctx = sub_ctx.with_five_w2h(five_w2h_iri, five_w2h.clone());
 
@@ -1912,7 +3001,18 @@ Output only JSON."#,
                             })
                             .collect();
                         if !summaries.is_empty() {
-                            sub_ctx = sub_ctx.with_prev_summary(&summaries.join("\n"));
+                            let max_chars = self
+                                .runner
+                                .agent_settings
+                                .execution_budget
+                                .recursive_handoff_max_chars
+                                .max(1);
+                            let parent = da_summary.chars().take(max_chars).collect::<String>();
+                            let related = truncate_chars(&summaries.join("\n"), max_chars);
+                            sub_ctx = sub_ctx.with_prev_summary(&format!(
+                                "Parent DA evidence:\n{}{}\n\nRelated completed-step evidence:\n{}",
+                                parent, sibling_evidence, related
+                            ));
                         }
                     }
                 }
@@ -1929,6 +3029,7 @@ Output only JSON."#,
                     branch_fallback: None,
                     retry_count: 0,
                     retry_delay_secs: 0,
+                    effect_policy: sub_effect_policy,
                 };
 
                 let total = parsed.sub_tasks.len();
@@ -1948,6 +3049,8 @@ Output only JSON."#,
                 let sub_result = self
                     .dispatch_agent(AgentRole::Do, sub_ctx, cycle_id, Some(sub_step), 0)
                     .await?;
+                recursive_budget.record_turns(sub_result.turn_count);
+                execution_facts.record(&sub_result);
 
                 self.emit_sa_thought(
                     task_iri,
@@ -1966,6 +3069,7 @@ Output only JSON."#,
                     let icon = if sub_result.status == "success" {
                         "✅"
                     } else {
+                        outcome.partial_count += 1;
                         "⚠️"
                     };
                     sub_summaries.push(format!(
@@ -1975,7 +3079,15 @@ Output only JSON."#,
                         sub_result.summary
                     ));
 
-                    if current_depth < max_depth && sub_result.status == "success" {
+                    let sub_completion = crate::core::effect::CompletionEnvelope::from_result(
+                        &sub_result.status,
+                        sub_result.output.as_ref(),
+                        &sub_result.summary,
+                    );
+                    if current_depth < max_depth
+                        && sub_result.status == "success"
+                        && sub_completion.needs_follow_up_execution()
+                    {
                         // Only fully successful sub-tasks continue deeper recursion; partial_success continues in upper recursion
                         self.emit_sa_thought(
                             task_iri,
@@ -1990,6 +3102,7 @@ Output only JSON."#,
                         match self
                             .execute_recursive_sub_cycle(
                                 &sub_result.summary,
+                                &sub_completion,
                                 task_iri,
                                 cycle_id,
                                 &format!("{}_sub_{}", parent_step_id, idx),
@@ -1997,22 +3110,35 @@ Output only JSON."#,
                                 current_depth + 1,
                                 five_w2h,
                                 five_w2h_iri,
+                                execution_facts,
+                                task_effect_policy,
+                                task_constraints,
+                                recursive_budget,
                             )
                             .await
                         {
-                            Ok(deeper_summary) => {
+                            Ok(deeper_outcome) => {
+                                outcome.failed_count += deeper_outcome.failed_count;
+                                outcome.partial_count += deeper_outcome.partial_count;
                                 sub_summaries.push(format!(
                                     "#### Deep sub-task (depth={})\n{}",
                                     current_depth + 1,
-                                    deeper_summary
+                                    deeper_outcome.summary
                                 ));
                             }
                             Err(e) => {
                                 warn!(error = %e, "Deep recursive sub-cycle failed");
+                                outcome.failed_count += 1;
+                                sub_summaries.push(format!(
+                                    "#### Deep sub-task (depth={}) ❌\nRecursive execution failed: {}",
+                                    current_depth + 1,
+                                    e
+                                ));
                             }
                         }
                     }
                 } else {
+                    outcome.failed_count += 1;
                     sub_summaries.push(format!(
                         "### Sub-task {} ❌\nExecution failed: {}",
                         idx + 1,
@@ -2030,7 +3156,8 @@ Output only JSON."#,
                 "recursive_sub_cycle_end",
             )
             .await;
-            Ok(sub_summaries.join("\n\n"))
+            outcome.summary = sub_summaries.join("\n\n");
+            Ok(outcome)
         })
     }
 }
@@ -2038,6 +3165,223 @@ Output only JSON."#,
 #[cfg(test)]
 mod terminal_status_tests {
     use super::*;
+
+    #[test]
+    fn recursive_budget_is_shared_across_branches_and_turns() {
+        let mut budget = RecursiveExecutionBudget::new(2, 10);
+        assert_eq!(budget.reserve(8), Some(8));
+        budget.record_turns(6);
+        assert_eq!(budget.reserve(8), Some(4));
+        budget.record_turns(4);
+        assert_eq!(budget.reserve(1), None);
+    }
+
+    #[test]
+    fn recursive_required_effect_is_revalidated_conditionally() {
+        let required = crate::core::effect::EffectPolicy::Required {
+            effect: crate::core::effect::EffectKind::WorkspaceMutation,
+        };
+        assert!(matches!(
+            recursive_effect_policy(&required, &crate::core::effect::EffectPolicy::None),
+            crate::core::effect::EffectPolicy::Conditional {
+                effect: crate::core::effect::EffectKind::WorkspaceMutation,
+                ..
+            }
+        ));
+        let missing_condition = crate::core::effect::EffectPolicy::Conditional {
+            effect: crate::core::effect::EffectKind::StateChange,
+            condition: String::new(),
+        };
+        assert!(matches!(
+            recursive_effect_policy(
+                &missing_condition,
+                &crate::core::effect::EffectPolicy::None
+            ),
+            crate::core::effect::EffectPolicy::Conditional { condition, .. }
+                if !condition.is_empty()
+        ));
+    }
+
+    #[test]
+    fn residual_task_key_deduplicates_case_and_punctuation() {
+        let first = ResidualTaskDef {
+            objective: "Verify API wiring!".to_string(),
+            role: "Do".to_string(),
+            success_criteria: "done".to_string(),
+            effect_policy: crate::core::effect::EffectPolicy::None,
+        };
+        let mut second = first.clone();
+        second.objective = " verify-api WIRING ".to_string();
+        assert_eq!(residual_task_key(&first), residual_task_key(&second));
+        let mut budget = RecursiveExecutionBudget::new(4, 20);
+        assert!(budget.claim_residual(&first));
+        assert!(!budget.claim_residual(&second));
+    }
+
+    #[test]
+    fn aa_failure_reenters_pa_while_ca_and_da_failures_stay_executable() {
+        assert_eq!(
+            failed_business_role_recovery(AgentRole::Act),
+            ("ReplanPa", "Task")
+        );
+        assert_eq!(
+            failed_business_role_recovery(AgentRole::Plan),
+            ("ReplanPa", "Task")
+        );
+        assert_eq!(
+            failed_business_role_recovery(AgentRole::Check),
+            ("RetryDa", "Step")
+        );
+        assert_eq!(
+            failed_business_role_recovery(AgentRole::Do),
+            ("RetryDa", "Step")
+        );
+    }
+
+    #[test]
+    fn recursive_subtasks_receive_an_executable_turn_budget() {
+        assert_eq!(recursive_subtask_turn_budget(50, 1), 25);
+        assert_eq!(recursive_subtask_turn_budget(50, 2), 16);
+        assert_eq!(recursive_subtask_turn_budget(50, 3), 12);
+        assert_eq!(recursive_subtask_turn_budget(8, 1), 8);
+    }
+
+    #[test]
+    fn business_role_tool_policy_cannot_be_broadened_by_plan_output() {
+        assert_eq!(
+            enforce_business_role_tool_policy(
+                AgentRole::Act,
+                Some(vec!["file_read".into(), "bash".into()])
+            ),
+            Some(Vec::new()),
+            "AA is decision-only even when an LLM plan requests tools"
+        );
+        assert_eq!(
+            enforce_business_role_tool_policy(
+                AgentRole::Check,
+                Some(vec!["file_read".into(), "file_write".into()])
+            ),
+            Some(vec!["file_read".into()]),
+            "CA may inspect evidence but may not mutate it"
+        );
+        assert_eq!(
+            enforce_business_role_tool_policy(AgentRole::Do, Some(vec!["file_write".into()])),
+            Some(vec!["file_write".into()]),
+            "DA retains the plan's execution capability"
+        );
+    }
+
+    #[test]
+    fn aa_declared_failure_is_not_flattened_to_runner_success() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/aa-verdict".into(),
+            status: "success".into(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "CA evidence PASS, but process audit failed; 判定 FAILED".into(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        apply_aa_declared_verdict(&mut result, None);
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.verdict, Some(TaskVerdict::Failed));
+    }
+
+    #[test]
+    fn aa_missing_prefix_converges_from_latest_ca_report() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/aa-ca-fallback".into(),
+            status: "success".into(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "任务完成，闭环通过".into(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let report = crate::core::recovery::AuditReport {
+            verdict: crate::core::recovery::AuditVerdict::Pass,
+            failed_dimensions: vec![],
+            findings: vec![],
+            scope: crate::core::recovery::RepairScope::Step,
+            reason: None,
+        };
+
+        apply_aa_declared_verdict(&mut result, Some(&report));
+
+        assert_eq!(result.status, "success");
+        assert_eq!(result.verdict, Some(TaskVerdict::Success));
+    }
+
+    #[test]
+    fn aa_output_prefix_is_authoritative_when_summary_omits_it() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/aa-output-verdict".into(),
+            status: "success".into(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "AA accepts after CA PASS".into(),
+            output: Some(serde_json::Value::String(
+                "SUCCESS: CA audit PASS confirmed the artifact byte-exact".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let conditional = crate::core::recovery::AuditReport {
+            verdict: crate::core::recovery::AuditVerdict::Conditional,
+            failed_dimensions: vec![],
+            findings: vec![],
+            scope: crate::core::recovery::RepairScope::Step,
+            reason: None,
+        };
+
+        apply_aa_declared_verdict(&mut result, Some(&conditional));
+
+        assert_eq!(result.status, "success");
+        assert_eq!(result.verdict, Some(TaskVerdict::Success));
+    }
+
+    #[test]
+    fn aa_failed_output_prefix_is_not_flattened_by_runner_summary() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/aa-output-failure".into(),
+            status: "success".into(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "AA reviewed the evidence".into(),
+            output: Some(serde_json::Value::String(
+                "FAILED: required acceptance evidence is absent".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+
+        apply_aa_declared_verdict(&mut result, None);
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.verdict, Some(TaskVerdict::Failed));
+    }
 
     #[test]
     fn ca_dimension_failure_forces_terminal_failure() {
@@ -2089,5 +3433,63 @@ mod terminal_status_tests {
 
         assert_eq!(result.status, "success");
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn task_execution_facts_preserve_earlier_agent_tools() {
+        let action = crate::core::tracked_action::TrackedAction {
+            action_id: "action-da-1".to_string(),
+            tool_name: "file_write".to_string(),
+            agent_role: "DA".to_string(),
+            duration_secs: 0.1,
+            status: crate::core::tracked_action::ActionStatus::Success,
+            files_created: Vec::new(),
+            files_modified: Vec::new(),
+            files_read: Vec::new(),
+            error: None,
+            substantive_effect: false,
+            tool_args: std::collections::HashMap::new(),
+        };
+        let da = TaskResult {
+            task_iri: "iri://task/facts".to_string(),
+            status: "success".to_string(),
+            summary: "implemented".to_string(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![serde_json::json!({"path": "out.txt"})],
+            errors: Vec::new(),
+            turn_count: 4,
+            tool_call_count: 2,
+            five_w2h_updates: None,
+            tracked_actions: vec![action],
+            verdict: Some(TaskVerdict::Success),
+            archive_iri: None,
+        };
+        let mut aa = TaskResult {
+            task_iri: "iri://task/facts".to_string(),
+            status: "success".to_string(),
+            summary: "accepted".to_string(),
+            output: None,
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: Vec::new(),
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            verdict: Some(TaskVerdict::Success),
+            archive_iri: None,
+        };
+
+        let mut facts = TaskExecutionFacts::default();
+        facts.record(&da);
+        facts.record(&aa);
+        facts.apply_to(&mut aa);
+
+        assert_eq!(aa.turn_count, 5);
+        assert_eq!(aa.tool_call_count, 2);
+        assert_eq!(aa.tracked_actions.len(), 1);
+        assert_eq!(aa.tracked_actions[0].tool_name, "file_write");
+        assert_eq!(aa.artifacts.len(), 1);
     }
 }

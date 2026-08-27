@@ -57,6 +57,133 @@ mod tests {
     }
 
     #[test]
+    fn empty_tools_allowlist_denies_every_tool() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let result = executor
+                .execute_with_security_context(
+                    "file_read",
+                    json!({"path": "unused"}),
+                    crate::skill_graph::security::SecurityContext::new("agent:aa", "AA")
+                        .with_task("iri://tasks/aa-deny-all"),
+                    Some(&[]),
+                )
+                .await
+                .unwrap();
+            assert!(result
+                .get("error")
+                .and_then(|error| error.as_str())
+                .unwrap_or_default()
+                .contains("Tool not allowed: file_read"));
+        });
+    }
+
+    #[test]
+    fn file_read_capability_allows_only_read_result_microtools() {
+        let allowed = vec!["file_read".to_string()];
+        assert!(ToolExecutor::explicit_allowlist_permits(
+            "read_full_result_call_123",
+            &allowed
+        ));
+        assert!(ToolExecutor::explicit_allowlist_permits(
+            "read_agent_output",
+            &allowed
+        ));
+        assert!(!ToolExecutor::explicit_allowlist_permits(
+            "file_write",
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn micro_tool_lookup_is_scoped_by_originating_call() {
+        let mut executor = ToolExecutor::new();
+        for call_id in ["call_a", "call_b"] {
+            executor.register_micro_tool(
+                &format!("read_full_result_{call_id}"),
+                MicroToolContext {
+                    call_id: call_id.to_string(),
+                    storage_key: format!("iri://tool-result/{call_id}"),
+                    tool_name: "file_read".to_string(),
+                    entity_types: vec![],
+                    preview_size: 100,
+                },
+            );
+        }
+
+        assert_eq!(
+            executor.get_micro_tool_names_for_call("call_a"),
+            vec!["read_full_result_call_a".to_string()]
+        );
+        assert!(executor.get_micro_tool_names_for_call("unknown").is_empty());
+    }
+
+    #[test]
+    fn configured_micro_tool_limits_control_catalog_and_paging() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            executor.set_micro_tool_limits(2, 2, 3);
+            for call_id in ["one", "two", "three"] {
+                let storage_key = format!("iri://tool-result/{call_id}");
+                executor.store_micro_tool_data(&storage_key, json!({"content": "a\nb\nc\nd\ne"}));
+                executor.register_micro_tool(
+                    &format!("read_full_result_{call_id}"),
+                    MicroToolContext {
+                        call_id: call_id.to_string(),
+                        storage_key,
+                        tool_name: "file_read".to_string(),
+                        entity_types: vec![],
+                        preview_size: 1,
+                    },
+                );
+            }
+
+            let advertised = executor
+                .tool_definitions_for_role("DA")
+                .into_iter()
+                .filter(|definition| {
+                    definition["function"]["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("read_full_result_"))
+                })
+                .count();
+            assert_eq!(advertised, 2);
+
+            let default_page = executor
+                .execute("read_full_result_three", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(default_page["returned"], 2);
+            let capped_page = executor
+                .execute("read_full_result_three", json!({"limit": 99}))
+                .await
+                .unwrap();
+            assert_eq!(capped_page["returned"], 3);
+        });
+    }
+
+    #[test]
+    fn tool_search_queries_the_live_catalog_instead_of_static_fallback() {
+        rt().block_on(async {
+            let executor = ToolExecutor::new();
+            let result = executor
+                .execute(
+                    "tool_search",
+                    json!({"query": "knowledge import directory", "max_results": 10}),
+                )
+                .await
+                .unwrap();
+            let names: Vec<&str> = result["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect();
+            assert!(names.contains(&"knowledge_import_directory"));
+        });
+    }
+
+    #[test]
     fn tools_allowed_passes_listed_tool_through() {
         rt().block_on(async {
             let executor = ToolExecutor::new();
@@ -76,6 +203,192 @@ mod tests {
                 .and_then(|e| e.as_str())
                 .unwrap_or("")
                 .contains("Tool not allowed: tool_search"));
+        });
+    }
+
+    #[test]
+    fn cached_large_file_still_returns_later_requested_ranges() {
+        rt().block_on(async {
+            // Built-in file tools intentionally enforce the process workspace.
+            // Keep the fixture inside it so this test reaches the cache/range
+            // behavior instead of being rejected by path isolation first.
+            let dir = tempfile::Builder::new()
+                .prefix(".file-read-cache-test-")
+                .tempdir_in(std::env::current_dir().unwrap())
+                .unwrap();
+            let path = dir.path().join("large.txt");
+            let content = (0..500)
+                .map(|index| format!("line-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&path, content).unwrap();
+
+            let monitor = crate::tools::workspace_monitor::WorkspaceMonitor::initialize(
+                crate::tools::workspace_monitor::WorkspaceMonitorConfig {
+                    workspace_root: dir.path().to_path_buf(),
+                    watch_enabled: false,
+                    db_path: None,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let mut executor = ToolExecutor::new();
+            executor.set_workspace_monitor(Arc::new(monitor));
+
+            let first = executor
+                .execute("file_read", json!({"path": path, "offset": 0, "limit": 10}))
+                .await
+                .unwrap();
+            let second = executor
+                .execute(
+                    "file_read",
+                    json!({"path": path, "offset": 10, "limit": 10}),
+                )
+                .await
+                .unwrap();
+
+            assert!(first.get("lines").is_some());
+            assert!(second.get("lines").is_some(), "{second}");
+            assert!(second.to_string().contains("line-10"), "{second}");
+        });
+    }
+
+    #[test]
+    fn file_write_reports_semantic_noop_without_advancing_workspace_generation() {
+        rt().block_on(async {
+            let dir = tempfile::Builder::new()
+                .prefix(".file-write-noop-test-")
+                .tempdir_in(std::env::current_dir().unwrap())
+                .unwrap();
+            let path = dir.path().join("same.txt");
+            std::fs::write(&path, "same content").unwrap();
+            let monitor = Arc::new(
+                crate::tools::workspace_monitor::WorkspaceMonitor::initialize(
+                    crate::tools::workspace_monitor::WorkspaceMonitorConfig {
+                        workspace_root: dir.path().to_path_buf(),
+                        watch_enabled: false,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            let initial_generation = monitor.generation();
+            let mut executor = ToolExecutor::new();
+            executor.set_workspace_monitor(monitor.clone());
+
+            let result = executor
+                .execute(
+                    "file_write",
+                    json!({"path": path, "content": "same content"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["success"], true);
+            assert_eq!(result["changed"], false);
+            assert_eq!(result["bytes_written"], 0);
+            assert_eq!(monitor.generation(), initial_generation);
+        });
+    }
+
+    #[test]
+    fn file_list_uses_complete_workspace_inventory_with_canonical_state() {
+        rt().block_on(async {
+            let dir = tempfile::Builder::new()
+                .prefix(".inventory-list-test-")
+                .tempdir_in(std::env::current_dir().unwrap())
+                .unwrap();
+            std::fs::create_dir_all(dir.path().join("src")).unwrap();
+            std::fs::write(dir.path().join("src/lib.rs"), "pub fn value() -> u8 { 1 }").unwrap();
+            let monitor = crate::tools::workspace_monitor::WorkspaceMonitor::initialize(
+                crate::tools::workspace_monitor::WorkspaceMonitorConfig {
+                    workspace_root: dir.path().to_path_buf(),
+                    watch_enabled: false,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let mut executor = ToolExecutor::new();
+            executor.set_workspace_monitor(Arc::new(monitor));
+
+            let root = executor
+                .execute("file_list", json!({"path": dir.path()}))
+                .await
+                .unwrap();
+            assert_eq!(root["source"], "workspace_inventory");
+            assert!(root["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == "src" && entry["type"] == "dir"));
+
+            let src = executor
+                .execute("file_list", json!({"path": dir.path().join("src")}))
+                .await
+                .unwrap();
+            let lib = src["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == "lib.rs")
+                .unwrap();
+            assert_eq!(lib["language"], "rust");
+            assert_eq!(lib["state"], "discovered");
+        });
+    }
+
+    #[test]
+    fn whole_file_cache_visibility_is_isolated_between_biz_agents() {
+        rt().block_on(async {
+            let dir = tempfile::Builder::new()
+                .prefix(".file-read-agent-cache-test-")
+                .tempdir_in(std::env::current_dir().unwrap())
+                .unwrap();
+            let path = dir.path().join("shared.txt");
+            std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+            let monitor = crate::tools::workspace_monitor::WorkspaceMonitor::initialize(
+                crate::tools::workspace_monitor::WorkspaceMonitorConfig {
+                    workspace_root: dir.path().to_path_buf(),
+                    watch_enabled: false,
+                    db_path: None,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let mut executor = ToolExecutor::new();
+            executor.set_workspace_monitor(Arc::new(monitor));
+            let allowed = ["file_read".to_string()];
+
+            let read_as = |agent: &str| {
+                executor.execute_with_security_context(
+                    "file_read",
+                    json!({"path": path}),
+                    crate::skill_graph::security::SecurityContext::new(agent, "DA")
+                        .with_task("iri://tasks/shared-cache"),
+                    Some(&allowed),
+                )
+            };
+
+            let pa_first = read_as("pa_001").await.unwrap();
+            let pa_repeat = read_as("pa_001").await.unwrap();
+            let da_first = read_as("da_001").await.unwrap();
+
+            assert!(pa_first.get("lines").is_some(), "{pa_first}");
+            assert!(pa_repeat.get("lines").is_none(), "{pa_repeat}");
+            assert_eq!(pa_repeat.get("from_cache"), Some(&Value::Bool(true)));
+            assert!(
+                da_first.get("lines").is_some(),
+                "a new BizAgent context must receive cached content: {da_first}"
+            );
+            assert_eq!(da_first.get("from_cache"), Some(&Value::Bool(true)));
         });
     }
 
@@ -120,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn security_gate_allows_aa_ca_inspection_tools_with_whitelisted_file_read() {
+    fn security_gate_allows_ca_inspection_tools_with_whitelisted_file_read() {
         rt().block_on(async {
             let executor = ToolExecutor::new();
             let registry = Arc::new(SkillRegistry::new());
@@ -146,9 +459,8 @@ mod tests {
             executor.set_shared_skill_graph(graph);
             executor.set_security_engine(security.clone());
 
-            // The AA/CA default inspection tools (also registered read-only workspace/KG readers)
-            // must NOT be rejected as "no registered executable skill" — otherwise the
-            // verify-first CA/AA cannot inspect the workspace and cannot verify deliverables.
+            // CA inspection tools must not be rejected as unregistered. AA is
+            // decision-only and receives this evidence from CA through BizAgent.
             for tool in [
                 "file_list",
                 "workspace_status",
@@ -164,7 +476,7 @@ mod tests {
                     .execute_with_security_context(
                         tool,
                         json!({"path": "."}),
-                        crate::skill_graph::security::SecurityContext::new("agent:test", "AA")
+                        crate::skill_graph::security::SecurityContext::new("agent:test", "CA")
                             .with_task("iri://tasks/security-test"),
                         None,
                     )
@@ -184,6 +496,24 @@ mod tests {
                     err
                 );
             }
+
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!("ca-security-audit-{}.txt", uuid::Uuid::new_v4()));
+            std::fs::write(&path, b"verified").unwrap();
+            let read_result = executor
+                .execute_with_security_context(
+                    "file_read",
+                    json!({"path": path}),
+                    crate::skill_graph::security::SecurityContext::new("agent:test", "CA")
+                        .with_task("iri://tasks/security-test"),
+                    None,
+                )
+                .await;
+            let _ = std::fs::remove_file(&path);
+            let read = read_result.unwrap();
+            assert_eq!(read["lines"][0], "verified");
 
             let audit = security
                 .get_audit_log(Some("iri://skills/file_read"), Some("agent:test"), 50)
@@ -340,8 +670,16 @@ mod tests {
         assert!(ToolExecutor::is_pa_readonly_tool("bash"));
         assert!(ToolExecutor::is_pa_readonly_tool("file_read"));
         assert!(ToolExecutor::is_pa_readonly_tool("grep_search"));
+        assert!(ToolExecutor::is_pa_readonly_tool("read_agent_output"));
+        assert!(ToolExecutor::is_pa_readonly_tool(
+            "read_full_result_call_session_a"
+        ));
+        assert!(ToolExecutor::is_pa_readonly_tool("query_result_entities"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_write"));
         assert!(!ToolExecutor::is_pa_readonly_tool("file_edit"));
+        assert!(!ToolExecutor::is_pa_readonly_tool(
+            "unregistered_dynamic_tool"
+        ));
     }
 
     #[test]
@@ -393,8 +731,9 @@ mod tests {
 
     /// Regression test: MCP tools are registered with long-form role names
     /// ("Plan"/"Do"/"Check"/"Act", see McpClient::register_tools_to_tool_executor),
-    /// while consumers call tool_definitions_for_role with short-form names
-    /// ("PA"/"DA"/"CA"/"AA", see AgentRole::Display). Both conventions must match.
+    /// while consumers call tool_definitions_for_role with short-form names.
+    /// Trusted role aliases must match, while the kernel ceiling still blocks
+    /// arbitrary tools for PA/CA and every tool for decision-only AA.
     #[test]
     fn test_long_form_allowed_roles_match_short_form_agent_roles() {
         rt().block_on(async {
@@ -406,21 +745,34 @@ mod tests {
                 Arc::new(|input: Value| Box::pin(async move { Ok(json!({"ok": input})) })),
                 &["Plan", "Do", "Check", "Act"],
             );
+            executor.register(
+                "web_search",
+                "PA read-only MCP tool",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(|input: Value| Box::pin(async move { Ok(json!({"ok": input})) })),
+                &["Plan"],
+            );
+            executor.register(
+                "jsonld_validate",
+                "CA validation MCP tool",
+                json!({"type": "object", "properties": {}}),
+                Arc::new(|input: Value| Box::pin(async move { Ok(json!({"ok": input})) })),
+                &["Check"],
+            );
 
-            for role in ["PA", "DA", "CA", "AA"] {
-                let defs = executor.tool_definitions_for_role(role);
-                let names: Vec<String> = defs
+            let names = |role: &str| {
+                executor
+                    .tool_definitions_for_role(role)
                     .iter()
-                    .map(|d| d["function"]["name"].as_str().unwrap_or("").to_string())
-                    .collect();
-                assert!(
-                    names.contains(&"mcp_server_browse".to_string()),
-                    "role {} should see the MCP-registered tool, got {} tools: {:?}",
-                    role,
-                    names.len(),
-                    &names[..names.len().min(15)]
-                );
-            }
+                    .filter_map(|d| d["function"]["name"].as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            };
+            assert!(names("PA").contains(&"web_search".to_string()));
+            assert!(names("CA").contains(&"jsonld_validate".to_string()));
+            assert!(names("DA").contains(&"mcp_server_browse".to_string()));
+            assert!(!names("PA").contains(&"mcp_server_browse".to_string()));
+            assert!(!names("CA").contains(&"mcp_server_browse".to_string()));
+            assert!(executor.tool_definitions_for_role("AA").is_empty());
         });
     }
 
@@ -434,7 +786,7 @@ mod tests {
             .filter_map(|td| td["function"]["name"].as_str().map(String::from))
             .collect();
 
-        // None/empty allowlist → full role-filtered set unchanged
+        // None keeps the full role-filtered set; explicit empty denies all.
         assert_eq!(
             executor
                 .tool_definitions_for_role_with_allowlist("DA", None)
@@ -442,12 +794,9 @@ mod tests {
             full.len()
         );
         let empty: Vec<String> = vec![];
-        assert_eq!(
-            executor
-                .tool_definitions_for_role_with_allowlist("DA", Some(&empty))
-                .len(),
-            full.len()
-        );
+        assert!(executor
+            .tool_definitions_for_role_with_allowlist("DA", Some(&empty))
+            .is_empty());
 
         // Single-tool allowlist → intersection keeps only that tool
         let one = vec![full_names[0].clone()];
@@ -476,10 +825,7 @@ mod tests {
             .filter_map(|td| td["function"]["name"].as_str().map(String::from))
             .collect();
 
-        assert!(names.contains("file_read"));
-        assert!(names.contains("tool_search"));
-        assert!(!names.contains("rag_search"));
-        assert!(!names.contains("knowledge_search"));
+        assert!(names.is_empty(), "AA must not receive a tool menu");
     }
 
     #[cfg(unix)]

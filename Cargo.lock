@@ -1595,6 +1595,7 @@ dependencies = [
  "dashmap 5.5.3",
  "dotenv",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "glob",
  "hex",

@@ -1,10 +1,13 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::causal::engine::CausalEngine;
 use crate::causal::types::CausalObservation;
@@ -38,12 +41,23 @@ pub struct WorkspaceMonitorConfig {
     pub content_cache_capacity: usize,
     /// Enable native file system watching.
     pub watch_enabled: bool,
+    /// Defer the initial inventory scan until async components start. TUI
+    /// applications use this so interface rendering is never blocked by a
+    /// large workspace walk; services may retain eager initialization.
+    pub defer_initial_scan: bool,
+    /// Maximum number of workspace deltas retained for generation queries.
+    pub change_history_capacity: usize,
     /// Polling interval in ms (fallback when native watching unavailable).
     pub poll_interval_ms: u64,
     /// Debounce window in ms for file events.
     pub debounce_ms: u64,
     /// Maximum debounce wait in ms.
     pub max_debounce_wait_ms: u64,
+    pub initial_scan_wait_ms: u64,
+    /// Bounds for semantic before/after snapshots used to confirm shell-like
+    /// workspace effects without making full content part of the LLM context.
+    pub effect_snapshot_max_files: usize,
+    pub effect_snapshot_max_bytes: u64,
     /// Optional redb database path for persistent storage.
     pub db_path: Option<PathBuf>,
 }
@@ -68,9 +82,14 @@ impl Default for WorkspaceMonitorConfig {
             content_store_max_bytes: 64 * 1024 * 1024, // 64 MB
             content_cache_capacity: 1000,
             watch_enabled: true,
+            defer_initial_scan: false,
+            change_history_capacity: 2048,
             poll_interval_ms: 5000,
             debounce_ms: 500,
             max_debounce_wait_ms: 5000,
+            initial_scan_wait_ms: 250,
+            effect_snapshot_max_files: 10_000,
+            effect_snapshot_max_bytes: 64 * 1024 * 1024,
             db_path: None,
         }
     }
@@ -88,12 +107,90 @@ pub struct WorkspaceMonitor {
     pub inventory: Arc<RwLock<FileInventory>>,
     pub content_store: Arc<ContentStore>,
     pub snapshot_manager: Arc<SnapshotManager>,
-    watch_engine: Option<WatchEngine>,
+    /// Watch installation can require walking every non-excluded directory.
+    /// Keep it behind a shared slot so initialization can happen after the TUI
+    /// is visible on a blocking worker instead of delaying application startup.
+    watch_engine: Arc<RwLock<Option<WatchEngine>>>,
+    watch_config: Option<WatchConfig>,
     event_bus: Option<Arc<EventBus>>,
     perception_store: RwLock<Option<Arc<PerceptionStore>>>,
     causal_engine: RwLock<Option<Arc<CausalEngine>>>,
     /// Idempotent guard for start_async_components().
     async_started: AtomicBool,
+    /// Monotonic workspace view generation. It changes only when the visible
+    /// inventory changes, allowing AgentRunner to inject bounded deltas rather
+    /// than repeating a complete manifest every turn.
+    generation: Arc<AtomicU64>,
+    scan_complete: Arc<AtomicBool>,
+    scan_notify: Arc<tokio::sync::Notify>,
+    changes: Arc<RwLock<VecDeque<WorkspaceChange>>>,
+    recent_agent_writes: Arc<RwLock<std::collections::HashMap<String, std::time::Instant>>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceChangeKind {
+    Created,
+    Modified,
+    Removed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceChangeOrigin {
+    AgentTool,
+    External,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceChange {
+    pub generation: u64,
+    pub path: String,
+    pub kind: WorkspaceChangeKind,
+    pub origin: WorkspaceChangeOrigin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFileView {
+    pub path: String,
+    pub file_size: u64,
+    pub language: String,
+    pub state: String,
+    pub version: u64,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    pub generation: u64,
+    pub scan_complete: bool,
+    pub total_files: usize,
+    pub files: Vec<WorkspaceFileView>,
+    pub changes: Vec<WorkspaceChange>,
+    pub truncated: bool,
+}
+
+fn record_workspace_change(
+    generation: &AtomicU64,
+    changes: &RwLock<VecDeque<WorkspaceChange>>,
+    capacity: usize,
+    path: &str,
+    kind: WorkspaceChangeKind,
+    origin: WorkspaceChangeOrigin,
+) {
+    let next = generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    let mut history = changes.write();
+    history.push_back(WorkspaceChange {
+        generation: next,
+        path: path.to_string(),
+        kind,
+        origin,
+    });
+    let capacity = capacity.max(1);
+    while history.len() > capacity {
+        history.pop_front();
+    }
 }
 
 impl WorkspaceMonitor {
@@ -146,8 +243,10 @@ impl WorkspaceMonitor {
 
         let event_bus_for_struct = event_bus.clone();
 
-        // WatchEngine — native file watching (inotify thread, no tokio needed)
-        let watch_engine = if let Some(eb) = event_bus.clone() {
+        // Prepare watching now, but defer directory-watch installation. Even
+        // metadata-only inventory scans are not the only startup cost: native
+        // non-recursive watches must enumerate every included directory.
+        let watch_config = if event_bus.is_some() && config.watch_enabled {
             let mut watch_config = WatchConfig {
                 debounce_ms: config.debounce_ms,
                 max_debounce_wait_ms: config.max_debounce_wait_ms,
@@ -162,17 +261,7 @@ impl WorkspaceMonitor {
             // Synchronize gitignore patterns to FileInventory so full_scan also respects them
             let gitignore_patterns = watch_config.exclude_patterns.clone();
             inventory.read().set_exclude_patterns(gitignore_patterns);
-
-            match WatchEngine::start(&root, watch_config, eb, Some(inventory.clone())) {
-                Ok(engine) => {
-                    info!("WatchEngine started for {}", root);
-                    Some(engine)
-                }
-                Err(e) => {
-                    tracing::warn!("WatchEngine failed to start: {}", e);
-                    None
-                }
-            }
+            Some(watch_config)
         } else {
             None
         };
@@ -183,21 +272,28 @@ impl WorkspaceMonitor {
             inventory,
             content_store,
             snapshot_manager,
-            watch_engine,
+            watch_engine: Arc::new(RwLock::new(None)),
+            watch_config,
             event_bus: event_bus_for_struct,
             perception_store: RwLock::new(None),
             causal_engine: RwLock::new(None),
             async_started: AtomicBool::new(false),
+            generation: Arc::new(AtomicU64::new(0)),
+            scan_complete: Arc::new(AtomicBool::new(false)),
+            scan_notify: Arc::new(tokio::sync::Notify::new()),
+            changes: Arc::new(RwLock::new(VecDeque::new())),
+            recent_agent_writes: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
 
         // Event consumers are deferred to start_async_components() which is called
         // from within an async context (process_task) after finalize_setup() has
         // wired the perception_store. This avoids spawning consumers with None.
-        // Perform initial scan
-        {
-            let inv = ws.inventory.read();
-            let discovered = inv.full_scan(&root);
-            debug!(discovered = discovered, "Initial workspace scan completed");
+        if !ws.config.defer_initial_scan {
+            let discovered = ws.inventory.read().full_scan(&root);
+            ws.scan_complete.store(true, Ordering::Release);
+            ws.scan_notify.notify_waiters();
+            ws.generation.store(1, Ordering::Release);
+            debug!(discovered, "Initial workspace metadata scan completed");
         }
 
         info!("WorkspaceMonitor initialized for root={}", root);
@@ -207,14 +303,19 @@ impl WorkspaceMonitor {
 
     /// Read a file through ContentStore with cache/diff support.
     pub fn read_file(&self, path: &str, mode: ReadMode) -> std::io::Result<ReadResult> {
-        let result = self.content_store.read_file(path, mode)?;
+        let normalized = self.normalize_path(path);
+        let result = self.content_store.read_file(&normalized, mode)?;
 
         // Update FileInventory state
         let inv = self.inventory.read();
         if result.changed {
-            inv.add_or_update(path);
+            inv.add_or_update(&normalized);
         }
-        inv.mark_read(path, result.version);
+        inv.mark_read_with_hash(
+            &normalized,
+            result.version,
+            self.content_store.get_hash(&normalized),
+        );
 
         Ok(result)
     }
@@ -223,15 +324,182 @@ impl WorkspaceMonitor {
     /// Used when file content was provided via read_full_result micro-tool,
     /// so subsequent file_read calls recognize it as already-read.
     pub fn mark_file_read_external(&self, path: &str) {
+        let path = self.normalize_path(path);
         let inv = self.inventory.read();
-        inv.mark_external_read(path);
+        inv.mark_external_read(&path);
     }
 
     /// Mark a file as written by the agent.
     pub fn mark_file_written(&self, path: &str) {
+        let path = self.normalize_path(path);
         let inv = self.inventory.read();
-        inv.mark_written(path);
-        self.content_store.invalidate(path);
+        let existed = inv.get_entry(&path).is_some();
+        inv.mark_written(&path);
+        self.content_store.invalidate(&path);
+        self.recent_agent_writes
+            .write()
+            .insert(path.clone(), std::time::Instant::now());
+        self.record_change(
+            &path,
+            if existed {
+                WorkspaceChangeKind::Modified
+            } else {
+                WorkspaceChangeKind::Created
+            },
+            WorkspaceChangeOrigin::AgentTool,
+        );
+    }
+
+    pub fn normalize_path(&self, path: &str) -> String {
+        let candidate = std::path::Path::new(path);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.config.workspace_root.join(candidate)
+        };
+        std::fs::canonicalize(&joined)
+            .unwrap_or(joined)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Compute a bounded digest of substantive workspace file paths and
+    /// contents. This is execution evidence only: the digest is never placed
+    /// in conversational history and therefore does not weaken L1's
+    /// current-session/history-summary boundary.
+    pub fn semantic_effect_fingerprint(&self) -> Result<String, String> {
+        self.inventory.read().semantic_fingerprint(
+            &self.config.workspace_root,
+            self.config.effect_snapshot_max_files,
+            self.config.effect_snapshot_max_bytes,
+        )
+    }
+
+    pub fn scan_complete(&self) -> bool {
+        self.scan_complete.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_initial_scan(&self) -> bool {
+        if self.scan_complete() {
+            return true;
+        }
+        let wait = self.scan_notify.notified();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(self.config.initial_scan_wait_ms),
+            wait,
+        )
+        .await;
+        self.scan_complete()
+    }
+
+    /// Return a bounded, generation-stamped view. File contents are never
+    /// embedded here; callers recover them through the existing micro-tools.
+    pub fn workspace_view(
+        &self,
+        since_generation: Option<u64>,
+        objective: Option<&str>,
+        max_files: usize,
+    ) -> WorkspaceView {
+        let terms = objective
+            .unwrap_or_default()
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|term| term.chars().count() >= 3)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut entries = self.inventory.read().list_all();
+        entries.sort_by(|left, right| {
+            let relevance = |path: &str| {
+                let normalized = path.to_lowercase();
+                terms
+                    .iter()
+                    .filter(|term| normalized.contains(term.as_str()))
+                    .count()
+            };
+            relevance(&right.path)
+                .cmp(&relevance(&left.path))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let total_files = entries.len();
+        let files = entries
+            .into_iter()
+            .take(max_files)
+            .map(|entry| WorkspaceFileView {
+                path: entry.path,
+                file_size: entry.file_size,
+                language: entry.language,
+                state: entry.state.as_str().to_string(),
+                version: entry.current_version,
+                content_hash: entry.content_hash,
+            })
+            .collect::<Vec<_>>();
+        let since = since_generation.unwrap_or(0);
+        let changes = self
+            .changes
+            .read()
+            .iter()
+            .filter(|change| change.generation > since)
+            .cloned()
+            .collect();
+        WorkspaceView {
+            generation: self.generation(),
+            scan_complete: self.scan_complete(),
+            total_files,
+            truncated: files.len() < total_files,
+            files,
+            changes,
+        }
+    }
+
+    pub fn format_delta_since(&self, since_generation: u64, max_changes: usize) -> Option<String> {
+        let current = self.generation();
+        if current <= since_generation {
+            return None;
+        }
+        let changes = self
+            .changes
+            .read()
+            .iter()
+            .filter(|change| change.generation > since_generation)
+            .take(max_changes)
+            .map(|change| {
+                format!(
+                    "- generation={} kind={:?} origin={:?} path={}",
+                    change.generation, change.kind, change.origin, change.path
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(if changes.is_empty() {
+            format!(
+                "Workspace inventory generation advanced from {} to {}; initial scan complete={}",
+                since_generation,
+                current,
+                self.scan_complete()
+            )
+        } else {
+            format!(
+                "Workspace generation {} -> {} (scan_complete={}):\n{}",
+                since_generation,
+                current,
+                self.scan_complete(),
+                changes.join("\n")
+            )
+        })
+    }
+
+    fn record_change(&self, path: &str, kind: WorkspaceChangeKind, origin: WorkspaceChangeOrigin) {
+        record_workspace_change(
+            &self.generation,
+            &self.changes,
+            self.config.change_history_capacity,
+            path,
+            kind,
+            origin,
+        );
     }
 
     /// Re-scan the entire workspace root, discovering new files and tracking state changes.
@@ -274,6 +542,10 @@ impl WorkspaceMonitor {
         let inventory = self.inventory.clone();
         let perception = self.perception_store.read().clone();
         let causal = self.causal_engine.read().clone();
+        let generation = self.generation.clone();
+        let changes = self.changes.clone();
+        let recent_agent_writes = self.recent_agent_writes.clone();
+        let change_history_capacity = self.config.change_history_capacity;
         let mut receiver = event_bus.subscribe();
         tokio::spawn(async move {
             loop {
@@ -284,6 +556,14 @@ impl WorkspaceMonitor {
                         match EventType::from_str(&event_type_name) {
                             EventType::WorkspaceFileCreated => {
                                 inventory.read().add_or_update(&path);
+                                record_workspace_change(
+                                    &generation,
+                                    &changes,
+                                    change_history_capacity,
+                                    &path,
+                                    WorkspaceChangeKind::Created,
+                                    WorkspaceChangeOrigin::External,
+                                );
                                 if let Some(ref ce) = causal {
                                     ce.record_observation(CausalObservation::new(
                                         &format!("ws_create_{}", uuid::Uuid::new_v4()),
@@ -303,13 +583,35 @@ impl WorkspaceMonitor {
                             }
                             EventType::WorkspaceFileModified => {
                                 let inv = inventory.read();
-                                if inv.get_entry(&path).is_none()
-                                    && std::path::Path::new(&path).exists()
-                                {
+                                let newly_discovered = inv.get_entry(&path).is_none()
+                                    && std::path::Path::new(&path).exists();
+                                if newly_discovered {
                                     drop(inv);
                                     inventory.read().add_or_update(&path);
+                                } else {
+                                    drop(inv);
                                 }
-                                inventory.read().mark_stale(&path);
+                                let agent_origin = recent_agent_writes
+                                    .write()
+                                    .remove(&path)
+                                    .is_some_and(|instant| {
+                                        instant.elapsed() <= std::time::Duration::from_secs(3)
+                                    });
+                                if !agent_origin {
+                                    inventory.read().mark_stale(&path);
+                                    record_workspace_change(
+                                        &generation,
+                                        &changes,
+                                        change_history_capacity,
+                                        &path,
+                                        if newly_discovered {
+                                            WorkspaceChangeKind::Created
+                                        } else {
+                                            WorkspaceChangeKind::Modified
+                                        },
+                                        WorkspaceChangeOrigin::External,
+                                    );
+                                }
                                 if let Some(ref ce) = causal {
                                     ce.record_observation(CausalObservation::new(
                                         &format!("ws_modify_{}", uuid::Uuid::new_v4()),
@@ -329,6 +631,15 @@ impl WorkspaceMonitor {
                             }
                             EventType::WorkspaceFileRemoved => {
                                 inventory.read().remove(&path);
+                                recent_agent_writes.write().remove(&path);
+                                record_workspace_change(
+                                    &generation,
+                                    &changes,
+                                    change_history_capacity,
+                                    &path,
+                                    WorkspaceChangeKind::Removed,
+                                    WorkspaceChangeOrigin::External,
+                                );
                                 if let Some(ref ce) = causal {
                                     ce.record_observation(CausalObservation::new(
                                         &format!("ws_remove_{}", uuid::Uuid::new_v4()),
@@ -376,12 +687,48 @@ impl WorkspaceMonitor {
             return;
         }
         self.register_event_consumers();
+        if let (Some(watch_config), Some(event_bus)) =
+            (self.watch_config.clone(), self.event_bus.clone())
+        {
+            let watch_engine = self.watch_engine.clone();
+            let inventory = self.inventory.clone();
+            let root = self.config.workspace_root.to_string_lossy().to_string();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                // WatchEngine's polling fallback and event callback capture the
+                // runtime handle from this entered context.
+                let _runtime_guard = runtime.enter();
+                match WatchEngine::start(&root, watch_config, event_bus, Some(inventory)) {
+                    Ok(engine) => {
+                        *watch_engine.write() = Some(engine);
+                        info!(root = %root, "Deferred WatchEngine installation completed");
+                    }
+                    Err(error) => {
+                        warn!(root = %root, %error, "Deferred WatchEngine installation failed");
+                    }
+                }
+            });
+        }
+        if !self.scan_complete() {
+            let inventory = self.inventory.clone();
+            let root = self.config.workspace_root.to_string_lossy().to_string();
+            let scan_complete = self.scan_complete.clone();
+            let generation = self.generation.clone();
+            let scan_notify = self.scan_notify.clone();
+            tokio::task::spawn_blocking(move || {
+                let discovered = inventory.read().full_scan(&root);
+                scan_complete.store(true, Ordering::Release);
+                generation.fetch_add(1, Ordering::AcqRel);
+                scan_notify.notify_waiters();
+                debug!(discovered, "Deferred workspace metadata scan completed");
+            });
+        }
     }
 
     /// Check whether a native or polling WatchEngine is actively monitoring the filesystem.
     /// Returns false when WatchEngine was never started (no EventBus) or failed to start.
     pub fn watch_engine_active(&self) -> bool {
-        self.watch_engine.is_some()
+        self.watch_engine.read().is_some()
     }
 
     /// Register hooks for file read/write tools to check inventory state.
@@ -427,7 +774,7 @@ impl WorkspaceMonitor {
                                 serde_json::Value::Bool(true),
                             );
                             let hint = format!(
-                                "[workspace_monitor] File '{}' unchanged since last read (v{}). Use mode:diff for incremental changes or mode:force_refresh to re-read.",
+                                "[workspace_monitor] File '{}' unchanged since last read (v{}). Use mode:diff for changes, or a targeted offset/limit range when prior content is no longer visible.",
                                 path, entry.current_version
                             );
                             ctx.data.insert(
@@ -607,7 +954,11 @@ impl WorkspaceMonitor {
         }
 
         if !discovered.is_empty() {
-            let names: Vec<&str> = discovered.iter().take(10).map(|e| e.path.as_str()).collect();
+            let names: Vec<&str> = discovered
+                .iter()
+                .take(10)
+                .map(|e| e.path.as_str())
+                .collect();
             parts.push(format!(
                 "{} new discovered files unread{}",
                 discovered.len(),
@@ -1504,11 +1855,8 @@ mod tests {
         assert_eq!(count, 0, "rescan on empty dir should discover 0 new files");
     }
 
-    #[test]
-    fn test_rescan_skipped_when_watch_engine_active() {
-        // When EventBus is provided, WatchEngine starts but may be in polling mode.
-        // rescan checks watch_engine_active() and skips if Some.
-        // We can only verify it doesn't crash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_watch_engine_installation_is_deferred_then_rescan_is_skipped() {
         let dir = tempfile::TempDir::new().unwrap();
         let bus = Arc::new(EventBus::new(100));
         let config = WorkspaceMonitorConfig {
@@ -1518,8 +1866,20 @@ mod tests {
             ..WorkspaceMonitorConfig::default()
         };
         let ws = WorkspaceMonitor::initialize(config, None, Some(bus)).unwrap();
+        assert!(
+            !ws.watch_engine_active(),
+            "watch enumeration must not delay synchronous/TUI initialization"
+        );
+        ws.start_async_components();
+        for _ in 0..100 {
+            if ws.watch_engine_active() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ws.watch_engine_active());
 
-        // rescan should return 0 (skipped, or if native watch started, skipped)
+        // An active watcher owns incremental discovery, so no full rescan runs.
         let count = ws.rescan();
         assert_eq!(
             count, 0,
@@ -1839,5 +2199,81 @@ mod tests {
             r2.unified_diff.as_ref().unwrap().contains("modified"),
             "Diff should contain the modified line"
         );
+    }
+
+    #[test]
+    fn workspace_view_tracks_agent_change_with_generation() {
+        let (ws, dir) = temp_ws_monitor();
+        let path = dir.path().join("generated.txt");
+        std::fs::write(&path, "generated").unwrap();
+        ws.mark_file_written(path.to_string_lossy().as_ref());
+
+        let view = ws.workspace_view(Some(0), Some("generated"), 20);
+        assert!(view.generation > 0);
+        assert!(view.scan_complete);
+        assert!(view
+            .files
+            .iter()
+            .any(|file| file.path == ws.normalize_path(path.to_string_lossy().as_ref())));
+        assert!(view.changes.iter().any(|change| {
+            change.origin == WorkspaceChangeOrigin::AgentTool
+                && change.kind == WorkspaceChangeKind::Created
+        }));
+    }
+
+    #[test]
+    fn initial_scan_is_metadata_only_and_targeted_read_populates_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("source.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                watch_enabled: false,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let normalized = ws.normalize_path(path.to_string_lossy().as_ref());
+        assert_eq!(
+            ws.inventory
+                .read()
+                .get_entry(&normalized)
+                .unwrap()
+                .content_hash,
+            ""
+        );
+        ws.read_file(&normalized, ReadMode::Full).unwrap();
+        assert!(!ws
+            .inventory
+            .read()
+            .get_entry(&normalized)
+            .unwrap()
+            .content_hash
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_initial_scan_completes_without_blocking_initialize() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                watch_enabled: false,
+                defer_initial_scan: true,
+                initial_scan_wait_ms: 2_000,
+                ..Default::default()
+            },
+            None,
+            Some(Arc::new(EventBus::new(16))),
+        )
+        .unwrap();
+        assert!(!ws.scan_complete());
+        ws.start_async_components();
+        assert!(ws.wait_for_initial_scan().await);
+        assert_eq!(ws.workspace_view(None, None, 10).total_files, 1);
     }
 }

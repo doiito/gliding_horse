@@ -14,12 +14,22 @@ impl MemoryBus {
     }
 
     pub async fn publish_invalidate(&self, node_iri: &str, scope_iri: &str) {
+        self.publish_invalidate_generation(node_iri, scope_iri, 0)
+            .await;
+    }
+
+    pub async fn publish_invalidate_generation(
+        &self,
+        node_iri: &str,
+        scope_iri: &str,
+        generation: u64,
+    ) {
         self.event_bus
             .emit(
                 scope_iri,
                 "CACHE_INVALIDATE",
                 "system:consistency_engine",
-                &serde_json::json!({"node_iri": node_iri}).to_string(),
+                &serde_json::json!({"node_iri": node_iri, "generation": generation}).to_string(),
             )
             .await;
     }
@@ -82,5 +92,28 @@ impl MemoryBus {
     /// Returns a `broadcast::Receiver` for system event notifications.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.event_bus.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalidation_event_carries_canonical_generation() {
+        let event_bus = Arc::new(EventBus::new(16));
+        let memory_bus = MemoryBus::new(event_bus);
+        let mut receiver = memory_bus.subscribe();
+
+        memory_bus
+            .publish_invalidate_generation("iri://knowledge/one", "iri://task/one", 42)
+            .await;
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.event_type, "CACHE_INVALIDATE");
+        assert_eq!(event.task_iri, "iri://task/one");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(payload["node_iri"], "iri://knowledge/one");
+        assert_eq!(payload["generation"], 42);
     }
 }

@@ -319,6 +319,7 @@ sequenceDiagram
     participant SA
     participant SPB as SystemPromptBuilder
     participant L3 as L3 Projection
+    participant BA as BizAgent
     participant AR as AgentRunner
     participant LLM
     participant L0 as L0 Store
@@ -329,7 +330,8 @@ sequenceDiagram
     L3-->>SPB: projection_data
     SPB-->>SA: 完整系统提示词
     
-    SA->>AR: execute(agent, ctx)
+    SA->>BA: 构造 BizAgent(agent.md, role, ctx)
+    BA->>AR: execute_with_agent_md(agent, ctx, agent.md)
     AR->>AR: 构建输出格式约束（带/不带 thought）
     AR->>LLM: 发送系统提示词 + 用户消息
     LLM-->>AR: thought/content/summary
@@ -338,7 +340,8 @@ sequenceDiagram
     AR->>L0: 存储强调内容（永久记忆）
     AR->>AR: apply_output_mapping()
     AR->>L2: 存储 JSON-LD 输出
-    AR-->>SA: TaskResult
+    AR-->>BA: TaskResult
+    BA-->>SA: TaskResult
 ```
 
 ## 2.5 配置驱动

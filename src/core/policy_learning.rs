@@ -16,6 +16,383 @@ use crate::memory::l0_store::L0Store;
 
 const PREFIX: &str = "iri://learning/policy/";
 
+/// Stable task-family features used by retrieval, treatment comparison and
+/// policy learning. `family` is deliberately coarser than `raw_features`:
+/// outcomes such as "summarise duration" and "summarise status" belong to the
+/// same intervention family, while the raw features remain available for
+/// audit and similarity ranking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearningTaskContext {
+    pub family: String,
+    pub operations: Vec<String>,
+    pub modalities: Vec<String>,
+    pub raw_features: Vec<String>,
+}
+
+fn canonical_family_from_parts(operations: &[String], modalities: &[String]) -> String {
+    let has = |values: &[String], candidates: &[&str]| {
+        values
+            .iter()
+            .any(|value| candidates.contains(&value.as_str()))
+    };
+    let intent = if has(
+        operations,
+        &[
+            "build",
+            "fix",
+            "implement",
+            "migrate",
+            "optimize",
+            "refactor",
+            "write",
+        ],
+    ) {
+        "change"
+    } else if has(operations, &["design"]) {
+        "design"
+    } else if has(
+        operations,
+        &["analyze", "audit", "research", "summarize", "verify"],
+    ) {
+        "inspect"
+    } else if has(operations, &["test"]) {
+        "test"
+    } else if has(operations, &["operate"]) {
+        "operate"
+    } else {
+        "generic"
+    };
+    let domain = if has(modalities, &["game", "ui", "web"]) {
+        "interactive"
+    } else if has(modalities, &["api", "code", "network", "service"]) {
+        "software"
+    } else if has(modalities, &["graph", "skill", "workflow"]) {
+        "knowledge_system"
+    } else if has(modalities, &["model"]) {
+        "model"
+    } else if has(modalities, &["data", "storage"]) {
+        "data"
+    } else if has(modalities, &["document"]) {
+        "document"
+    } else if has(modalities, &["image"]) {
+        "media"
+    } else {
+        "generic"
+    };
+    format!("planning:v3:intent={intent};domain={domain}")
+}
+
+/// Map persisted v2 family keys to the coarser v3 intervention boundary.
+/// Unknown/custom families remain exact, preserving caller-defined scopes.
+pub fn canonicalize_learning_family_key(family: &str) -> String {
+    if family.starts_with("planning:v3:") || !family.starts_with("planning:v2:") {
+        return family.to_string();
+    }
+    let Some((ops, kinds)) = family
+        .strip_prefix("planning:v2:ops=")
+        .and_then(|rest| rest.split_once(";kinds="))
+    else {
+        return family.to_string();
+    };
+    let operations = ops
+        .split('+')
+        .filter(|value| *value != "generic")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let modalities = kinds
+        .split('+')
+        .filter(|value| *value != "generic")
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    canonical_family_from_parts(&operations, &modalities)
+}
+
+pub fn learning_families_compatible(left: &str, right: &str) -> bool {
+    canonicalize_learning_family_key(left) == canonicalize_learning_family_key(right)
+}
+
+fn contains_any(text: &str, alternatives: &[&str]) -> bool {
+    alternatives
+        .iter()
+        .any(|candidate| text.contains(candidate))
+}
+
+/// Build a stable, transport-neutral task family from an objective.
+///
+/// Numbers, filenames and output-field names are intentionally excluded from
+/// the family key. Operations and broad artifact modalities remain, which is
+/// enough to share treatment evidence without pooling every implementation or
+/// analysis task into one unsafe global arm.
+pub fn learning_task_context(objective: &str) -> LearningTaskContext {
+    let normalized = objective.to_lowercase();
+    let operation_vocabulary: [(&str, &[&str]); 15] = [
+        ("analyze", &["analyze", "analyse", "analysis", "分析"]),
+        ("audit", &["audit", "审计"]),
+        (
+            "build",
+            &[
+                "build", "create", "generate", "develop", "创建", "生成", "搭建", "开发",
+            ],
+        ),
+        ("design", &["design", "设计"]),
+        ("fix", &["fix", "repair", "resolve", "修复", "解决", "修正"]),
+        (
+            "implement",
+            &[
+                "implement",
+                "add",
+                "extend",
+                "update",
+                "modify",
+                "support",
+                "实现",
+                "编写",
+                "新增",
+                "增加",
+                "扩展",
+                "修改",
+                "支持",
+            ],
+        ),
+        ("migrate", &["migrate", "migration", "迁移"]),
+        (
+            "optimize",
+            &["optimize", "optimise", "optimization", "优化", "完善"],
+        ),
+        ("refactor", &["refactor", "重构"]),
+        ("research", &["research", "search", "调研", "搜索"]),
+        (
+            "summarize",
+            &["summarize", "summarise", "summary", "汇总", "总结"],
+        ),
+        ("test", &["test", "benchmark", "测试", "基准"]),
+        ("verify", &["verify", "validate", "confirm", "验证", "确认"]),
+        ("write", &["write", "输出", "写入"]),
+        ("operate", &["run", "execute", "执行", "运行"]),
+    ];
+    let modality_vocabulary: [(&str, &[&str]); 15] = [
+        ("api", &[" api", "api ", "接口"]),
+        (
+            "code",
+            &[
+                "code",
+                "program",
+                "python",
+                "rust",
+                "javascript",
+                "typescript",
+                "golang",
+                "代码",
+                "程序",
+            ],
+        ),
+        ("data", &["data", "csv", "json", "jsonl", "数据"]),
+        (
+            "document",
+            &["document", "report", "markdown", "文档", "报告"],
+        ),
+        ("game", &["game", "游戏"]),
+        (
+            "graph",
+            &["graph", "ontology", "knowledge graph", "图谱", "本体"],
+        ),
+        ("image", &["image", "picture", "图片", "图像"]),
+        ("model", &["model", "policy", "模型", "策略"]),
+        ("network", &["network", "websocket", "网络"]),
+        ("service", &["service", "server", "daemon", "服务"]),
+        ("skill", &["skill", "技能"]),
+        (
+            "storage",
+            &["database", "storage", "memory", "数据库", "存储", "记忆"],
+        ),
+        ("ui", &[" ui", "ui ", "tui", "界面"]),
+        ("web", &["web", "html", "browser", "网页", "浏览器"]),
+        ("workflow", &["workflow", "dag", "pdca", "流程", "编排"]),
+    ];
+
+    let mut operations = operation_vocabulary
+        .iter()
+        .filter(|(_, alternatives)| contains_any(&normalized, alternatives))
+        .map(|(canonical, _)| (*canonical).to_string())
+        .collect::<Vec<_>>();
+    let mut modalities = modality_vocabulary
+        .iter()
+        .filter(|(_, alternatives)| contains_any(&normalized, alternatives))
+        .map(|(canonical, _)| (*canonical).to_string())
+        .collect::<Vec<_>>();
+    operations.sort();
+    operations.dedup();
+    modalities.sort();
+    modalities.dedup();
+
+    let mut raw_features = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| term.chars().count() >= 2)
+        .filter(|term| !term.chars().all(|character| character.is_ascii_digit()))
+        .filter(|term| {
+            !matches!(
+                *term,
+                "the"
+                    | "and"
+                    | "with"
+                    | "from"
+                    | "for"
+                    | "this"
+                    | "that"
+                    | "into"
+                    | "under"
+                    | "exact"
+                    | "bytes"
+            )
+        })
+        .map(|term| {
+            term.trim_end_matches(|character: char| character.is_ascii_digit())
+                .to_string()
+        })
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    raw_features.sort();
+    raw_features.dedup();
+    raw_features.truncate(24);
+
+    let family = if operations.is_empty() && modalities.is_empty() {
+        let fallback = raw_features.iter().take(6).cloned().collect::<Vec<_>>();
+        if fallback.is_empty() {
+            "planning:v3:intent=generic;domain=generic".to_string()
+        } else {
+            format!("planning:v3:terms={}", fallback.join("+"))
+        }
+    } else {
+        canonical_family_from_parts(&operations, &modalities)
+    };
+
+    LearningTaskContext {
+        family,
+        operations,
+        modalities,
+        raw_features,
+    }
+}
+
+pub fn learning_policy_context(objective: &str) -> String {
+    learning_task_context(objective).family
+}
+
+/// Controls whether accumulated experience may influence the current task.
+///
+/// Baseline is a true ablation arm: it neither retrieves historical context
+/// nor updates learned state. Shadow measures what would have been retrieved
+/// without changing the prompt or online policy. Active enables the complete
+/// continuous-learning loop.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningMode {
+    Baseline,
+    Shadow,
+    #[default]
+    Active,
+}
+
+impl LearningMode {
+    pub fn retrieves_history(self) -> bool {
+        !matches!(self, Self::Baseline)
+    }
+
+    pub fn injects_history(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    pub fn updates_learning(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+impl std::fmt::Display for LearningMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Baseline => "baseline",
+            Self::Shadow => "shadow",
+            Self::Active => "active",
+        })
+    }
+}
+
+impl std::str::FromStr for LearningMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "baseline" | "off" | "disabled" => Ok(Self::Baseline),
+            "shadow" | "observe" | "observation" => Ok(Self::Shadow),
+            "active" | "on" | "enabled" => Ok(Self::Active),
+            other => Err(format!(
+                "invalid learning mode '{other}'; expected active, baseline, or shadow"
+            )),
+        }
+    }
+}
+
+pub const AUDIT_EVIDENCE_PREFIX: &str = "iri://learning/ca-audit/";
+
+/// Durable, domain-neutral evidence emitted by SA after the latest CA audit
+/// and AA terminal decision. Applications may nominate a skill IRI to which a
+/// compact fragment is attached, but the kernel never invents an application
+/// domain or treats an LLM summary as verification by itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskAuditKnowledgeEvidence {
+    pub task_iri: String,
+    pub task_family: String,
+    pub raw_features: Vec<String>,
+    pub objective: String,
+    pub terminal_status: String,
+    pub ca_verdict: String,
+    #[serde(default)]
+    pub failed_dimensions: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<String>,
+    #[serde(default)]
+    pub procedure: Vec<String>,
+    #[serde(default)]
+    pub successful_checks: Vec<String>,
+    #[serde(default)]
+    pub failed_checks: Vec<String>,
+    #[serde(default)]
+    pub attached_skill_iri: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl TaskAuditKnowledgeEvidence {
+    pub fn reusable_success(&self) -> bool {
+        self.ca_verdict == "pass"
+            && matches!(self.terminal_status.as_str(), "success" | "completed")
+            && !self.successful_checks.is_empty()
+    }
+
+    pub fn storage_iri(&self) -> String {
+        let digest = sha2::Sha256::digest(self.task_iri.as_bytes());
+        format!("{AUDIT_EVIDENCE_PREFIX}{}", hex::encode(digest))
+    }
+}
+
+pub fn load_task_audit_evidence(
+    store: &L0Store,
+    task_family: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TaskAuditKnowledgeEvidence>, String> {
+    let mut evidence = store
+        .scan_iri_prefix(AUDIT_EVIDENCE_PREFIX, limit.max(1))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+        .filter(|item: &TaskAuditKnowledgeEvidence| {
+            task_family.map_or(true, |family| item.task_family == family)
+        })
+        .collect::<Vec<_>>();
+    evidence.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    evidence.truncate(limit);
+    Ok(evidence)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArmStats {
     pub pulls: u32,
@@ -97,6 +474,12 @@ pub struct TrainingMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PolicyEvaluation {
     pub samples: u32,
+    #[serde(default)]
+    pub baseline_samples: u32,
+    #[serde(default)]
+    pub candidate_samples: u32,
+    #[serde(default)]
+    pub candidate_action: Option<String>,
     pub baseline_return: f32,
     pub candidate_return: f32,
     pub improvement: f32,
@@ -130,16 +513,27 @@ pub struct PolicyDriftReport {
 
 impl Default for PolicyGate {
     fn default() -> Self {
-        Self { min_samples: 5, min_improvement: 0.0 }
+        Self {
+            min_samples: 5,
+            min_improvement: 0.0,
+        }
     }
 }
 
 impl PolicyGate {
-    pub fn assess(&self, baseline_return: f32, candidate_return: f32, samples: u32) -> PolicyEvaluation {
+    pub fn assess(
+        &self,
+        baseline_return: f32,
+        candidate_return: f32,
+        samples: u32,
+    ) -> PolicyEvaluation {
         let improvement = candidate_return - baseline_return;
         let accepted = samples >= self.min_samples && improvement >= self.min_improvement;
         PolicyEvaluation {
             samples,
+            baseline_samples: samples,
+            candidate_samples: samples,
+            candidate_action: None,
             baseline_return,
             candidate_return,
             improvement,
@@ -204,7 +598,10 @@ impl TrainablePolicyModel {
         }
         let scores: Vec<f32> = candidates.iter().map(|a| self.score(context, a)).collect();
         let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp: Vec<f32> = scores.iter().map(|score| (*score - max_score).exp()).collect();
+        let exp: Vec<f32> = scores
+            .iter()
+            .map(|score| (*score - max_score).exp())
+            .collect();
         let total = exp.iter().sum::<f32>().max(f32::EPSILON);
         exp.into_iter().map(|value| value / total).collect()
     }
@@ -232,7 +629,9 @@ impl TrainablePolicyModel {
                 } else {
                     observation.candidates.clone()
                 };
-                if self.greedy_action(&observation.context, &candidates).as_deref()
+                if self
+                    .greedy_action(&observation.context, &candidates)
+                    .as_deref()
                     == Some(observation.action.as_str())
                 {
                     observation.reward
@@ -250,7 +649,11 @@ impl TrainablePolicyModel {
         let baseline = &rewards[..baseline_count];
         let recent = &rewards[baseline_count..];
         let mean = |values: &[f32]| {
-            if values.is_empty() { 0.0 } else { values.iter().sum::<f32>() / values.len() as f32 }
+            if values.is_empty() {
+                0.0
+            } else {
+                values.iter().sum::<f32>() / values.len() as f32
+            }
         };
         let baseline_mean = mean(baseline);
         let recent_mean = mean(recent);
@@ -306,13 +709,22 @@ impl TrainablePolicyModel {
                 future_return += future_discount * future.reward.clamp(-1.0, 1.0);
                 future_discount *= gamma;
             }
-            self.train(&step.context, &step.action, &step.candidates, future_return.clamp(-1.0, 1.0));
+            self.train(
+                &step.context,
+                &step.action,
+                &step.candidates,
+                future_return.clamp(-1.0, 1.0),
+            );
         }
         TrainingMetrics {
             updates: self.updates,
             steps: steps.len() as u32,
             discounted_return,
-            average_reward: if steps.is_empty() { 0.0 } else { discounted_return / steps.len() as f32 },
+            average_reward: if steps.is_empty() {
+                0.0
+            } else {
+                discounted_return / steps.len() as f32
+            },
         }
     }
 }
@@ -338,7 +750,10 @@ impl Default for ConstrainedPolicy {
             model_version: 0,
             rollback_model: None,
             exploration_rate: 0.05,
-            min_observations: 2,
+            // One same-family rule outcome is enough to begin a bounded
+            // candidate trial. Promotion still requires PolicyGate's five
+            // independent observations on both arms.
+            min_observations: 1,
         }
     }
 }
@@ -364,6 +779,14 @@ impl ConstrainedPolicy {
                 })
                 .collect();
         }
+        // Rebuild the executable model from durable observations so v2
+        // contexts are normalized in memory before feature hashing. Arm
+        // records themselves remain untouched and auditable on disk.
+        if let Ok(observations) = Self::load_observations(&store) {
+            if !observations.is_empty() {
+                self.model = Self::replay(&observations).model;
+            }
+        }
         self.store = Some(store);
         self
     }
@@ -381,30 +804,56 @@ impl ConstrainedPolicy {
         let safe_fallback = if candidates.iter().any(|candidate| candidate == fallback) {
             fallback.to_string()
         } else {
-            candidates.first().cloned().unwrap_or_else(|| fallback.to_string())
+            candidates
+                .first()
+                .cloned()
+                .unwrap_or_else(|| fallback.to_string())
         };
-        let state = self.states.entry(context.to_string()).or_insert_with(|| PolicyState {
-            context: context.to_string(),
-            arms: HashMap::new(),
-            updated_at: chrono::Utc::now(),
-        });
-        let observed: Vec<&ArmStats> = candidates
+        // Pool legacy v2 and current v3 evidence only when both normalize to
+        // the same generic intervention family. The original per-task raw
+        // features remain in audit evidence and are not erased by pooling.
+        let mut pooled_arms: HashMap<String, ArmStats> = HashMap::new();
+        for state in self
+            .states
+            .values()
+            .filter(|state| learning_families_compatible(&state.context, context))
+        {
+            for (action, stats) in &state.arms {
+                let pooled = pooled_arms.entry(action.clone()).or_insert(ArmStats {
+                    pulls: 0,
+                    reward_sum: 0.0,
+                });
+                pooled.pulls = pooled.pulls.saturating_add(stats.pulls);
+                pooled.reward_sum += stats.reward_sum;
+            }
+        }
+        let pulls_for = |candidate: &str| {
+            pooled_arms
+                .get(candidate)
+                .map(|stats| stats.pulls)
+                .unwrap_or(0)
+        };
+        let baseline_pulls = pulls_for(&safe_fallback);
+        let enough_baseline_evidence = baseline_pulls >= self.min_observations;
+        let gate_samples = PolicyGate::default().min_samples;
+        let candidate_under_evaluation = candidates
             .iter()
-            .filter_map(|candidate| state.arms.get(candidate))
-            .collect();
-        let total_pulls: u32 = observed.iter().map(|stats| stats.pulls).sum();
-        let enough_evidence = total_pulls >= self.min_observations;
-        let unexplored = candidates.iter().find(|candidate| {
-            state.arms.get(*candidate).map(|stats| stats.pulls).unwrap_or(0) == 0
-        });
-        let interval = (1.0 / self.exploration_rate.max(0.0001)).ceil() as u32;
-        let should_explore = enough_evidence
-            && unexplored.is_some()
-            && total_pulls % interval == 0;
-        let action = if !enough_evidence {
+            .filter(|candidate| candidate.as_str() != safe_fallback)
+            .filter(|candidate| pulls_for(candidate) < gate_samples)
+            .min_by_key(|candidate| pulls_for(candidate))
+            .cloned();
+        // Candidate sampling is deterministic and bounded. It starts only
+        // after the same family has an independent rule baseline and stops at
+        // the promotion gate's evidence threshold.
+        let should_explore = enough_baseline_evidence && candidate_under_evaluation.is_some();
+        let action = if !enough_baseline_evidence {
             safe_fallback.clone()
         } else if should_explore {
-            unexplored.cloned().unwrap_or_else(|| safe_fallback.clone())
+            candidate_under_evaluation.unwrap_or_else(|| safe_fallback.clone())
+        } else if self.model_version == 0 {
+            // An unpromoted trainable policy remains shadow-only. Empirical
+            // means are audit evidence, not authority to bypass the gate.
+            safe_fallback.clone()
         } else {
             candidates
                 .iter()
@@ -418,24 +867,32 @@ impl ConstrainedPolicy {
         };
         let best = candidates
             .iter()
-            .filter_map(|candidate| state.arms.get(candidate).map(ArmStats::mean))
+            .filter_map(|candidate| pooled_arms.get(candidate).map(ArmStats::mean))
             .fold(0.0_f32, f32::max);
+        let used_fallback = action == safe_fallback && self.model_version == 0;
         PolicyChoice {
             context: context.to_string(),
             action,
-            used_fallback: !enough_evidence,
-            confidence: if enough_evidence { (best.max(0.0) / 1.0).clamp(0.0, 1.0) } else { 0.0 },
+            used_fallback,
+            confidence: if self.model_version > 0 {
+                (best.max(0.0) / 1.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             explored: should_explore,
             candidates: candidates.to_vec(),
         }
     }
 
     pub fn record_reward(&mut self, choice: &PolicyChoice, reward: f32) -> Result<(), String> {
-        let state = self.states.entry(choice.context.clone()).or_insert_with(|| PolicyState {
-            context: choice.context.clone(),
-            arms: HashMap::new(),
-            updated_at: chrono::Utc::now(),
-        });
+        let state = self
+            .states
+            .entry(choice.context.clone())
+            .or_insert_with(|| PolicyState {
+                context: choice.context.clone(),
+                arms: HashMap::new(),
+                updated_at: chrono::Utc::now(),
+            });
         let stats = state.arms.entry(choice.action.clone()).or_insert(ArmStats {
             pulls: 0,
             reward_sum: 0.0,
@@ -445,16 +902,17 @@ impl ConstrainedPolicy {
         state.updated_at = chrono::Utc::now();
         // The historical arm statistics remain available for auditability;
         // the trainable model is the policy used for future selections.
-        self.model.train(
-            &choice.context,
-            &choice.action,
-            &choice.candidates,
-            reward,
-        );
+        self.model
+            .train(&choice.context, &choice.action, &choice.candidates, reward);
         if let Some(store) = &self.store {
-            let key = format!("{PREFIX}{}", hex::encode(sha2::Sha256::digest(choice.context.as_bytes())));
+            let key = format!(
+                "{PREFIX}{}",
+                hex::encode(sha2::Sha256::digest(choice.context.as_bytes()))
+            );
             let content = serde_json::to_string(state).map_err(|error| error.to_string())?;
-            store.store(&key, &content).map_err(|error| error.to_string())?;
+            store
+                .store(&key, &content)
+                .map_err(|error| error.to_string())?;
             let observation = PolicyObservation {
                 context: choice.context.clone(),
                 action: choice.action.clone(),
@@ -463,22 +921,157 @@ impl ConstrainedPolicy {
                 candidates: choice.candidates.clone(),
                 created_at: chrono::Utc::now(),
             };
-            let observation_key = format!("{PREFIX}observations/{}", uuid::Uuid::new_v4().hyphenated());
-            let observation_content = serde_json::to_string(&observation)
+            let observation_key =
+                format!("{PREFIX}observations/{}", uuid::Uuid::new_v4().hyphenated());
+            let observation_content =
+                serde_json::to_string(&observation).map_err(|error| error.to_string())?;
+            store
+                .store(&observation_key, &observation_content)
                 .map_err(|error| error.to_string())?;
-            store.store(&observation_key, &observation_content)
-                .map_err(|error| error.to_string())?;
-            let model_content = serde_json::to_string(&self.model).map_err(|error| error.to_string())?;
-            store.store(&format!("{PREFIX}model"), &model_content)
+            let model_content =
+                serde_json::to_string(&self.model).map_err(|error| error.to_string())?;
+            store
+                .store(&format!("{PREFIX}model"), &model_content)
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
 
+    /// Record an auditable observation, but promote a replayed model only
+    /// after baseline and treatment arms both have independent outcomes in
+    /// the same normalized task context. Arm statistics and raw observations
+    /// are retained even when promotion is rejected.
+    pub fn record_reward_gated(
+        &mut self,
+        choice: &PolicyChoice,
+        reward: f32,
+        gate: PolicyGate,
+    ) -> Result<PolicyEvaluation, String> {
+        let baseline_model = self.model.clone();
+        let baseline_version = self.model_version;
+        self.record_reward(choice, reward)?;
+        let observations = match &self.store {
+            Some(store) => Self::load_observations(store)?,
+            None => vec![PolicyObservation {
+                context: choice.context.clone(),
+                action: choice.action.clone(),
+                reward: reward.clamp(-1.0, 1.0),
+                explored: choice.explored,
+                candidates: choice.candidates.clone(),
+                created_at: chrono::Utc::now(),
+            }],
+        };
+        if choice.candidates.len() <= 1 {
+            // There is no intervention to compare. Keep the baseline outcome
+            // as future evidence, but do not promote a no-op model version.
+            self.model = baseline_model;
+            self.model_version = baseline_version;
+            self.persist_model()?;
+            let baseline_rewards = observations
+                .iter()
+                .filter(|item| {
+                    learning_families_compatible(&item.context, &choice.context)
+                        && item.action == "baseline"
+                })
+                .map(|item| item.reward)
+                .collect::<Vec<_>>();
+            let baseline_return = if baseline_rewards.is_empty() {
+                0.0
+            } else {
+                baseline_rewards.iter().sum::<f32>() / baseline_rewards.len() as f32
+            };
+            return Ok(PolicyEvaluation {
+                samples: 0,
+                baseline_samples: baseline_rewards.len().min(u32::MAX as usize) as u32,
+                candidate_samples: 0,
+                candidate_action: None,
+                baseline_return,
+                candidate_return: 0.0,
+                improvement: 0.0,
+                accepted: false,
+                reason: "no_eligible_alternative".into(),
+            });
+        }
+
+        // This is a treatment-effect gate, not an action-imitation score.
+        // Compare rewards actually observed for baseline and one concrete
+        // history treatment in the same normalized task context.  Requiring
+        // evidence on both arms prevents an unobserved counterfactual from
+        // being reported as a zero return.
+        let relevant = observations
+            .iter()
+            .filter(|item| learning_families_compatible(&item.context, &choice.context))
+            .collect::<Vec<_>>();
+        let candidate_action = if choice.action != "baseline" {
+            Some(choice.action.clone())
+        } else {
+            choice
+                .candidates
+                .iter()
+                .filter(|action| action.as_str() != "baseline")
+                .max_by_key(|action| {
+                    relevant
+                        .iter()
+                        .filter(|item| item.action.as_str() == action.as_str())
+                        .count()
+                })
+                .cloned()
+        };
+        let rewards_for = |action: &str| {
+            relevant
+                .iter()
+                .filter(|item| item.action == action)
+                .map(|item| item.reward)
+                .collect::<Vec<_>>()
+        };
+        let baseline_rewards = rewards_for("baseline");
+        let candidate_rewards = candidate_action
+            .as_deref()
+            .map(rewards_for)
+            .unwrap_or_default();
+        let mean = |values: &[f32]| {
+            if values.is_empty() {
+                0.0
+            } else {
+                values.iter().sum::<f32>() / values.len() as f32
+            }
+        };
+        let baseline_samples = baseline_rewards.len().min(u32::MAX as usize) as u32;
+        let candidate_samples = candidate_rewards.len().min(u32::MAX as usize) as u32;
+        let paired_samples = baseline_samples.min(candidate_samples);
+        let mut evaluation = gate.assess(
+            mean(&baseline_rewards),
+            mean(&candidate_rewards),
+            paired_samples,
+        );
+        evaluation.baseline_samples = baseline_samples;
+        evaluation.candidate_samples = candidate_samples;
+        evaluation.candidate_action = candidate_action;
+
+        // A promoted model must contain the complete accumulated training
+        // history.  Replaying durable observations fixes the former behavior
+        // where every rejected online update forgot all earlier samples.
+        let replayed_model = Self::replay(&observations).model;
+        if evaluation.accepted {
+            self.rollback_model = Some(baseline_model);
+            self.model = replayed_model;
+            self.model_version = baseline_version.saturating_add(1);
+        } else {
+            self.model = baseline_model;
+            self.model_version = baseline_version;
+        }
+        self.persist_model()?;
+        Ok(evaluation)
+    }
+
     /// Train a complete multi-step trajectory and keep a rollback snapshot.
     /// Promotion is intentionally explicit: callers can run PolicyGate on an
     /// evaluation holdout before retaining the new version.
-    pub fn train_trajectory(&mut self, steps: &[TrajectoryStep], gamma: f32) -> Result<TrainingMetrics, String> {
+    pub fn train_trajectory(
+        &mut self,
+        steps: &[TrajectoryStep],
+        gamma: f32,
+    ) -> Result<TrainingMetrics, String> {
         self.rollback_model = Some(self.model.clone());
         let metrics = self.model.train_trajectory(steps, gamma);
         self.model_version = self.model_version.saturating_add(1);
@@ -508,19 +1101,25 @@ impl ConstrainedPolicy {
     }
 
     pub fn rollback(&mut self) -> Result<bool, String> {
-        let Some(previous) = self.rollback_model.take() else { return Ok(false); };
+        let Some(previous) = self.rollback_model.take() else {
+            return Ok(false);
+        };
         self.model = previous;
         self.model_version = self.model_version.saturating_add(1);
         self.persist_model()?;
         Ok(true)
     }
 
-    pub fn model_version(&self) -> u64 { self.model_version }
+    pub fn model_version(&self) -> u64 {
+        self.model_version
+    }
 
     fn persist_model(&self) -> Result<(), String> {
         if let Some(store) = &self.store {
             let content = serde_json::to_string(&self.model).map_err(|error| error.to_string())?;
-            store.store(&format!("{PREFIX}model"), &content).map_err(|error| error.to_string())?;
+            store
+                .store(&format!("{PREFIX}model"), &content)
+                .map_err(|error| error.to_string())?;
             store
                 .store(&format!("{PREFIX}version"), &self.model_version.to_string())
                 .map_err(|error| error.to_string())?;
@@ -554,7 +1153,12 @@ impl ConstrainedPolicy {
             .map_err(|error| error.to_string())?;
         Ok(entries
             .into_iter()
-            .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+            .filter_map(|entry| {
+                let mut observation =
+                    serde_json::from_str::<PolicyObservation>(&entry.content).ok()?;
+                observation.context = canonicalize_learning_family_key(&observation.context);
+                Some(observation)
+            })
             .collect())
     }
 
@@ -576,10 +1180,185 @@ mod tests {
     #[test]
     fn baseline_is_used_until_evidence_exists() {
         let mut policy = ConstrainedPolicy::default();
-        let choice = policy.choose("task:code", &["baseline".into(), "knowledge_first".into()], "baseline");
+        let choice = policy.choose(
+            "task:code",
+            &["baseline".into(), "knowledge_first".into()],
+            "baseline",
+        );
         assert_eq!(choice.action, "baseline");
         assert!(choice.used_fallback);
         assert!(!choice.explored);
+    }
+
+    #[test]
+    fn learning_mode_has_a_true_non_injecting_baseline() {
+        assert!(!LearningMode::Baseline.retrieves_history());
+        assert!(!LearningMode::Baseline.injects_history());
+        assert!(!LearningMode::Baseline.updates_learning());
+        assert!(LearningMode::Shadow.retrieves_history());
+        assert!(!LearningMode::Shadow.injects_history());
+        assert!(LearningMode::Active.injects_history());
+        assert!(LearningMode::Active.updates_learning());
+    }
+
+    #[test]
+    fn task_family_groups_field_variants_but_separates_modalities() {
+        let duration =
+            learning_task_context("Use Python to summarize duration counts from a JSONL test log");
+        let status =
+            learning_task_context("Summarize status counts in the JSONL test log using Python");
+        let web_game = learning_task_context("Build and test a playable web game");
+        assert_eq!(duration.family, status.family);
+        assert_ne!(duration.family, web_game.family);
+        assert_ne!(duration.raw_features, status.raw_features);
+    }
+
+    #[test]
+    fn task_family_groups_paraphrased_software_feature_changes() {
+        let tags = learning_task_context(
+            "Add normalized tags to the existing Python task queue and run tests",
+        );
+        let owner = learning_task_context(
+            "Extend the existing Python task queue with owner filtering and run tests",
+        );
+        let web_game = learning_task_context("Build and test a playable web game");
+        assert_eq!(tags.family, owner.family);
+        assert_eq!(tags.family, "planning:v3:intent=change;domain=software");
+        assert_ne!(tags.family, web_game.family);
+    }
+
+    #[test]
+    fn policy_can_use_compatible_v2_baseline_evidence_without_rewriting_it() {
+        let legacy = "planning:v2:ops=build+operate+test+write;kinds=code+data";
+        let current = learning_policy_context(
+            "Extend the existing Python task queue with owner filtering and run tests",
+        );
+        assert!(learning_families_compatible(legacy, &current));
+
+        let mut policy = ConstrainedPolicy::default();
+        policy.states.insert(
+            legacy.into(),
+            PolicyState {
+                context: legacy.into(),
+                arms: HashMap::from([(
+                    "baseline".into(),
+                    ArmStats {
+                        pulls: 1,
+                        reward_sum: 0.5,
+                    },
+                )]),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        let choice = policy.choose(
+            &current,
+            &["baseline".into(), "knowledge_first".into()],
+            "baseline",
+        );
+        assert_eq!(choice.action, "knowledge_first");
+        assert!(choice.explored);
+    }
+
+    #[test]
+    fn ca_audit_evidence_is_family_filterable_and_requires_direct_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_str().unwrap()).unwrap();
+        let mut evidence = TaskAuditKnowledgeEvidence {
+            task_iri: "iri://task/verified".into(),
+            task_family: "planning:v2:ops=test;kinds=data".into(),
+            raw_features: vec!["jsonl".into()],
+            objective: "test data".into(),
+            terminal_status: "success".into(),
+            ca_verdict: "pass".into(),
+            failed_dimensions: vec![],
+            findings: vec![],
+            procedure: vec!["write output".into()],
+            successful_checks: vec![],
+            failed_checks: vec![],
+            attached_skill_iri: None,
+            created_at: chrono::Utc::now(),
+        };
+        assert!(!evidence.reusable_success());
+        evidence.successful_checks.push("verify output".into());
+        assert!(evidence.reusable_success());
+        store
+            .store(
+                &evidence.storage_iri(),
+                &serde_json::to_string(&evidence).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            load_task_audit_evidence(&store, Some(&evidence.task_family), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(load_task_audit_evidence(&store, Some("other"), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn candidate_sampling_requires_same_family_baseline_evidence() {
+        let candidates = vec![
+            "baseline".into(),
+            "knowledge_first".into(),
+            "skill_first".into(),
+        ];
+        let mut policy = ConstrainedPolicy::default();
+        for _ in 0..5 {
+            let choice = PolicyChoice {
+                context: "task:create".into(),
+                action: "baseline".into(),
+                used_fallback: true,
+                confidence: 0.0,
+                explored: false,
+                candidates: candidates.clone(),
+            };
+            policy.record_reward(&choice, 0.2).unwrap();
+        }
+
+        let unrelated = policy.choose("task:unrelated", &candidates, "baseline");
+        assert_eq!(unrelated.action, "baseline");
+        assert!(!unrelated.explored);
+
+        let first = policy.choose("task:create", &candidates, "baseline");
+        assert_eq!(first.action, "knowledge_first");
+        assert!(first.explored);
+        policy.record_reward(&first, 0.8).unwrap();
+
+        let second = policy.choose("task:create", &candidates, "baseline");
+        assert_eq!(second.action, "skill_first");
+        assert!(second.explored);
+    }
+
+    #[test]
+    fn empirical_best_arm_remains_shadow_while_model_is_still_gated() {
+        let candidates = vec!["baseline".into(), "knowledge_first".into()];
+        let mut policy = ConstrainedPolicy::default();
+        for (action, reward) in std::iter::repeat_n(("baseline", 0.1), 5)
+            .chain(std::iter::repeat_n(("knowledge_first", 0.9), 5))
+        {
+            policy
+                .record_reward(
+                    &PolicyChoice {
+                        context: "task:stable".into(),
+                        action: action.into(),
+                        used_fallback: false,
+                        confidence: 0.0,
+                        explored: false,
+                        candidates: candidates.clone(),
+                    },
+                    reward,
+                )
+                .unwrap();
+        }
+        // Simulate the production gate retaining observations while rejecting
+        // candidate weights.
+        policy.model = TrainablePolicyModel::default();
+        policy.model_version = 0;
+        let choice = policy.choose("task:stable", &candidates, "baseline");
+        assert_eq!(choice.action, "baseline");
     }
 
     #[test]
@@ -587,27 +1366,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let mut policy = ConstrainedPolicy::default().with_persistence(l0.clone());
-        let choice = policy.choose("task:code", &["baseline".into(), "knowledge_first".into()], "baseline");
-        policy.record_reward(&choice, 0.1).unwrap();
-        let choice = PolicyChoice { action: "knowledge_first".into(), ..choice };
-        policy.record_reward(&choice, 0.9).unwrap();
-        let selected = policy.choose("task:code", &["baseline".into(), "knowledge_first".into()], "baseline");
+        let candidates = vec!["baseline".into(), "knowledge_first".into()];
+        let baseline = PolicyChoice {
+            context: "task:code".into(),
+            action: "baseline".into(),
+            used_fallback: true,
+            confidence: 0.0,
+            explored: false,
+            candidates: candidates.clone(),
+        };
+        let treatment = PolicyChoice {
+            action: "knowledge_first".into(),
+            used_fallback: false,
+            explored: true,
+            ..baseline.clone()
+        };
+        for _ in 0..5 {
+            policy
+                .record_reward_gated(&baseline, 0.1, PolicyGate::default())
+                .unwrap();
+        }
+        for _ in 0..5 {
+            policy
+                .record_reward_gated(&treatment, 0.9, PolicyGate::default())
+                .unwrap();
+        }
+        let selected = policy.choose("task:code", &candidates, "baseline");
         assert_eq!(selected.action, "knowledge_first");
 
         let restored = ConstrainedPolicy::default().with_persistence(l0);
         assert!(restored.state("task:code").is_some());
-        assert_eq!(restored.model().updates, 2);
+        assert_eq!(restored.model().updates, 10);
     }
 
     #[test]
     fn observations_replay_into_a_fresh_policy() {
         let now = chrono::Utc::now();
         let observations = vec![
-            PolicyObservation { context: "task:code".into(), action: "baseline".into(), reward: 0.2, explored: false, candidates: vec!["baseline".into(), "knowledge_first".into()], created_at: now },
-            PolicyObservation { context: "task:code".into(), action: "knowledge_first".into(), reward: 0.9, explored: true, candidates: vec!["baseline".into(), "knowledge_first".into()], created_at: now },
+            PolicyObservation {
+                context: "task:code".into(),
+                action: "baseline".into(),
+                reward: 0.2,
+                explored: false,
+                candidates: vec!["baseline".into(), "knowledge_first".into()],
+                created_at: now,
+            },
+            PolicyObservation {
+                context: "task:code".into(),
+                action: "knowledge_first".into(),
+                reward: 0.9,
+                explored: true,
+                candidates: vec!["baseline".into(), "knowledge_first".into()],
+                created_at: now,
+            },
         ];
         let policy = ConstrainedPolicy::replay(&observations);
-        assert_eq!(policy.state("task:code").unwrap().arms["knowledge_first"].pulls, 1);
+        assert_eq!(
+            policy.state("task:code").unwrap().arms["knowledge_first"].pulls,
+            1
+        );
         assert_eq!(policy.state("task:code").unwrap().arms["baseline"].pulls, 1);
     }
 
@@ -628,10 +1445,27 @@ mod tests {
         let mut policy = ConstrainedPolicy::default();
         let candidates = vec!["baseline".into(), "knowledge_first".into()];
         let before = policy.model().clone();
-        let metrics = policy.train_trajectory(&[
-            TrajectoryStep { context: "task:code".into(), action: "knowledge_first".into(), candidates: candidates.clone(), reward: 0.2, terminal: false },
-            TrajectoryStep { context: "task:code".into(), action: "knowledge_first".into(), candidates, reward: 1.0, terminal: true },
-        ], 0.9).unwrap();
+        let metrics = policy
+            .train_trajectory(
+                &[
+                    TrajectoryStep {
+                        context: "task:code".into(),
+                        action: "knowledge_first".into(),
+                        candidates: candidates.clone(),
+                        reward: 0.2,
+                        terminal: false,
+                    },
+                    TrajectoryStep {
+                        context: "task:code".into(),
+                        action: "knowledge_first".into(),
+                        candidates,
+                        reward: 1.0,
+                        terminal: true,
+                    },
+                ],
+                0.9,
+            )
+            .unwrap();
         assert_eq!(metrics.steps, 2);
         assert!(policy.model().updates > before.updates);
         assert!(policy.rollback().unwrap());
@@ -645,13 +1479,16 @@ mod tests {
         let mut policy = ConstrainedPolicy::default().with_persistence(store.clone());
         let candidates = vec!["pdca".into()];
         policy
-            .train_trajectory(&[TrajectoryStep {
-                context: "orchestration:code".into(),
-                action: "pdca".into(),
-                candidates,
-                reward: 1.0,
-                terminal: true,
-            }], 0.9)
+            .train_trajectory(
+                &[TrajectoryStep {
+                    context: "orchestration:code".into(),
+                    action: "pdca".into(),
+                    candidates,
+                    reward: 1.0,
+                    terminal: true,
+                }],
+                0.9,
+            )
             .unwrap();
         let restored = ConstrainedPolicy::default().with_persistence(store);
         assert_eq!(restored.model_version(), 1);
@@ -681,6 +1518,108 @@ mod tests {
             .unwrap();
         assert!(!evaluation.accepted);
         assert_eq!(policy.model(), &before);
+    }
+
+    #[test]
+    fn online_update_is_not_promoted_before_gate_has_independent_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut policy = ConstrainedPolicy::default().with_persistence(store);
+        let choice = PolicyChoice {
+            context: "task:code".into(),
+            action: "knowledge_first".into(),
+            used_fallback: false,
+            confidence: 0.0,
+            explored: true,
+            candidates: vec!["baseline".into(), "knowledge_first".into()],
+        };
+        let before = policy.model().clone();
+        let evaluation = policy
+            .record_reward_gated(&choice, 1.0, PolicyGate::default())
+            .unwrap();
+        assert!(!evaluation.accepted);
+        assert_eq!(evaluation.reason, "insufficient_evidence");
+        assert_eq!(evaluation.baseline_samples, 0);
+        assert_eq!(evaluation.candidate_samples, 1);
+        assert_eq!(evaluation.candidate_return, 1.0);
+        assert_eq!(policy.model(), &before);
+        assert_eq!(policy.model_version(), 0);
+    }
+
+    #[test]
+    fn gated_online_policy_uses_observed_arm_returns_and_replays_all_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut policy = ConstrainedPolicy::default().with_persistence(store.clone());
+        let baseline = PolicyChoice {
+            context: "task:stable".into(),
+            action: "baseline".into(),
+            used_fallback: false,
+            confidence: 0.0,
+            explored: false,
+            candidates: vec!["baseline".into(), "knowledge_first".into()],
+        };
+        let candidate = PolicyChoice {
+            action: "knowledge_first".into(),
+            explored: true,
+            ..baseline.clone()
+        };
+
+        for _ in 0..5 {
+            let evaluation = policy
+                .record_reward_gated(&baseline, 0.6, PolicyGate::default())
+                .unwrap();
+            assert!(!evaluation.accepted);
+        }
+        let mut final_evaluation = None;
+        for _ in 0..5 {
+            final_evaluation = Some(
+                policy
+                    .record_reward_gated(&candidate, 0.9, PolicyGate::default())
+                    .unwrap(),
+            );
+        }
+
+        let evaluation = final_evaluation.unwrap();
+        assert!(evaluation.accepted, "{evaluation:?}");
+        assert_eq!(evaluation.samples, 5);
+        assert_eq!(evaluation.baseline_samples, 5);
+        assert_eq!(evaluation.candidate_samples, 5);
+        assert_eq!(
+            evaluation.candidate_action.as_deref(),
+            Some("knowledge_first")
+        );
+        assert!((evaluation.baseline_return - 0.6).abs() < f32::EPSILON);
+        assert!((evaluation.candidate_return - 0.9).abs() < f32::EPSILON);
+        assert_eq!(policy.model_version(), 1);
+        assert_eq!(policy.model().updates, 10);
+        let restored = ConstrainedPolicy::default().with_persistence(store);
+        assert_eq!(restored.model_version(), 1);
+        assert_eq!(restored.model().updates, 10);
+    }
+
+    #[test]
+    fn single_arm_observation_never_promotes_a_noop_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut policy = ConstrainedPolicy::default().with_persistence(store);
+        let choice = PolicyChoice {
+            context: "task:no-alternative".into(),
+            action: "baseline".into(),
+            used_fallback: true,
+            confidence: 0.0,
+            explored: false,
+            candidates: vec!["baseline".into()],
+        };
+
+        for _ in 0..8 {
+            let evaluation = policy
+                .record_reward_gated(&choice, 1.0, PolicyGate::default())
+                .unwrap();
+            assert_eq!(evaluation.reason, "no_eligible_alternative");
+            assert!(!evaluation.accepted);
+        }
+        assert_eq!(policy.model_version(), 0);
     }
 
     #[test]

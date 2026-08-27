@@ -49,7 +49,7 @@ impl ConsistencyEngine {
         let hook_critical = result.critical_tags.clone();
         let hook_projection = result.projection.clone();
         let closure_blackboard = hook_blackboard.clone();
-        hook_blackboard.set_write_hook(move |node_iri, tags| {
+        hook_blackboard.add_write_hook(move |node_iri, tags| {
             hook_projection.invalidate_by_node(node_iri);
             let has_critical = tags.iter().any(|t| hook_critical.read().contains(t));
             if has_critical {
@@ -76,7 +76,10 @@ impl ConsistencyEngine {
             debug!(node_iri = %node_iri, flushed = flushed, "WriteThrough: dirty node flushed to L0");
         }
 
-        self.memory_bus.publish_invalidate(node_iri, task_iri).await;
+        let generation = self.blackboard.node_generation(node_iri).unwrap_or(0);
+        self.memory_bus
+            .publish_invalidate_generation(node_iri, task_iri, generation)
+            .await;
 
         self.projection.invalidate_by_node(node_iri);
 
@@ -86,17 +89,22 @@ impl ConsistencyEngine {
     #[instrument(skip(self))]
     pub fn on_l2_read(&self, node_iri: &str) -> Result<(), CoreError> {
         if let Some(node) = self.blackboard.read_node(node_iri)? {
-            match node.mesi_state {
-                MesiState::Modified | MesiState::Exclusive | MesiState::Shared => {
+            let canonical_generation = self.l0_store.generation(node_iri)?.unwrap_or(0);
+            let stale = canonical_generation > node.generation;
+            match (node.mesi_state, stale) {
+                (MesiState::Modified | MesiState::Exclusive | MesiState::Shared, false) => {
                     debug!(node_iri = %node_iri, state = ?node.mesi_state, "L2 read: cache hit");
                 }
-                MesiState::Invalid => {
-                    debug!(node_iri = %node_iri, "L2 read: Invalid state, reloading from L0");
-                    self.blackboard.delete_node(node_iri)?;
+                (MesiState::Invalid, _) | (_, true) => {
+                    debug!(node_iri = %node_iri, canonical_generation, l2_generation = node.generation, "L2 read: stale generation, reloading from L0");
                     if let Some(entry) = self.l0_store.retrieve(node_iri)? {
                         let config = CoreConfig::default();
-                        self.blackboard
-                            .write_node(node_iri, &entry.content, &config)?;
+                        self.blackboard.write_node_from_l0(
+                            node_iri,
+                            &entry.content,
+                            L0Store::entry_generation(&entry),
+                            &config,
+                        )?;
                         debug!(node_iri = %node_iri, "L2 read: node reloaded from L0");
                     } else {
                         warn!(node_iri = %node_iri, "L2 read: no corresponding entry in L0");
@@ -109,10 +117,13 @@ impl ConsistencyEngine {
 
     #[instrument(skip(self))]
     pub async fn on_l0_update(&self, iri: &str) -> Result<(), CoreError> {
-        self.l0_store.update_mesi_state(iri, MesiState::Modified)?;
-        debug!(iri = %iri, "L0 update: MESI state set to Modified");
+        let generation = self.l0_store.generation(iri)?.unwrap_or(0);
+        let invalidated = self.blackboard.invalidate_if_older(iri, generation);
+        debug!(iri = %iri, generation, invalidated, "L0 canonical generation published");
 
-        self.memory_bus.publish_invalidate(iri, iri).await;
+        self.memory_bus
+            .publish_invalidate_generation(iri, iri, generation)
+            .await;
 
         self.projection.invalidate_by_node(iri);
 
@@ -289,9 +300,25 @@ mod tests {
             .write_node("iri://l0_1", r#"{"@id":"iri://l0_1"}"#, &config)
             .unwrap();
 
+        l0_store
+            .store("iri://l0_1", r#"{"@id":"iri://l0_1","version":2}"#)
+            .unwrap();
+
         consistency.on_l0_update("iri://l0_1").await.unwrap();
-        let entry = l0_store.retrieve("iri://l0_1").unwrap().unwrap();
-        assert_eq!(entry.mesi_state, MesiState::Modified);
+        assert_eq!(
+            blackboard
+                .read_node("iri://l0_1")
+                .unwrap()
+                .unwrap()
+                .mesi_state,
+            MesiState::Invalid
+        );
+
+        consistency.on_l2_read("iri://l0_1").unwrap();
+        let repaired = blackboard.read_node("iri://l0_1").unwrap().unwrap();
+        assert_eq!(repaired.mesi_state, MesiState::Shared);
+        assert_eq!(repaired.generation, 2);
+        assert!(repaired.json_ld.contains("\"version\":2"));
     }
 
     #[test]
@@ -374,10 +401,9 @@ mod tests {
 
         let config = CoreConfig::default();
         let node_iri = "iri://task/inval_proj/node_1";
-        let json_ld = r#"{"@id":"iri://task/inval_proj/node_1","@type":"Artifact","status":"created"}"#;
-        blackboard
-            .write_node(node_iri, json_ld, &config)
-            .unwrap();
+        let json_ld =
+            r#"{"@id":"iri://task/inval_proj/node_1","@type":"Artifact","status":"created"}"#;
+        blackboard.write_node(node_iri, json_ld, &config).unwrap();
 
         projection
             .project("iri://task/inval_proj", "reference_only", HashMap::new())
@@ -385,9 +411,7 @@ mod tests {
             .unwrap();
         assert_eq!(projection.cleanup_invalid(), 0);
 
-        blackboard
-            .write_node(node_iri, json_ld, &config)
-            .unwrap();
+        blackboard.write_node(node_iri, json_ld, &config).unwrap();
         assert_eq!(
             projection.cleanup_invalid(),
             1,

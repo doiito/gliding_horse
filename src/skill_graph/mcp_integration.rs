@@ -234,10 +234,7 @@ impl MCPIntegration {
     }
 
     /// Attach the shared MCP client handle so invoke_tool dispatches real tool calls.
-    pub fn with_client(
-        mut self,
-        client: Arc<tokio::sync::Mutex<Option<McpClient>>>,
-    ) -> Self {
+    pub fn with_client(mut self, client: Arc<tokio::sync::Mutex<Option<McpClient>>>) -> Self {
         self.client = Some(client);
         self
     }
@@ -384,15 +381,16 @@ impl MCPIntegration {
             mapping.mcp_server_id, mapping.mcp_tool_name, mcp_params
         );
 
-        let handle = self.client.as_ref().ok_or_else(|| CoreError::ValidationFailed {
-            message: format!("No MCP client attached for skill: {}", skill_iri),
-        })?;
-        let mut guard = handle.lock().await;
-        let client = guard
-            .as_mut()
+        let handle = self
+            .client
+            .as_ref()
             .ok_or_else(|| CoreError::ValidationFailed {
-                message: format!("MCP client not connected for skill: {}", skill_iri),
+                message: format!("No MCP client attached for skill: {}", skill_iri),
             })?;
+        let mut guard = handle.lock().await;
+        let client = guard.as_mut().ok_or_else(|| CoreError::ValidationFailed {
+            message: format!("MCP client not connected for skill: {}", skill_iri),
+        })?;
 
         let result = client
             .call_tool(&mapping.mcp_server_id, &mapping.mcp_tool_name, &mcp_params)

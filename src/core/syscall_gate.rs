@@ -60,14 +60,9 @@ impl WhitelistManager {
             s.insert("rag_search".to_string());
             s
         });
-        map.insert(AgentRole::Act, {
-            let mut s = HashSet::new();
-            s.insert("file_read".to_string());
-            s.insert("file_write".to_string());
-            s.insert("http_request".to_string());
-            s.insert("tool_search".to_string());
-            s
-        });
+        // AA is a decision-only BizAgent. Custom task policy may narrow other
+        // roles, but the kernel default must never grant AA execution tools.
+        map.insert(AgentRole::Act, HashSet::new());
         Self {
             role_whitelist: map,
             custom_whitelist: HashMap::new(),
@@ -89,6 +84,9 @@ impl WhitelistManager {
         role: &AgentRole,
         tool_name: &str,
     ) -> bool {
+        if *role == AgentRole::Act {
+            return false;
+        }
         if let Some(custom) = self.custom_whitelist.get(agent_id) {
             if custom.contains(tool_name) {
                 return true;
@@ -384,8 +382,9 @@ mod tests {
         assert!(wm.check_permission(&AgentRole::Check, "bash"));
         assert!(!wm.check_permission(&AgentRole::Check, "file_write"));
 
-        assert!(wm.check_permission(&AgentRole::Act, "file_write"));
-        assert!(!wm.check_permission(&AgentRole::Act, "bash"));
+        assert!(!wm.check_permission(&AgentRole::Act, "file_read"));
+        assert!(!wm.check_permission(&AgentRole::Act, "file_write"));
+        assert!(wm.list_allowed_tools(&AgentRole::Act).is_empty());
     }
 
     #[test]
@@ -396,6 +395,7 @@ mod tests {
         assert!(wm.check_permission_for_agent("special_agent", &AgentRole::Plan, "custom_tool"));
         assert!(wm.check_permission_for_agent("special_agent", &AgentRole::Plan, "file_read"));
         assert!(!wm.check_permission_for_agent("normal_agent", &AgentRole::Plan, "custom_tool"));
+        assert!(!wm.check_permission_for_agent("special_agent", &AgentRole::Act, "custom_tool"));
     }
 
     #[test]

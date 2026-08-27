@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -19,6 +20,7 @@ pub struct MaterializedView {
     pub cache_key: String,
     pub result_json: String,
     pub dependent_nodes: Vec<String>,
+    pub dependent_generations: HashMap<String, u64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub is_valid: bool,
 }
@@ -49,12 +51,29 @@ pub struct ProjectionEngine {
     max_size: usize,
     frames: HashMap<String, ProjectionFrame>,
     materialized_cache: RwLock<HashMap<String, MaterializedView>>,
+    /// Zero means unlimited. Applies to materialized projection JSON only.
+    max_cache_bytes: AtomicUsize,
     /// node_iri → Vec<cache_key> reverse index for O(1) node invalidation
     reverse_index: RwLock<HashMap<String, Vec<String>>>,
     vector_store: Option<Arc<HyperspaceStore>>,
 }
 
 impl ProjectionEngine {
+    fn projection_cache_key(
+        task_iri: &str,
+        frame_name: &str,
+        params: &HashMap<String, String>,
+    ) -> String {
+        let ordered = params
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let serialized = serde_json::to_vec(&ordered).unwrap_or_default();
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(serialized);
+        format!("{}:{}:{}", task_iri, frame_name, hex::encode(&digest[..8]))
+    }
+
     pub fn new(blackboard: Arc<Blackboard>, max_size: usize) -> Self {
         Self::with_vector_store(blackboard, max_size, None)
     }
@@ -70,8 +89,55 @@ impl ProjectionEngine {
             max_size,
             frames,
             materialized_cache: RwLock::new(HashMap::new()),
+            max_cache_bytes: AtomicUsize::new(0),
             reverse_index: RwLock::new(HashMap::new()),
             vector_store,
+        }
+    }
+
+    pub fn set_max_memory_mb(&self, max_memory_mb: u64) {
+        self.set_max_cache_bytes(
+            max_memory_mb
+                .saturating_mul(1024 * 1024)
+                .min(usize::MAX as u64) as usize,
+        );
+    }
+
+    pub fn set_max_cache_bytes(&self, max_cache_bytes: usize) {
+        self.max_cache_bytes
+            .store(max_cache_bytes, Ordering::Relaxed);
+        let mut cache = self.materialized_cache.write();
+        self.evict_cache_to_limit(&mut cache, None);
+        self.rebuild_reverse_index(&cache);
+    }
+
+    fn evict_cache_to_limit(
+        &self,
+        cache: &mut HashMap<String, MaterializedView>,
+        protected_key: Option<&str>,
+    ) {
+        let limit = self.max_cache_bytes.load(Ordering::Relaxed);
+        if limit == 0 {
+            return;
+        }
+        while cache
+            .values()
+            .map(|view| view.result_json.len())
+            .sum::<usize>()
+            > limit
+            && cache.len() > 1
+        {
+            let oldest = cache
+                .iter()
+                .filter(|(key, _)| protected_key != Some(key.as_str()))
+                .min_by_key(|(_, view)| view.created_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    cache.remove(&key);
+                }
+                None => break,
+            }
         }
     }
 
@@ -661,11 +727,23 @@ impl ProjectionEngine {
                 name: frame_name.to_string(),
             })?;
 
-        let cache_key = format!("{}:{}", task_iri, frame_name);
-        if let Some(cached) = self.materialized_cache.read().get(&cache_key) {
-            if cached.is_valid {
+        let cache_key = Self::projection_cache_key(task_iri, frame_name, &params);
+        let cached_view = { self.materialized_cache.read().get(&cache_key).cloned() };
+        if let Some(cached) = cached_view {
+            let generations_current = cached.dependent_generations.iter().all(|(iri, seen)| {
+                self.blackboard
+                    .node_generation(iri)
+                    .is_some_and(|current| current == *seen)
+            });
+            if cached.is_valid && generations_current {
                 debug!(cache_key = %cache_key, "Projection cache hit");
                 return Ok(cached.result_json.clone());
+            }
+            if cached.is_valid && !generations_current {
+                debug!(cache_key = %cache_key, "Projection cache generation mismatch");
+                let mut cache = self.materialized_cache.write();
+                cache.remove(&cache_key);
+                self.rebuild_reverse_index(&cache);
             }
         }
 
@@ -735,24 +813,27 @@ impl ProjectionEngine {
         };
 
         let dependent_nodes: Vec<String> = self.blackboard.get_task_nodes(task_iri);
+        let dependent_generations = dependent_nodes
+            .iter()
+            .filter_map(|iri| {
+                self.blackboard
+                    .node_generation(iri)
+                    .map(|generation| (iri.clone(), generation))
+            })
+            .collect();
         let view = MaterializedView {
             cache_key: cache_key.clone(),
             result_json: result.clone(),
             dependent_nodes: dependent_nodes.clone(),
+            dependent_generations,
             created_at: chrono::Utc::now(),
             is_valid: true,
         };
-        self.materialized_cache
-            .write()
-            .insert(cache_key.clone(), view);
         {
-            let mut index = self.reverse_index.write();
-            for node in &dependent_nodes {
-                index
-                    .entry(node.clone())
-                    .or_default()
-                    .push(cache_key.clone());
-            }
+            let mut cache = self.materialized_cache.write();
+            cache.insert(cache_key.clone(), view);
+            self.evict_cache_to_limit(&mut cache, Some(&cache_key));
+            self.rebuild_reverse_index(&cache);
         }
 
         Ok(result)
@@ -988,10 +1069,12 @@ impl ProjectionEngine {
     }
 
     pub fn invalidate_view(&self, frame_name: &str, task_iri: &str) {
-        let cache_key = format!("{}:{}", task_iri, frame_name);
-        if let Some(view) = self.materialized_cache.write().get_mut(&cache_key) {
-            view.is_valid = false;
-            debug!(cache_key = %cache_key, "Materialized view invalidated");
+        let prefix = format!("{}:{}:", task_iri, frame_name);
+        for (cache_key, view) in self.materialized_cache.write().iter_mut() {
+            if cache_key.starts_with(&prefix) {
+                view.is_valid = false;
+                debug!(cache_key = %cache_key, "Materialized view invalidated");
+            }
         }
     }
 
@@ -1285,6 +1368,109 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn configured_cache_limit_evicts_old_materialized_views() {
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let engine = ProjectionEngine::new(blackboard, 4096);
+        // Every projection is larger than one byte. The cache deliberately
+        // retains the newest view even when that single view exceeds the cap,
+        // but it must not retain older views as well.
+        engine.set_max_cache_bytes(1);
+
+        engine
+            .project("iri://task/cache-cap", "summary_only", HashMap::new())
+            .await
+            .unwrap();
+        engine
+            .project("iri://task/cache-cap", "reference_only", HashMap::new())
+            .await
+            .unwrap();
+
+        let stats = engine.cache_stats();
+        assert_eq!(stats.total_views, 1);
+        assert_eq!(stats.valid_views, 1);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_validates_dependent_node_generations() {
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let engine = ProjectionEngine::new(blackboard.clone(), 4096);
+        let config = crate::CoreConfig::default();
+        let task = "iri://task/l3-generation";
+        let iri = "iri://task/l3-generation/node_1";
+        blackboard
+            .write_node(
+                iri,
+                &serde_json::json!({"@id": iri, "summary": "generation-one"}).to_string(),
+                &config,
+            )
+            .unwrap();
+        let first = engine
+            .project(task, "summary_only", HashMap::new())
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+        let cache_key =
+            ProjectionEngine::projection_cache_key(task, "summary_only", &HashMap::new());
+        assert_eq!(
+            engine.materialized_cache.read()[&cache_key]
+                .dependent_generations
+                .get(iri),
+            Some(&1)
+        );
+
+        // No ConsistencyEngine hook is installed in this test, so event-based
+        // invalidation cannot help. Read-time generation validation must still
+        // reject the materialized cache hit.
+        blackboard
+            .write_node(
+                iri,
+                &serde_json::json!({"@id": iri, "summary": "generation-two"}).to_string(),
+                &config,
+            )
+            .unwrap();
+        let second = engine
+            .project(task, "summary_only", HashMap::new())
+            .await
+            .unwrap();
+        assert!(!second.is_empty());
+        assert_eq!(
+            engine.materialized_cache.read()[&cache_key]
+                .dependent_generations
+                .get(iri),
+            Some(&2)
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_cache_key_separates_frame_parameters() {
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let engine = ProjectionEngine::new(blackboard, 4096);
+        let task = "iri://task/l3-params";
+        let first = engine
+            .project(
+                task,
+                "reference_only",
+                HashMap::from([("target".to_string(), "one".to_string())]),
+            )
+            .await
+            .unwrap();
+        let second = engine
+            .project(
+                task,
+                "reference_only",
+                HashMap::from([("target".to_string(), "two".to_string())]),
+            )
+            .await
+            .unwrap();
+        assert!(first.contains("\"target\":\"one\""));
+        assert!(second.contains("\"target\":\"two\""));
+        assert_eq!(engine.cache_stats().total_views, 2);
+
+        engine.invalidate_view("reference_only", task);
+        assert_eq!(engine.cache_stats().invalid_views, 2);
+    }
+
     #[test]
     fn test_frame_templates() {
         let blackboard = Arc::new(Blackboard::new().unwrap());
@@ -1475,6 +1661,52 @@ mod tests {
                 frame_name
             );
         }
+    }
+
+    #[test]
+    fn normal_agent_frames_exclude_full_history_but_explicit_read_returns_it() {
+        let blackboard = Arc::new(Blackboard::new().unwrap());
+        let engine = ProjectionEngine::new(blackboard.clone(), 4096);
+
+        for frame_name in [
+            "summary_only",
+            "pa_init",
+            "da_input",
+            "ca_review",
+            "aa_decision",
+            "reference_only",
+        ] {
+            let frame = engine.get_frame(frame_name).unwrap();
+            assert!(
+                !frame.include_properties.iter().any(|property| {
+                    property == "content"
+                        || property == "thought"
+                        || property == "reasoning_content"
+                }),
+                "{frame_name} must not inject archived full history"
+            );
+        }
+
+        let config = crate::CoreConfig::default();
+        let iri = "iri://task/history-contract/turn_1";
+        let full_body = "FULL_BODY_AVAILABLE_ONLY_THROUGH_EXPLICIT_MICRO_TOOL_READ";
+        blackboard
+            .write_node(
+                iri,
+                &serde_json::json!({
+                    "@id": iri,
+                    "@type": "AgentTurn",
+                    "summary": "compact historical summary",
+                    "content": full_body,
+                    "thought": "private reasoning"
+                })
+                .to_string(),
+                &config,
+            )
+            .unwrap();
+
+        let explicitly_loaded = engine.read_node(iri).unwrap().unwrap();
+        assert_eq!(explicitly_loaded["content"], full_body);
     }
 
     #[test]

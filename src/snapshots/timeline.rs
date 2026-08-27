@@ -184,7 +184,11 @@ impl TimelineStore {
         *self.snapshots.write() = snapshots;
         *self.mutations_since_last_full.write() = mutations;
         self.mutation_count.store(max_count, Ordering::SeqCst);
-        Ok(count)
+        // Older builds only removed snapshot metadata in memory. Enforce the
+        // retention limit during hydration as a one-time repair of durable
+        // stores that accumulated every historical full snapshot.
+        self.gc();
+        Ok(self.snapshot_count().min(count))
     }
 
     pub fn load_snapshot(
@@ -672,14 +676,24 @@ impl TimelineStore {
         if full_count > self.max_full_snapshots {
             let to_remove = full_count - self.max_full_snapshots;
             let mut removed = 0;
+            let mut removed_snapshot_ids = Vec::with_capacity(to_remove);
             snapshots.retain(|meta| {
                 if removed < to_remove && !meta.label.starts_with("incr-") {
                     removed += 1;
+                    removed_snapshot_ids.push(meta.snapshot_id.clone());
                     false
                 } else {
                     true
                 }
             });
+            drop(snapshots);
+            if let Some(l0_store) = &self.l0_store {
+                for snapshot_id in &removed_snapshot_ids {
+                    if let Err(error) = l0_store.delete(&Self::snapshot_key(snapshot_id)) {
+                        tracing::warn!(%error, %snapshot_id, "Failed to delete expired durable timeline snapshot");
+                    }
+                }
+            }
             debug!("TimelineStore GC: removed {} old snapshots", removed);
         }
     }
@@ -950,6 +964,29 @@ mod tests {
         }
 
         assert!(timeline.snapshot_count() <= 3);
+    }
+
+    #[test]
+    fn gc_removes_expired_snapshots_from_durable_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let backend = test_backend();
+        let timeline = TimelineStore::new(100, 2).with_l0_store(l0.clone());
+        for index in 0..5 {
+            timeline.create_snapshot(&backend, &format!("durable-{index}"));
+        }
+
+        assert_eq!(timeline.snapshot_count(), 2);
+        assert_eq!(
+            l0.scan_iri_prefix("iri://timeline/snapshot/", usize::MAX)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let rebuilt = TimelineStore::new(100, 2).with_l0_store(l0);
+        assert_eq!(rebuilt.load_persisted().unwrap(), 2);
+        assert_eq!(rebuilt.snapshot_count(), 2);
     }
 
     #[test]

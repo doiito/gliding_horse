@@ -1,8 +1,588 @@
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
+
+/// Resolve one BizAgent's turn budget. Every role inherits the task budget by
+/// default; an operator may configure a workload-specific ceiling per role.
+/// This avoids silently weakening complex PA/CA/AA work with small fixed caps.
+pub(super) fn effective_role_max_turns(
+    role: AgentRole,
+    requested: u32,
+    budget: &crate::config::settings::AgentExecutionBudgetSettings,
+) -> u32 {
+    let requested = requested.max(1);
+    let configured = match role {
+        AgentRole::Plan => budget.role_max_turns.plan,
+        AgentRole::Do => budget.role_max_turns.do_agent,
+        AgentRole::Check => budget.role_max_turns.check,
+        AgentRole::Act => budget.role_max_turns.act,
+    };
+    configured.map_or(requested, |limit| requested.min(limit.max(1)))
+}
+
+pub(super) fn turn_warning_thresholds(
+    max_turns: u32,
+    early_remaining: u32,
+    final_remaining: u32,
+) -> (Option<u32>, Option<u32>) {
+    let threshold =
+        |remaining| (remaining > 0 && remaining < max_turns).then(|| max_turns - remaining);
+    let final_turn = threshold(final_remaining);
+    let mut early_turn = threshold(early_remaining);
+    if early_turn.is_some_and(|early| final_turn.is_some_and(|final_| early >= final_)) {
+        early_turn = None;
+    }
+    (early_turn, final_turn)
+}
+
+pub(super) fn requires_workspace_effect(ctx: &TaskContext, role: AgentRole) -> bool {
+    role == AgentRole::Do && ctx.effective_effect_policy().requires_workspace_mutation()
+}
+
+/// Conservative evidence that a tool call can create or modify substantive
+/// workspace content. Directory creation alone intentionally does not count:
+/// it was the observed failure mode where DA created a folder and then only
+/// inspected files while claiming implementation progress.
+pub(super) fn is_substantive_workspace_effect(name: &str, args: &Value) -> bool {
+    match name {
+        "file_write" | "file_edit" => true,
+        "bash" | "powershell" | "code_execute" => {
+            let command = args
+                .get("command")
+                .or_else(|| args.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            if command.is_empty() {
+                return false;
+            }
+            let mutating_patterns = [
+                "sed -i",
+                "perl -pi",
+                "git apply",
+                "patch ",
+                "mv ",
+                "install ",
+                "curl -o",
+                "curl --output",
+                "wget -o",
+                "unzip ",
+                "tar -x",
+                "npm create",
+                "npx create-",
+                "cargo new",
+                "cargo add",
+                "django-admin startproject",
+                "rails new",
+                "write_text(",
+                "write_bytes(",
+                "open(",
+            ];
+            mutating_patterns
+                .iter()
+                .any(|pattern| command.contains(pattern))
+                || has_substantive_copy_effect(&command)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WorkspaceEffectSnapshot {
+    generation: u64,
+    semantic_fingerprint: Option<String>,
+    debounce_ms: u64,
+}
+
+pub(super) fn capture_workspace_effect_snapshot(
+    executor: &parking_lot::RwLock<crate::tools::ToolExecutor>,
+) -> Option<WorkspaceEffectSnapshot> {
+    executor
+        .read()
+        .get_workspace_monitor()
+        .map(|monitor| WorkspaceEffectSnapshot {
+            generation: monitor.generation(),
+            semantic_fingerprint: monitor.semantic_effect_fingerprint().ok(),
+            debounce_ms: monitor.config.debounce_ms,
+        })
+}
+
+/// Confirm a successful semantic effect rather than inferring one from tool
+/// syntax. Explicit file tools expose `changed`; shell-like tools use bounded
+/// before/after content fingerprints and degrade to monitor generation only
+/// when the configured snapshot limits cannot cover the workspace.
+pub(super) async fn confirmed_workspace_effect(
+    executor: &parking_lot::RwLock<crate::tools::ToolExecutor>,
+    name: &str,
+    args: &Value,
+    result: &Value,
+    before: Option<&WorkspaceEffectSnapshot>,
+) -> bool {
+    if crate::core::tracked_action::tool_result_failed(result)
+        || result.get("background_task_id").is_some()
+    {
+        return false;
+    }
+    if matches!(name, "file_write" | "file_edit") {
+        return result.get("changed").and_then(Value::as_bool) == Some(true);
+    }
+    if !is_substantive_workspace_effect(name, args) {
+        return false;
+    }
+
+    let Some(before) = before else {
+        return false;
+    };
+    let Some(monitor) = executor.read().get_workspace_monitor() else {
+        return false;
+    };
+    let after_fingerprint = monitor.semantic_effect_fingerprint().ok();
+    if let (Some(before_fingerprint), Some(after_fingerprint)) =
+        (&before.semantic_fingerprint, after_fingerprint.as_ref())
+    {
+        return before_fingerprint != after_fingerprint;
+    }
+
+    // Oversized/unreadable snapshots use the existing monitor as a degraded
+    // strategy. Wait only for its configured debounce window, and only on
+    // this uncommon fallback path.
+    warn!(
+        tool = name,
+        before_generation = before.generation,
+        "semantic workspace effect snapshot unavailable; using generation fallback"
+    );
+    if monitor.generation() <= before.generation && before.debounce_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(before.debounce_ms)).await;
+    }
+    monitor.generation() > before.generation
+}
+
+/// Treat a normal copy (including restoring *from* a backup) as a workspace
+/// effect, but do not let precautionary `cp source source.bak` calls reset the
+/// DA progress guard. This is intentionally a narrow shell-token inspection,
+/// not a shell parser: uncertain copy forms remain substantive so the guard
+/// does not incorrectly block legitimate generators.
+fn has_substantive_copy_effect(command: &str) -> bool {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index]
+            .trim_matches(|ch: char| matches!(ch, '\'' | '"' | '(' | ')' | ';' | '&' | '|'));
+        if token.rsplit('/').next() != Some("cp") {
+            index += 1;
+            continue;
+        }
+
+        let mut operands = Vec::new();
+        index += 1;
+        while index < tokens.len() {
+            let raw = tokens[index];
+            if matches!(raw, "&&" | "||" | "|" | ";") {
+                break;
+            }
+            let operand =
+                raw.trim_matches(|ch: char| matches!(ch, '\'' | '"' | '(' | ')' | ';' | '&' | '|'));
+            if !operand.is_empty() && !operand.starts_with('-') {
+                operands.push(operand);
+            }
+            index += 1;
+        }
+
+        let Some(destination) = operands.last() else {
+            // An unrecognized/incomplete copy is not evidence of progress.
+            continue;
+        };
+        let backup_only = destination.ends_with(".bak")
+            || destination.ends_with(".backup")
+            || destination.ends_with(".orig")
+            || destination.ends_with('~');
+        if !backup_only {
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) fn is_workspace_mutation_candidate(name: &str, args: &Value) -> bool {
+    if is_substantive_workspace_effect(name, args) {
+        return true;
+    }
+    if !matches!(name, "bash" | "powershell" | "code_execute") {
+        return false;
+    }
+    let command = args
+        .get("command")
+        .or_else(|| args.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    [
+        "mkdir ",
+        "touch ",
+        "rm ",
+        "rmdir ",
+        "del ",
+        "remove-item",
+        "new-item",
+        "set-content",
+        "add-content",
+    ]
+    .iter()
+    .any(|pattern| command.contains(pattern))
+}
+
+/// Update the DA progress tail after one tool-call turn. `effect_observed`
+/// remains the all-time completion evidence, while the consecutive counter is
+/// deliberately reset and resumed throughout the whole execution. Keeping
+/// those two meanings separate prevents one early write from disabling
+/// detection of a much later inspection-only stall.
+pub(super) fn record_workspace_effect_turn(
+    effect_observed: &mut bool,
+    consecutive_effectless_tool_turns: &mut u32,
+    effect_succeeded_this_turn: bool,
+) {
+    if effect_succeeded_this_turn {
+        *effect_observed = true;
+        *consecutive_effectless_tool_turns = 0;
+    } else {
+        *consecutive_effectless_tool_turns = consecutive_effectless_tool_turns.saturating_add(1);
+    }
+}
+
+pub(super) fn workspace_effect_recovery_active(
+    workspace_effect_required: bool,
+    consecutive_effectless_tool_turns: u32,
+    low_novelty_evidence_calls: u32,
+    effect_block_turns: u32,
+) -> bool {
+    workspace_effect_required
+        && effect_block_turns > 0
+        && consecutive_effectless_tool_turns.max(low_novelty_evidence_calls) >= effect_block_turns
+}
+
+fn is_workspace_mutation_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "file_write" | "file_edit" | "bash" | "powershell" | "code_execute"
+    )
+}
+
+/// During recovery, advertise only tools that can make the required workspace
+/// change. This is an intersection with the already role/SA-authorized window;
+/// it never broadens authority. If a custom workflow allowed only reads, the
+/// result is intentionally empty and DA must report the capability blocker.
+pub(super) fn mutation_recovery_tool_definitions(definitions: Vec<Value>) -> Vec<Value> {
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            definition["function"]["name"]
+                .as_str()
+                .is_some_and(is_workspace_mutation_tool_name)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExecutionPhase {
+    Inspect,
+    Implement,
+    Verify,
+    Repair,
+}
+
+pub(super) fn da_phase_after_tool_turn(
+    current: ExecutionPhase,
+    substantive_effect: bool,
+    verification_failed: bool,
+) -> ExecutionPhase {
+    if verification_failed {
+        ExecutionPhase::Repair
+    } else if substantive_effect {
+        // Every mutation, including a repair made while verifying, must be
+        // followed by fresh verification of the changed state.
+        ExecutionPhase::Verify
+    } else {
+        current
+    }
+}
+
+pub(crate) const SA_RECOVERY_MODE_CONSTRAINT: &str = "sa_recovery_mode";
+pub(crate) const CA_DA_CORRECTION_MODE: &str = "ca_da_correction";
+
+pub(super) fn initial_execution_phase(
+    role: AgentRole,
+    constraints: &std::collections::HashMap<String, String>,
+) -> ExecutionPhase {
+    if role == AgentRole::Check {
+        ExecutionPhase::Verify
+    } else if role == AgentRole::Do
+        && constraints
+            .get(SA_RECOVERY_MODE_CONSTRAINT)
+            .is_some_and(|mode| mode == CA_DA_CORRECTION_MODE)
+    {
+        ExecutionPhase::Repair
+    } else {
+        ExecutionPhase::Inspect
+    }
+}
+
+pub(super) fn effective_effect_block_turns(
+    phase: ExecutionPhase,
+    general_turns: u32,
+    repair_turns: u32,
+) -> u32 {
+    if phase == ExecutionPhase::Repair && repair_turns > 0 {
+        repair_turns
+    } else {
+        general_turns
+    }
+}
+
+pub(super) fn phase_tool_definitions(
+    definitions: Vec<Value>,
+    role: AgentRole,
+    phase: ExecutionPhase,
+) -> Vec<Value> {
+    if role != AgentRole::Do || phase == ExecutionPhase::Inspect {
+        return definitions;
+    }
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            let name = definition["function"]["name"].as_str().unwrap_or_default();
+            match phase {
+                ExecutionPhase::Implement | ExecutionPhase::Repair => !matches!(
+                    name,
+                    "file_list" | "glob_search" | "grep_search" | "workspace_status"
+                ),
+                ExecutionPhase::Verify => !matches!(name, "file_list" | "glob_search"),
+                ExecutionPhase::Inspect => true,
+            }
+        })
+        .collect()
+}
+
+/// If the bounded manifest contains the complete inventory, another broad
+/// list/glob/status call cannot discover a file the Agent was not already
+/// shown. Targeted reads/searches remain available for content retrieval.
+pub(super) fn workspace_inventory_tool_definitions(
+    definitions: Vec<Value>,
+    inventory_complete_and_bounded: bool,
+) -> Vec<Value> {
+    if !inventory_complete_and_bounded {
+        return definitions;
+    }
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            !matches!(
+                definition["function"]["name"].as_str().unwrap_or_default(),
+                "file_list" | "glob_search" | "workspace_status"
+            )
+        })
+        .collect()
+}
+
+/// Snapshot the exact tool window advertised for one LLM turn.  Tool schemas
+/// are intentionally phase-sensitive, so execution must validate against the
+/// same snapshot rather than the runner's broader registry.
+pub(super) fn advertised_tool_names(definitions: &[Value]) -> HashSet<String> {
+    definitions
+        .iter()
+        .filter_map(|definition| definition["function"]["name"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Keep discovered ordinary tools active for the current execution, but only
+/// advertise dynamic result readers that are still referenced by the current
+/// message window. This preserves valid compressed-result links without
+/// turning every historical reader into permanent tool-schema overhead.
+pub(super) fn active_session_tool_names(
+    messages: &[ChatMessage],
+    session_tools: &HashSet<String>,
+) -> HashSet<String> {
+    session_tools
+        .iter()
+        .filter(|name| {
+            !ToolExecutor::is_micro_tool_name(name)
+                || messages.iter().any(|message| {
+                    message.content.contains(name.as_str())
+                        || message.tool_calls.as_ref().is_some_and(|calls| {
+                            calls.iter().any(|call| call.function.name == **name)
+                        })
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+pub(super) fn unadvertised_tool_call_result(
+    advertised: &HashSet<String>,
+    tool_name: &str,
+) -> Option<Value> {
+    (!advertised.contains(tool_name)).then(|| {
+        json!({
+            "status": "not_executed",
+            "reason": "tool_not_advertised",
+            "message": format!(
+                "Tool {tool_name} is unavailable in the current execution phase and was not executed"
+            ),
+            "required_next_action": "Use only a tool advertised in the current turn, or finish with the exact blocker."
+        })
+    })
+}
+
+pub(super) fn ca_evidence_focus_tool_definitions(
+    definitions: Vec<Value>,
+    role: AgentRole,
+    evidence_focus_active: bool,
+) -> Vec<Value> {
+    if role != AgentRole::Check || !evidence_focus_active {
+        return definitions;
+    }
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            matches!(
+                definition["function"]["name"].as_str().unwrap_or_default(),
+                "bash" | "powershell" | "file_read" | "read_agent_output"
+            )
+        })
+        .collect()
+}
+
+pub(super) fn ca_evidence_close_tool_definitions(
+    definitions: Vec<Value>,
+    role: AgentRole,
+    evidence_close_active: bool,
+) -> Vec<Value> {
+    if role == AgentRole::Check && evidence_close_active {
+        Vec::new()
+    } else {
+        definitions
+    }
+}
+
+pub(super) fn pa_planning_focus_tool_definitions(
+    definitions: Vec<Value>,
+    role: AgentRole,
+    planning_focus_active: bool,
+) -> Vec<Value> {
+    if role == AgentRole::Plan && planning_focus_active {
+        Vec::new()
+    } else {
+        definitions
+    }
+}
+
+pub(super) fn workspace_inventory_complete_and_bounded(
+    executor: &parking_lot::RwLock<crate::tools::ToolExecutor>,
+    max_manifest_files: usize,
+) -> bool {
+    executor
+        .read()
+        .get_workspace_monitor()
+        .map(|monitor| {
+            let view = monitor.workspace_view(None, None, max_manifest_files.max(1));
+            view.scan_complete && !view.truncated
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkspaceInventoryCoverage {
+    pub scan_complete: bool,
+    pub truncated: bool,
+    pub total_files: usize,
+}
+
+pub(super) fn workspace_inventory_coverage(
+    executor: &parking_lot::RwLock<crate::tools::ToolExecutor>,
+    max_manifest_files: usize,
+) -> Option<WorkspaceInventoryCoverage> {
+    executor.read().get_workspace_monitor().map(|monitor| {
+        let view = monitor.workspace_view(None, None, max_manifest_files.max(1));
+        WorkspaceInventoryCoverage {
+            scan_complete: view.scan_complete,
+            truncated: view.truncated,
+            total_files: view.total_files,
+        }
+    })
+}
+
+pub(super) fn evidence_key(name: &str, args: &Value, generation: u64) -> Option<String> {
+    let is_evidence = matches!(
+        name,
+        "file_read"
+            | "file_list"
+            | "glob_search"
+            | "grep_search"
+            | "workspace_status"
+            | "tool_search"
+    );
+    is_evidence.then(|| {
+        let canonical = serde_json::to_string(args).unwrap_or_default();
+        format!("{generation}:{name}:{canonical}")
+    })
+}
+
+pub(super) fn refresh_execution_ledger(
+    messages: &mut Vec<ChatMessage>,
+    role: AgentRole,
+    phase: ExecutionPhase,
+    effect_policy: &crate::core::effect::EffectPolicy,
+    mutation_count: u32,
+    verification_turns: u32,
+    low_novelty_turns: u32,
+    workspace_generation: u64,
+) {
+    if role != AgentRole::Do {
+        return;
+    }
+    messages.retain(|message| message.name.as_deref() != Some("execution_ledger"));
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "# Execution Ledger (replaceable state)\n\n- phase: {:?}\n- effect_policy: {:?}\n- substantive_effects: {}\n- verification_tool_turns_after_effect: {}\n- low_novelty_evidence_score: {}\n- workspace_generation: {}\n\nContinue from this state. Do not repeat evidence queries that produced no new generation or target information.",
+            phase,
+            effect_policy,
+            mutation_count,
+            verification_turns,
+            low_novelty_turns,
+            workspace_generation,
+        ),
+        name: Some("execution_ledger".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+pub(super) fn final_turn_limit_notice(
+    role: AgentRole,
+    workspace_effect_required: bool,
+    workspace_effect_observed: bool,
+    consecutive_effectless_tool_turns: u32,
+) -> String {
+    if role == AgentRole::Do && workspace_effect_required {
+        let progress = if workspace_effect_observed {
+            format!(
+                "A workspace mutation was made earlier, but the current no-change tail is {} tool turn(s).",
+                consecutive_effectless_tool_turns
+            )
+        } else {
+            "No substantive workspace mutation has succeeded yet.".to_string()
+        };
+        return format!(
+            "【Turn Limit Urgent】The DA budget is nearly exhausted. {} Use the remaining turns for the highest-priority incomplete implementation with file_write/file_edit or a genuinely mutating command, followed by only targeted verification. Do not start broad inspection. If implementation is impossible, finish with `FAILED:` and the exact blocker.",
+            progress
+        );
+    }
+
+    "【Turn Limit Urgent】The role-specific budget is nearly exhausted. Finish from the evidence already collected and output the final result now. Do not initiate new tool calls.".to_string()
+}
 
 use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
@@ -15,9 +595,40 @@ use crate::CoreError;
 
 use super::{TaskContext, TaskResult, TaskVerdict};
 
-/// Cap on (tool_name, result) pairs aggregated into the force-finish summary
-/// prompt — bounds prompt size for long tasks regardless of total tool calls.
-const MAX_AGGREGATE_TOOL_ENTRIES: usize = 20;
+/// Replace (never accumulate) the transient workspace delta message when the
+/// monitor generation advances. Full file content remains out of prompt and
+/// is recovered through the existing micro-tools.
+pub(super) fn refresh_workspace_delta_message(
+    executor: &std::sync::Arc<parking_lot::RwLock<ToolExecutor>>,
+    messages: &mut Vec<ChatMessage>,
+    last_generation: &mut u64,
+    max_changes: usize,
+) {
+    let monitor = executor.read().get_workspace_monitor();
+    let Some(monitor) = monitor else {
+        return;
+    };
+    let current = monitor.generation();
+    if current <= *last_generation {
+        return;
+    }
+    let Some(delta) = monitor.format_delta_since(*last_generation, max_changes.max(1)) else {
+        return;
+    };
+    *last_generation = current;
+    messages.retain(|message| message.name.as_deref() != Some("workspace_delta"));
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: format!(
+            "# Workspace Delta (evidence only)\n\n{}\n\nUse the changed paths directly; do not re-list unchanged directories.",
+            delta
+        ),
+        name: Some("workspace_delta".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
 
 /// Collect assistant→tool message pairs from the history, keeping only the
 /// most recent `max_entries` so the summary prompt stays bounded.
@@ -48,6 +659,28 @@ impl super::AgentRunner {
         &self,
         agent: &mut AgentInstance,
         ctx: TaskContext,
+    ) -> Result<TaskResult, CoreError> {
+        self.execute_internal(agent, ctx, None).await
+    }
+
+    /// Execute one BizAgent's ReAct loop with the business-layer agent.md
+    /// already assembled by SA.  BizAgent remains the owner of role identity
+    /// and business prompt construction; AgentRunner owns the low-level
+    /// lifecycle, memory session, tools, checkpoints, and terminal semantics.
+    pub(crate) async fn execute_with_agent_md(
+        &self,
+        agent: &mut AgentInstance,
+        ctx: TaskContext,
+        agent_md: &str,
+    ) -> Result<TaskResult, CoreError> {
+        self.execute_internal(agent, ctx, Some(agent_md)).await
+    }
+
+    async fn execute_internal(
+        &self,
+        agent: &mut AgentInstance,
+        ctx: TaskContext,
+        agent_md: Option<&str>,
     ) -> Result<TaskResult, CoreError> {
         // AgentInit hook
         {
@@ -157,7 +790,7 @@ impl super::AgentRunner {
                 .await;
         }
 
-        let result = self.exec(agent, ctx.clone(), &mut session).await;
+        let result = self.exec(agent, ctx.clone(), &mut session, agent_md).await;
 
         {
             let mut mm = self.memory_manager.lock().await;
@@ -177,7 +810,7 @@ impl super::AgentRunner {
                             })
                             .count() as f32
                             / r.tracked_actions.len().max(1) as f32;
-                        let _ = mm.archive_experience(
+                        let _ = mm.archive_agent_execution(
                             &r.task_iri,
                             &agent.role.to_string(),
                             &r.summary,
@@ -239,166 +872,6 @@ impl super::AgentRunner {
         result
     }
 
-    /// Execute task using an independent BizAgent instance (Agent isolation)
-    pub async fn execute_with_biz_agent(
-        &self,
-        agent: &AgentInstance,
-        ctx: TaskContext,
-        plan_step: Option<crate::core::sa::PlanStep>,
-    ) -> Result<TaskResult, CoreError> {
-        use crate::core::biz_agent::{AgentConfig, BizAgent};
-
-        let ctx = if let Some(ref step) = plan_step {
-            if step.tools_allowed.is_empty() {
-                ctx
-            } else {
-                ctx.with_allowed_tools(step.tools_allowed.clone())
-            }
-        } else {
-            ctx
-        };
-
-        // AgentInit hook
-        {
-            let mut hook_ctx = HookContext::new(
-                HookPoint::AgentInit,
-                &agent.agent_id,
-                &agent.role.to_string(),
-            )
-            .with_task(&ctx.task_iri, &ctx.task_iri);
-            self.hook_manager
-                .execute(HookPoint::AgentInit, &mut hook_ctx)
-                .await;
-        }
-
-        // Build independent agent.md
-        let context_data = self.gather_context_data_async(agent.role, &ctx).await;
-        let agent_md = if let Some(ref step) = plan_step {
-            self.build_agent_md_from_step(agent.role, step, &context_data)
-        } else {
-            let model = self
-                .gateway
-                .get_model(&agent.role.to_string().to_lowercase());
-            self.build_agent_md(agent.role, &ctx.objective, &context_data, &model)
-        };
-
-        // Create BizAgent configuration
-        let config = AgentConfig {
-            orchestrator_mode: false,
-            max_sub_agents: 5,
-            max_iterations: ctx.max_iterations,
-            parallel_sub_agents: true,
-        };
-
-        // Create independent BizAgent instance
-        let mut biz_agent = BizAgent::new(
-            agent.agent_id.clone(),
-            agent.role,
-            &agent_md,
-            Arc::new((*self).clone()),
-            config,
-        );
-
-        // TaskStart hook
-        {
-            let mut hook_ctx = HookContext::new(
-                HookPoint::TaskStart,
-                &agent.agent_id,
-                &agent.role.to_string(),
-            )
-            .with_task(&ctx.task_iri, &ctx.task_iri);
-            let hook_result = self
-                .hook_manager
-                .execute(HookPoint::TaskStart, &mut hook_ctx)
-                .await;
-            if hook_result == HookResult::Abort {
-                return Ok(TaskResult {
-                    task_iri: ctx.task_iri,
-                    status: "aborted".to_string(),
-                    summary: "Agent aborted by hook".to_string(),
-                    output: None,
-                    jsonld_output: None,
-                    artifacts: Vec::new(),
-                    errors: vec!["Agent aborted by hook".to_string()],
-                    turn_count: 0,
-                    tool_call_count: 0,
-                    five_w2h_updates: None,
-                    tracked_actions: Vec::new(),
-                    verdict: None,
-                    archive_iri: None,
-                });
-            }
-        }
-
-        // AgentStart hook
-        let mut hook_ctx = HookContext::new(
-            HookPoint::AgentStart,
-            &agent.agent_id,
-            &agent.role.to_string(),
-        )
-        .with_task(&ctx.task_iri, &ctx.task_iri);
-        let hook_result = self
-            .hook_manager
-            .execute(HookPoint::AgentStart, &mut hook_ctx)
-            .await;
-        if hook_result == HookResult::Abort {
-            return Ok(TaskResult {
-                task_iri: ctx.task_iri,
-                status: "aborted".to_string(),
-                summary: "Agent aborted by hook".to_string(),
-                output: None,
-                jsonld_output: None,
-                artifacts: Vec::new(),
-                errors: vec!["Agent aborted by hook".to_string()],
-                turn_count: 0,
-                tool_call_count: 0,
-                five_w2h_updates: None,
-                tracked_actions: Vec::new(),
-                verdict: None,
-                archive_iri: None,
-            });
-        }
-
-        // Execute BizAgent (isolated environment)
-        let result = biz_agent.execute(ctx.clone()).await;
-
-        // TaskEnd hook
-        {
-            let mut hook_ctx =
-                HookContext::new(HookPoint::TaskEnd, &agent.agent_id, &agent.role.to_string())
-                    .with_task(&ctx.task_iri, &ctx.task_iri);
-            self.hook_manager
-                .execute(HookPoint::TaskEnd, &mut hook_ctx)
-                .await;
-        }
-
-        // AgentEnd hook
-        let mut hook_ctx = HookContext::new(
-            HookPoint::AgentEnd,
-            &agent.agent_id,
-            &agent.role.to_string(),
-        );
-        self.hook_manager
-            .execute(HookPoint::AgentEnd, &mut hook_ctx)
-            .await;
-
-        // Handle errors
-        if result.status == "failed" {
-            let mut hook_ctx = HookContext::new(
-                HookPoint::AgentError,
-                &agent.agent_id,
-                &agent.role.to_string(),
-            )
-            .with_task(&ctx.task_iri, &ctx.task_iri);
-            hook_ctx.error = Some(result.summary.clone());
-            self.hook_manager
-                .execute(HookPoint::AgentError, &mut hook_ctx)
-                .await;
-        }
-
-        Ok(result)
-    }
-
     /// In force-finish scenarios, extract tool results from messages and call LLM for final aggregated summary.
     /// Returns (summary, full_content), or None if no tool results are aggregatable or LLM fails.
     async fn aggregate_tool_results(
@@ -408,7 +881,8 @@ impl super::AgentRunner {
         ctx: &TaskContext,
     ) -> Option<(String, String)> {
         // Extract assistant messages with tool_calls and corresponding tool results
-        let tool_entries = collect_tool_entries(messages, MAX_AGGREGATE_TOOL_ENTRIES);
+        let budget = &self.agent_settings.execution_budget;
+        let tool_entries = collect_tool_entries(messages, budget.force_finish_max_tool_entries);
 
         if tool_entries.is_empty() {
             return None;
@@ -417,11 +891,15 @@ impl super::AgentRunner {
         let prompt_parts: Vec<String> = tool_entries
             .iter()
             .map(|(name, result)| {
-                let truncated = if result.len() > 2000 {
+                let result_chars = result.chars().count();
+                let truncated = if result_chars > budget.force_finish_tool_result_max_chars {
                     format!(
                         "{}...\n[truncated, original {} chars]",
-                        &result[..2000],
-                        result.len()
+                        result
+                            .chars()
+                            .take(budget.force_finish_tool_result_max_chars)
+                            .collect::<String>(),
+                        result_chars
                     )
                 } else {
                     result.clone()
@@ -492,17 +970,25 @@ Output the summary report directly, not in JSON format."#,
         agent: &AgentInstance,
         ctx: TaskContext,
         sess: &mut L1Session,
+        agent_md_override: Option<&str>,
     ) -> Result<TaskResult, CoreError> {
         let model = self
             .gateway
             .get_model(&agent.role.to_string().to_lowercase());
         let supports_reasoning = self.gateway.supports_native_reasoning(&model);
 
-        let context_data = self.gather_context_data_async(agent.role, &ctx).await;
-        let agent_md = self.build_agent_md(agent.role, &ctx.objective, &context_data, &model);
+        let generated_agent_md;
+        let agent_md = if let Some(agent_md) = agent_md_override {
+            agent_md
+        } else {
+            let context_data = self.gather_context_data_async(agent.role, &ctx).await;
+            generated_agent_md =
+                self.build_agent_md(agent.role, &ctx.objective, &context_data, &model);
+            &generated_agent_md
+        };
 
         // Build system prompt (relatively static, placed in system role)
-        let system_content = self.build_system_prompt(agent, &ctx, sess, &agent_md).await;
+        let system_content = self.build_system_prompt(agent, &ctx, sess, agent_md).await;
 
         // Build context message (dynamic, placed in the final user role)
         let summary_iris = sess.get_summary_chain_with_iris(20, 100);
@@ -568,21 +1054,29 @@ Output the summary report directly, not in JSON format."#,
 
         // Proactive KG context injection: query the knowledge graph for entities relevant to the task
         // and inject them as environment context before the agent begins reasoning.
-        if let Some(ref kg_store) = self.unified_graph_store {
-            let kg_context = Self::build_kg_context(kg_store, &ctx.objective);
-            if !kg_context.is_empty() {
-                info!(
-                    "[kg_context] injecting {} bytes of knowledge graph context",
-                    kg_context.len()
+        if self.learning_mode.injects_history() {
+            if let Some(ref kg_store) = self.unified_graph_store {
+                let prompt_settings = &self.token_optimization.prompt_optimization;
+                let kg_context = Self::build_kg_context(
+                    kg_store,
+                    &ctx.objective,
+                    prompt_settings.max_kg_context_entities,
+                    prompt_settings.max_kg_context_bytes,
                 );
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: format!("# Knowledge Graph Context\n\n{}", kg_context),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                });
+                if !kg_context.is_empty() {
+                    info!(
+                        "[kg_context] injecting {} bytes of knowledge graph context",
+                        kg_context.len()
+                    );
+                    messages.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: format!("# Knowledge Graph Context\n\n{}", kg_context),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                }
             }
         }
 
@@ -629,7 +1123,8 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         });
 
-        let tools = self.tool_definitions_for_agent(&agent.role.to_string());
+        let tools = self
+            .tool_definitions_for_context(&agent.role.to_string(), ctx.allowed_tools.as_deref());
 
         info!(
             "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
@@ -645,6 +1140,9 @@ Output the summary report directly, not in JSON format."#,
         let mut consecutive_failures = 0u32;
         let mut recovery_mode_active = false;
         let mut guard_pending_pre_injections: Vec<String> = Vec::new();
+        // Micro-tools are backed by process-wide archived results, but their
+        // schemas belong only to the BizAgent execution that produced them.
+        let mut session_micro_tools = std::collections::HashSet::<String>::new();
         // Track error count per tool, early terminate if same tool fails repeatedly
         let mut tool_error_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
@@ -652,6 +1150,15 @@ Output the summary report directly, not in JSON format."#,
             std::collections::HashSet::new();
         let mut action_tracker =
             crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string());
+        let workspace_effect_required = requires_workspace_effect(&ctx, agent.role);
+        // Conditional-effect tasks need the same anti-stall phase guidance as
+        // required-effect tasks, but only Required may hard-fail at completion.
+        let workspace_effect_tracked = agent.role == AgentRole::Do
+            && ctx
+                .effective_effect_policy()
+                .may_require_workspace_mutation();
+        let mut workspace_effect_observed = false;
+        let mut consecutive_effectless_tool_turns = 0u32;
         let checkpoint_manager =
             crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
 
@@ -660,12 +1167,49 @@ Output the summary report directly, not in JSON format."#,
         let mut best_content_str: String = String::new();
         let mut best_content_iri: String = String::new();
 
-        let effective_max_turns = match agent.role {
-            AgentRole::Plan => ctx.max_iterations.min(200),
-            AgentRole::Do => ctx.max_iterations,
-            AgentRole::Check => ctx.max_iterations.min(200),
-            AgentRole::Act => ctx.max_iterations.min(150),
-        };
+        let execution_budget = &self.agent_settings.execution_budget;
+        let effective_max_turns =
+            effective_role_max_turns(agent.role, ctx.max_iterations, execution_budget);
+        let (early_warning_turn, final_warning_turn) = turn_warning_thresholds(
+            effective_max_turns,
+            execution_budget.early_warning_remaining,
+            execution_budget.final_warning_remaining,
+        );
+        let effect_warning_turns = execution_budget.effect_progress_warning_turns;
+        let mut workspace_generation = self
+            .tool_executor
+            .read()
+            .get_workspace_monitor()
+            .map(|monitor| monitor.generation())
+            .unwrap_or(0);
+        let workspace_delta_limit = self
+            .token_optimization
+            .prompt_optimization
+            .max_workspace_manifest_files;
+        let mut execution_phase = initial_execution_phase(agent.role, &ctx.constraints);
+        let effect_block_turns = effective_effect_block_turns(
+            execution_phase,
+            execution_budget.effect_progress_block_turns,
+            execution_budget.da_repair_effect_block_turns,
+        );
+        if let Some(coverage) =
+            workspace_inventory_coverage(&self.tool_executor, workspace_delta_limit)
+        {
+            info!(
+                role = %agent.role,
+                scan_complete = coverage.scan_complete,
+                truncated = coverage.truncated,
+                total_files = coverage.total_files,
+                max_manifest_files = workspace_delta_limit,
+                broad_inventory_tools_needed = !(coverage.scan_complete && !coverage.truncated),
+                "Workspace inventory coverage resolved"
+            );
+        }
+        let mut evidence_keys = std::collections::HashSet::<String>::new();
+        let mut low_novelty_turns = 0u32;
+        let mut substantive_effect_count = 0u32;
+        let mut verification_turns = 0u32;
+        let mut planning_tool_turns = 0u32;
 
         // Initial checkpoint: record task start state
         let start_role_str = agent.role.to_string();
@@ -702,12 +1246,33 @@ Output the summary report directly, not in JSON format."#,
         let mut soft_limit_force_finish = false;
 
         loop {
-            // --- Soft limit phase 1: Early warning (~8 turns remaining) ---
-            if !soft_limit_early_warning_sent && turn >= effective_max_turns.saturating_sub(8) {
+            refresh_workspace_delta_message(
+                &self.tool_executor,
+                &mut messages,
+                &mut workspace_generation,
+                workspace_delta_limit,
+            );
+            refresh_execution_ledger(
+                &mut messages,
+                agent.role,
+                execution_phase,
+                &ctx.effective_effect_policy(),
+                substantive_effect_count,
+                verification_turns,
+                low_novelty_turns,
+                workspace_generation,
+            );
+            // --- Soft limit phase 1: role-budget-aware early warning ---
+            if !soft_limit_early_warning_sent
+                && early_warning_turn.is_some_and(|threshold| turn >= threshold)
+            {
                 soft_limit_early_warning_sent = true;
                 warn!(
-                    "[turn {}] soft limit warning: ~8 turns remaining (max={})",
-                    turn, effective_max_turns
+                    "[turn {}] soft limit warning (role={}, remaining={}, max={})",
+                    turn,
+                    agent.role,
+                    effective_max_turns.saturating_sub(turn),
+                    effective_max_turns
                 );
                 messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -718,16 +1283,26 @@ Output the summary report directly, not in JSON format."#,
                     reasoning_content: None,
                 });
             }
-            // --- Soft limit phase 2: Final warning (~3 turns remaining) ---
-            if !soft_limit_final_warning_sent && turn >= effective_max_turns.saturating_sub(3) {
+            // --- Soft limit phase 2: final warning ---
+            if !soft_limit_final_warning_sent
+                && final_warning_turn.is_some_and(|threshold| turn >= threshold)
+            {
                 soft_limit_final_warning_sent = true;
                 warn!(
-                    "[turn {}] soft limit final warning: ~3 turns remaining (max={})",
-                    turn, effective_max_turns
+                    "[turn {}] soft limit final warning (role={}, remaining={}, max={})",
+                    turn,
+                    agent.role,
+                    effective_max_turns.saturating_sub(turn),
+                    effective_max_turns
                 );
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: "【Turn Limit Urgent】Only 3 turns remaining. Please finish your current work and output the final result immediately. Do not initiate new tool calls.".to_string(),
+                    content: final_turn_limit_notice(
+                        agent.role,
+                        workspace_effect_tracked,
+                        workspace_effect_observed,
+                        consecutive_effectless_tool_turns,
+                    ),
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -739,17 +1314,9 @@ Output the summary report directly, not in JSON format."#,
                 if !soft_limit_force_finish {
                     soft_limit_force_finish = true;
                     warn!("[turn {}] max turns {} reached, injecting force-finish directive (no truncation)", turn, effective_max_turns);
-                    errs.push("max turns reached".to_string());
-                    if let Some(ref event_bus) = self.event_bus {
-                        let _ = event_bus
-                            .emit(
-                                &ctx.task_iri,
-                                "AGENT_BLOCKED",
-                                &agent.agent_id,
-                                &serde_json::json!({"iterations": turn}).to_string(),
-                            )
-                            .await;
-                    }
+                    // Budget exhaustion requests a terminal response; it is
+                    // not itself evidence that the BizAgent is blocked. The
+                    // returned terminal verdict decides success or failure.
                     let max_role_str = agent.role.to_string();
                     let tool_error_str = serde_json::json!({
                         "error_counts": tool_error_counts,
@@ -1008,7 +1575,20 @@ Output the summary report directly, not in JSON format."#,
                 let model = self
                     .gateway
                     .get_model(&agent.role.to_string().to_lowercase());
-                if cwm.should_compress_for_model(messages.len(), &messages, &model) {
+                let active_session_tools =
+                    active_session_tool_names(&messages, &session_micro_tools);
+                let turn_tool_definitions = self.tool_definitions_for_context_with_microtools(
+                    &agent.role.to_string(),
+                    ctx.allowed_tools.as_deref(),
+                    &active_session_tools,
+                );
+                let tool_schema_token_reserve = crate::core::context_compressor::ContextWindowManager::estimate_tool_schema_tokens(&turn_tool_definitions);
+                if cwm.should_compress_for_model_with_reserve(
+                    messages.len(),
+                    &messages,
+                    &model,
+                    tool_schema_token_reserve,
+                ) {
                     let (compressed, summary_text) = cwm.compress_messages(&messages);
                     if !summary_text.is_empty() {
                         sess.add_summary("system", &summary_text, None);
@@ -1057,25 +1637,114 @@ Output the summary report directly, not in JSON format."#,
                 tools.len()
             );
 
+            let mutation_recovery_active = workspace_effect_recovery_active(
+                workspace_effect_tracked,
+                consecutive_effectless_tool_turns,
+                low_novelty_turns,
+                effect_block_turns,
+            );
+            let mut request_messages = messages.clone();
+            let ca_evidence_focus_active = agent.role == AgentRole::Check
+                && execution_budget.ca_evidence_focus_turns > 0
+                && verification_turns >= execution_budget.ca_evidence_focus_turns;
+            let ca_evidence_close_active = agent.role == AgentRole::Check
+                && execution_budget.ca_evidence_close_turns > 0
+                && verification_turns >= execution_budget.ca_evidence_close_turns;
+            let pa_planning_focus_active = agent.role == AgentRole::Plan
+                && execution_budget.pa_planning_focus_turns > 0
+                && planning_tool_turns >= execution_budget.pa_planning_focus_turns;
+            if ca_evidence_focus_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[CA Evidence Convergence] Multiple verification tool turns have already completed. Finish now with PASS/FAIL and criterion-linked evidence unless one named acceptance criterion is still unverified. If one remains, perform only the single targeted check needed for that criterion; do not repeat broad discovery or already-passing checks.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if ca_evidence_close_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[CA Evidence Close Gate] The configured evidence window is exhausted. Do not call another tool. Return the final criterion-linked PASS/FAIL audit now. Any criterion lacking evidence must be marked FAIL; uncertainty is not a reason for more discovery.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if pa_planning_focus_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[PA Planning Convergence] The configured inspection window is complete. Use the objective, workspace manifest, retrieved evidence, and prior-cycle feedback already supplied. Emit the executable plan now; do not request more tools. Preserve explicit acceptance criteria and name the checks DA/CA must run.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if mutation_recovery_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "[DA Mutation Recovery Mode] The last {} tool turns made no substantive workspace change. Inspection/search tools are temporarily unavailable. Make the highest-priority pending change now with an advertised mutation-capable tool. If the authorized tool window contains no such tool or another exact blocker prevents progress, finish with `FAILED:` and name the blocker.",
+                        consecutive_effectless_tool_turns
+                    ),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+
+            // The exact per-turn tool window is also retained for execution-
+            // time authorization.  Some OpenAI-compatible providers may emit
+            // a tool name remembered from earlier context even after its
+            // schema has been withdrawn for the current phase.
+            let current_tools = {
+                let active_session_tools =
+                    active_session_tool_names(&request_messages, &session_micro_tools);
+                let current_tools = self.tool_definitions_for_context_with_microtools(
+                    &agent.role.to_string(),
+                    ctx.allowed_tools.as_deref(),
+                    &active_session_tools,
+                );
+                let current_tools =
+                    phase_tool_definitions(current_tools, agent.role, execution_phase);
+                let current_tools = workspace_inventory_tool_definitions(
+                    current_tools,
+                    workspace_inventory_complete_and_bounded(
+                        &self.tool_executor,
+                        workspace_delta_limit,
+                    ),
+                );
+                let current_tools = ca_evidence_focus_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    ca_evidence_focus_active,
+                );
+                let current_tools = ca_evidence_close_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    ca_evidence_close_active,
+                );
+                let current_tools = pa_planning_focus_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    pa_planning_focus_active,
+                );
+                if mutation_recovery_active {
+                    mutation_recovery_tool_definitions(current_tools)
+                } else {
+                    current_tools
+                }
+            };
+            let advertised_tools = advertised_tool_names(&current_tools);
+            let request_tools = (!current_tools.is_empty()).then_some(current_tools);
+
             let response = self
                 .gateway
-                .chat_with_params(
-                    &model,
-                    messages.clone(),
-                    None,
-                    None,
-                    {
-                        // Refresh tools list before each call to ensure newly registered micro-tools (e.g. read_full_result_*) are included
-                        let current_tools =
-                            self.tool_definitions_for_agent(&agent.role.to_string());
-                        if current_tools.is_empty() {
-                            None
-                        } else {
-                            Some(current_tools)
-                        }
-                    },
-                    None,
-                )
+                .chat_with_params(&model, request_messages, None, None, request_tools, None)
                 .await
                 .map_err(|e| CoreError::Internal {
                     message: e.to_string(),
@@ -1115,16 +1784,30 @@ Output the summary report directly, not in JSON format."#,
             let reasoning_content = choice.message.reasoning_content.clone();
             let finish = choice.finish_reason.as_deref().unwrap_or("");
 
+            // Some Responses-API-compatible reasoning models (observed with
+            // DeepSeek) complete a terminal turn with `content: null` while
+            // putting the only conclusion in `reasoning_content`. Treating
+            // that as an empty answer let a DA that explicitly reported
+            // "not completed" pass through SA as success. Tool-call turns
+            // intentionally keep empty assistant content; this fallback is
+            // terminal-only.
+            let effective_content = Self::effective_response_content(
+                &raw_content,
+                reasoning_content.as_deref(),
+                finish,
+                choice.message.tool_calls.is_some(),
+            );
+
             debug!(
                 "[turn {}] LLM response: finish={}, content_len={}, has_reasoning={}",
                 turn,
                 finish,
-                raw_content.len(),
+                effective_content.len(),
                 reasoning_content.is_some()
             );
 
             let parsed = self.parse_llm_response(
-                &raw_content,
+                &effective_content,
                 reasoning_content.as_deref(),
                 supports_reasoning,
             );
@@ -1349,7 +2032,7 @@ Output the summary report directly, not in JSON format."#,
 
                     // When parsed.content is empty (LLM returned content=null + tool_calls),
                     // aggregate from tool results in messages to ensure subsequent agent can read a valid plan
-                    let (final_summary, output_value) =
+                    let (mut final_summary, output_value) =
                         if !parsed.content.trim().is_empty() {
                             (
                                 parsed.summary.clone().unwrap_or_else(|| {
@@ -1437,7 +2120,14 @@ Output the summary report directly, not in JSON format."#,
                     } else {
                         Some(node_iri.clone())
                     };
-                    let task_verdict = if Self::detect_blocker_verdict(&final_summary).is_some() {
+                    if workspace_effect_required && !workspace_effect_observed {
+                        let detail = "DA completed without creating or modifying substantive workspace content";
+                        errs.push(detail.to_string());
+                        final_summary = format!("FAILED: {}. {}", detail, final_summary);
+                    }
+                    let task_verdict = if workspace_effect_required && !workspace_effect_observed {
+                        TaskVerdict::Failed
+                    } else if Self::detect_blocker_verdict(&final_summary).is_some() {
                         TaskVerdict::Blocked
                     } else {
                         TaskVerdict::Success
@@ -1470,7 +2160,8 @@ Output the summary report directly, not in JSON format."#,
                             })
                         );
                         // If parsed.content is empty (tool_calls-only response), try LLM aggregation of existing tool results
-                        let (final_summary, output_value) = if !parsed.content.trim().is_empty() {
+                        let (mut final_summary, output_value) = if !parsed.content.trim().is_empty()
+                        {
                             (
                                 parsed.summary.clone().unwrap_or_else(|| {
                                     Self::generate_auto_summary(&parsed.content)
@@ -1496,15 +2187,23 @@ Output the summary report directly, not in JSON format."#,
                         } else {
                             None
                         };
-                        let force_verdict = if soft_limit_force_finish
-                            && errs
-                                .iter()
-                                .any(|e| e.contains("max turns") || e.contains("force-finish"))
-                        {
-                            TaskVerdict::PartialSuccess
-                        } else {
-                            TaskVerdict::Success
-                        };
+                        if workspace_effect_required && !workspace_effect_observed {
+                            let detail = "DA reached its turn limit without a substantive workspace mutation";
+                            errs.push(detail.to_string());
+                            final_summary = format!("FAILED: {}. {}", detail, final_summary);
+                        }
+                        let force_verdict =
+                            if workspace_effect_required && !workspace_effect_observed {
+                                TaskVerdict::Failed
+                            } else if soft_limit_force_finish
+                                && errs
+                                    .iter()
+                                    .any(|e| e.contains("max turns") || e.contains("force-finish"))
+                            {
+                                TaskVerdict::PartialSuccess
+                            } else {
+                                TaskVerdict::Success
+                            };
                         return Ok(TaskResult {
                             task_iri: ctx.task_iri,
                             status: force_verdict.to_status_str().to_string(),
@@ -1526,6 +2225,44 @@ Output the summary report directly, not in JSON format."#,
                         let tool_names: Vec<&str> =
                             calls.iter().map(|c| c.function.name.as_str()).collect();
                         debug!("[tool_calls] {} → {:?}", calls.len(), tool_names);
+
+                        let has_effect_candidate = calls.iter().any(|call| {
+                            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                                .unwrap_or_default();
+                            is_substantive_workspace_effect(&call.function.name, &args)
+                        });
+                        let block_effectless_calls =
+                            mutation_recovery_active && !has_effect_candidate;
+                        let mut effect_succeeded_this_turn = false;
+                        let mut verification_failed_this_turn = false;
+                        let mut evidence_calls = 0usize;
+                        let mut novel_evidence_calls = 0usize;
+                        for call in calls {
+                            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                                .unwrap_or_default();
+                            if let Some(key) =
+                                evidence_key(&call.function.name, &args, workspace_generation)
+                            {
+                                evidence_calls += 1;
+                                novel_evidence_calls += evidence_keys.insert(key) as usize;
+                            }
+                        }
+                        if evidence_calls > 0 {
+                            let duplicate_evidence_calls =
+                                evidence_calls.saturating_sub(novel_evidence_calls);
+                            if duplicate_evidence_calls == 0 {
+                                low_novelty_turns = 0;
+                            } else {
+                                low_novelty_turns = low_novelty_turns
+                                    .saturating_add(duplicate_evidence_calls as u32);
+                            }
+                        }
+                        if agent.role == AgentRole::Check && !calls.is_empty() {
+                            verification_turns = verification_turns.saturating_add(1);
+                        }
+                        if agent.role == AgentRole::Plan && !calls.is_empty() {
+                            planning_tool_turns = planning_tool_turns.saturating_add(1);
+                        }
 
                         // 🔴 PA role forbidden from calling write tools, but read-only tools allowed
                         if agent.role == AgentRole::Plan {
@@ -1644,6 +2381,27 @@ Output the summary report directly, not in JSON format."#,
                                 &args_raw.chars().take(100).collect::<String>()
                             );
 
+                            if !ctx.effective_effect_policy().permits_mutation()
+                                && is_workspace_mutation_candidate(name, &args)
+                            {
+                                let message = format!(
+                                    "EffectPolicy {:?} rejected mutating tool call {}",
+                                    ctx.effective_effect_policy(),
+                                    name
+                                );
+                                warn!("{}", message);
+                                errs.push(message.clone());
+                                messages.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: message,
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(c.id.clone()),
+                                    reasoning_content: None,
+                                });
+                                continue;
+                            }
+
                             // Emit tool_call event for TUI display
                             if let Some(ref event_bus) = self.event_bus {
                                 let tce = ExecutionEvent {
@@ -1668,6 +2426,65 @@ Output the summary report directly, not in JSON format."#,
                                         &serde_json::to_string(&tce).unwrap_or_default(),
                                     )
                                     .await;
+                            }
+
+                            // A provider can emit a tool name remembered from
+                            // earlier context even though its schema was not
+                            // advertised for this request.  Keep the execution
+                            // boundary strict, but treat this as protocol
+                            // feedback rather than a failed skill execution:
+                            // no skill hooks, action-ledger entry, ToolGuard
+                            // validation, or AGENT_ERROR should be produced.
+                            if let Some(rejection) =
+                                unadvertised_tool_call_result(&advertised_tools, name)
+                            {
+                                info!(
+                                    "[tool] ignored unadvertised call {} for the current turn",
+                                    name
+                                );
+                                let result_str =
+                                    serde_json::to_string(&rejection).unwrap_or_default();
+                                if let Some(ref event_bus) = self.event_bus {
+                                    let tre = ExecutionEvent {
+                                        event_id: format!(
+                                            "evt_{}",
+                                            uuid::Uuid::new_v4().hyphenated()
+                                        ),
+                                        task_iri: ctx.task_iri.clone(),
+                                        timestamp: chrono::Utc::now().timestamp_millis(),
+                                        event: ExecutionEventKind::ToolResult(
+                                            crate::core::execution_event::ToolResult {
+                                                call_id: c.id.clone(),
+                                                tool_name: name.clone(),
+                                                result: result_str.clone(),
+                                                // The protocol feedback was
+                                                // handled successfully; the
+                                                // requested tool was not run.
+                                                success: true,
+                                                result_size_bytes: result_str.len() as u32,
+                                                duration_ms: 0,
+                                                agent_id: agent.agent_id.clone(),
+                                            },
+                                        ),
+                                    };
+                                    let _ = event_bus
+                                        .emit(
+                                            &ctx.task_iri,
+                                            "TOOL_RESULT",
+                                            &agent.agent_id,
+                                            &serde_json::to_string(&tre).unwrap_or_default(),
+                                        )
+                                        .await;
+                                }
+                                messages.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: result_str,
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(c.id.clone()),
+                                    reasoning_content: None,
+                                });
+                                continue;
                             }
 
                             {
@@ -1697,24 +2514,36 @@ Output the summary report directly, not in JSON format."#,
 
                             let started_at = std::time::Instant::now();
                             let args_clone = args.clone();
+                            let effect_snapshot =
+                                (is_substantive_workspace_effect(name, &args_clone)
+                                    && !matches!(name.as_str(), "file_write" | "file_edit"))
+                                .then(|| capture_workspace_effect_snapshot(&self.tool_executor))
+                                .flatten();
                             // Clone before awaiting to keep the executor lock
                             // out of the handler's async I/O path.  Unlike a
                             // direct handler call this also applies executor
                             // permission, syscall and hook policies.
-                            let executor = self.tool_executor.read().clone();
-                            let result = executor
-                                .execute_with_security_context(
-                                    name,
-                                    args,
-                                    crate::skill_graph::security::SecurityContext::new(
-                                        &agent.agent_id,
-                                        &agent.role.to_string(),
+                            let result = if block_effectless_calls {
+                                json!({
+                                    "error": "DA execution-progress guard blocked another inspection-only turn",
+                                    "required_next_action": "Create or modify a substantive artifact with file_write/file_edit or a genuinely mutating command; otherwise finish with FAILED and the exact blocker."
+                                })
+                            } else {
+                                let executor = self.tool_executor.read().clone();
+                                executor
+                                    .execute_with_security_context(
+                                        name,
+                                        args,
+                                        crate::skill_graph::security::SecurityContext::new(
+                                            &agent.agent_id,
+                                            &agent.role.to_string(),
+                                        )
+                                        .with_task(&ctx.task_iri),
+                                        ctx.allowed_tools.as_deref(),
                                     )
-                                    .with_task(&ctx.task_iri),
-                                    ctx.allowed_tools.as_deref(),
-                                )
-                                .await
-                                .unwrap_or_else(|e| json!({"error": e}));
+                                    .await
+                                    .unwrap_or_else(|e| json!({"error": e}))
+                            };
                             action_tracker.record(
                                 name,
                                 &args_clone,
@@ -1723,8 +2552,45 @@ Output the summary report directly, not in JSON format."#,
                             );
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
 
+                            if agent.role == AgentRole::Do
+                                && matches!(name.as_str(), "bash" | "powershell" | "code_execute")
+                                && crate::core::tracked_action::tool_result_failed(&result)
+                            {
+                                verification_failed_this_turn = true;
+                            }
+
+                            if !block_effectless_calls
+                                && confirmed_workspace_effect(
+                                    &self.tool_executor,
+                                    name,
+                                    &args_clone,
+                                    &result,
+                                    effect_snapshot.as_ref(),
+                                )
+                                .await
+                            {
+                                effect_succeeded_this_turn = true;
+                                action_tracker.mark_last_substantive_effect();
+                            }
+
                             let mut result_str =
                                 self.route_tool_result(&raw_result_str, name, &c.id).await;
+                            session_micro_tools.extend(
+                                self.tool_executor
+                                    .read()
+                                    .get_micro_tool_names_for_call(&c.id),
+                            );
+                            if name == "tool_search" {
+                                session_micro_tools.extend(
+                                    result
+                                        .get("matches")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|item| item.get("name").and_then(Value::as_str))
+                                        .map(str::to_string),
+                                );
+                            }
 
                             debug!(
                                 "  [tool] {} result: {} bytes (raw: {} bytes)",
@@ -1744,7 +2610,10 @@ Output the summary report directly, not in JSON format."#,
                                             call_id: c.id.clone(),
                                             tool_name: name.clone(),
                                             result: result_str.clone(),
-                                            success: result.get("error").is_none(),
+                                            success:
+                                                !crate::core::tracked_action::tool_result_failed(
+                                                    &result,
+                                                ),
                                             result_size_bytes: result_str.len() as u32,
                                             duration_ms: 0,
                                             agent_id: agent.agent_id.clone(),
@@ -1888,6 +2757,92 @@ Output the summary report directly, not in JSON format."#,
                             }
                         }
 
+                        if workspace_effect_tracked {
+                            record_workspace_effect_turn(
+                                &mut workspace_effect_observed,
+                                &mut consecutive_effectless_tool_turns,
+                                effect_succeeded_this_turn,
+                            );
+                            if effect_succeeded_this_turn {
+                                substantive_effect_count =
+                                    substantive_effect_count.saturating_add(1);
+                                low_novelty_turns = 0;
+                                execution_phase = da_phase_after_tool_turn(
+                                    execution_phase,
+                                    true,
+                                    verification_failed_this_turn,
+                                );
+                                verification_turns = 0;
+                                info!("[DA progress] substantive workspace effect observed; no-change tail reset");
+                            }
+                            if verification_failed_this_turn {
+                                execution_phase = da_phase_after_tool_turn(
+                                    execution_phase,
+                                    effect_succeeded_this_turn,
+                                    true,
+                                );
+                                verification_turns = 0;
+                                messages.push(ChatMessage {
+                                    role: "user".to_string(),
+                                    content: "[DA Verification Failure] An execution/verification command returned a failure signal. Repair the concrete reported defect before performing more broad inspection or declaring completion; then rerun the targeted verification.".to_string(),
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                    reasoning_content: None,
+                                });
+                                info!("[DA progress] failed verification moved execution phase to Repair");
+                            } else if !effect_succeeded_this_turn {
+                                if matches!(
+                                    execution_phase,
+                                    ExecutionPhase::Verify | ExecutionPhase::Repair
+                                ) {
+                                    verification_turns = verification_turns.saturating_add(1);
+                                } else if effect_warning_turns > 0
+                                    && (consecutive_effectless_tool_turns >= effect_warning_turns
+                                        || low_novelty_turns >= effect_warning_turns)
+                                {
+                                    execution_phase = ExecutionPhase::Implement;
+                                }
+                                if effect_warning_turns > 0
+                                    && (consecutive_effectless_tool_turns == effect_warning_turns
+                                        || (effect_block_turns > 0
+                                            && consecutive_effectless_tool_turns
+                                                == effect_block_turns))
+                                {
+                                    let recovery_now = workspace_effect_recovery_active(
+                                        workspace_effect_tracked,
+                                        consecutive_effectless_tool_turns,
+                                        low_novelty_turns,
+                                        effect_block_turns,
+                                    );
+                                    if recovery_now
+                                        && consecutive_effectless_tool_turns == effect_block_turns
+                                    {
+                                        warn!(
+                                            "[DA progress] mutation recovery activated after {} consecutive no-change tool turns; inspection/search schemas withheld",
+                                            consecutive_effectless_tool_turns
+                                        );
+                                    }
+                                    let urgency = if recovery_now {
+                                        "Inspection/search tool schemas are now withheld until a substantive mutation succeeds."
+                                    } else {
+                                        "The available evidence is sufficient; stop broad inspection."
+                                    };
+                                    messages.push(ChatMessage {
+                                        role: "user".to_string(),
+                                        content: format!(
+                                            "[DA Execution Progress Contract] You have used {} consecutive tool turns without creating or modifying substantive workspace content. {} On the next turn, execute an implementation action with file_write/file_edit or a genuinely mutating command. If an exact blocker prevents that, finish with `FAILED:` and name it.",
+                                            consecutive_effectless_tool_turns, urgency
+                                        ),
+                                        name: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        reasoning_content: None,
+                                    });
+                                }
+                            }
+                        }
+
                         // ===== Observation Phase =====
                         info!("[ReAct Turn {}] ===== Observation =====", turn);
 
@@ -2002,7 +2957,7 @@ Output the summary report directly, not in JSON format."#,
 
         warn!("AgentRunner incomplete: {} turns, errors: {:?}", turn, errs);
         // Prefer the best content turn's output (with substantive content) over the last assistant reply's short summary
-        let (unfinished_status, unfinished_summary, unfinished_output, unfinished_archive) =
+        let (mut unfinished_status, mut unfinished_summary, unfinished_output, unfinished_archive) =
             if !best_content_str.is_empty() {
                 (
                     "partial_success".to_string(),
@@ -2041,6 +2996,14 @@ Output the summary report directly, not in JSON format."#,
             } else {
                 ("failed".to_string(), String::new(), None, None)
             };
+        if workspace_effect_required && !workspace_effect_observed {
+            unfinished_status = "failed".to_string();
+            unfinished_summary = format!(
+                "FAILED: DA exhausted its execution budget without creating or modifying substantive workspace content. {}",
+                unfinished_summary
+            );
+            errs.push("required workspace mutation was not observed".to_string());
+        }
         Ok(TaskResult {
             task_iri: ctx.task_iri,
             status: unfinished_status,
@@ -2061,12 +3024,43 @@ Output the summary report directly, not in JSON format."#,
     /// Build knowledge graph context string from the unified Oxigraph store.
     /// Queries for entities (subjects with rdf:type) that have labels or names,
     /// returning them as a structured context block the LLM can use to ground its reasoning.
-    fn build_kg_context(store: &oxigraph::store::Store, objective: &str) -> String {
-        // Extract meaningful keywords from the task objective (words >= 3 chars, no punctuation)
-        let keywords: Vec<&str> = objective
+    fn build_kg_context(
+        store: &oxigraph::store::Store,
+        objective: &str,
+        max_entities: usize,
+        max_bytes: usize,
+    ) -> String {
+        // Generic orchestration words match nearly every task/turn node and
+        // become progressively noisier as the graph grows. Keep only terms
+        // that can discriminate reusable domain knowledge for this objective.
+        let keywords = objective
+            .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() >= 3)
-            .collect();
+            .filter(|word| word.chars().count() >= 3)
+            .filter(|word| {
+                !matches!(
+                    *word,
+                    "the"
+                        | "and"
+                        | "for"
+                        | "with"
+                        | "from"
+                        | "task"
+                        | "result"
+                        | "execute"
+                        | "execution"
+                        | "create"
+                        | "check"
+                        | "plan"
+                        | "artifact"
+                        | "configured"
+                        | "workspace"
+                        | "latest"
+                        | "strictly"
+                )
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
 
         // Query the two dataset scopes with static SPARQL and filter keywords
         // below. This avoids interpolating task text into SPARQL and keeps
@@ -2096,7 +3090,7 @@ Output the summary report directly, not in JSON format."#,
             _ => return String::new(),
         };
 
-        let mut lines: Vec<String> = Vec::new();
+        let mut candidates: Vec<(u8, String)> = Vec::new();
         for solution in &solutions {
             let s = solution
                 .get("s")
@@ -2110,29 +3104,40 @@ Output the summary report directly, not in JSON format."#,
                 .get("type")
                 .map(|v| format!("{}", v))
                 .unwrap_or_default();
-            if s.is_empty() {
+            // Internal runtime nodes generally have only an IRI and rdf:type.
+            // Injecting those opaque identifiers leaks implementation state,
+            // consumes tokens, and makes prompt size grow with every task.
+            if s.is_empty() || label.is_empty() {
                 continue;
             }
-            if !keywords.is_empty()
-                && !keywords.iter().any(|keyword| {
-                    let keyword = keyword.to_lowercase();
-                    s.to_lowercase().contains(&keyword)
-                        || label.to_lowercase().contains(&keyword)
-                        || type_.to_lowercase().contains(&keyword)
-                })
-            {
+            let subject_lower = s.to_lowercase();
+            let label_lower = label.to_lowercase();
+            let type_lower = type_.to_lowercase();
+            let score = keywords.iter().fold(0_u8, |score, keyword| {
+                score
+                    .saturating_add(u8::from(label_lower.contains(keyword)) * 4)
+                    .saturating_add(u8::from(type_lower.contains(keyword)) * 2)
+                    .saturating_add(u8::from(subject_lower.contains(keyword)))
+            });
+            if keywords.is_empty() || score == 0 {
                 continue;
             }
-            let name = if !label.is_empty() { label } else { s.clone() };
             let entity = if !type_.is_empty() {
-                format!("- **{}** ({})", name, type_)
+                format!("- **{}** ({})", label, type_)
             } else {
-                format!("- **{}**", name)
+                format!("- **{}**", label)
             };
-            if !lines.contains(&entity) {
-                lines.push(entity);
+            if !candidates.iter().any(|(_, existing)| existing == &entity) {
+                candidates.push((score, entity));
             }
         }
+
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        candidates.truncate(max_entities);
+        let lines = candidates
+            .into_iter()
+            .map(|(_, entity)| entity)
+            .collect::<Vec<_>>();
 
         if lines.is_empty() {
             return String::new();
@@ -2142,7 +3147,16 @@ Output the summary report directly, not in JSON format."#,
             "The following entities are available in the knowledge graph (task context: {}):\n\n",
             objective.chars().take(80).collect::<String>()
         );
-        result.push_str(&lines.join("\n"));
+        for line in lines {
+            if result.len() + line.len() + 1 > max_bytes {
+                break;
+            }
+            result.push_str(&line);
+            result.push('\n');
+        }
+        if result.ends_with('\n') {
+            result.pop();
+        }
         result
     }
 }
@@ -2197,7 +3211,7 @@ mod kg_context_tests {
             ))
             .unwrap();
 
-        let context = AgentRunner::build_kg_context(&store, "find alpha information");
+        let context = AgentRunner::build_kg_context(&store, "find alpha information", 12, 4096);
         assert!(context.contains("Default Alpha"), "{context}");
         assert!(context.contains("Named Alpha"), "{context}");
     }
@@ -2250,7 +3264,7 @@ mod kg_context_tests {
             ))
             .unwrap();
 
-        let context = AgentRunner::build_kg_context(&store, "find alpha information");
+        let context = AgentRunner::build_kg_context(&store, "find alpha information", 12, 4096);
         assert!(
             context.contains("Alpha Relevant"),
             "task-relevant entity beyond label top-50 must be injected, got: {context}"
@@ -2258,10 +3272,54 @@ mod kg_context_tests {
     }
 
     #[test]
+    fn kg_context_excludes_unlabelled_runtime_nodes_and_is_bounded() {
+        let store = Store::new().unwrap();
+        let rdf_type = NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").unwrap();
+        let schema_name = NamedNode::new("http://schema.org/name").unwrap();
+        let entity_type = NamedNode::new("https://example.org/ProbeKnowledge").unwrap();
+
+        let runtime_node = NamedNode::new("iri://task/probe-internal-turn").unwrap();
+        store
+            .insert(&Quad::new(
+                runtime_node,
+                rdf_type.clone(),
+                entity_type.clone(),
+                GraphName::DefaultGraph,
+            ))
+            .unwrap();
+
+        for index in 0..30 {
+            let subject = NamedNode::new(format!("https://example.org/probe/{index}")).unwrap();
+            store
+                .insert(&Quad::new(
+                    subject.clone(),
+                    rdf_type.clone(),
+                    entity_type.clone(),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+            store
+                .insert(&Quad::new(
+                    subject,
+                    schema_name.clone(),
+                    Literal::new_simple_literal(format!("Probe Knowledge {index}")),
+                    GraphName::DefaultGraph,
+                ))
+                .unwrap();
+        }
+
+        let context = AgentRunner::build_kg_context(&store, "use probe knowledge", 12, 4096);
+
+        assert!(!context.contains("probe-internal-turn"), "{context}");
+        assert_eq!(context.matches("- **").count(), 12, "{context}");
+        assert!(context.len() <= 4096, "{} bytes", context.len());
+    }
+
+    #[test]
     fn collect_tool_entries_caps_at_max_keeping_most_recent() {
         use crate::gateway::unified_gateway::{ChatMessage, ToolCallFunction, ToolCallPayload};
 
-        // Build 25 assistant→tool pairs; only the most recent MAX_AGGREGATE_TOOL_ENTRIES
+        // Build 25 assistant→tool pairs; only the configured recent entries
         // should survive so the force-finish summary prompt stays bounded.
         let mut messages: Vec<ChatMessage> = Vec::new();
         for i in 0..25 {
@@ -2290,7 +3348,7 @@ mod kg_context_tests {
             });
         }
 
-        let entries = super::collect_tool_entries(&messages, super::MAX_AGGREGATE_TOOL_ENTRIES);
+        let entries = super::collect_tool_entries(&messages, 20);
         assert_eq!(entries.len(), 20, "entries must be capped");
         assert!(
             entries.iter().any(|(_, c)| c.contains("result_of_call_24")),

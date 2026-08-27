@@ -197,7 +197,8 @@ Go Center handles workflow orchestration (Temporal), project management, agent r
 - **MCP server integration** via `--mcp-server` and `--mcp-server-stdio` flags
 - **Checkpoint/resume** with `--resume <task_iri>` and `--list-checkpoints`
 - **Multi-model backends**: DeepSeek, OpenAI-compatible APIs
-- **PDCA workflow execution** with plan/do/check/act cycles
+- **PDCA and JSON-LD DAG workflow execution** through the same SA → BizAgent runtime
+- **Auditable continuous learning** with CA-validated, task-family-scoped knowledge and guarded policy promotion
 - **Configurable** workspace, max iterations, max PDCA cycles, verbosity
 
 ![Gliding Code Demo](assets/screenshot.gif)
@@ -272,7 +273,28 @@ export EXA_API_KEY="your-exa-api-key"
 
 # Resume from checkpoint
 ./glidingcode --resume task:abc123
+
+# Execute an explicit JSON-LD DAG instead of the default PDCA-generated plan
+./glidingcode --workflow ./workflow.jsonld "Run the workflow"
+
+# Inspect durable task-level learning evidence without starting the full TUI engine
+./glidingcode --list-learning-evaluations
+./glidingcode --summarize-learning-evaluations
+
+# Controlled baseline/shadow/active replay labels. Reuse the pair ID, model,
+# seed, objective, workspace snapshot, and orchestration mode across all arms.
+./glidingcode --learning-mode baseline --learning-pair-id replay-001 --learning-seed 42 "Task"
+./glidingcode --learning-mode shadow   --learning-pair-id replay-001 --learning-seed 42 "Task"
+./glidingcode --learning-mode active   --learning-pair-id replay-001 --learning-seed 42 "Task"
 ```
+
+Active learning never bypasses the current task's CA audit. A learned policy
+remains a bounded candidate (or shadow observation) until the same normalized
+task family has at least five independent baseline and five candidate samples
+and passes the promotion gate. The summary command reports observed sample
+counts, success rates, P50/P95 reward, latency, prompt tokens, turns, tool calls,
+and whether replay arms are actually comparable; it does not synthesize missing
+counterfactual results.
 
 ### Build from Source
 
@@ -315,11 +337,16 @@ cargo build -p code_cli --release
 |-----------|---------|-----------|
 | L2 Node Write (Oxigraph) | ~2ms | 500 ops/sec |
 | L3 SPARQL Projection | ~15ms | 66 ops/sec |
-| L0 Sled KV Read | ~1ms | 1000 ops/sec |
+| L0 redb KV Read | ~1ms | 1000 ops/sec |
 | Hyperspace HNSW Search (10K vectors) | ~1ms | 1000 qps |
 | Poincaré Embedding (4D) | ~50µs | — |
 | Agent ReAct Turn | 1-5s | 0.2-1 turns/sec |
 | Idle Memory | ~200MB | scales with tasks |
+
+The deterministic local targets (L0/L2/L3/HNSW/Poincaré) can be measured in
+release mode with `cargo run --release --example readme_performance`. Agent
+turn latency and idle memory are environment/model-level measurements and must
+be verified from a real provider run and the glidingcode process respectively.
 
 ---
 

@@ -89,24 +89,31 @@ impl BizAgent {
         self.instance.status = AgentStatus::Running;
         info!(agent = %self.agent_id(), role = %self.role(), "BizAgent start");
 
-        let task_iri = context.task_iri.clone();
-        let mut session = {
-            let mut mm = self.runner.memory_manager.lock().await;
-            mm.create_session(self.agent_id(), &self.role().to_string(), &context.task_iri)
-        };
-
         let result = if self.config.orchestrator_mode && self.should_decompose(&context) {
-            self.execute_orchestrator(context, &mut session).await
+            // The parent orchestration session stores decomposition summaries.
+            // MONO execution has its own Runner-owned session and must not be
+            // wrapped in a second, empty BizAgent session.
+            let task_iri = context.task_iri.clone();
+            let mut session = {
+                let mut mm = self.runner.memory_manager.lock().await;
+                mm.create_session(self.agent_id(), &self.role().to_string(), &task_iri)
+            };
+            let result = self.execute_orchestrator(context, &mut session).await;
+            {
+                let mut mm = self.runner.memory_manager.lock().await;
+                let _ = mm.finalize_session(session, &task_iri);
+            }
+            result
         } else {
             self.execute_mono(context).await
         };
 
+        self.instance.status = if matches!(result.status.as_str(), "failed" | "aborted" | "timeout")
         {
-            let mut mm = self.runner.memory_manager.lock().await;
-            let _ = mm.finalize_session(session, &task_iri);
-        }
-
-        self.instance.status = AgentStatus::Completed;
+            AgentStatus::Failed
+        } else {
+            AgentStatus::Completed
+        };
         result
     }
 
@@ -114,10 +121,11 @@ impl BizAgent {
 
     /// Single Agent direct execution, delegates to AgentRunner.execute().
     /// AgentRunner.execute() internally creates and manages an L1 session.
-    async fn execute_mono(&self, context: TaskContext) -> TaskResult {
-        let result: Result<TaskResult, CoreError> = self
-            .runner
-            .execute(&mut self.instance.clone(), context)
+    async fn execute_mono(&mut self, context: TaskContext) -> TaskResult {
+        let runner = self.runner.clone();
+        let agent_md = self.agent_md.clone();
+        let result: Result<TaskResult, CoreError> = runner
+            .execute_with_agent_md(&mut self.instance, context, &agent_md)
             .await;
 
         match result {
@@ -192,7 +200,7 @@ impl BizAgent {
                 let role = self.role();
 
                 let handle = tokio::spawn(async move {
-                    let sub = BizAgent::new(sub_id, role, &agent_md, runner, config);
+                    let mut sub = BizAgent::new(sub_id, role, &agent_md, runner, config);
                     sub.execute_mono(sub_ctx).await
                 });
 
@@ -232,7 +240,7 @@ impl BizAgent {
         } else {
             for (i, sub_ctx) in sub_contexts.into_iter().enumerate() {
                 let sub_id = format!("{}_sub_{}", self.agent_id(), i);
-                let sub = BizAgent::new(
+                let mut sub = BizAgent::new(
                     sub_id,
                     self.role(),
                     &self.agent_md,
@@ -418,7 +426,7 @@ Output only the JSON array, no other content."#,
     }
 
     async fn aggregate_with_llm(&self, context: &TaskContext, phase: &str) -> TaskResult {
-        let simple_result = self.aggregate_results(phase);
+        let simple_result = self.aggregate_results(context, phase);
 
         if self.sub_results.len() <= 1 {
             return simple_result;
@@ -519,7 +527,7 @@ Output only the JSON, no other content."#,
                     .unwrap_or(&fallback.status)
                     .to_string();
 
-                let mut artifacts = Vec::new();
+                let mut artifacts = fallback.artifacts.clone();
                 if let Some(findings) = parsed.get("key_findings").and_then(|f| f.as_array()) {
                     artifacts.push(json!({"type": "key_findings", "items": findings}));
                 }
@@ -541,9 +549,9 @@ Output only the JSON, no other content."#,
                     turn_count: fallback.turn_count,
                     tool_call_count: fallback.tool_call_count,
                     five_w2h_updates: None,
-                    tracked_actions: Vec::new(),
-                    verdict: None,
-                    archive_iri: None,
+                    tracked_actions: fallback.tracked_actions.clone(),
+                    verdict: fallback.verdict.clone(),
+                    archive_iri: fallback.archive_iri.clone(),
                 }
             }
             _ => {
@@ -553,7 +561,7 @@ Output only the JSON, no other content."#,
         }
     }
 
-    fn aggregate_results(&self, _phase: &str) -> TaskResult {
+    fn aggregate_results(&self, context: &TaskContext, _phase: &str) -> TaskResult {
         let total = self.sub_results.len();
         let successes = self
             .sub_results
@@ -561,11 +569,19 @@ Output only the JSON, no other content."#,
             .filter(|r| r.status == "success")
             .count();
         let mut all_errors = Vec::new();
+        let mut all_artifacts = Vec::new();
+        let mut all_actions = Vec::new();
+        let mut turn_count = 0u32;
+        let mut tool_call_count = 0u32;
 
         let mut summary_parts = Vec::new();
         for (i, r) in self.sub_results.iter().enumerate() {
             summary_parts.push(format!("  [{}] {}: {}", i, r.status, r.summary));
             all_errors.extend(r.errors.clone());
+            all_artifacts.extend(r.artifacts.clone());
+            all_actions.extend(r.tracked_actions.clone());
+            turn_count = turn_count.saturating_add(r.turn_count);
+            tool_call_count = tool_call_count.saturating_add(r.tool_call_count);
         }
 
         let summary = format!(
@@ -577,7 +593,7 @@ Output only the JSON, no other content."#,
         );
 
         TaskResult {
-            task_iri: String::new(),
+            task_iri: context.task_iri.clone(),
             status: if successes == total {
                 "success".to_string()
             } else {
@@ -586,12 +602,12 @@ Output only the JSON, no other content."#,
             summary,
             output: None,
             jsonld_output: None,
-            artifacts: Vec::new(),
+            artifacts: all_artifacts,
             errors: all_errors,
-            turn_count: 0,
-            tool_call_count: 0,
+            turn_count,
+            tool_call_count,
             five_w2h_updates: None,
-            tracked_actions: Vec::new(),
+            tracked_actions: all_actions,
             verdict: None,
             archive_iri: None,
         }

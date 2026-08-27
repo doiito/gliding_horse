@@ -604,7 +604,10 @@ impl SkillGraphNode {
             .with_trust_level(TrustLevel::System)
             .with_risk_score(operation_risk);
 
-        let w2h = Skill5W2H::new(&meta.name, &meta.description).with_agent_role("DA");
+        let w2h = meta
+            .discovery_5w2h
+            .clone()
+            .unwrap_or_else(|| Skill5W2H::new(&meta.name, &meta.description).with_agent_role("DA"));
 
         Self {
             skill_iri: meta.skill_iri.clone(),
@@ -893,6 +896,40 @@ pub struct KnowledgeFragment {
     pub recommendation: String,
     pub discovered_by: Option<String>,
     pub discovered_at: Option<DateTime<Utc>>,
+    /// `failure_mitigation` for legacy fragments, or
+    /// `ca_validated_task_knowledge` for accumulated task evidence.
+    #[serde(default = "default_fragment_kind")]
+    pub kind: String,
+    /// Stable normalized family used to prevent cross-task evidence leakage.
+    #[serde(default)]
+    pub task_family: Option<String>,
+    /// Original task that contributed the most recent evidence.
+    #[serde(default)]
+    pub source_task_iri: Option<String>,
+    /// Structured CA verdict (`pass`, `conditional`, or `fail`).
+    #[serde(default)]
+    pub ca_verdict: Option<String>,
+    /// Bounded procedure steps observed from successful execution actions.
+    #[serde(default)]
+    pub procedure: Vec<String>,
+    /// Bounded direct checks observed from CA tool actions.
+    #[serde(default)]
+    pub successful_checks: Vec<String>,
+    /// Failed checks/findings define when this knowledge must not be reused.
+    #[serde(default)]
+    pub counterexamples: Vec<String>,
+    #[serde(default)]
+    pub evidence_count: u32,
+    #[serde(default)]
+    pub success_count: u32,
+    #[serde(default)]
+    pub failure_count: u32,
+    #[serde(default)]
+    pub last_verified_at: Option<DateTime<Utc>>,
+}
+
+fn default_fragment_kind() -> String {
+    "failure_mitigation".to_string()
 }
 
 impl KnowledgeFragment {
@@ -906,6 +943,17 @@ impl KnowledgeFragment {
             recommendation: recommendation.to_string(),
             discovered_by: None,
             discovered_at: Some(Utc::now()),
+            kind: default_fragment_kind(),
+            task_family: None,
+            source_task_iri: None,
+            ca_verdict: None,
+            procedure: Vec::new(),
+            successful_checks: Vec::new(),
+            counterexamples: Vec::new(),
+            evidence_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            last_verified_at: None,
         }
     }
 
@@ -1809,6 +1857,7 @@ mod tests {
             input_mapping: std::collections::HashMap::new(),
             output_mapping: std::collections::HashMap::new(),
             skill_types: vec!["iri://skill-types/FileOperation".to_string()],
+            discovery_5w2h: None,
         };
         let node = SkillGraphNode::from_skill_meta(&meta);
         assert_eq!(node.skill_iri, "iri://skills/test_read");
@@ -1845,6 +1894,7 @@ mod tests {
                 input_mapping: std::collections::HashMap::new(),
                 output_mapping: std::collections::HashMap::new(),
                 skill_types: vec![],
+                discovery_5w2h: None,
             };
             let node = SkillGraphNode::from_skill_meta(&meta);
             let security = node.security_info.unwrap();

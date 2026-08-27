@@ -1,0 +1,61 @@
+{
+  "@context": {
+    "@version": 1.1,
+    "@vocab": "https://agent-os.org/ontology/workflow#",
+    "wf": "https://agent-os.org/ontology/workflow#"
+  },
+  "@graph": [
+    {
+      "@id": "wf:learning-ab",
+      "@type": "Workflow",
+      "wf:name": "Controlled continuous-learning evaluation",
+      "wf:description": "Fixed PA to DA to CA to AA path for matched learning treatments",
+      "wf:entryNode": "ab_plan",
+      "wf:nodes": [
+        {"@id": "ab_plan"},
+        {"@id": "ab_do"},
+        {"@id": "ab_check"},
+        {"@id": "ab_act"}
+      ]
+    },
+    {
+      "@id": "ab_plan",
+      "@type": "AgentNode",
+      "wf:agentRole": "Plan",
+      "wf:objective": "Turn the exact user request into a minimal executable plan. Preserve the required file path, exact bytes, no-trailing-newline constraint, verification commands, and acceptance criteria.",
+      "wf:tools": ["__deny_all__"],
+      "wf:successCriteria": "Plan preserves every exact user constraint",
+      "wf:next": "ab_do"
+    },
+    {
+      "@id": "ab_do",
+      "@type": "AgentNode",
+      "wf:agentRole": "Do",
+      "wf:objective": "Execute the PA plan in the configured workspace and verify the produced artifact before finishing.",
+      "wf:dependencies": ["ab_plan"],
+      "wf:tools": ["file_write", "file_read", "bash"],
+      "wf:successCriteria": "Artifact exists with exact bytes and verification evidence",
+      "wf:next": "ab_check"
+    },
+    {
+      "@id": "ab_check",
+      "@type": "AgentNode",
+      "wf:agentRole": "Check",
+      "wf:objective": "Audit the DA artifact against every exact user constraint and report PASS or FAIL with file and command evidence.",
+      "wf:dependencies": ["ab_do"],
+      "wf:tools": ["file_read", "bash"],
+      "wf:successCriteria": "CA gives an evidence-backed terminal verdict",
+      "wf:next": "ab_act"
+    },
+    {
+      "@id": "ab_act",
+      "@type": "AgentNode",
+      "wf:agentRole": "Act",
+      "wf:objective": "Decide final user-task acceptance strictly from the latest CA audit.",
+      "wf:dependencies": ["ab_check"],
+      "wf:tools": [],
+      "wf:successCriteria": "AA emits SUCCESS only after a CA PASS",
+      "wf:finalNode": "true"
+    }
+  ]
+}

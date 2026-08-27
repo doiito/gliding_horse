@@ -181,9 +181,7 @@ pub enum EvolutionPatch {
     /// Governed record for a methodology adjustment recommendation. The
     /// matching skill IRI is synthetic (`iri://methodology/<methodology_id>`)
     /// and never requires a graph node.
-    Methodology {
-        methodology_id: String,
-    },
+    Methodology { methodology_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,11 +646,12 @@ impl EvolutionProposalStore {
         }) = &proposal.suggestion.patch
         {
             let fragment_iri = knowledge_fragment_iri(skill_iri, problem, recommendation);
-            let before = graph_store
-                .get_skill(skill_iri)
-                .ok_or_else(|| CoreError::SkillNotFound {
-                    iri: skill_iri.clone(),
-                })?;
+            let before =
+                graph_store
+                    .get_skill(skill_iri)
+                    .ok_or_else(|| CoreError::SkillNotFound {
+                        iri: skill_iri.clone(),
+                    })?;
             proposal.preimages.insert(skill_iri.clone(), before);
             proposal.status = EvolutionProposalStatus::Applying;
             proposal.updated_at = Utc::now();
@@ -690,7 +689,10 @@ impl EvolutionProposalStore {
                 Ok(_) if applied => Ok(proposal),
                 Err(error) => Err(error),
                 Ok(_) => Err(CoreError::StorageError {
-                    message: format!("Proposal {} knowledge fragment verification failed", proposal.proposal_id),
+                    message: format!(
+                        "Proposal {} knowledge fragment verification failed",
+                        proposal.proposal_id
+                    ),
                 }),
             };
         }
@@ -731,7 +733,9 @@ impl EvolutionProposalStore {
                 }
                 Some(EvolutionPatch::CreateFragment { .. }) => {
                     return Err(CoreError::ValidationFailed {
-                        message: "Knowledge fragment proposal was not handled by fragment commit path".to_string(),
+                        message:
+                            "Knowledge fragment proposal was not handled by fragment commit path"
+                                .to_string(),
                     })
                 }
                 None => {
@@ -1177,9 +1181,10 @@ impl SkillEvolutionEngine {
                 uuid::Uuid::new_v4(),
                 record.skill_iri.replace('/', "%2F")
             );
-            let content = serde_json::to_string(&record).map_err(|error| CoreError::StorageError {
-                message: format!("Failed to serialize skill usage evidence: {error}"),
-            })?;
+            let content =
+                serde_json::to_string(&record).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to serialize skill usage evidence: {error}"),
+                })?;
             store.store(&key, &content)?;
         }
         self.usage_history.push(record);
@@ -1632,13 +1637,15 @@ impl SkillEvolutionEngine {
                 discoverer,
             }) => {
                 let fragment_iri = knowledge_fragment_iri(skill_iri, problem, recommendation);
-                self.graph_store.create_fragment(
-                    &fragment_iri,
-                    skill_iri,
-                    problem,
-                    recommendation,
-                    Some(discoverer),
-                ).map(|_| ())
+                self.graph_store
+                    .create_fragment(
+                        &fragment_iri,
+                        skill_iri,
+                        problem,
+                        recommendation,
+                        Some(discoverer),
+                    )
+                    .map(|_| ())
             }
             None => Err(CoreError::ValidationFailed {
                 message: "Suggestion has no typed patch; approval is required".to_string(),
@@ -1770,10 +1777,65 @@ impl SkillEvolutionEngine {
         }
     }
 
+    /// Evolution proposals must be supported by independent task outcomes.
+    /// Repeating one tool many times in a single task is useful usage data,
+    /// but is not evidence that a durable graph relationship generalizes.
+    fn distinct_task_count(&self, skill_iri: &str) -> usize {
+        self.usage_history
+            .iter()
+            .filter(|record| record.skill_iri == skill_iri)
+            .map(|record| record.task_iri.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Count independently tagged task families. Different task IRIs alone
+    /// are insufficient because retries or repeated benchmark prompts receive
+    /// fresh IRIs while providing no evidence of cross-scenario transfer.
+    fn distinct_task_family_count(&self, skill_iri: &str) -> usize {
+        self.usage_history
+            .iter()
+            .filter(|record| record.skill_iri == skill_iri)
+            .flat_map(|record| record.context_tags.iter())
+            .filter_map(|tag| tag.strip_prefix("task-family:"))
+            .filter(|family| !family.is_empty())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn has_generalized_task_evidence(&self, skill_iri: &str) -> bool {
+        self.distinct_task_count(skill_iri) >= 3 && self.distinct_task_family_count(skill_iri) >= 2
+    }
+
     pub async fn suggest_improvements(&mut self) -> Vec<EvolutionSuggestion> {
+        self.suggest_improvements_for_nodes(self.graph_store.list_all_skills())
+            .await
+    }
+
+    /// Analyze only skills touched by the current task. Interactive task
+    /// finalization calls this path so learning cost scales with task effects,
+    /// not with the entire accumulated skill graph. Periodic/offline audits
+    /// can still use `suggest_improvements` for a full scan.
+    pub async fn suggest_improvements_for_skills(
+        &mut self,
+        skill_iris: &[String],
+    ) -> Vec<EvolutionSuggestion> {
+        let mut seen = HashSet::new();
+        let skills = skill_iris
+            .iter()
+            .filter(|skill_iri| seen.insert((*skill_iri).clone()))
+            .filter_map(|skill_iri| self.graph_store.get_skill(skill_iri))
+            .collect::<Vec<_>>();
+        self.suggest_improvements_for_nodes(skills).await
+    }
+
+    async fn suggest_improvements_for_nodes(
+        &mut self,
+        skills: Vec<SkillGraphNode>,
+    ) -> Vec<EvolutionSuggestion> {
         let mut suggestions = Vec::new();
 
-        for skill in self.graph_store.list_all_skills() {
+        for skill in skills {
             let health = self.analyze_skill_health(&skill.skill_iri);
 
             if health.status == HealthStatus::Unhealthy {
@@ -1793,8 +1855,7 @@ impl SkillEvolutionEngine {
             // Similarity alone is not evidence of a useful evolution.  Do
             // not create durable link proposals for skills that have not yet
             // accumulated repeated observed usage in this engine.
-            let usage = self.get_usage_stats(&skill.skill_iri);
-            if usage.total_usage < 3 {
+            if !self.has_generalized_task_evidence(&skill.skill_iri) {
                 continue;
             }
             let link_suggestions = self.graph_store.suggest_links(&skill.skill_iri, None).await;
@@ -2046,6 +2107,63 @@ mod tests {
         let suggestions = engine.suggest_improvements().await;
 
         assert!(!suggestions.is_empty());
+    }
+
+    #[test]
+    fn distinct_task_evidence_does_not_count_repeated_calls_as_generalization() {
+        let store = setup_test_store();
+        let mut engine = SkillEvolutionEngine::new(store);
+
+        for _ in 0..20 {
+            engine
+                .record_usage(UsageRecord::new(
+                    "iri://skills/test-skill",
+                    "iri://task/one",
+                    "agent:da/001",
+                    true,
+                ))
+                .unwrap();
+        }
+        assert_eq!(engine.distinct_task_count("iri://skills/test-skill"), 1);
+
+        for task in ["iri://task/two", "iri://task/three"] {
+            engine
+                .record_usage(UsageRecord::new(
+                    "iri://skills/test-skill",
+                    task,
+                    "agent:da/001",
+                    true,
+                ))
+                .unwrap();
+        }
+        assert_eq!(engine.distinct_task_count("iri://skills/test-skill"), 3);
+        assert!(!engine.has_generalized_task_evidence("iri://skills/test-skill"));
+
+        engine
+            .record_usage(
+                UsageRecord::new(
+                    "iri://skills/test-skill",
+                    "iri://task/four",
+                    "agent:da/001",
+                    true,
+                )
+                .with_context_tag("task-family:reporting"),
+            )
+            .unwrap();
+        assert!(!engine.has_generalized_task_evidence("iri://skills/test-skill"));
+
+        engine
+            .record_usage(
+                UsageRecord::new(
+                    "iri://skills/test-skill",
+                    "iri://task/five",
+                    "agent:da/001",
+                    true,
+                )
+                .with_context_tag("task-family:validation"),
+            )
+            .unwrap();
+        assert!(engine.has_generalized_task_evidence("iri://skills/test-skill"));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -3007,9 +3125,8 @@ mod tests {
     #[test]
     fn knowledge_fragment_proposal_requires_review_and_commits_reusable_knowledge() {
         let dir = tempfile::tempdir().unwrap();
-        let l0 = Arc::new(
-            crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap(),
-        );
+        let l0 =
+            Arc::new(crate::memory::l0_store::L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let graph = Arc::new(SkillGraphStore::new().with_l0_store(l0.clone()));
         graph
             .register_skill(SkillGraphNode::new(
@@ -3049,9 +3166,17 @@ mod tests {
             .commit_validated_link_patch(&validated.proposal_id, graph.as_ref())
             .unwrap();
         assert_eq!(committed.status, EvolutionProposalStatus::Committed);
-        assert_eq!(graph.get_fragments_for_skill("iri://skills/parser").len(), 1);
         assert_eq!(
-            graph.get_skill("iri://skills/parser").unwrap().graph_meta.known_failure_modes.len(),
+            graph.get_fragments_for_skill("iri://skills/parser").len(),
+            1
+        );
+        assert_eq!(
+            graph
+                .get_skill("iri://skills/parser")
+                .unwrap()
+                .graph_meta
+                .known_failure_modes
+                .len(),
             1
         );
     }

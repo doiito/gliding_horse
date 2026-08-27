@@ -94,9 +94,9 @@ pub struct UnifiedGateway {
     timeout_seconds: u64,
     max_retries: u32,
     retry_base_ms: u64,
-    /// When enabled, requests for Responses-API-capable models (deepseek-v4-flash)
-    /// are sent to `{base_url}/v1/responses`; all other models keep using
-    /// `/v1/chat/completions`.
+    /// Explicit endpoint selection. When enabled, requests are sent to
+    /// `{base_url}/v1/responses`; model capability is owned by the configured
+    /// provider rather than a kernel-side model-name allowlist.
     use_responses_api: RwLock<bool>,
 }
 
@@ -380,14 +380,8 @@ impl UnifiedGateway {
     }
 
     fn should_use_responses_api(&self, model: &str) -> bool {
-        *self.use_responses_api.read().unwrap() && Self::is_responses_capable_model(model)
-    }
-
-    /// Only `deepseek-v4-flash` supports the Responses API today;
-    /// `deepseek-v4-pro` keeps using chat completions until DeepSeek enables it.
-    fn is_responses_capable_model(model: &str) -> bool {
-        let m = model.to_lowercase();
-        m == "deepseek-v4-flash" || m.starts_with("deepseek-v4-flash-")
+        let _ = model;
+        *self.use_responses_api.read().unwrap()
     }
 
     fn build_responses_body(
@@ -579,10 +573,7 @@ impl UnifiedGateway {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            arguments: item
-                                .get("input")
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
+                            arguments: item.get("input").map(|v| v.to_string()).unwrap_or_default(),
                         },
                     });
                 }
@@ -617,18 +608,9 @@ impl UnifiedGateway {
             "tool_calls"
         };
         let usage = json.get("usage").map(|u| Usage {
-            prompt_tokens: u
-                .get("input_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
-            completion_tokens: u
-                .get("output_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
-            total_tokens: u
-                .get("total_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
+            prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         });
 
         Ok(ChatCompletionResponse {
@@ -734,6 +716,7 @@ impl UnifiedGateway {
             "model": model,
             "messages": messages,
             "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if let Some(temp) = temperature {
             body["temperature"] = serde_json::json!(temp);
@@ -940,7 +923,10 @@ mod tests {
         let message = &response.choices[0].message;
         assert_eq!(message.content.as_deref(), Some("The answer is 42"));
         assert_eq!(message.reasoning_content.as_deref(), Some("I think..."));
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
 
         let calls = message.tool_calls.as_ref().expect("tool calls present");
         assert_eq!(calls.len(), 1);
@@ -965,13 +951,16 @@ mod tests {
             "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}
         });
         let response = UnifiedGateway::parse_responses_response(&json).unwrap();
-        assert_eq!(response.choices[0].message.content.as_deref(), Some("hello world"));
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("hello world")
+        );
         assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
         assert!(response.choices[0].message.tool_calls.is_none());
     }
 
     #[test]
-    fn test_responses_routing_only_for_capable_models() {
+    fn test_responses_routing_follows_explicit_endpoint_setting() {
         let settings = GatewaySettings {
             base_url: "https://api.deepseek.com".to_string(),
             api_key: "sk-test".to_string(),
@@ -985,8 +974,8 @@ mod tests {
         let gateway = UnifiedGateway::new(&settings).unwrap();
 
         assert!(gateway.should_use_responses_api("deepseek-v4-flash"));
-        assert!(!gateway.should_use_responses_api("deepseek-v4-pro"));
-        assert!(!gateway.should_use_responses_api("gpt-4o"));
+        assert!(gateway.should_use_responses_api("deepseek-v4-pro"));
+        assert!(gateway.should_use_responses_api("gpt-4o"));
 
         gateway.set_use_responses_api(false);
         assert!(!gateway.should_use_responses_api("deepseek-v4-flash"));
@@ -994,8 +983,14 @@ mod tests {
 
     #[test]
     fn test_parse_tool_choice_handles_string_and_object() {
-        assert_eq!(UnifiedGateway::parse_tool_choice("auto"), serde_json::json!("auto"));
-        assert_eq!(UnifiedGateway::parse_tool_choice("none"), serde_json::json!("none"));
+        assert_eq!(
+            UnifiedGateway::parse_tool_choice("auto"),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            UnifiedGateway::parse_tool_choice("none"),
+            serde_json::json!("none")
+        );
 
         let obj = UnifiedGateway::parse_tool_choice(r#"{"type":"function","name":"get_weather"}"#);
         assert!(obj.is_object());
@@ -1097,7 +1092,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            response.choices[0].message.content.as_deref().map(str::trim),
+            response.choices[0]
+                .message
+                .content
+                .as_deref()
+                .map(str::trim),
             Some("PONG")
         );
         assert!(response.usage.is_some());
@@ -1172,6 +1171,9 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "get_weather");
         let args: Value = serde_json::from_str(&tool_calls[0].function.arguments).unwrap();
         assert!(args.get("city").is_some());
-        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            response.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
     }
 }

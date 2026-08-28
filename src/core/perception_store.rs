@@ -161,6 +161,18 @@ impl PerceptionStore {
     /// Returns formatted perception text, or empty string if nothing new.
     /// Consumed entries are marked consumed but retained in the list for audit.
     pub fn take_perception_text(&self, task_iri: &str) -> String {
+        self.take_perception_text_scoped(task_iri, true)
+    }
+
+    /// Pull perception while optionally suppressing process-global workspace
+    /// events. Task-scoped entries and global non-workspace signals remain
+    /// visible. This prevents a shared workspace from becoming cross-task
+    /// evidence for CA or for tasks declared independent of the workspace.
+    pub fn take_perception_text_scoped(
+        &self,
+        task_iri: &str,
+        include_global_workspace: bool,
+    ) -> String {
         let mut entries: Vec<PerceptionEntry> = Vec::new();
 
         // 1. Get global unconsumed entries
@@ -172,7 +184,11 @@ impl PerceptionStore {
             for entry in global.iter_mut() {
                 if !entry.consumed {
                     entry.consumed = true;
-                    entries.push(entry.clone());
+                    if include_global_workspace
+                        || entry.source != PerceptionSource::WorkspaceMonitor
+                    {
+                        entries.push(entry.clone());
+                    }
                 }
             }
         }
@@ -341,6 +357,23 @@ mod tests {
             text2.is_empty(),
             "Global entry should be consumed after first take"
         );
+    }
+
+    #[test]
+    fn scoped_take_suppresses_only_global_workspace_perception() {
+        let store = PerceptionStore::new();
+        store.store_global(PerceptionEntry::new(
+            PerceptionSource::WorkspaceMonitor,
+            "/workspace/calculator_project/test_calculator.py changed",
+        ));
+        store.store_global(PerceptionEntry::new(
+            PerceptionSource::System,
+            "network connection available",
+        ));
+
+        let text = store.take_perception_text_scoped("iri://task/research", false);
+        assert!(!text.contains("calculator_project"));
+        assert!(text.contains("network connection available"));
     }
 
     #[test]

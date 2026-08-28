@@ -395,6 +395,26 @@ pub(super) fn advertised_tool_names(definitions: &[Value]) -> HashSet<String> {
         .collect()
 }
 
+/// Restrict live-catalog search results to the capability set that can become
+/// active in this exact task phase. `tool_search` is an on-demand discovery
+/// mechanism, so filtering only the schemas already in the prompt would make
+/// it useless; filtering against the phase-authorized full catalog prevents it
+/// from leaking withdrawn or application-disabled tools.
+pub(super) fn filter_tool_search_result(result: &mut Value, discoverable_tools: &HashSet<String>) {
+    let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) else {
+        return;
+    };
+    matches.retain(|item| {
+        item.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| discoverable_tools.contains(name))
+    });
+    let count = matches.len();
+    if let Some(object) = result.as_object_mut() {
+        object.insert("count".to_string(), Value::from(count));
+    }
+}
+
 /// Keep discovered ordinary tools active for the current execution, but only
 /// advertise dynamic result readers that are still referenced by the current
 /// message window. This preserves valid compressed-result links without
@@ -420,9 +440,16 @@ pub(super) fn active_session_tool_names(
 
 pub(super) fn unadvertised_tool_call_result(
     advertised: &HashSet<String>,
+    session_tools: &HashSet<String>,
     tool_name: &str,
 ) -> Option<Value> {
-    (!advertised.contains(tool_name)).then(|| {
+    // A result-reader may be created by an earlier call in the same provider
+    // response or retained by this BizAgent after its reference was compressed
+    // out of the current message window. It is still execution-local and safe
+    // to honor; ordinary withdrawn tools remain strictly rejected.
+    let owned_result_reader =
+        ToolExecutor::is_micro_tool_name(tool_name) && session_tools.contains(tool_name);
+    (!advertised.contains(tool_name) && !owned_result_reader).then(|| {
         json!({
             "status": "not_executed",
             "reason": "tool_not_advertised",
@@ -459,6 +486,38 @@ pub(super) fn ca_evidence_close_tool_definitions(
     evidence_close_active: bool,
 ) -> Vec<Value> {
     if role == AgentRole::Check && evidence_close_active {
+        Vec::new()
+    } else {
+        definitions
+    }
+}
+
+pub(super) fn da_evidence_focus_tool_definitions(
+    definitions: Vec<Value>,
+    role: AgentRole,
+    evidence_focus_active: bool,
+) -> Vec<Value> {
+    if role != AgentRole::Do || !evidence_focus_active {
+        return definitions;
+    }
+    definitions
+        .into_iter()
+        .filter(|definition| {
+            let name = definition["function"]["name"].as_str().unwrap_or_default();
+            matches!(
+                name,
+                "file_read" | "web_fetch" | "http_request" | "read_agent_output"
+            ) || ToolExecutor::is_micro_tool_name(name)
+        })
+        .collect()
+}
+
+pub(super) fn da_evidence_close_tool_definitions(
+    definitions: Vec<Value>,
+    role: AgentRole,
+    evidence_close_active: bool,
+) -> Vec<Value> {
+    if role == AgentRole::Do && evidence_close_active {
         Vec::new()
     } else {
         definitions
@@ -1001,6 +1060,12 @@ Output the summary report directly, not in JSON format."#,
         if !ctx.success_criteria.is_empty() {
             task_parts.push(format!("## Success Criteria\n{}", ctx.success_criteria));
         }
+        if let Some(contract) = super::direct_response_delivery_contract(&ctx.constraints) {
+            task_parts.push(format!("## Authoritative Delivery Contract\n{contract}"));
+        }
+        if let Some(contract) = super::required_capability_contract(&ctx.constraints) {
+            task_parts.push(format!("## Authoritative Evidence Capability\n{contract}"));
+        }
         let task_section = task_parts.join("\n\n");
 
         let context_msg = if summary_text.is_empty() {
@@ -1025,7 +1090,7 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         }];
 
-        {
+        if ctx.workspace_context_enabled() && agent.role != AgentRole::Check {
             let executor = self.tool_executor.read();
             if let Some(wm) = executor.get_workspace_monitor() {
                 wm.snapshots()
@@ -1036,7 +1101,10 @@ Output the summary report directly, not in JSON format."#,
 
         // Agent active perception area: environment-level perception data from system components (file changes, batch analysis, alerts, etc.)
         // Placed after system and before history messages so LLM sees global environment state first
-        let perception_text = self.perception_store.take_perception_text(&ctx.task_iri);
+        let perception_text = self.perception_store.take_perception_text_scoped(
+            &ctx.task_iri,
+            ctx.workspace_context_enabled() && agent.role != AgentRole::Check,
+        );
         if !perception_text.is_empty() {
             info!(
                 "[perception] injecting {} bytes of perception content",
@@ -1054,7 +1122,9 @@ Output the summary report directly, not in JSON format."#,
 
         // Proactive KG context injection: query the knowledge graph for entities relevant to the task
         // and inject them as environment context before the agent begins reasoning.
-        if self.learning_mode.injects_history() {
+        if self.learning_mode.injects_history()
+            && matches!(agent.role, AgentRole::Plan | AgentRole::Do)
+        {
             if let Some(ref kg_store) = self.unified_graph_store {
                 let prompt_settings = &self.token_optimization.prompt_optimization;
                 let kg_context = Self::build_kg_context(
@@ -1123,15 +1193,19 @@ Output the summary report directly, not in JSON format."#,
             reasoning_content: None,
         });
 
-        let tools = self
-            .tool_definitions_for_context(&agent.role.to_string(), ctx.allowed_tools.as_deref());
+        let tools = self.tool_definitions_for_task_context(&agent.role.to_string(), &ctx);
+        let tool_names = tools
+            .iter()
+            .filter_map(|definition| definition["function"]["name"].as_str())
+            .collect::<Vec<_>>();
 
         info!(
-            "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}",
+            "AgentRunner start: role={}, model={}, tools={}, supports_reasoning={}, tool_names={:?}",
             agent.role,
             model,
             tools.len(),
-            supports_reasoning
+            supports_reasoning,
+            tool_names
         );
 
         let mut tc = ctx.resumed_tool_count;
@@ -1210,6 +1284,7 @@ Output the summary report directly, not in JSON format."#,
         let mut substantive_effect_count = 0u32;
         let mut verification_turns = 0u32;
         let mut planning_tool_turns = 0u32;
+        let mut evidence_only_tool_turns = 0u32;
 
         // Initial checkpoint: record task start state
         let start_role_str = agent.role.to_string();
@@ -1246,12 +1321,14 @@ Output the summary report directly, not in JSON format."#,
         let mut soft_limit_force_finish = false;
 
         loop {
-            refresh_workspace_delta_message(
-                &self.tool_executor,
-                &mut messages,
-                &mut workspace_generation,
-                workspace_delta_limit,
-            );
+            if ctx.workspace_context_enabled() {
+                refresh_workspace_delta_message(
+                    &self.tool_executor,
+                    &mut messages,
+                    &mut workspace_generation,
+                    workspace_delta_limit,
+                );
+            }
             refresh_execution_ledger(
                 &mut messages,
                 agent.role,
@@ -1577,9 +1654,9 @@ Output the summary report directly, not in JSON format."#,
                     .get_model(&agent.role.to_string().to_lowercase());
                 let active_session_tools =
                     active_session_tool_names(&messages, &session_micro_tools);
-                let turn_tool_definitions = self.tool_definitions_for_context_with_microtools(
+                let turn_tool_definitions = self.tool_definitions_for_task_context_with_microtools(
                     &agent.role.to_string(),
-                    ctx.allowed_tools.as_deref(),
+                    &ctx,
                     &active_session_tools,
                 );
                 let tool_schema_token_reserve = crate::core::context_compressor::ContextWindowManager::estimate_tool_schema_tokens(&turn_tool_definitions);
@@ -1653,6 +1730,20 @@ Output the summary report directly, not in JSON format."#,
             let pa_planning_focus_active = agent.role == AgentRole::Plan
                 && execution_budget.pa_planning_focus_turns > 0
                 && planning_tool_turns >= execution_budget.pa_planning_focus_turns;
+            let da_evidence_focus_active = agent.role == AgentRole::Do
+                && matches!(
+                    ctx.effective_effect_policy(),
+                    crate::core::effect::EffectPolicy::EvidenceOnly
+                )
+                && execution_budget.da_evidence_focus_turns > 0
+                && evidence_only_tool_turns >= execution_budget.da_evidence_focus_turns;
+            let da_evidence_close_active = agent.role == AgentRole::Do
+                && matches!(
+                    ctx.effective_effect_policy(),
+                    crate::core::effect::EffectPolicy::EvidenceOnly
+                )
+                && execution_budget.da_evidence_close_turns > 0
+                && evidence_only_tool_turns >= execution_budget.da_evidence_close_turns;
             if ca_evidence_focus_active {
                 request_messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -1683,6 +1774,26 @@ Output the summary report directly, not in JSON format."#,
                     reasoning_content: None,
                 });
             }
+            if da_evidence_focus_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[DA Evidence Convergence] The configured evidence-discovery window is complete. Synthesize the requested deliverable now from the sources and evidence already collected. Only one targeted source read is permitted when a specific claim lacks support; do not perform another broad search.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if da_evidence_close_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[DA Evidence Close Gate] The configured evidence window is exhausted. Do not call another tool. Return the complete evidence-backed deliverable now, explicitly marking any unsupported point as a limitation.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
             if mutation_recovery_active {
                 request_messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -1701,14 +1812,7 @@ Output the summary report directly, not in JSON format."#,
             // time authorization.  Some OpenAI-compatible providers may emit
             // a tool name remembered from earlier context even after its
             // schema has been withdrawn for the current phase.
-            let current_tools = {
-                let active_session_tools =
-                    active_session_tool_names(&request_messages, &session_micro_tools);
-                let current_tools = self.tool_definitions_for_context_with_microtools(
-                    &agent.role.to_string(),
-                    ctx.allowed_tools.as_deref(),
-                    &active_session_tools,
-                );
+            let apply_turn_tool_policy = |current_tools: Vec<Value>| {
                 let current_tools =
                     phase_tool_definitions(current_tools, agent.role, execution_phase);
                 let current_tools = workspace_inventory_tool_definitions(
@@ -1733,13 +1837,36 @@ Output the summary report directly, not in JSON format."#,
                     agent.role,
                     pa_planning_focus_active,
                 );
+                let current_tools = da_evidence_focus_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    da_evidence_focus_active,
+                );
+                let current_tools = da_evidence_close_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    da_evidence_close_active,
+                );
                 if mutation_recovery_active {
                     mutation_recovery_tool_definitions(current_tools)
                 } else {
                     current_tools
                 }
             };
+            let current_tools = {
+                let active_session_tools =
+                    active_session_tool_names(&request_messages, &session_micro_tools);
+                let current_tools = self.tool_definitions_for_task_context_with_microtools(
+                    &agent.role.to_string(),
+                    &ctx,
+                    &active_session_tools,
+                );
+                apply_turn_tool_policy(current_tools)
+            };
             let advertised_tools = advertised_tool_names(&current_tools);
+            let discoverable_tools = advertised_tool_names(&apply_turn_tool_policy(
+                self.discoverable_tool_definitions_for_task_context(&agent.role.to_string(), &ctx),
+            ));
             let request_tools = (!current_tools.is_empty()).then_some(current_tools);
 
             let response = self
@@ -1931,11 +2058,7 @@ Output the summary report directly, not in JSON format."#,
                     .await;
             }
 
-            let task_id = ctx
-                .task_iri
-                .strip_prefix("iri://task/")
-                .unwrap_or_else(|| ctx.task_iri.strip_prefix("iri://").unwrap_or(&ctx.task_iri));
-            let node_iri = format!("iri://task/{}/turn_{}", task_id, turn);
+            let node_iri = super::agent_turn_iri(&ctx.task_iri, sess.session_id(), turn);
             if parsed.content.len() > best_content_len {
                 best_content_len = parsed.content.len();
                 best_content_str = parsed.content.clone();
@@ -2263,6 +2386,15 @@ Output the summary report directly, not in JSON format."#,
                         if agent.role == AgentRole::Plan && !calls.is_empty() {
                             planning_tool_turns = planning_tool_turns.saturating_add(1);
                         }
+                        if agent.role == AgentRole::Do
+                            && matches!(
+                                ctx.effective_effect_policy(),
+                                crate::core::effect::EffectPolicy::EvidenceOnly
+                            )
+                            && !calls.is_empty()
+                        {
+                            evidence_only_tool_turns = evidence_only_tool_turns.saturating_add(1);
+                        }
 
                         // 🔴 PA role forbidden from calling write tools, but read-only tools allowed
                         if agent.role == AgentRole::Plan {
@@ -2435,9 +2567,11 @@ Output the summary report directly, not in JSON format."#,
                             // feedback rather than a failed skill execution:
                             // no skill hooks, action-ledger entry, ToolGuard
                             // validation, or AGENT_ERROR should be produced.
-                            if let Some(rejection) =
-                                unadvertised_tool_call_result(&advertised_tools, name)
-                            {
+                            if let Some(rejection) = unadvertised_tool_call_result(
+                                &advertised_tools,
+                                &session_micro_tools,
+                                name,
+                            ) {
                                 info!(
                                     "[tool] ignored unadvertised call {} for the current turn",
                                     name
@@ -2523,7 +2657,7 @@ Output the summary report directly, not in JSON format."#,
                             // out of the handler's async I/O path.  Unlike a
                             // direct handler call this also applies executor
                             // permission, syscall and hook policies.
-                            let result = if block_effectless_calls {
+                            let mut result = if block_effectless_calls {
                                 json!({
                                     "error": "DA execution-progress guard blocked another inspection-only turn",
                                     "required_next_action": "Create or modify a substantive artifact with file_write/file_edit or a genuinely mutating command; otherwise finish with FAILED and the exact blocker."
@@ -2544,6 +2678,9 @@ Output the summary report directly, not in JSON format."#,
                                     .await
                                     .unwrap_or_else(|e| json!({"error": e}))
                             };
+                            if name == "tool_search" {
+                                filter_tool_search_result(&mut result, &discoverable_tools);
+                            }
                             action_tracker.record(
                                 name,
                                 &args_clone,

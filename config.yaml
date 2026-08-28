@@ -36,6 +36,14 @@ workspace:
     - ".git/"
     - "dist/"
 
+# Generic continuous-learning promotion gate. These values govern bounded
+# hint-ordering policy trials; they never bypass CA/AA quality decisions.
+policy_learning:
+  candidate_trial_min_baseline_samples: 1
+  promotion_min_samples: 5
+  # Require a measurable positive gain; equality is not an upward promotion.
+  promotion_min_improvement: 0.01
+
 memory:
   l0:
     path: "/tmp/agent_os_data/l0"
@@ -100,6 +108,10 @@ agents:
     ca_evidence_close_turns: 10
     # 0 disables; bounds PA inspection without reducing DA execution budget.
     pa_planning_focus_turns: 4
+    # Evidence-only DA: stop broad discovery, then force synthesis. These do
+    # not cap implementation DA turns for workspace-changing complex tasks.
+    da_evidence_focus_turns: 5
+    da_evidence_close_turns: 8
     max_sub_agents: 5
     ca_handoff_max_chars: 6000
     recursive_handoff_max_chars: 4000

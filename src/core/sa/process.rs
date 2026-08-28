@@ -46,6 +46,8 @@ struct LearningTreatmentMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     experiment_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    experiment_config_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workspace_fingerprint: Option<String>,
     objective_fingerprint: String,
     orchestration_mode: String,
@@ -276,6 +278,7 @@ fn policy_reward_breakdown(
     result: &TaskResult,
     prompt_tokens: u64,
     elapsed_ms: u64,
+    workspace_mutation_required: bool,
 ) -> PolicyRewardBreakdown {
     let status_reward = match result.status.as_str() {
         "success" | "completed" if !result.summary.contains("[Recovery] scope=Task") => 1.0,
@@ -359,11 +362,12 @@ fn policy_reward_breakdown(
         .rev()
         .take_while(|action| !action.substantive_effect)
         .count();
-    let no_effect_tail_penalty = if result.tracked_actions.is_empty() {
-        0.0
-    } else {
-        (no_effect_tail as f32 / result.tracked_actions.len() as f32 * 0.12).min(0.12)
-    };
+    let no_effect_tail_penalty =
+        if !workspace_mutation_required || result.tracked_actions.is_empty() {
+            0.0
+        } else {
+            (no_effect_tail as f32 / result.tracked_actions.len() as f32 * 0.12).min(0.12)
+        };
     let total = (status_reward
         - failed_action_penalty
         - excess_turn_penalty
@@ -660,6 +664,10 @@ impl SupervisorAgent {
             experiment_pair_id: ctx.constraints.get("learning_pair_id").cloned(),
             experiment_seed: ctx.constraints.get("learning_seed").cloned(),
             experiment_model: ctx.constraints.get("learning_model").cloned(),
+            experiment_config_fingerprint: ctx
+                .constraints
+                .get("learning_experiment_config_fingerprint")
+                .cloned(),
             workspace_fingerprint: ctx
                 .constraints
                 .get("learning_workspace_fingerprint")
@@ -729,8 +737,14 @@ impl SupervisorAgent {
             info!(task_iri = %task_iri, complexity = ?initial_complexity, "Using structural SA plan; detailed planning delegated once to PA");
             self.build_plan_from_complexity(initial_complexity)
         } else {
-            self.analyze_task_with_llm(task_iri, user_input, &five_w2h, &all_hints)
-                .await
+            self.analyze_task_with_llm(
+                task_iri,
+                user_input,
+                &five_w2h,
+                &all_hints,
+                &ctx.constraints,
+            )
+            .await
         };
         tracing::info!(
             task_iri = %task_iri,
@@ -1035,7 +1049,13 @@ impl SupervisorAgent {
             // dominant latency/token cost from already-complete tasks.
             if cycle_num >= 1 && plan.verify_first && !fallback_plan_generated {
                 let detailed = self
-                    .analyze_task_with_llm(task_iri, user_input, &five_w2h, &all_hints)
+                    .analyze_task_with_llm(
+                        task_iri,
+                        user_input,
+                        &five_w2h,
+                        &all_hints,
+                        &ctx.constraints,
+                    )
                     .await;
                 plan.fallback_steps = detailed.steps;
                 plan.parallel_groups = detailed.parallel_groups;
@@ -1091,7 +1111,7 @@ impl SupervisorAgent {
                 self.emit_sa_thought(
                     task_iri,
                     &format!(
-                        "⚠️ AA did not pass cycle #{} — restarting PDCA with feedback",
+                        "⚠️ PDCA cycle #{} did not pass its latest quality gate — restarting with targeted feedback",
                         cycle_num + 1
                     ),
                     "pdca_retry_start",
@@ -1198,6 +1218,7 @@ impl SupervisorAgent {
                     task_started_at,
                     task_prompt_tokens_start,
                     task_completion_tokens_start,
+                    ctx.effective_effect_policy().requires_workspace_mutation(),
                 )
                 .await;
                 return Ok(result);
@@ -1252,8 +1273,9 @@ impl SupervisorAgent {
                 task_scope_replans_used = task_scope_replans_used.saturating_add(1);
             }
 
-            // Build targeted feedback — when AA identifies execution gaps, tell PA
-            // to preserve the plan structure and focus on specific DA improvements.
+            // Build targeted feedback from the latest quality gate. The
+            // failing gate can be CA (before AA is allowed to run) or AA; do
+            // not misreport every retry as an AA rejection.
             // The CA→DA correction loop (in execute_plan) already handles in-cycle fixes;
             // this SA-level feedback addresses persistent failures requiring plan adjustment.
             let task_level_audit = result.summary.contains("[Recovery] scope=Task");
@@ -1262,13 +1284,16 @@ impl SupervisorAgent {
                     || result.summary.contains("execution failed")
                     || result.summary.contains("not completed"));
 
-            let authoritative_contract =
-                super::execution::authoritative_task_contract(user_input, &five_w2h);
+            let authoritative_contract = super::execution::authoritative_task_contract(
+                user_input,
+                &five_w2h,
+                &ctx.constraints,
+            );
             cycle_feedback = Some(if da_fixes {
                 format!(
-                    "{}\n\nPDCA Cycle #{} (plan revision {}): AA identified execution-level issues.\n\
+                    "{}\n\nPDCA Cycle #{} (plan revision {}): the latest quality gate identified execution-level issues.\n\
                      Status: {}\n\n\
-                     AA Evaluation:\n{}\n\n\
+                     Quality-gate evidence:\n{}\n\n\
                      ---\n\
                      PRESERVE your previous plan structure. Focus ONLY on:\n\
                      1. Which specific execution steps failed or were incomplete\n\
@@ -1283,7 +1308,7 @@ impl SupervisorAgent {
             } else {
                 format!(
                     "{}\n\nPDCA Cycle #{} (plan revision {}): result\nStatus: {}\nRecovery directive: replan_pa\n\n\
-                     AA Evaluation:\n{}\n\n\
+                     Quality-gate evidence:\n{}\n\n\
                      ---\n\
                      The previous plan is not sufficient. Re-plan the task at PA,\
                      preserve verified evidence where possible, and create an improved approach.",
@@ -1324,6 +1349,7 @@ impl SupervisorAgent {
             task_started_at,
             task_prompt_tokens_start,
             task_completion_tokens_start,
+            ctx.effective_effect_policy().requires_workspace_mutation(),
         )
         .await;
         Ok(final_result)
@@ -1338,6 +1364,7 @@ impl SupervisorAgent {
         task_started_at: std::time::Instant,
         prompt_tokens_start: u64,
         completion_tokens_start: u64,
+        workspace_mutation_required: bool,
     ) {
         let prompt_tokens = self
             .runner
@@ -1350,8 +1377,24 @@ impl SupervisorAgent {
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(completion_tokens_start);
         let elapsed_ms = task_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        let reward = policy_reward_breakdown(result, prompt_tokens, elapsed_ms);
+        let reward = policy_reward_breakdown(
+            result,
+            prompt_tokens,
+            elapsed_ms,
+            workspace_mutation_required,
+        );
         let mut evaluation = None;
+        let observation_evidence = crate::core::policy_learning::PolicyObservationEvidence {
+            task_iri: Some(task_iri.to_string()),
+            experiment_pair_id: treatment.experiment_pair_id.clone(),
+            experiment_seed: treatment.experiment_seed.clone(),
+            experiment_model: treatment.experiment_model.clone(),
+            experiment_config_fingerprint: treatment.experiment_config_fingerprint.clone(),
+            workspace_fingerprint: treatment.workspace_fingerprint.clone(),
+            objective_fingerprint: Some(treatment.objective_fingerprint.clone()),
+            orchestration_mode: Some(treatment.orchestration_mode.clone()),
+        };
+        let mut policy_observation_recorded = false;
         if self.learning_mode.updates_learning() {
             let task_result = serde_json::json!({
                 "status": &result.status,
@@ -1364,15 +1407,39 @@ impl SupervisorAgent {
             // A durable experience represents the terminal user task, not an
             // intermediate PA/DA/CA/AA BizAgent invocation.
             self.perception.on_task_end(&task_result, task_iri).await;
-            match self.policy_learning.record_reward_gated(
+            match self.policy_learning.record_reward_gated_with_evidence(
                 policy_choice,
                 reward.total,
-                crate::core::policy_learning::PolicyGate::default(),
+                self.policy_learning.gate(),
+                observation_evidence,
             ) {
-                Ok(report) => evaluation = Some(report),
+                Ok(report) => {
+                    policy_observation_recorded = true;
+                    evaluation = Some(report);
+                }
                 Err(error) => {
                     tracing::warn!(task_iri = %task_iri, %error, "Policy reward persistence failed")
                 }
+            }
+        } else if matches!(
+            self.learning_mode,
+            crate::core::policy_learning::LearningMode::Baseline
+        ) {
+            // A baseline run remains a true behavioral ablation: no history
+            // retrieval/injection, perception update, or model training. Its
+            // immutable outcome is nevertheless required for a controlled
+            // treatment-effect promotion gate.
+            match self.policy_learning.record_baseline_evidence(
+                policy_choice,
+                reward.total,
+                observation_evidence,
+            ) {
+                Ok(recorded) => policy_observation_recorded = recorded,
+                Err(error) => tracing::warn!(
+                    task_iri = %task_iri,
+                    %error,
+                    "Controlled baseline evidence persistence failed"
+                ),
             }
         }
 
@@ -1400,6 +1467,9 @@ impl SupervisorAgent {
             "elapsed_ms": elapsed_ms,
             "reward": reward,
             "policy_evaluation": evaluation,
+            "policy_observation_recorded": policy_observation_recorded,
+            "policy_gate": self.policy_learning.gate(),
+            "candidate_trial_min_baseline_samples": self.policy_learning.min_observations(),
             "model_version": self.policy_learning.model_version(),
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
@@ -1427,10 +1497,32 @@ mod tests {
         let mut five_w2h = crate::core::five_w2h::Task5W2H::new(original, "verify behavior");
         five_w2h.why.success_criteria = vec!["at least 10 test cases pass".to_string()];
 
-        let contract = crate::core::sa::execution::authoritative_task_contract(original, &five_w2h);
+        let contract = crate::core::sa::execution::authoritative_task_contract(
+            original,
+            &five_w2h,
+            &std::collections::HashMap::new(),
+        );
         assert!(contract.contains(original));
         assert!(contract.contains("at least 10 test cases pass"));
         assert!(contract.contains("must not add, remove, strengthen, weaken, or reinterpret"));
+    }
+
+    #[test]
+    fn direct_response_contract_does_not_require_a_file_or_graph_node() {
+        let original = "输出一份 Markdown 调研报告";
+        let five_w2h = crate::core::five_w2h::Task5W2H::new(original, "供用户阅读");
+        let constraints = std::collections::HashMap::from([(
+            crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+            crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+        )]);
+        let contract = crate::core::sa::execution::authoritative_task_contract(
+            original,
+            &five_w2h,
+            &constraints,
+        );
+        assert!(contract.contains("direct_response"));
+        assert!(contract.contains("filesystem path"));
+        assert!(contract.contains("invented graph IRI"));
     }
 
     #[test]
@@ -1639,14 +1731,47 @@ mod tests {
         costly.errors = vec!["retry one".into(), "retry two".into()];
         costly.summary = "[Recovery] scope=Task; eventually accepted".into();
 
-        let clean_reward = policy_reward_breakdown(&clean, 10_000, 10_000);
-        let costly_reward = policy_reward_breakdown(&costly, 180_000, 240_000);
+        let clean_reward = policy_reward_breakdown(&clean, 10_000, 10_000, true);
+        let costly_reward = policy_reward_breakdown(&costly, 180_000, 240_000, true);
         assert_eq!(clean_reward.total, 1.0);
         assert!(costly_reward.total < clean_reward.total);
         assert!(costly_reward.excess_turn_penalty > 0.0);
         assert!(costly_reward.recovery_penalty > 0.0);
         assert!(costly_reward.prompt_token_penalty > 0.0);
         assert!(costly_reward.latency_penalty > 0.0);
+    }
+
+    #[test]
+    fn evidence_only_success_is_not_penalized_for_having_no_mutation_tail() {
+        let mut tracker =
+            crate::core::tracked_action::ActionTracker::new("iri://task/read-only", "CA");
+        tracker.record(
+            "file_read",
+            &serde_json::json!({"path": "fixture.txt"}),
+            &serde_json::json!({"success": true, "content": "ANSWER=helios-731"}),
+            0.01,
+        );
+        let result = TaskResult {
+            task_iri: "iri://task/read-only".into(),
+            status: "success".into(),
+            verdict: None,
+            summary: "ANSWER=helios-731".into(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: tracker.actions,
+            archive_iri: None,
+        };
+        let evidence_only = policy_reward_breakdown(&result, 1_000, 1_000, false);
+        let mutation_required = policy_reward_breakdown(&result, 1_000, 1_000, true);
+        assert_eq!(evidence_only.no_effect_tail, 1);
+        assert_eq!(evidence_only.no_effect_tail_penalty, 0.0);
+        assert!(mutation_required.no_effect_tail_penalty > 0.0);
+        assert!(evidence_only.total > mutation_required.total);
     }
 
     #[test]

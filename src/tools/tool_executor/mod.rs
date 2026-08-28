@@ -138,6 +138,138 @@ const MICRO_TOOL_PREFIXES: &[&str] = &[
     "expand_relation",
 ];
 
+pub(crate) fn sanitize_session_tool_references(text: &str) -> (String, usize) {
+    const PATTERNS: &[(&str, &str)] = &[
+        (
+            "read_full_result_",
+            "[session-scoped result reader omitted]",
+        ),
+        ("iri://tool-result/", "[session-scoped tool result omitted]"),
+        (
+            "https://agent-os.org/ontology/tool-result/",
+            "[session-scoped tool result omitted]",
+        ),
+    ];
+
+    let mut sanitized = text.to_string();
+    let mut total = 0;
+    for (prefix, replacement) in PATTERNS {
+        let mut remaining = sanitized.as_str();
+        let mut output = String::with_capacity(sanitized.len());
+        let mut redacted = 0;
+        while let Some(start) = remaining.find(prefix) {
+            output.push_str(&remaining[..start]);
+            let token_start = start + prefix.len();
+            let token_len = remaining[token_start..]
+                .bytes()
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                })
+                .count();
+            if token_len == 0 {
+                output.push_str(prefix);
+                remaining = &remaining[token_start..];
+                continue;
+            }
+            output.push_str(replacement);
+            remaining = &remaining[token_start + token_len..];
+            redacted += 1;
+        }
+        output.push_str(remaining);
+        sanitized = output;
+        total += redacted;
+    }
+    (sanitized, total)
+}
+
+fn redact_session_tool_references(value: &mut Value) -> usize {
+    match value {
+        Value::String(text) => {
+            let (redacted_text, count) = sanitize_session_tool_references(text);
+            *text = redacted_text;
+            count
+        }
+        Value::Array(items) => items.iter_mut().map(redact_session_tool_references).sum(),
+        Value::Object(object) => object
+            .values_mut()
+            .map(redact_session_tool_references)
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn agent_turn_content_page(node: &mut Value, input: &Value, node_iri: &str) -> Option<Value> {
+    let redacted = redact_session_tool_references(node);
+    let content = node.get("content")?.as_str()?;
+    let char_offset = input
+        .get("char_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let char_limit = input
+        .get("char_limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(4_000)
+        .clamp(1, 6_000) as usize;
+    let total_chars = content.chars().count();
+    let page = content
+        .chars()
+        .skip(char_offset)
+        .take(char_limit)
+        .collect::<String>();
+    let next_char_offset = char_offset.saturating_add(page.chars().count());
+    Some(json!({
+        "content": page,
+        "total_chars": total_chars,
+        "char_offset": char_offset,
+        "returned_chars": next_char_offset.saturating_sub(char_offset),
+        "next_char_offset": (next_char_offset < total_chars).then_some(next_char_offset),
+        "iri": node_iri,
+        "role": node.get("role").cloned().unwrap_or(Value::Null),
+        "cycle_id": node.get("cycle_id").cloned().unwrap_or(Value::Null),
+        "session_tool_references_redacted": redacted,
+    }))
+}
+
+fn archived_text_page(
+    content: &str,
+    line_offset: usize,
+    line_limit: usize,
+    char_offset: usize,
+    max_chars: usize,
+    call_id: &str,
+) -> Value {
+    let lines = content.lines().collect::<Vec<_>>();
+    let selected = lines
+        .iter()
+        .skip(line_offset)
+        .take(line_limit)
+        .copied()
+        .collect::<Vec<_>>();
+    let selected_text = selected.join("\n");
+    let selected_chars = selected_text.chars().count();
+    let page = selected_text
+        .chars()
+        .skip(char_offset)
+        .take(max_chars.max(1))
+        .collect::<String>();
+    let returned_chars = page.chars().count();
+    let consumed_chars = char_offset.saturating_add(returned_chars);
+    let next_char_offset = (consumed_chars < selected_chars).then_some(consumed_chars);
+
+    json!({
+        "content": page,
+        "total_lines": lines.len(),
+        "offset": line_offset,
+        "returned": selected.len(),
+        "char_offset": char_offset,
+        "returned_chars": returned_chars,
+        "selected_chars": selected_chars,
+        "next_char_offset": next_char_offset,
+        "truncated": next_char_offset.is_some(),
+        "call_id": call_id,
+    })
+}
+
 /// Built-ins that are executor capabilities rather than independently
 /// registered skills inherit a reviewed least-privilege SkillGraph policy.
 /// Keep this table explicit: an unknown tool must still fail closed.
@@ -1020,11 +1152,13 @@ impl ToolExecutor {
         let proj_for_tool = self.projection_engine.clone();
         let archived_store_for_tool = self.archived_result_store.clone();
         let archived_memory_for_tool = self.micro_tool_data.clone();
-        self.register("read_agent_output", "Read archived output by IRI. Agent report IRIs (iri://task/.../turn_N) are projected from L2; tool-result IRIs (iri://tool-result/...) are returned as a bounded page from the result archive. Prefer the exact read_full_result_* session tool when it is advertised.", json!({
+        self.register("read_agent_output", "Read archived output by an exact IRI supplied in the current task handoff. Agent report IRIs (iri://task/.../session/.../turn_N; legacy iri://task/.../turn_N remains readable) return stable character pages from the AgentTurn content. Tool-result IRIs (iri://tool-result/...) return bounded line pages. Continue AgentTurn reads with next_char_offset on the same IRI; never chase reader names or tool-result IRIs found inside archived text, and never invent an IRI from an expected output or filename.", json!({
             "properties": {
                 "node_iri": {"type":"string","description":"Agent report or archived tool-result IRI."},
                 "offset": {"type":"integer","description":"Starting line for a tool-result IRI (default 0)."},
-                "limit": {"type":"integer","description":"Maximum lines for a tool-result IRI (default 100, maximum 200)."}
+                "limit": {"type":"integer","description":"Maximum lines for a tool-result IRI (default 100, maximum 200)."},
+                "char_offset": {"type":"integer","description":"Starting Unicode character for an AgentTurn IRI (default 0)."},
+                "char_limit": {"type":"integer","description":"Maximum Unicode characters for an AgentTurn page (default 4000, maximum 6000)."}
             },
             "required": ["node_iri"]
         }), Arc::new(move |input: Value| {
@@ -1077,7 +1211,21 @@ impl ToolExecutor {
                 let result = engine.read_node(node_iri)
                     .map_err(|e| format!("Failed to read L2 node: {}", e))?;
                 match result {
-                    Some(node) => Ok(node),
+                    Some(mut node) => {
+                        if let Some(page) = agent_turn_content_page(&mut node, &input, node_iri) {
+                            return Ok(page);
+                        }
+                        let redacted = redact_session_tool_references(&mut node);
+                        if redacted > 0 {
+                            if let Some(object) = node.as_object_mut() {
+                                object.insert(
+                                    "session_tool_references_redacted".to_string(),
+                                    Value::Number((redacted as u64).into()),
+                                );
+                            }
+                        }
+                        Ok(node)
+                    }
                     None => Err(format!("Node not found: {}", node_iri)),
                 }
             })
@@ -1243,7 +1391,8 @@ impl ToolExecutor {
             "type": "object",
             "properties": {
                 "offset": {"type": "integer", "description": "Starting offset"},
-                "limit": {"type": "integer", "description": "Max results to return"}
+                "limit": {"type": "integer", "description": "Max results to return"},
+                "char_offset": {"type": "integer", "description": "Character offset within the selected line page; continue from next_char_offset for a very long line"}
             }
         });
 
@@ -1276,20 +1425,15 @@ impl ToolExecutor {
 
                     if tool_name_owned.starts_with("read_full_result_") {
                         if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                            let lines: Vec<&str> = content.lines().collect();
-                            let selected: Vec<String> = lines
-                                .iter()
-                                .skip(offset)
-                                .take(limit)
-                                .map(|l| l.to_string())
-                                .collect();
-                            return Ok(json!({
-                                "content": selected.join("\n"),
-                                "total_lines": lines.len(),
-                                "offset": offset,
-                                "returned": selected.len(),
-                                "call_id": ctx.call_id,
-                            }));
+                            let char_offset = input["char_offset"].as_u64().unwrap_or(0) as usize;
+                            return Ok(archived_text_page(
+                                content,
+                                offset,
+                                limit,
+                                char_offset,
+                                ctx.preview_size,
+                                &ctx.call_id,
+                            ));
                         }
                     } else if tool_name_owned.starts_with("query_") {
                         if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
@@ -1410,7 +1554,8 @@ impl ToolExecutor {
                     "type": "object",
                     "properties": {
                         "offset": {"type": "integer", "description": "Starting offset"},
-                        "limit": {"type": "integer", "description": "Maximum results to return"}
+                        "limit": {"type": "integer", "description": "Maximum results to return"},
+                        "char_offset": {"type": "integer", "description": "Character offset within the selected line page; continue from next_char_offset for a very long line"}
                     }
                 }
             }
@@ -1617,6 +1762,7 @@ impl ToolExecutor {
         drop(data_guard);
         let default_page_size = self.micro_tool_page_size;
         let max_page_size = self.micro_tool_max_page_size;
+        let max_chars = ctx.preview_size.max(1);
 
         Some(Arc::new(move |input: Value| {
             let _storage_key = storage_key.clone();
@@ -1629,21 +1775,15 @@ impl ToolExecutor {
                     .min(max_page_size);
 
                 if let Some(content) = stored_data.get("content").and_then(|v| v.as_str()) {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let selected: Vec<String> = lines
-                        .iter()
-                        .skip(offset)
-                        .take(limit)
-                        .map(|l| l.to_string())
-                        .collect();
-                    return Ok(serde_json::json!({
-                        "content": selected.join("
-                    "),
-                        "total_lines": lines.len(),
-                        "offset": offset,
-                        "returned": selected.len(),
-                        "call_id": call_id,
-                    }));
+                    let char_offset = input["char_offset"].as_u64().unwrap_or(0) as usize;
+                    return Ok(archived_text_page(
+                        content,
+                        offset,
+                        limit,
+                        char_offset,
+                        max_chars,
+                        &call_id,
+                    ));
                 }
 
                 Ok(serde_json::json!({

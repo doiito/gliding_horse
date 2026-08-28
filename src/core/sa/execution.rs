@@ -1,7 +1,7 @@
 use petgraph::prelude::NodeIndex;
 use petgraph::Incoming;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::core::agent_instance::{AgentInstance, AgentRole};
 use crate::core::agent_runner::{TaskContext, TaskResult, TaskVerdict};
@@ -16,6 +16,21 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn sanitized_handoff_text(text: &str) -> String {
+    crate::tools::tool_executor::sanitize_session_tool_references(text).0
+}
+
+pub(super) fn direct_response_recheck_tools(
+    constraints: &std::collections::HashMap<String, String>,
+) -> Option<Vec<String>> {
+    let direct_response =
+        crate::core::agent_runner::direct_response_delivery_contract(constraints).is_some();
+    let workspace_disabled = constraints
+        .get(crate::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT)
+        .is_some_and(|scope| scope == crate::core::agent_runner::WORKSPACE_CONTEXT_DISABLED);
+    (direct_response && workspace_disabled).then(|| vec!["read_agent_output".to_string()])
+}
+
 /// Build the evidence passed from one business agent to the next.
 ///
 /// AA intentionally has no execution tools: it decides from CA's evidence and
@@ -28,13 +43,24 @@ pub(super) fn result_handoff(
     ca_handoff_max_chars: usize,
 ) -> String {
     if role != AgentRole::Check {
-        let summary = truncate_chars(&result.summary, ca_handoff_max_chars.max(1));
+        let summary_budget = ca_handoff_max_chars.saturating_sub(600).max(1);
+        let summary = truncate_chars(&sanitized_handoff_text(&result.summary), summary_budget);
         return match result.archive_iri.as_ref() {
             Some(iri) => format!(
-                "{}\n\nFor the full report, use read_agent_output tool to query: {}",
+                "{}\n\n## Durable Previous-Agent Output\nUse `read_agent_output` with `node_iri: {}`. It returns the AgentTurn正文 directly in stable character pages; continue only with `next_char_offset` on this same IRI. Ignore any session reader or tool-result reference inside archived text.",
                 summary, iri
             ),
-            None => summary,
+            None => result
+                .output
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .map(|value| match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .map(|text| sanitized_handoff_text(&text))
+                .map(|text| truncate_chars(&text, ca_handoff_max_chars.max(1)))
+                .unwrap_or(summary),
         };
     }
 
@@ -47,11 +73,12 @@ pub(super) fn result_handoff(
             other => other.to_string(),
         })
         .filter(|text| !text.trim().is_empty())
+        .map(|text| sanitized_handoff_text(&text))
         .map(|text| truncate_chars(&text, ca_handoff_max_chars.max(1)));
 
     let mut handoff = format!(
         "{}\n\n## CA Verification Metadata\n- status: {}\n- verification tool calls: {}\n- verification turns: {}\n- reported artifacts: {}",
-        result.summary,
+        sanitized_handoff_text(&result.summary),
         result.status,
         result.tool_call_count,
         result.turn_count,
@@ -73,6 +100,52 @@ pub(super) fn result_handoff(
         ),
         _ => bounded,
     }
+}
+
+pub(super) fn restore_accepted_deliverable(
+    final_result: &mut TaskResult,
+    latest_da_result: Option<&TaskResult>,
+    latest_ca_result: Option<&TaskResult>,
+    constraints: &std::collections::HashMap<String, String>,
+    task_effect_policy: &crate::core::effect::EffectPolicy,
+    verify_first: bool,
+) {
+    if !matches!(final_result.status.as_str(), "success" | "partial_success") {
+        return;
+    }
+
+    let deliverable =
+        if crate::core::agent_runner::direct_response_delivery_contract(constraints).is_some() {
+            latest_da_result
+        } else if verify_first
+            && matches!(
+                task_effect_policy,
+                crate::core::effect::EffectPolicy::EvidenceOnly
+            )
+            && latest_da_result.is_none()
+        {
+            // In a verify-first evidence task CA can establish the requested fact
+            // directly from immutable evidence. AA remains the terminal decision,
+            // but its disposition must not replace the accepted business answer.
+            latest_ca_result
+        } else {
+            None
+        };
+    let Some(deliverable) = deliverable else {
+        return;
+    };
+
+    final_result.output = deliverable.output.clone().or_else(|| {
+        (!deliverable.summary.trim().is_empty())
+            .then(|| serde_json::Value::String(deliverable.summary.clone()))
+    });
+    if let Some(serde_json::Value::String(text)) = final_result.output.as_mut() {
+        *text = sanitized_handoff_text(text);
+    }
+    final_result.jsonld_output = deliverable.jsonld_output.clone();
+    final_result.artifacts = deliverable.artifacts.clone();
+    final_result.archive_iri = deliverable.archive_iri.clone();
+    final_result.summary = deliverable.summary.clone();
 }
 
 /// Apply the CA 5W2H audit to a result and return whether any dimension failed.
@@ -375,6 +448,14 @@ fn persist_ca_validated_knowledge(
 /// AA decides the terminal business outcome; Runner success only means the AA
 /// invocation itself completed. Convert AA's explicit decision contract into
 /// TaskResult status before SA performs failure routing.
+fn starts_with_aa_verdict(text: &str, verdict: &str) -> bool {
+    text.strip_prefix(verdict).is_some_and(|rest| {
+        rest.is_empty()
+            || rest
+                .starts_with(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '：' | '-' | '—'))
+    })
+}
+
 fn apply_aa_declared_verdict(
     result: &mut TaskResult,
     latest_ca_report: Option<&crate::core::recovery::AuditReport>,
@@ -394,31 +475,25 @@ fn apply_aa_declared_verdict(
     // fallback only when AA did not declare a verdict in either channel.
     let declared_lines = evidence.lines().map(str::trim).collect::<Vec<_>>();
 
-    let failed = declared_lines
-        .iter()
-        .any(|line| line.starts_with("failed:") || line.starts_with("aa failed:"))
-        || evidence.lines().any(|line| {
-            (line.contains("task_verdict")
-                || line.contains("task status")
-                || line.contains("任务状态"))
-                && (line.contains("failed") || line.contains("失败"))
-        })
-        || evidence.contains("判定 failed");
+    let failed = declared_lines.iter().any(|line| {
+        starts_with_aa_verdict(line, "failed") || starts_with_aa_verdict(line, "aa failed")
+    }) || evidence.lines().any(|line| {
+        (line.contains("task_verdict") || line.contains("task status") || line.contains("任务状态"))
+            && (line.contains("failed") || line.contains("失败"))
+    }) || evidence.contains("判定 failed");
     let partial = declared_lines.iter().any(|line| {
-        line.starts_with("partial_success:") || line.starts_with("aa partial_success:")
+        starts_with_aa_verdict(line, "partial_success")
+            || starts_with_aa_verdict(line, "aa partial_success")
     }) || evidence.lines().any(|line| {
         (line.contains("task_verdict") || line.contains("task status") || line.contains("任务状态"))
             && (line.contains("partial_success") || line.contains("部分成功"))
     });
-    let success = declared_lines
-        .iter()
-        .any(|line| line.starts_with("success:") || line.starts_with("aa success:"))
-        || evidence.lines().any(|line| {
-            (line.contains("task_verdict")
-                || line.contains("task status")
-                || line.contains("任务状态"))
-                && (line.contains("success") || line.contains("成功"))
-        });
+    let success = declared_lines.iter().any(|line| {
+        starts_with_aa_verdict(line, "success") || starts_with_aa_verdict(line, "aa success")
+    }) || evidence.lines().any(|line| {
+        (line.contains("task_verdict") || line.contains("task status") || line.contains("任务状态"))
+            && (line.contains("success") || line.contains("成功"))
+    });
 
     if failed {
         result.status = "failed".to_string();
@@ -470,6 +545,7 @@ use super::types::*;
 pub(super) fn authoritative_task_contract(
     user_input: &str,
     five_w2h: &crate::core::five_w2h::Task5W2H,
+    constraints: &std::collections::HashMap<String, String>,
 ) -> String {
     let criteria = if five_w2h.why.success_criteria.is_empty() {
         "- Use the original request as the complete acceptance boundary.".to_string()
@@ -482,8 +558,14 @@ pub(super) fn authoritative_task_contract(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let delivery = crate::core::agent_runner::direct_response_delivery_contract(constraints)
+        .map(|contract| format!("\n\nDelivery contract:\n- {contract}"))
+        .unwrap_or_default();
+    let capability = crate::core::agent_runner::required_capability_contract(constraints)
+        .map(|contract| format!("\n\nEvidence capability contract:\n- {contract}"))
+        .unwrap_or_default();
     format!(
-        "## Authoritative Task Contract\nOriginal user request (verbatim):\n{user_input}\n\nDeclared success criteria:\n{criteria}\n\nContract rule: planning and recovery may clarify execution steps, but must not add, remove, strengthen, weaken, or reinterpret requirements. Preserve exact quantities and scope."
+        "## Authoritative Task Contract\nOriginal user request (verbatim):\n{user_input}\n\nDeclared success criteria:\n{criteria}{delivery}{capability}\n\nContract rule: planning and recovery may clarify execution steps, but must not add, remove, strengthen, weaken, or reinterpret requirements. Preserve exact quantities and scope."
     )
 }
 
@@ -631,6 +713,37 @@ fn recursive_effect_policy(
     }
 }
 
+/// Resolve a plan step under the task-level effect contract supplied by the
+/// application. Model-generated plans may narrow authority for an individual
+/// step, but cannot upgrade an evidence-only/decision-only task into mutation
+/// or strengthen a conditional task effect into an unconditional one.
+fn effective_step_effect_policy(
+    role: AgentRole,
+    step: &crate::core::effect::EffectPolicy,
+    task: &crate::core::effect::EffectPolicy,
+) -> crate::core::effect::EffectPolicy {
+    use crate::core::effect::EffectPolicy;
+    match role {
+        AgentRole::Plan | AgentRole::Check => EffectPolicy::EvidenceOnly,
+        AgentRole::Act => EffectPolicy::DecisionOnly,
+        AgentRole::Do => match task {
+            EffectPolicy::EvidenceOnly => EffectPolicy::EvidenceOnly,
+            EffectPolicy::DecisionOnly => EffectPolicy::DecisionOnly,
+            EffectPolicy::Conditional { .. } => match step {
+                EffectPolicy::EvidenceOnly | EffectPolicy::DecisionOnly => step.clone(),
+                _ => task.clone(),
+            },
+            EffectPolicy::Required { .. } => match step {
+                EffectPolicy::EvidenceOnly
+                | EffectPolicy::DecisionOnly
+                | EffectPolicy::Conditional { .. } => step.clone(),
+                _ => task.clone(),
+            },
+            EffectPolicy::None => step.clone(),
+        },
+    }
+}
+
 fn residual_task_key(task: &ResidualTaskDef) -> String {
     let source = if task.objective.trim().is_empty() {
         &task.success_criteria
@@ -685,6 +798,32 @@ impl TaskExecutionFacts {
         result.errors = self.errors.clone();
         result.tracked_actions = self.tracked_actions.clone();
     }
+
+    fn workspace_evidence_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for action in self.tracked_actions.iter().filter(|action| {
+            matches!(action.agent_role.as_str(), "DA" | "Do")
+                && action.status == crate::core::tracked_action::ActionStatus::Success
+        }) {
+            for change in action.files_created.iter().chain(&action.files_modified) {
+                if !paths.contains(&change.path) {
+                    paths.push(change.path.clone());
+                }
+            }
+        }
+        for artifact in &self.artifacts {
+            if let Some(path) = artifact.get("path").and_then(serde_json::Value::as_str) {
+                if !paths.iter().any(|existing| existing == path) {
+                    paths.push(path.to_string());
+                }
+            } else if let Some(path) = artifact.as_str() {
+                if !paths.iter().any(|existing| existing == path) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+        paths
+    }
 }
 
 /// Re-dispatch on failure up to `retry_count` times, sleeping `retry_delay_secs`
@@ -727,12 +866,19 @@ async fn run_biz_agent(
     context: TaskContext,
     plan_step: Option<PlanStep>,
 ) -> TaskResult {
-    let requested_tools = plan_step
-        .as_ref()
-        .and_then(|step| (!step.tools_allowed.is_empty()).then(|| step.tools_allowed.clone()))
-        .or_else(|| context.allowed_tools.clone());
+    // Only TaskContext carries an authoritative capability restriction. A
+    // generated PlanStep's `tools_allowed` is model advice and must not hide
+    // essential role tools (the observed failure was DA receiving tool_search
+    // but no file_read for an explicitly named file). Explicit DAG workflows
+    // copy their declared list into TaskContext before dispatch below.
+    let requested_tools = context.allowed_tools.clone();
     let mut context = context;
     context.allowed_tools = enforce_business_role_tool_policy(agent.role, requested_tools);
+    debug!(
+        role = %agent.role,
+        effective_allowed_tools = ?context.allowed_tools,
+        "BizAgent authoritative task capability resolved"
+    );
     let agent_md = runner
         .build_biz_agent_md(agent.role, &context, plan_step.as_ref())
         .await;
@@ -1144,13 +1290,23 @@ impl SupervisorAgent {
         let mut prev_summary: Option<String> = initial_prev_summary;
         // Track the Do agent's output separately so AA can access it alongside CA's evaluation.
         let mut da_output: Option<String> = None;
+        // Preserve the latest concrete DA deliverable separately from CA/AA
+        // decisions. Direct-response tasks return this accepted deliverable
+        // after the decision gates pass instead of replacing it with an AA
+        // disposition summary.
+        let mut latest_da_result: Option<TaskResult> = None;
+        // Preserve CA's concrete verification separately from its structured
+        // AuditReport. Verify-first evidence tasks have no DA deliverable, so
+        // the accepted CA evidence is their user-facing business result.
+        let mut latest_ca_result: Option<TaskResult> = None;
         // The latest CA audit is a terminal quality gate.  A later successful
         // re-audit clears this flag; an unresolved failure forces final status.
         let mut latest_ca_report: Option<crate::core::recovery::AuditReport> = None;
         let mut local_repairs_used = 0u32;
         let mut previous_ca_signature: Option<Vec<String>> = None;
         let mut repeated_ca_failures = 0u32;
-        let authoritative_contract = authoritative_task_contract(user_input, &five_w2h);
+        let authoritative_contract =
+            authoritative_task_contract(user_input, &five_w2h, &task_constraints);
 
         // Resume mode: determine which phase to start from
         // Load latest checkpoint from L0 to resolve phase tags
@@ -1531,6 +1687,11 @@ impl SupervisorAgent {
                         }
                     };
                     let count = parallel_group.len();
+                    let explicit_workflow_tools = if plan.dag_jsonld.is_some() {
+                        step.tools_allowed.as_slice()
+                    } else {
+                        &[]
+                    };
                     let results = self
                         .dispatch_agents_parallel(
                             step.role,
@@ -1540,20 +1701,13 @@ impl SupervisorAgent {
                             &cycle_id,
                             self.effective_max_iterations(&cycle_id),
                             self.effective_timeout_secs(&cycle_id, nd.timeout_secs),
-                            &step.tools_allowed,
+                            explicit_workflow_tools,
                             &task_constraints,
-                            match &step.effect_policy {
-                                crate::core::effect::EffectPolicy::None => match step.role {
-                                    AgentRole::Plan | AgentRole::Check => {
-                                        crate::core::effect::EffectPolicy::EvidenceOnly
-                                    }
-                                    AgentRole::Act => {
-                                        crate::core::effect::EffectPolicy::DecisionOnly
-                                    }
-                                    AgentRole::Do => task_effect_policy.clone(),
-                                },
-                                policy => policy.clone(),
-                            },
+                            effective_step_effect_policy(
+                                step.role,
+                                &step.effect_policy,
+                                &task_effect_policy,
+                            ),
                         )
                         .await?;
 
@@ -1643,14 +1797,14 @@ impl SupervisorAgent {
                         format!("{}\n\n{}{}\n\nThe upper PA plan is supplied once in the bounded previous-agent handoff. Execute it only within the authoritative contract; if it conflicts, the contract wins.", step.objective, authoritative_contract, hints_block)
                     }
                     (Some(_), AgentRole::Check) => {
-                        format!("{}{}\n\nExecution results are supplied once in the bounded previous-agent handoff. Please independently verify whether they are correct and complete.", step.objective, hints_block)
+                        format!("{}\n\n{}{}\n\nExecution results are supplied once in the bounded previous-agent handoff. Please independently verify whether they are correct and complete. The authoritative contract overrides any plan-generated expected output that would add a file, path, graph node, or other undeclared deliverable.", step.objective, authoritative_contract, hints_block)
                     }
                     (Some(_), AgentRole::Act) => {
                         let da_context = da_output
                             .as_ref()
                             .map(|da| format!("\n\n## Execution Results\n{}", da))
                             .unwrap_or_default();
-                        format!("{}\n\n## Original Task\n{}{}{}\n\nThe latest CA conclusions are supplied once in the bounded previous-agent handoff. Please make the final decision and summarize.", step.objective, user_input, da_context, hints_block)
+                        format!("{}\n\n{}\n\n## Original Task\n{}{}{}\n\nThe latest CA conclusions are supplied once in the bounded previous-agent handoff. Please make the final decision and summarize without adding acceptance requirements.", step.objective, authoritative_contract, user_input, da_context, hints_block)
                     }
                     (None, AgentRole::Plan) => {
                         format!("{}\n\n{}{}\n\nPlease create a detailed execution plan for the task contract.", step.objective, authoritative_contract, hints_block)
@@ -1669,18 +1823,17 @@ impl SupervisorAgent {
                 )
                 .with_original_task(user_input)
                 .with_constraints(task_constraints.clone())
-                .with_effect_policy(match &step.effect_policy {
-                    crate::core::effect::EffectPolicy::None => match step.role {
-                        AgentRole::Plan | AgentRole::Check => {
-                            crate::core::effect::EffectPolicy::EvidenceOnly
-                        }
-                        AgentRole::Act => crate::core::effect::EffectPolicy::DecisionOnly,
-                        AgentRole::Do => task_effect_policy.clone(),
-                    },
-                    policy => policy.clone(),
-                })
+                .with_effect_policy(effective_step_effect_policy(
+                    step.role,
+                    &step.effect_policy,
+                    &task_effect_policy,
+                ))
                 .with_step_info(&step.expected_output, &step.success_criteria)
-                .with_cycle_id(&cycle_id);
+                .with_cycle_id(&cycle_id)
+                .with_workspace_evidence_paths(execution_facts.workspace_evidence_paths());
+                if plan.dag_jsonld.is_some() && !step.tools_allowed.is_empty() {
+                    context = context.with_allowed_tools(step.tools_allowed.clone());
+                }
                 context = context.with_five_w2h(five_w2h_iri, five_w2h.clone());
 
                 // Resume mode: history messages on first executed step
@@ -1815,6 +1968,8 @@ impl SupervisorAgent {
                             result_wi,
                             &mut prev_summary,
                             &mut da_output,
+                            &mut latest_da_result,
+                            &mut latest_ca_result,
                             &mut latest_ca_report,
                             &mut previous_ca_signature,
                             &mut repeated_ca_failures,
@@ -1859,6 +2014,8 @@ impl SupervisorAgent {
                         wt.wi,
                         &mut prev_summary,
                         &mut da_output,
+                        &mut latest_da_result,
+                        &mut latest_ca_result,
                         &mut latest_ca_report,
                         &mut previous_ca_signature,
                         &mut repeated_ca_failures,
@@ -1912,6 +2069,13 @@ impl SupervisorAgent {
             correction_count += 1;
             local_repairs_used += 1;
             let ca_text = ca_summary.unwrap_or_default();
+            let original_execution_handoff = latest_da_result
+                .as_ref()
+                .map(|result| {
+                    result_handoff(result, AgentRole::Do, correction_handoff_max_chars.max(1))
+                })
+                .or_else(|| da_output.clone())
+                .unwrap_or_else(|| "No prior DA deliverable was retained.".to_string());
 
             info!(
                 task_iri = %task_iri,
@@ -1921,9 +2085,11 @@ impl SupervisorAgent {
 
             let da_corrective_objective = format!(
                 "## Corrective Re-Execution (iteration {})\n\n\
-                 Previous audit found gaps:\n\n{}\n\n\
-                 Fix ALL identified issues. Output what was fixed.",
+                 ## Original DA Deliverable\n{}\n\n\
+                 ## Previous CA Findings\n{}\n\n\
+                 Fix ALL identified issues without discarding already-valid work. Return the complete corrected deliverable, followed by a concise change note; do not return only a repair receipt.",
                 correction_count,
+                original_execution_handoff,
                 ca_text
                     .chars()
                     .take(correction_handoff_max_chars)
@@ -1948,7 +2114,8 @@ impl SupervisorAgent {
             } else {
                 task_effect_policy.clone()
             })
-            .with_cycle_id(&cycle_id);
+            .with_cycle_id(&cycle_id)
+            .with_workspace_evidence_paths(execution_facts.workspace_evidence_paths());
 
             match self
                 .dispatch_agent(AgentRole::Do, da_ctx, &cycle_id, None, 0)
@@ -1956,14 +2123,23 @@ impl SupervisorAgent {
             {
                 Ok(da_result) => {
                     execution_facts.record(&da_result);
+                    let corrected_handoff = result_handoff(
+                        &da_result,
+                        AgentRole::Do,
+                        self.runner
+                            .agent_settings
+                            .execution_budget
+                            .ca_handoff_max_chars,
+                    );
+                    da_output = Some(corrected_handoff.clone());
+                    latest_da_result = Some(da_result.clone());
                     let ca_objective = format!(
                         "Re-evaluate corrected execution:\n\n\
-                         Corrected Output (iteration {}):\n{}\n\n\
-                         Verify ALL previous audit issues are resolved.",
-                        correction_count, da_result.summary
+                         The complete corrected output for iteration {} is supplied once in the bounded previous-agent handoff. Read that exact AgentTurn when more content is needed. Verify ALL previous audit issues are resolved; do not search KG/RAG for a repair receipt.",
+                        correction_count
                     );
 
-                    let ca_ctx = TaskContext::new(
+                    let mut ca_ctx = TaskContext::new(
                         task_iri,
                         &ca_objective,
                         self.effective_max_iterations(&cycle_id),
@@ -1971,7 +2147,12 @@ impl SupervisorAgent {
                     .with_original_task(user_input)
                     .with_constraints(task_constraints.clone())
                     .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly)
-                    .with_cycle_id(&cycle_id);
+                    .with_cycle_id(&cycle_id)
+                    .with_prev_summary(&corrected_handoff)
+                    .with_workspace_evidence_paths(execution_facts.workspace_evidence_paths());
+                    if let Some(tools) = direct_response_recheck_tools(&task_constraints) {
+                        ca_ctx = ca_ctx.with_allowed_tools(tools);
+                    }
 
                     match self
                         .dispatch_agent(AgentRole::Check, ca_ctx, &cycle_id, None, 0)
@@ -1992,6 +2173,7 @@ impl SupervisorAgent {
                             );
                             execution_facts.record(&ca_result);
                             latest_ca_report = Some(ca_report);
+                            latest_ca_result = Some(ca_result.clone());
                             let ca_evidence = result_handoff(
                                 &ca_result,
                                 AgentRole::Check,
@@ -2126,6 +2308,8 @@ impl SupervisorAgent {
                         order.len().saturating_sub(1),
                         &mut prev_summary,
                         &mut da_output,
+                        &mut latest_da_result,
+                        &mut latest_ca_result,
                         &mut latest_ca_report,
                         &mut previous_ca_signature,
                         &mut repeated_ca_failures,
@@ -2181,6 +2365,14 @@ impl SupervisorAgent {
             verdict: None,
             archive_iri: None,
         });
+        restore_accepted_deliverable(
+            &mut final_result,
+            latest_da_result.as_ref(),
+            latest_ca_result.as_ref(),
+            &task_constraints,
+            &task_effect_policy,
+            plan.verify_first,
+        );
         execution_facts.apply_to(&mut final_result);
         enforce_ca_audit_terminal_status(
             &mut final_result,
@@ -2244,6 +2436,8 @@ impl SupervisorAgent {
         i: usize,
         prev_summary: &mut Option<String>,
         da_output: &mut Option<String>,
+        latest_da_result: &mut Option<TaskResult>,
+        latest_ca_result: &mut Option<TaskResult>,
         latest_ca_report: &mut Option<crate::core::recovery::AuditReport>,
         previous_ca_signature: &mut Option<Vec<String>>,
         repeated_ca_failures: &mut u32,
@@ -2427,6 +2621,7 @@ impl SupervisorAgent {
                 repeated_ca_failures,
             );
             *latest_ca_report = Some(ca_report);
+            *latest_ca_result = Some(result.clone());
         }
 
         // AA early exit — skip remaining PDCA cycles after AA evaluates
@@ -2537,14 +2732,15 @@ impl SupervisorAgent {
             ));
         }
 
-        *last_result = Some(result);
-
         // Track Do agent output separately
         if step.role == AgentRole::Do {
             if let Some(ref s) = *prev_summary {
                 *da_output = Some(s.clone());
             }
+            *latest_da_result = Some(result.clone());
         }
+
+        *last_result = Some(result);
 
         // 5W2H constraint check
         if let Some(alert) = self.perception.check_5w2h_constraints(five_w2h_iri) {
@@ -3203,6 +3399,42 @@ mod terminal_status_tests {
     }
 
     #[test]
+    fn task_effect_contract_cannot_be_escalated_by_model_generated_steps() {
+        use crate::core::effect::{EffectKind, EffectPolicy};
+
+        let model_requested_write = EffectPolicy::Required {
+            effect: EffectKind::WorkspaceMutation,
+        };
+        assert_eq!(
+            effective_step_effect_policy(
+                AgentRole::Do,
+                &model_requested_write,
+                &EffectPolicy::EvidenceOnly,
+            ),
+            EffectPolicy::EvidenceOnly,
+            "an application-scoped evidence task must not become a write task"
+        );
+
+        let conditional = EffectPolicy::Conditional {
+            effect: EffectKind::WorkspaceMutation,
+            condition: "only if current state is incomplete".to_string(),
+        };
+        assert_eq!(
+            effective_step_effect_policy(AgentRole::Do, &model_requested_write, &conditional),
+            conditional,
+            "a model step cannot strengthen a conditional task effect"
+        );
+        assert_eq!(
+            effective_step_effect_policy(
+                AgentRole::Check,
+                &model_requested_write,
+                &EffectPolicy::required_workspace_mutation(),
+            ),
+            EffectPolicy::EvidenceOnly
+        );
+    }
+
+    #[test]
     fn residual_task_key_deduplicates_case_and_punctuation() {
         let first = ResidualTaskDef {
             objective: "Verify API wiring!".to_string(),
@@ -3249,6 +3481,11 @@ mod terminal_status_tests {
     #[test]
     fn business_role_tool_policy_cannot_be_broadened_by_plan_output() {
         assert_eq!(
+            enforce_business_role_tool_policy(AgentRole::Do, None),
+            None,
+            "a generated PDCA plan cannot implicitly narrow DA's task capability"
+        );
+        assert_eq!(
             enforce_business_role_tool_policy(
                 AgentRole::Act,
                 Some(vec!["file_read".into(), "bash".into()])
@@ -3291,6 +3528,28 @@ mod terminal_status_tests {
         apply_aa_declared_verdict(&mut result, None);
         assert_eq!(result.status, "failed");
         assert_eq!(result.verdict, Some(TaskVerdict::Failed));
+    }
+
+    #[test]
+    fn aa_fullwidth_success_prefix_is_terminal_success() {
+        let mut result = TaskResult {
+            task_iri: "iri://task/aa-fullwidth-verdict".into(),
+            status: "failed".into(),
+            verdict: Some(TaskVerdict::Failed),
+            summary: "SUCCESS：CA 已验证全部原始要求".into(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        apply_aa_declared_verdict(&mut result, None);
+        assert_eq!(result.status, "success");
+        assert_eq!(result.verdict, Some(TaskVerdict::Success));
     }
 
     #[test]

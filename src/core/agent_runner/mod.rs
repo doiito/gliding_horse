@@ -65,6 +65,56 @@ Example:
 {"content": "View file contents", "summary": "Read file", "action": "tool_call", "emphasis": []}
 "#;
 
+/// Application-declared workspace context policy. The generic kernel does
+/// not infer whether a task belongs to a mounted workspace.
+pub const WORKSPACE_CONTEXT_SCOPE_CONSTRAINT: &str = "workspace_context_scope";
+pub const WORKSPACE_CONTEXT_DISABLED: &str = "disabled";
+
+/// Application-declared delivery boundary. The generic kernel enforces the
+/// declared mode but does not infer a domain-specific deliverable from words
+/// such as "report", "build", or "output".
+pub const DELIVERY_MODE_CONSTRAINT: &str = "delivery_mode";
+pub const DELIVERY_MODE_DIRECT_RESPONSE: &str = "direct_response";
+
+/// Application-declared external evidence capability. The kernel exposes and
+/// enforces the generic capability; each application decides whether a task
+/// actually requires current web evidence.
+pub const REQUIRED_CAPABILITY_CONSTRAINT: &str = "required_capability";
+pub const REQUIRED_CAPABILITY_WEB_RESEARCH: &str = "web_research";
+
+pub(crate) fn direct_response_delivery_contract(
+    constraints: &HashMap<String, String>,
+) -> Option<&'static str> {
+    constraints
+        .get(DELIVERY_MODE_CONSTRAINT)
+        .is_some_and(|mode| mode == DELIVERY_MODE_DIRECT_RESPONSE)
+        .then_some(
+            "Delivery mode is direct_response: the final deliverable must be returned in the agent response. A filesystem path, file artifact, or invented graph IRI is neither required nor valid acceptance evidence unless the original user request explicitly requires one.",
+        )
+}
+
+pub(crate) fn required_capability_contract(
+    constraints: &HashMap<String, String>,
+) -> Option<&'static str> {
+    constraints
+        .get(REQUIRED_CAPABILITY_CONSTRAINT)
+        .is_some_and(|capability| capability == REQUIRED_CAPABILITY_WEB_RESEARCH)
+        .then_some(
+            "Current external evidence is required: use web_search for source discovery and web_fetch/http_request for targeted source reading before relying on RAG, KG, or model memory. If live retrieval is unavailable, state that limitation explicitly and do not present remembered or synthesized claims as newly verified facts.",
+        )
+}
+
+/// AgentTurn identities must be unique inside a task. Each BizAgent owns a
+/// distinct L1 session, so adding that session to the path prevents PA/DA/CA/
+/// AA and later PDCA cycles from overwriting one another while preserving the
+/// task prefix and the familiar turn suffix.
+pub(crate) fn agent_turn_iri(task_iri: &str, session_id: &str, turn: u32) -> String {
+    let task_id = task_iri
+        .strip_prefix("iri://task/")
+        .unwrap_or_else(|| task_iri.strip_prefix("iri://").unwrap_or(task_iri));
+    format!("iri://task/{task_id}/session/{session_id}/turn_{turn}")
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskContext {
     pub task_iri: String,
@@ -96,6 +146,9 @@ pub struct TaskContext {
     /// Summary of workspace file inventory (set by CodeCliEngine before passing to SA).
     /// Used by SA to decide verification-first routing when workspace has existing files.
     pub workspace_file_summary: Option<String>,
+    /// Current-task paths eligible as independent verification evidence. This
+    /// is deliberately distinct from the process-wide workspace inventory.
+    pub workspace_evidence_paths: Vec<String>,
     /// Tool allowlist for this execution (None = all tools allowed)
     pub allowed_tools: Option<Vec<String>>,
     /// Generic execution-effect contract. Domain applications classify their
@@ -126,6 +179,7 @@ impl TaskContext {
             success_criteria: String::new(),
             cycle_id: String::new(),
             workspace_file_summary: None,
+            workspace_evidence_paths: Vec::new(),
             allowed_tools: None,
             effect_policy: crate::core::effect::EffectPolicy::None,
         }
@@ -229,6 +283,23 @@ impl TaskContext {
         self
     }
 
+    pub fn with_workspace_evidence_paths(mut self, paths: Vec<String>) -> Self {
+        self.workspace_evidence_paths = paths;
+        self
+    }
+
+    pub fn workspace_context_enabled(&self) -> bool {
+        self.constraints
+            .get(WORKSPACE_CONTEXT_SCOPE_CONSTRAINT)
+            .is_none_or(|scope| scope != WORKSPACE_CONTEXT_DISABLED)
+    }
+
+    pub fn requires_web_research(&self) -> bool {
+        self.constraints
+            .get(REQUIRED_CAPABILITY_CONSTRAINT)
+            .is_some_and(|capability| capability == REQUIRED_CAPABILITY_WEB_RESEARCH)
+    }
+
     pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
         // None means unrestricted by this layer; Some(empty) is an explicit
         // deny-all capability set (used by decision-only BizAgents such as AA).
@@ -260,6 +331,7 @@ impl Default for TaskContext {
             success_criteria: String::new(),
             cycle_id: String::new(),
             workspace_file_summary: None,
+            workspace_evidence_paths: Vec::new(),
             allowed_tools: None,
             effect_policy: crate::core::effect::EffectPolicy::None,
         }
@@ -631,6 +703,7 @@ impl AgentRunner {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn tool_definitions_for_context(
         &self,
         role: &str,
@@ -698,6 +771,103 @@ impl AgentRunner {
                     .unwrap_or(true)
             })
             .collect()
+    }
+
+    fn is_workspace_bound_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "glob_search"
+                | "grep_search"
+                | "file_read"
+                | "file_write"
+                | "file_edit"
+                | "file_list"
+                | "workspace_status"
+                | "bash"
+                | "powershell"
+                | "code_execute"
+                | "knowledge_import_file"
+                | "knowledge_import_directory"
+                | "knowledge_extract_code"
+        )
+    }
+
+    fn apply_task_tool_scope(&self, definitions: Vec<Value>, ctx: &TaskContext) -> Vec<Value> {
+        definitions
+            .into_iter()
+            .filter(|definition| {
+                let Some(name) = definition["function"]["name"].as_str() else {
+                    return false;
+                };
+                let allowlisted = ctx
+                    .allowed_tools
+                    .as_deref()
+                    .map(|allowed| ToolExecutor::explicit_allowlist_permits(name, allowed))
+                    .unwrap_or(true);
+                let workspace_scoped =
+                    ctx.workspace_context_enabled() || !Self::is_workspace_bound_tool(name);
+                allowlisted && workspace_scoped
+            })
+            .collect()
+    }
+
+    /// Apply the application-declared workspace scope after normal role and
+    /// allowlist filtering. This keeps external/research tasks from seeing or
+    /// invoking tools against unrelated projects in a shared workspace.
+    pub(super) fn tool_definitions_for_task_context_with_microtools(
+        &self,
+        role: &str,
+        ctx: &TaskContext,
+        session_micro_tools: &HashSet<String>,
+    ) -> Vec<Value> {
+        let mut definitions = self.tool_definitions_for_context_with_microtools(
+            role,
+            ctx.allowed_tools.as_deref(),
+            session_micro_tools,
+        );
+        if ctx.requires_web_research() {
+            let mut names = definitions
+                .iter()
+                .filter_map(|definition| definition["function"]["name"].as_str())
+                .map(str::to_string)
+                .collect::<HashSet<_>>();
+            for definition in self.tool_executor.read().tool_definitions_for_role(role) {
+                let Some(name) = definition["function"]["name"].as_str() else {
+                    continue;
+                };
+                if !matches!(name, "web_search" | "web_fetch" | "http_request")
+                    || !names.insert(name.to_string())
+                    || ctx.allowed_tools.as_deref().is_some_and(|allowed| {
+                        !ToolExecutor::explicit_allowlist_permits(name, allowed)
+                    })
+                {
+                    continue;
+                }
+                definitions.push(definition);
+            }
+        }
+        self.apply_task_tool_scope(definitions, ctx)
+    }
+
+    /// Complete role-authorized catalog after application task scoping. This
+    /// is intentionally broader than the default prompt window: `tool_search`
+    /// may discover on-demand tools, but must never reveal tools excluded by
+    /// the task's allowlist or workspace boundary.
+    pub(super) fn discoverable_tool_definitions_for_task_context(
+        &self,
+        role: &str,
+        ctx: &TaskContext,
+    ) -> Vec<Value> {
+        let definitions = self.tool_executor.read().tool_definitions_for_role(role);
+        self.apply_task_tool_scope(definitions, ctx)
+    }
+
+    pub(super) fn tool_definitions_for_task_context(
+        &self,
+        role: &str,
+        ctx: &TaskContext,
+    ) -> Vec<Value> {
+        self.tool_definitions_for_task_context_with_microtools(role, ctx, &HashSet::new())
     }
 
     /// Set the workspace root directory for all agents.

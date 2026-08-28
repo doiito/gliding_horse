@@ -14,13 +14,14 @@ use crate::CoreError;
 
 use super::execution::{
     advertised_tool_names, ca_evidence_close_tool_definitions, ca_evidence_focus_tool_definitions,
-    effective_effect_block_turns, effective_role_max_turns, evidence_key, initial_execution_phase,
-    is_substantive_workspace_effect, is_workspace_mutation_candidate,
-    mutation_recovery_tool_definitions, pa_planning_focus_tool_definitions, phase_tool_definitions,
-    record_workspace_effect_turn, refresh_execution_ledger, requires_workspace_effect,
-    unadvertised_tool_call_result, workspace_effect_recovery_active,
-    workspace_inventory_complete_and_bounded, workspace_inventory_coverage,
-    workspace_inventory_tool_definitions, ExecutionPhase,
+    da_evidence_close_tool_definitions, da_evidence_focus_tool_definitions,
+    effective_effect_block_turns, effective_role_max_turns, evidence_key,
+    filter_tool_search_result, initial_execution_phase, is_substantive_workspace_effect,
+    is_workspace_mutation_candidate, mutation_recovery_tool_definitions,
+    pa_planning_focus_tool_definitions, phase_tool_definitions, record_workspace_effect_turn,
+    refresh_execution_ledger, requires_workspace_effect, unadvertised_tool_call_result,
+    workspace_effect_recovery_active, workspace_inventory_complete_and_bounded,
+    workspace_inventory_coverage, workspace_inventory_tool_definitions, ExecutionPhase,
 };
 use super::{LlmParsedResponse, TaskContext, TaskResult};
 
@@ -406,6 +407,27 @@ impl super::AgentRunner {
         result
     }
 
+    /// Load only operator-authored/global emphasis. Task-scoped emphasis is
+    /// emitted by business-agent model turns and is therefore historical
+    /// evidence, not an authoritative instruction for a later phase.
+    pub(super) async fn load_global_emphasis_from_l0(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        if let Ok(nodes) = self.l0_store.search_by_tags(&[String::from("emphasis")]) {
+            for node in nodes {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&node.content) {
+                    if parsed.get("task_iri").is_none() {
+                        if let Some(content) = parsed.get("content").and_then(Value::as_str) {
+                            if !result.iter().any(|existing| existing == content) {
+                                result.push(content.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
     fn calculate_similarity(a: &str, b: &str) -> f64 {
         if a == b {
             return 1.0;
@@ -726,14 +748,18 @@ impl super::AgentRunner {
             },
         ];
 
-        let tools = self
-            .tool_definitions_for_context(&agent.role.to_string(), ctx.allowed_tools.as_deref());
+        let tools = self.tool_definitions_for_task_context(&agent.role.to_string(), &ctx);
+        let tool_names = tools
+            .iter()
+            .filter_map(|definition| definition["function"]["name"].as_str())
+            .collect::<Vec<_>>();
 
         info!(
-            "AgentRunner streaming started: role={}, model={}, tools={}",
+            "AgentRunner streaming started: role={}, model={}, tools={}, tool_names={:?}",
             agent.role,
             model,
-            tools.len()
+            tools.len(),
+            tool_names
         );
 
         let mut running_messages = messages;
@@ -791,16 +817,19 @@ impl super::AgentRunner {
         let mut substantive_effect_count = 0u32;
         let mut verification_turns = 0u32;
         let mut planning_tool_turns = 0u32;
+        let mut evidence_only_tool_turns = 0u32;
         let mut action_tracker =
             crate::core::tracked_action::ActionTracker::new(&ctx.task_iri, &agent.role.to_string());
 
         loop {
-            super::execution::refresh_workspace_delta_message(
-                &self.tool_executor,
-                &mut running_messages,
-                &mut workspace_generation,
-                workspace_delta_limit,
-            );
+            if ctx.workspace_context_enabled() {
+                super::execution::refresh_workspace_delta_message(
+                    &self.tool_executor,
+                    &mut running_messages,
+                    &mut workspace_generation,
+                    workspace_delta_limit,
+                );
+            }
             refresh_execution_ledger(
                 &mut running_messages,
                 agent.role,
@@ -840,6 +869,20 @@ impl super::AgentRunner {
             let pa_planning_focus_active = agent.role == AgentRole::Plan
                 && execution_budget.pa_planning_focus_turns > 0
                 && planning_tool_turns >= execution_budget.pa_planning_focus_turns;
+            let da_evidence_focus_active = agent.role == AgentRole::Do
+                && matches!(
+                    ctx.effective_effect_policy(),
+                    crate::core::effect::EffectPolicy::EvidenceOnly
+                )
+                && execution_budget.da_evidence_focus_turns > 0
+                && evidence_only_tool_turns >= execution_budget.da_evidence_focus_turns;
+            let da_evidence_close_active = agent.role == AgentRole::Do
+                && matches!(
+                    ctx.effective_effect_policy(),
+                    crate::core::effect::EffectPolicy::EvidenceOnly
+                )
+                && execution_budget.da_evidence_close_turns > 0
+                && evidence_only_tool_turns >= execution_budget.da_evidence_close_turns;
             if ca_evidence_focus_active {
                 request_messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -870,6 +913,26 @@ impl super::AgentRunner {
                     reasoning_content: None,
                 });
             }
+            if da_evidence_focus_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[DA Evidence Convergence] The configured evidence-discovery window is complete. Synthesize the requested deliverable now from the sources and evidence already collected. Only one targeted source read is permitted when a specific claim lacks support; do not perform another broad search.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            if da_evidence_close_active {
+                request_messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "[DA Evidence Close Gate] The configured evidence window is exhausted. Do not call another tool. Return the complete evidence-backed deliverable now, explicitly marking any unsupported point as a limitation.".to_string(),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
             if mutation_recovery_active {
                 request_messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -886,16 +949,7 @@ impl super::AgentRunner {
 
             // Keep the exact advertised tool window so streaming execution
             // cannot invoke a tool withdrawn by phase or inventory policy.
-            let current_tools = {
-                let active_session_tools = super::execution::active_session_tool_names(
-                    &request_messages,
-                    &session_micro_tools,
-                );
-                let current_tools = self.tool_definitions_for_context_with_microtools(
-                    &agent.role.to_string(),
-                    ctx.allowed_tools.as_deref(),
-                    &active_session_tools,
-                );
+            let apply_turn_tool_policy = |current_tools: Vec<Value>| {
                 let current_tools =
                     phase_tool_definitions(current_tools, agent.role, execution_phase);
                 let current_tools = workspace_inventory_tool_definitions(
@@ -920,13 +974,38 @@ impl super::AgentRunner {
                     agent.role,
                     pa_planning_focus_active,
                 );
+                let current_tools = da_evidence_focus_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    da_evidence_focus_active,
+                );
+                let current_tools = da_evidence_close_tool_definitions(
+                    current_tools,
+                    agent.role,
+                    da_evidence_close_active,
+                );
                 if mutation_recovery_active {
                     mutation_recovery_tool_definitions(current_tools)
                 } else {
                     current_tools
                 }
             };
+            let current_tools = {
+                let active_session_tools = super::execution::active_session_tool_names(
+                    &request_messages,
+                    &session_micro_tools,
+                );
+                let current_tools = self.tool_definitions_for_task_context_with_microtools(
+                    &agent.role.to_string(),
+                    &ctx,
+                    &active_session_tools,
+                );
+                apply_turn_tool_policy(current_tools)
+            };
             let advertised_tools = advertised_tool_names(&current_tools);
+            let discoverable_tools = advertised_tool_names(&apply_turn_tool_policy(
+                self.discoverable_tool_definitions_for_task_context(&agent.role.to_string(), &ctx),
+            ));
             let current_tool_schema_token_reserve =
                 crate::core::context_compressor::ContextWindowManager::estimate_tool_schema_tokens(
                     &current_tools,
@@ -1022,6 +1101,15 @@ impl super::AgentRunner {
                         if agent.role == AgentRole::Plan && !tool_calls.is_empty() {
                             planning_tool_turns = planning_tool_turns.saturating_add(1);
                         }
+                        if agent.role == AgentRole::Do
+                            && matches!(
+                                ctx.effective_effect_policy(),
+                                crate::core::effect::EffectPolicy::EvidenceOnly
+                            )
+                            && !tool_calls.is_empty()
+                        {
+                            evidence_only_tool_turns = evidence_only_tool_turns.saturating_add(1);
+                        }
                         if agent.role == AgentRole::Plan {
                             let write_tools: Vec<&str> = tool_calls
                                 .iter()
@@ -1104,9 +1192,11 @@ impl super::AgentRunner {
                             // handled protocol mismatch, not a file/tool
                             // execution failure, so it must not reach
                             // ToolGuard, the action ledger, or learning.
-                            if let Some(rejection) =
-                                unadvertised_tool_call_result(&advertised_tools, name)
-                            {
+                            if let Some(rejection) = unadvertised_tool_call_result(
+                                &advertised_tools,
+                                &session_micro_tools,
+                                name,
+                            ) {
                                 info!(
                                     "[Streaming] ignored unadvertised call {} for current turn",
                                     name
@@ -1161,7 +1251,7 @@ impl super::AgentRunner {
                             })
                             .flatten();
                             let started_at = std::time::Instant::now();
-                            let result = if block_effectless_calls {
+                            let mut result = if block_effectless_calls {
                                 json!({
                                     "error": "DA execution-progress guard blocked another inspection-only turn",
                                     "required_next_action": "Create or modify a substantive artifact; otherwise finish with FAILED and the exact blocker."
@@ -1182,6 +1272,9 @@ impl super::AgentRunner {
                                     .await
                                     .unwrap_or_else(|e| json!({"error": e}))
                             };
+                            if name == "tool_search" {
+                                filter_tool_search_result(&mut result, &discoverable_tools);
+                            }
                             action_tracker.record(
                                 name,
                                 &c.arguments,
@@ -1580,20 +1673,27 @@ impl super::AgentRunner {
             }
         }
 
-        let task_id = ctx
-            .task_iri
-            .strip_prefix("iri://task/")
-            .unwrap_or_else(|| ctx.task_iri.strip_prefix("iri://").unwrap_or(&ctx.task_iri));
-        let node_iri = format!("iri://task/{}/turn_{}", task_id, turn);
+        let node_iri = super::agent_turn_iri(&ctx.task_iri, session.session_id(), turn);
         let mut node_json = json!({
             "@id": &node_iri,
             "@type": "AgentTurn",
             "role": agent.role.to_string(),
+            "cycle_id": ctx.cycle_id,
+            "content": last_content,
             "content_len": last_content.len(),
+            "summary": final_summary,
         });
         if !last_thought.is_empty() {
             node_json["has_thought"] = Value::Bool(true);
             node_json["thought_len"] = Value::Number(last_thought.len().into());
+        }
+        JsonLdContext::inject(&mut node_json);
+        let cfg = crate::CoreConfig::default();
+        if let Err(error) = self
+            .blackboard
+            .write_node(&node_iri, &node_json.to_string(), &cfg)
+        {
+            warn!(%error, %node_iri, "Unable to persist streaming AgentTurn node");
         }
 
         let output_value = Value::String(last_content.clone());
@@ -1624,7 +1724,7 @@ impl super::AgentRunner {
                 five_w2h_updates: None,
                 tracked_actions: action_tracker.actions,
                 verdict: None,
-                archive_iri: None,
+                archive_iri: Some(node_iri),
             }),
             session,
         )
@@ -1654,11 +1754,12 @@ impl super::AgentRunner {
         use crate::tools::result_router::RouteDecision;
         use crate::tools::tool_executor::MicroToolContext;
 
-        // Dynamic result readers already return a caller-selected, bounded
-        // page. Routing that page again can create read_full_result_<new id>,
+        // Result readers already return a caller-selected, bounded page.
+        // Routing that page again can create read_full_result_<new id>,
         // producing an unbounded "read an archived read" chain and needless
-        // context growth. Keep this terminal read result inline.
-        if ToolExecutor::is_micro_tool_name(tool_name) {
+        // context growth. `read_agent_output` is now a stable paged reader too,
+        // so keep both forms terminal and inline.
+        if tool_name == "read_agent_output" || ToolExecutor::is_micro_tool_name(tool_name) {
             return result_str.to_string();
         }
 
@@ -1809,11 +1910,34 @@ impl super::AgentRunner {
                 call_id: g_call_id,
                 graph_name,
             } => {
+                // `format_iri_message` advertises a canonical
+                // read_full_result_<call_id> reader. Register that reader for
+                // every Graphify outcome and store the same raw envelope used
+                // by the other routing branches. Previously Graphify emitted
+                // the reader name without registering it, causing a truthful
+                // follow-up call to be rejected as tool_not_advertised.
+                self.store_micro_tool_data_persistent(
+                    &iri,
+                    serde_json::json!({
+                        "content": result_str,
+                        "tool_name": tool_name,
+                    }),
+                );
+                let read_tool_name = format!("read_full_result_{}", call_id);
+                self.tool_executor.write().register_micro_tool(
+                    &read_tool_name,
+                    MicroToolContext {
+                        call_id: call_id.to_string(),
+                        storage_key: iri.clone(),
+                        tool_name: tool_name.to_string(),
+                        entity_types: vec![],
+                        preview_size: settings.preview_size,
+                    },
+                );
                 let parsed: Option<serde_json::Value> =
                     serde_json::from_str(result_str.trim()).ok();
                 match parsed {
                     Some(json_val) => {
-                        self.store_micro_tool_data_persistent(&iri, json_val.clone());
                         let engine_result = match &self.unified_graph_store {
                             Some(store) => GraphifyEngine::with_shared_store(
                                 store.clone(),

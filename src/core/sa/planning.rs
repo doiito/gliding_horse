@@ -10,6 +10,13 @@ use super::actions::parse_or_repair_json;
 use super::agent::SupervisorAgent;
 use super::types::*;
 
+// Structural protocol minima, not workload limits: standard PDCA requires one
+// PA, one DA and the CA/AA terminal gates; emergency mode intentionally omits
+// PA. The configurable max_plan_steps remains the workload ceiling above this
+// non-negotiable protocol shape.
+const STANDARD_PDCA_PROTOCOL_STEPS: usize = 4;
+const EMERGENCY_PDCA_PROTOCOL_STEPS: usize = 3;
+
 /// A token budget extracted from an LLM is only a rough estimate. Treating it
 /// as a hard task limit makes an otherwise normal task fail when the model
 /// happens to emit a small number such as 5000. Only a budget explicitly
@@ -52,6 +59,182 @@ mod token_budget_tests {
         assert!(!user_explicitly_requested_token_budget(
             "The model may estimate token budget"
         ));
+    }
+}
+
+fn generated_gate_step(role: AgentRole, step_id: &str) -> PlanStep {
+    let (objective, expected_output, success_criteria, effect_policy) = match role {
+        AgentRole::Plan => (
+            "Analyze the authoritative task contract and create the execution plan",
+            "Task-scoped execution plan",
+            "Plan preserves the original acceptance boundary",
+            crate::core::effect::EffectPolicy::EvidenceOnly,
+        ),
+        AgentRole::Do => (
+            "Execute every requirement in the authoritative task contract",
+            "Completed task deliverable and execution evidence",
+            "Original task requirements are completed",
+            crate::core::effect::EffectPolicy::None,
+        ),
+        AgentRole::Check => (
+            "Independently audit the execution against the authoritative task contract",
+            "Structured audit verdict with task-relevant evidence",
+            "Every original success criterion is independently verified",
+            crate::core::effect::EffectPolicy::EvidenceOnly,
+        ),
+        AgentRole::Act => (
+            "Make the terminal business decision from the latest CA audit",
+            "Structured final decision and user-facing summary",
+            "Decision follows the latest CA evidence without adding requirements",
+            crate::core::effect::EffectPolicy::DecisionOnly,
+        ),
+    };
+    PlanStep {
+        step_id: step_id.to_string(),
+        role,
+        objective: objective.to_string(),
+        expected_output: expected_output.to_string(),
+        dependencies: Vec::new(),
+        tools_allowed: Vec::new(),
+        success_criteria: success_criteria.to_string(),
+        branch_on_failure: false,
+        branch_fallback: None,
+        retry_count: 0,
+        retry_delay_secs: 0,
+        effect_policy,
+    }
+}
+
+/// Validate only model-generated PDCA plans. Explicit JSON-LD DAGs retain
+/// their authored topology and bypass this function.
+fn normalize_generated_pdca_steps(
+    steps: Vec<PlanStep>,
+    complexity: TaskComplexity,
+    configured_max_steps: usize,
+) -> Vec<PlanStep> {
+    if matches!(complexity, TaskComplexity::Instant | TaskComplexity::Simple) {
+        return steps
+            .into_iter()
+            .take(configured_max_steps.max(1))
+            .collect();
+    }
+
+    let requires_plan = complexity != TaskComplexity::Emergency;
+    let semantic_minimum = if requires_plan {
+        STANDARD_PDCA_PROTOCOL_STEPS
+    } else {
+        EMERGENCY_PDCA_PROTOCOL_STEPS
+    };
+    let effective_max = configured_max_steps.max(semantic_minimum);
+
+    let existing_plan = steps
+        .iter()
+        .find(|step| step.role == AgentRole::Plan)
+        .cloned();
+    let existing_check = steps
+        .iter()
+        .rfind(|step| step.role == AgentRole::Check)
+        .cloned();
+    let existing_act = steps
+        .iter()
+        .rfind(|step| step.role == AgentRole::Act)
+        .cloned();
+
+    let mut core = Vec::new();
+    if requires_plan {
+        core.push(
+            existing_plan
+                .unwrap_or_else(|| generated_gate_step(AgentRole::Plan, "step_kernel_plan")),
+        );
+    }
+    core.extend(steps.into_iter().filter(|step| step.role == AgentRole::Do));
+    if !core.iter().any(|step| step.role == AgentRole::Do) {
+        core.push(generated_gate_step(AgentRole::Do, "step_kernel_do"));
+    }
+
+    let core_capacity = effective_max.saturating_sub(2).max(1);
+    core.truncate(core_capacity);
+
+    let retained_ids = core
+        .iter()
+        .map(|step| step.step_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for index in 0..core.len() {
+        core[index]
+            .dependencies
+            .retain(|dependency| retained_ids.contains(dependency));
+        if index > 0 && core[index].dependencies.is_empty() {
+            core[index].dependencies = vec![core[index - 1].step_id.clone()];
+        }
+    }
+
+    let mut check = existing_check
+        .unwrap_or_else(|| generated_gate_step(AgentRole::Check, "step_kernel_check"));
+    let do_dependencies = core
+        .iter()
+        .filter(|step| step.role == AgentRole::Do)
+        .map(|step| step.step_id.clone())
+        .collect::<Vec<_>>();
+    check.dependencies = if do_dependencies.is_empty() {
+        core.last()
+            .map(|step| vec![step.step_id.clone()])
+            .unwrap_or_default()
+    } else {
+        do_dependencies
+    };
+
+    let mut act =
+        existing_act.unwrap_or_else(|| generated_gate_step(AgentRole::Act, "step_kernel_act"));
+    act.dependencies = vec![check.step_id.clone()];
+    core.push(check);
+    core.push(act);
+    core
+}
+
+#[cfg(test)]
+mod generated_plan_gate_tests {
+    use super::*;
+
+    #[test]
+    fn model_plan_missing_aa_gets_terminal_ca_and_aa() {
+        let steps = vec![
+            generated_gate_step(AgentRole::Plan, "pa"),
+            generated_gate_step(AgentRole::Do, "da"),
+            generated_gate_step(AgentRole::Check, "ca"),
+        ];
+        let normalized = normalize_generated_pdca_steps(steps, TaskComplexity::Standard, 12);
+        assert_eq!(
+            normalized.iter().map(|step| step.role).collect::<Vec<_>>(),
+            vec![
+                AgentRole::Plan,
+                AgentRole::Do,
+                AgentRole::Check,
+                AgentRole::Act
+            ]
+        );
+        assert_eq!(normalized.last().unwrap().dependencies, vec!["ca"]);
+    }
+
+    #[test]
+    fn step_budget_preserves_terminal_gates_instead_of_prefix_truncating_them() {
+        let mut steps = vec![generated_gate_step(AgentRole::Plan, "pa")];
+        for index in 0..20 {
+            steps.push(generated_gate_step(AgentRole::Do, &format!("da_{index}")));
+        }
+        steps.push(generated_gate_step(AgentRole::Check, "ca"));
+        steps.push(generated_gate_step(AgentRole::Act, "aa"));
+        let normalized = normalize_generated_pdca_steps(steps, TaskComplexity::Complex, 6);
+        assert_eq!(normalized.len(), 6);
+        assert_eq!(normalized[4].role, AgentRole::Check);
+        assert_eq!(normalized[5].role, AgentRole::Act);
+    }
+
+    #[test]
+    fn explicit_simple_plan_is_not_upgraded_to_full_pdca() {
+        let steps = vec![generated_gate_step(AgentRole::Do, "da")];
+        let normalized = normalize_generated_pdca_steps(steps, TaskComplexity::Simple, 12);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].role, AgentRole::Do);
     }
 }
 
@@ -537,22 +720,33 @@ Output only JSON, no other content."#,
         user_input: &str,
         five_w2h: &crate::core::five_w2h::Task5W2H,
         experience_hints: &[String],
+        task_constraints: &HashMap<String, String>,
     ) -> ExecutionPlan {
         // Keyword verdict takes precedence over the priority mapping for structural
         // complexity (Recursive/Exploratory/Emergency); the LLM refines the plan.
         let keyword_complexity = self.classify_complexity(user_input);
 
+        let delivery_contract =
+            crate::core::agent_runner::direct_response_delivery_contract(task_constraints)
+                .map(|contract| format!("\n\n## Delivery Contract\n{contract}"))
+                .unwrap_or_default();
+        let capability_contract =
+            crate::core::agent_runner::required_capability_contract(task_constraints)
+                .map(|contract| format!("\n\n## Evidence Capability Contract\n{contract}"))
+                .unwrap_or_default();
         let enhanced_input = if experience_hints.is_empty() {
-            user_input.to_string()
+            format!("{user_input}{delivery_contract}{capability_contract}")
         } else {
             format!(
-                "## Historical Experience Reference\n{}\n\n## Current Task\n{}",
+                "## Historical Experience Reference\n{}\n\n## Current Task\n{}{}{}",
                 experience_hints
                     .iter()
                     .map(|h| format!("- {}", h))
                     .collect::<Vec<_>>()
                     .join("\n"),
-                user_input
+                user_input,
+                delivery_contract,
+                capability_contract,
             )
         };
 
@@ -857,17 +1051,17 @@ Output only JSON, no other content."#,
             .collect();
 
         let max_plan_steps = self.runner.agent_settings.execution_budget.max_plan_steps;
-        let steps = if steps.len() > max_plan_steps {
+        let original_step_count = steps.len();
+        let steps = normalize_generated_pdca_steps(steps, complexity, max_plan_steps);
+        if original_step_count > max_plan_steps || steps.len() != original_step_count {
             warn!(
-                "Plan step count {} exceeds limit {}, truncating to first {} steps",
-                steps.len(),
+                original_steps = original_step_count,
+                normalized_steps = steps.len(),
+                complexity = ?complexity,
+                "Model-generated PDCA plan normalized to preserve required BizAgent gates (configured max {})",
                 max_plan_steps,
-                max_plan_steps
             );
-            steps.into_iter().take(max_plan_steps).collect()
-        } else {
-            steps
-        };
+        }
 
         let agent_sequence: Vec<AgentRole> = steps.iter().map(|s| s.role).collect();
 

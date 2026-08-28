@@ -291,7 +291,11 @@ export EXA_API_KEY="your-exa-api-key"
 Active learning never bypasses the current task's CA audit. A learned policy
 remains a bounded candidate (or shadow observation) until the same normalized
 task family has at least five independent baseline and five candidate samples
-and passes the promotion gate. The summary command reports observed sample
+and passes the configurable positive-improvement promotion gate. Controlled
+pairs must also match seed, model, application/workflow/skill-catalog
+configuration, workspace snapshot, objective, and orchestration mode;
+repeating one pair ID does not increase the independent sample count. The
+summary command reports observed sample
 counts, success rates, P50/P95 reward, latency, prompt tokens, turns, tool calls,
 and whether replay arms are actually comparable; it does not synthesize missing
 counterfactual results.
@@ -302,7 +306,7 @@ counterfactual results.
 git clone https://github.com/doiito/gliding_horse.git
 cd gliding_horse
 
-# Build the glidingcode binary (release, ~51 MB)
+# Build the glidingcode binary in release mode
 cargo build -p code_cli --release
 ./target/release/glidingcode --help
 ```

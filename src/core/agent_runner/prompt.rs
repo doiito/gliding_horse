@@ -74,7 +74,9 @@ impl super::AgentRunner {
             AgentRole::Act => "Act",
         };
 
-        let tools_list = if step.tools_allowed.is_empty() {
+        let tools_list = if let Some(runtime_tools) = context_data.get("runtime_tools") {
+            runtime_tools.lines().map(str::to_string).collect()
+        } else if step.tools_allowed.is_empty() {
             self.tool_executor.read().list_tools(&role.to_string())
         } else {
             step.tools_allowed.clone()
@@ -391,19 +393,41 @@ impl super::AgentRunner {
 
         // Planning, execution and independent verification share the bounded
         // metadata manifest. File contents remain lazy and targeted.
-        if matches!(role, AgentRole::Plan | AgentRole::Do | AgentRole::Check) {
-            let manifest = self.build_workspace_file_manifest(&ctx.objective);
+        if ctx.workspace_context_enabled()
+            && matches!(role, AgentRole::Plan | AgentRole::Do | AgentRole::Check)
+        {
+            let evidence_paths =
+                (role == AgentRole::Check).then_some(ctx.workspace_evidence_paths.as_slice());
+            let manifest = self.build_workspace_file_manifest(&ctx.objective, evidence_paths);
             if !manifest.is_empty() {
                 context_data.insert("workspace_files".to_string(), manifest);
             }
         }
+
+        let runtime_tools = super::execution::workspace_inventory_tool_definitions(
+            self.tool_definitions_for_task_context(&role.to_string(), ctx),
+            super::execution::workspace_inventory_complete_and_bounded(
+                &self.tool_executor,
+                self.token_optimization
+                    .prompt_optimization
+                    .max_workspace_manifest_files,
+            ),
+        )
+        .into_iter()
+        .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+        context_data.insert("runtime_tools".to_string(), runtime_tools.join("\n"));
 
         context_data
     }
 
     /// Render a workspace file manifest for the DA: path + size + line count
     /// when the line count is known from the content cache.
-    fn build_workspace_file_manifest(&self, objective: &str) -> String {
+    fn build_workspace_file_manifest(
+        &self,
+        objective: &str,
+        evidence_paths: Option<&[String]>,
+    ) -> String {
         let prompt_settings = &self.token_optimization.prompt_optimization;
         let max_manifest_files = prompt_settings.max_workspace_manifest_files;
         let max_manifest_chars = prompt_settings.max_workspace_manifest_chars;
@@ -414,9 +438,46 @@ impl super::AgentRunner {
         let Some(wm) = workspace_monitor else {
             return String::new();
         };
+        if evidence_paths.is_some_and(|paths| paths.is_empty()) {
+            return String::new();
+        }
         let view = wm.workspace_view(None, Some(objective), max_manifest_files);
-        let mut files: Vec<String> = view
-            .files
+        let evidence_paths = evidence_paths.map(|paths| {
+            paths
+                .iter()
+                .map(|path| wm.normalize_path(path))
+                .collect::<Vec<_>>()
+        });
+        let (entries, eligible_count) = if let Some(paths) = evidence_paths.as_ref() {
+            let entries = wm
+                .inventory
+                .read()
+                .list_all()
+                .into_iter()
+                .filter(|entry| {
+                    paths.iter().any(|path| {
+                        entry.path == *path
+                            || entry
+                                .path
+                                .starts_with(&format!("{}/", path.trim_end_matches('/')))
+                    })
+                })
+                .take(max_manifest_files)
+                .map(|entry| crate::tools::workspace_monitor::WorkspaceFileView {
+                    path: entry.path,
+                    file_size: entry.file_size,
+                    language: entry.language,
+                    state: entry.state.as_str().to_string(),
+                    version: entry.current_version,
+                    content_hash: entry.content_hash,
+                })
+                .collect::<Vec<_>>();
+            let count = entries.len();
+            (entries, count)
+        } else {
+            (view.files.clone(), view.total_files)
+        };
+        let mut files: Vec<String> = entries
             .iter()
             .filter(|e| {
                 !e.path.split('/').any(|part| {
@@ -443,7 +504,6 @@ impl super::AgentRunner {
             })
             .collect();
 
-        let eligible_count = view.total_files;
         let mut lines = vec![format!(
             "{} files in workspace inventory (generation={}, scan_complete={}):",
             eligible_count, view.generation, view.scan_complete
@@ -489,6 +549,14 @@ impl super::AgentRunner {
             if tool_names.contains(skill.name.as_str()) {
                 continue;
             }
+            // Built-in tools also live in the skill graph so execution
+            // outcomes can train/evolve them. They are not independently
+            // invokable skills, however: advertising a built-in whose schema
+            // was removed by the current task/phase policy gives the model a
+            // capability that the runtime will reject.
+            if skill.description.starts_with("Built-in executable tool:") {
+                continue;
+            }
             let summary = if skill.description.is_empty() {
                 skill.name.clone()
             } else {
@@ -501,6 +569,35 @@ impl super::AgentRunner {
         output
     }
 
+    /// Prompt templates may intentionally omit optional context, while the
+    /// built-in PromptLoader fallback contains no placeholders at all.  A
+    /// previous-agent handoff is not optional decoration: losing it makes a
+    /// corrective CA search memory for an output whose exact archive IRI was
+    /// already supplied. Append each authoritative context value exactly once
+    /// after template rendering, regardless of which template source won.
+    fn append_missing_context(mut md: String, context_data: &HashMap<String, String>) -> String {
+        for (key, title) in [
+            ("original_task", "Original Task Requirements"),
+            ("plan_content", "Prior Plan Evidence"),
+            ("execution_result", "Execution Evidence"),
+            ("check_result", "Check Evidence"),
+            ("context_summary", "Related Context Evidence"),
+            ("workspace_summary", "Workspace Evidence"),
+            ("workspace_files", "Workspace File Manifest"),
+        ] {
+            let Some(value) = context_data
+                .get(key)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            if !md.contains(value) {
+                md.push_str(&format!("\n\n## {title}\n{value}"));
+            }
+        }
+        md
+    }
+
     pub(super) fn build_agent_md(
         &self,
         role: AgentRole,
@@ -510,7 +607,10 @@ impl super::AgentRunner {
     ) -> String {
         let role_name = role.to_string();
         let role_lower = role_name.to_lowercase();
-        let tools_list = self.tool_executor.read().list_tools(&role_name);
+        let tools_list = context_data
+            .get("runtime_tools")
+            .map(|tools| tools.lines().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_else(|| self.tool_executor.read().list_tools(&role_name));
 
         let supports_reasoning = self.gateway.supports_native_reasoning(model);
         let _format_constraint = if supports_reasoning {
@@ -594,6 +694,7 @@ impl super::AgentRunner {
                 if !skills_text.trim().is_empty() && !md.contains(&skills_text) {
                     md.push_str(&format!("\n\n## Available Skills\n{}", skills_text));
                 }
+                let md = Self::append_missing_context(md, context_data);
                 debug!(
                     role = %role_name,
                     source = "PromptLoader",
@@ -609,7 +710,10 @@ impl super::AgentRunner {
             self.templates
                 .render_prompt(&role_lower, "skeleton", &vars, false, None)
         {
-            let md = format!("# {} Agent.md\n\n{}\n", role_name, rendered,);
+            let md = Self::append_missing_context(
+                format!("# {} Agent.md\n\n{}\n", role_name, rendered,),
+                context_data,
+            );
             debug!(
                 role = %role_name,
                 source = "template",
@@ -630,7 +734,7 @@ impl super::AgentRunner {
                 let w2h_env = context_data.get("five_w2h_execution_env").cloned().unwrap_or_else(|| "(not specified)".to_string());
                 format!("You are the Plan Agent (PA). Your responsibility is to analyze user tasks and create execution plans.\n\n🔴 Strictly Prohibited:\n1. Do not call write-operation tools (file_write, file_edit, etc.)\n2. Do not perform concrete work (create files, modify code, etc.)\n3. Do not use bash for write operations (e.g., writing files, installing packages, deleting)\n\n✅ Allowed Operations:\n1. You may call read-only tools to gather information (file_read, file_list, grep_search, etc.)\n2. You may use bash for read-only commands (e.g., ls, cat, grep, find, which, pwd, echo) to explore the environment\n3. Analyze user task requirements\n4. Create clear execution steps\n5. Output a JSON-formatted plan\n\n📋 Task Metadata (5W2H — Must Reference):\n- What: {}\n- Why: {}\n- Success Criteria: {}\n- Deadline: {}\n- Execution Environment: {}\n\nCreate a plan under the above metadata constraints. If you find information that needs to be supplemented, explain it in the plan.\n\nAfter planning, it is recommended to backfill the How and Where dimensions (optional):\n{{\"five_w2h_updates\": {{\"how\": {{\"planIRI\": \"Plan IRI\", \"preferredSkills\": [...], \"requiredSteps\": \"...\"}}, \"where\": {{\"dataSources\": [...], \"executionEnvironment\": \"...\"}}}}}}", w2h_what, w2h_why, w2h_success, w2h_deadline, w2h_env)
             }
-            AgentRole::Do => "You are the Do Agent (DA). Your responsibility is to execute tasks concretely.\n\n🔴 Strictly Prohibited:\n1. Do not execute recursive searches in the current directory (e.g., grep -r, find /) — this will cause timeout\n2. Do not use relative paths; you must use the absolute paths specified in the task\n3. Do not perform operations unrelated to the task\n\n✅ Execution Requirements:\n1. Create/modify files strictly according to the paths specified in the task\n2. If the task requires creating a directory, create the directory first, then create the file\n3. Verify the result after every step\n4. Call finish immediately after completing the task\n5. For research tasks requiring the latest information, prioritize using web_search to fetch data. If the network tool still fails after multiple attempts, answer based on your own knowledge\n\n📋 Output Management Rules (Must Follow):\n1. When executing commands that may return large output (ls, find, grep, cat large files, etc.), use | head -N to limit output lines\n2. Prefer precise searches (grep + path restriction, glob filtering), avoid scanning entire directories\n3. When you only need to confirm a command result, use | grep keyword or | tail to filter key information — do not view the full output\n4. The system will automatically truncate output exceeding 16KB, and results over 2KB will be summarized — actively control output volume to avoid information loss\n5. If a tool returns results showing an \"output truncated\" or \"archived\" indicator, the output is too large — re-run with a more precise command\n\nExample Flow:\n1. Task requires creating /tmp/test/file.txt → First use Bash to create the directory, then use file_write to write\n2. Task requires modifying a file → Use file_read to read, process, then use file_write to write\n3. Task requires verification → Use file_read to read and check the content\n4. Search tool fails → After 1 attempt, if still failing, answer based on your own knowledge".to_string(),
+            AgentRole::Do => "You are the Do Agent (DA). Your responsibility is to execute tasks concretely.\n\n🔴 Strictly Prohibited:\n1. Do not execute recursive searches in the current directory (e.g., grep -r, find /) — this will cause timeout\n2. Do not use relative paths; you must use the absolute paths specified in the task\n3. Do not perform operations unrelated to the task\n\n✅ Execution Requirements:\n1. Create/modify files strictly according to the paths specified in the task\n2. If the task requires creating a directory, create the directory first, then create the file\n3. Verify the result after every step\n4. Call finish immediately after completing the task\n5. For research tasks requiring current information, use the advertised live-retrieval tools. If live retrieval remains unavailable after a bounded retry, disclose the limitation and distinguish remembered background from newly verified facts\n\n📋 Output Management Rules (Must Follow):\n1. When executing commands that may return large output (ls, find, grep, cat large files, etc.), use | head -N to limit output lines\n2. Prefer precise searches (grep + path restriction, glob filtering), avoid scanning entire directories\n3. When you only need to confirm a command result, use | grep keyword or | tail to filter key information — do not view the full output\n4. The system will automatically truncate output exceeding 16KB, and results over 2KB will be summarized — actively control output volume to avoid information loss\n5. If a tool returns results showing an \"output truncated\" or \"archived\" indicator, the output is too large — re-run with a more precise command\n\nExample Flow:\n1. Task requires creating /tmp/test/file.txt → First use Bash to create the directory, then use file_write to write\n2. Task requires modifying a file → Use file_read to read, process, then use file_write to write\n3. Task requires verification → Use file_read to read and check the content\n4. Live retrieval fails → Retry only when the error is plausibly transient; otherwise report the limitation and continue without claiming current verification".to_string(),
             AgentRole::Check => {
                 let w2h_what = context_data.get("five_w2h_what").cloned().unwrap_or_else(|| "(not specified)".to_string());
                 let w2h_why = context_data.get("five_w2h_why").cloned().unwrap_or_else(|| "(not specified)".to_string());
@@ -787,7 +891,13 @@ impl super::AgentRunner {
             build_time_awareness_text(Some(&session_start)),
         );
 
-        if let Some(ref ws_root) = self.workspace_root {
+        if !ctx.workspace_context_enabled() {
+            prompt_builder.set_region(
+                SystemPromptRegion::EnvironmentInfo,
+                "## Environment Scope\n\nThe mounted workspace is not part of the current task. Do not inspect, cite, or infer evidence from local projects. Use only the current task, its current-session handoffs, and non-workspace capabilities advertised by the runtime."
+                    .to_string(),
+            );
+        } else if let Some(ref ws_root) = self.workspace_root {
             let env_info = format!(
                 "## Workspace\n\n- Workspace path: {}\n\
                  - All file operations (read, write, search, command execution) must stay within the workspace\n\
@@ -811,11 +921,29 @@ impl super::AgentRunner {
                 AgentRole::Act => policy_text.push_str("- AA must decide only from supplied task and CA evidence; do not explore files or execute repairs\n"),
                 _ => {}
             }
+            if let Some(contract) = super::direct_response_delivery_contract(&ctx.constraints) {
+                policy_text.push_str("\n### Authoritative Delivery Boundary\n- ");
+                policy_text.push_str(contract);
+                policy_text.push('\n');
+            }
+            if let Some(contract) = super::required_capability_contract(&ctx.constraints) {
+                policy_text.push_str("\n### Authoritative Evidence Capability\n- ");
+                policy_text.push_str(contract);
+                policy_text.push('\n');
+            }
             policy_text.push_str("\n### 📖 File Reading Efficiency Principles (Mandatory)\n");
             policy_text.push_str("- Only read files relevant to the current task. Files that have been 'written but not re-read' are output from other agents — only read them when you need to reference their content\n");
             policy_text.push_str("- Avoid redundant whole-file reads. If file_read returns from_cache=true and the earlier content is still visible, continue with it\n");
             policy_text.push_str("- If context compression removed content you genuinely need, request only the missing offset/limit range or use mode:full once; do not loop on cache markers\n");
             policy_text.push_str("- Prefer targeted ranges for large files and move from inspection to execution as soon as the relevant section is understood\n");
+            if super::execution::workspace_inventory_complete_and_bounded(
+                &self.tool_executor,
+                self.token_optimization
+                    .prompt_optimization
+                    .max_workspace_manifest_files,
+            ) {
+                policy_text.push_str("- The bounded workspace manifest is complete for this task. Broad file_list/glob_search/workspace_status calls are not advertised because they cannot discover additional paths; use the shown manifest and targeted file_read/grep_search instead\n");
+            }
 
             if let Some(methodology_addendum) =
                 MethodologyPromptInjector::build_for_role(agent.role)
@@ -845,7 +973,13 @@ impl super::AgentRunner {
             prompt_builder.set_region(SystemPromptRegion::BehavioralPolicy, policy_text);
         }
 
-        let mut emphasis_items = self.load_emphasis_from_l0(&ctx.task_iri).await;
+        // Per-turn `emphasis` is model-derived historical evidence. Persist it
+        // for deduplication, diagnostics and learning, but never promote it
+        // into a later BizAgent's system-level Critical Constraints. Doing so
+        // made stale observations such as "evidence window closed" override a
+        // fresh corrective execution. Only operator-authored global emphasis
+        // and kernel-owned runtime contracts are authoritative here.
+        let mut emphasis_items = self.load_global_emphasis_from_l0().await;
         let effect_policy = ctx.effective_effect_policy();
         let effect_contract = match &effect_policy {
             crate::core::effect::EffectPolicy::None => None,
@@ -896,7 +1030,7 @@ impl super::AgentRunner {
             crate::core::system_prompt::OUTPUT_MANAGEMENT.to_string(),
         );
 
-        let tool_menu = self.build_readable_tool_menu(&agent.role, ctx.allowed_tools.as_deref());
+        let tool_menu = self.build_readable_tool_menu(&agent.role, ctx);
         if !tool_menu.is_empty() {
             prompt_builder.set_region(SystemPromptRegion::Tools, tool_menu);
         }
@@ -934,13 +1068,17 @@ impl super::AgentRunner {
         prompt
     }
 
-    pub(super) fn build_readable_tool_menu(
-        &self,
-        role: &AgentRole,
-        allowed_tools: Option<&[String]>,
-    ) -> String {
+    pub(super) fn build_readable_tool_menu(&self, role: &AgentRole, ctx: &TaskContext) -> String {
         let role_str = role.to_string();
-        let tool_defs = self.tool_definitions_for_context(&role_str, allowed_tools);
+        let tool_defs = super::execution::workspace_inventory_tool_definitions(
+            self.tool_definitions_for_task_context(&role_str, ctx),
+            super::execution::workspace_inventory_complete_and_bounded(
+                &self.tool_executor,
+                self.token_optimization
+                    .prompt_optimization
+                    .max_workspace_manifest_files,
+            ),
+        );
 
         if tool_defs.is_empty() {
             return String::new();

@@ -198,6 +198,20 @@ impl SupervisorAgent {
         self
     }
 
+    pub fn with_policy_learning_settings(
+        mut self,
+        settings: &crate::config::settings::PolicyLearningSettings,
+    ) -> Self {
+        self.policy_learning = self
+            .policy_learning
+            .with_min_observations(settings.candidate_trial_min_baseline_samples)
+            .with_gate(crate::core::policy_learning::PolicyGate {
+                min_samples: settings.promotion_min_samples,
+                min_improvement: settings.promotion_min_improvement,
+            });
+        self
+    }
+
     /// Get supplementary input shared store (for AgentRunner injection)
     pub fn supplement_store(&self) -> SupplementaryInputStore {
         self.supplement_store.clone()

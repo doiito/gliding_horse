@@ -7,6 +7,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn agent_turn_iris_are_session_scoped_and_task_addressable() {
+    let first = agent_turn_iri("iri://task/demo", "l1_first", 3);
+    let second = agent_turn_iri("iri://task/demo", "l1_second", 3);
+    assert_eq!(first, "iri://task/demo/session/l1_first/turn_3".to_string());
+    assert_ne!(first, second);
+    assert!(second.starts_with("iri://task/demo/"));
+    assert!(second.ends_with("/turn_3"));
+}
+
+#[test]
+fn direct_response_delivery_contract_rejects_invented_artifact_requirements() {
+    let constraints = HashMap::from([(
+        DELIVERY_MODE_CONSTRAINT.to_string(),
+        DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+    )]);
+    let contract = direct_response_delivery_contract(&constraints).unwrap();
+    assert!(contract.contains("final deliverable must be returned in the agent response"));
+    assert!(contract.contains("invented graph IRI"));
+}
+
+#[test]
+fn web_research_capability_requires_live_evidence_and_disclosure() {
+    let constraints = std::collections::HashMap::from([(
+        REQUIRED_CAPABILITY_CONSTRAINT.to_string(),
+        REQUIRED_CAPABILITY_WEB_RESEARCH.to_string(),
+    )]);
+    let contract = required_capability_contract(&constraints).unwrap();
+    assert!(contract.contains("web_search"));
+    assert!(contract.contains("RAG"));
+    assert!(contract.contains("limitation"));
+}
+
+#[test]
 fn workspace_effect_progress_detects_a_late_read_only_stall() {
     use super::execution::{record_workspace_effect_turn, workspace_effect_recovery_active};
 
@@ -98,10 +131,20 @@ fn execution_rejects_a_tool_not_advertised_in_the_current_turn() {
         json!({"type":"function","function":{"name":"bash","parameters":{}}}),
     ];
     let advertised = super::execution::advertised_tool_names(&definitions);
+    let no_session_tools = std::collections::HashSet::new();
 
-    assert!(super::execution::unadvertised_tool_call_result(&advertised, "file_read").is_none());
-    let rejection = super::execution::unadvertised_tool_call_result(&advertised, "file_list")
-        .expect("a withdrawn broad inventory tool must be rejected at execution time");
+    assert!(super::execution::unadvertised_tool_call_result(
+        &advertised,
+        &no_session_tools,
+        "file_read"
+    )
+    .is_none());
+    let rejection = super::execution::unadvertised_tool_call_result(
+        &advertised,
+        &no_session_tools,
+        "file_list",
+    )
+    .expect("a withdrawn broad inventory tool must be rejected at execution time");
     assert_eq!(rejection["status"], "not_executed");
     assert_eq!(rejection["reason"], "tool_not_advertised");
     assert!(rejection.get("error").is_none());
@@ -112,6 +155,27 @@ fn execution_rejects_a_tool_not_advertised_in_the_current_turn() {
         !crate::core::tracked_action::tool_result_failed(&rejection),
         "protocol feedback must not be learned as a failed skill execution"
     );
+}
+
+#[test]
+fn execution_accepts_only_an_owned_dynamic_reader_outside_the_prompt_window() {
+    let advertised = std::collections::HashSet::from(["web_search".to_string()]);
+    let reader = "read_full_result_call_current";
+    let session_tools = std::collections::HashSet::from([
+        reader.to_string(),
+        "knowledge_import_directory".to_string(),
+    ]);
+
+    assert!(
+        super::execution::unadvertised_tool_call_result(&advertised, &session_tools, reader,)
+            .is_none()
+    );
+    assert!(super::execution::unadvertised_tool_call_result(
+        &advertised,
+        &session_tools,
+        "knowledge_import_directory",
+    )
+    .is_some());
 }
 
 #[test]
@@ -151,6 +215,44 @@ fn ca_evidence_close_gate_removes_tools_only_for_ca() {
         true,
     );
     assert_eq!(da_tools.len(), 1);
+}
+
+#[test]
+fn evidence_only_da_convergence_withdraws_discovery_then_closes_tools() {
+    let definition = |name: &str| {
+        serde_json::json!({
+            "type":"function",
+            "function":{"name":name,"parameters":{}}
+        })
+    };
+    let focused = super::execution::da_evidence_focus_tool_definitions(
+        vec![
+            definition("web_search"),
+            definition("web_fetch"),
+            definition("rag_search"),
+            definition("read_agent_output"),
+            definition("read_full_result_current"),
+        ],
+        AgentRole::Do,
+        true,
+    );
+    let focused_names = focused
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        focused_names,
+        vec!["web_fetch", "read_agent_output", "read_full_result_current"]
+    );
+
+    let closed = super::execution::da_evidence_close_tool_definitions(focused, AgentRole::Do, true);
+    assert!(closed.is_empty());
+    let implementation_da = super::execution::da_evidence_close_tool_definitions(
+        vec![definition("file_write")],
+        AgentRole::Do,
+        false,
+    );
+    assert_eq!(implementation_da.len(), 1);
 }
 
 #[test]
@@ -905,6 +1007,45 @@ async fn pass_through_result_advertises_an_iri_only_when_it_is_resolvable() {
     assert_eq!(archived["content"], "line");
 }
 
+#[tokio::test]
+async fn graphified_result_advertises_a_registered_canonical_reader() {
+    let runner = create_test_runner();
+    let rows = (0..2_000)
+        .map(|index| {
+            serde_json::json!({
+                "id": index,
+                "title": format!("structured search result {index}"),
+                "url": format!("https://example.test/{index}"),
+                "description": "x".repeat(40)
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_string(&rows).unwrap();
+    assert!(payload.len() > runner.tool_result_router_settings.threshold_large);
+
+    let routed = runner
+        .route_tool_result(&payload, "web_search", "call_graphified")
+        .await;
+    let reader = "read_full_result_call_graphified";
+    assert!(routed.contains("iri://tool-result/call_graphified"));
+    assert!(runner
+        .tool_executor
+        .read()
+        .get_micro_tool_names_for_call("call_graphified")
+        .iter()
+        .any(|name| name == reader));
+
+    let executor = runner.tool_executor.read().clone();
+    let page = executor
+        .execute(reader, serde_json::json!({"char_offset": 0, "limit": 1}))
+        .await
+        .unwrap();
+    assert_eq!(page["call_id"], "call_graphified");
+    assert!(page["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("structured search result")));
+}
+
 #[test]
 fn optimized_tool_window_is_small_and_can_activate_discovered_tools() {
     let runner = create_test_runner()
@@ -1104,6 +1245,91 @@ fn workspace_effect_guard_is_enabled_only_by_generic_task_constraint() {
         .with_constraint("required_effect", "workspace_mutation");
     assert!(requires_workspace_effect(&change, AgentRole::Do));
     assert!(!requires_workspace_effect(&change, AgentRole::Check));
+}
+
+#[test]
+fn workspace_disabled_task_keeps_web_tools_and_withholds_project_tools() {
+    let runner = create_test_runner();
+    let ctx = TaskContext::new("iri://task/research", "research current trends", 10)
+        .with_constraint(
+            WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+            WORKSPACE_CONTEXT_DISABLED,
+        );
+    let definitions = runner.tool_definitions_for_task_context("DA", &ctx);
+    let names = definitions
+        .iter()
+        .filter_map(|definition| definition["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"web_search"));
+    assert!(names.contains(&"web_fetch"));
+    assert!(!names.contains(&"file_read"));
+    assert!(!names.contains(&"file_list"));
+    assert!(!names.contains(&"grep_search"));
+    assert!(!names.contains(&"bash"));
+
+    let discoverable = runner
+        .discoverable_tool_definitions_for_task_context("DA", &ctx)
+        .iter()
+        .filter_map(|definition| definition["function"]["name"].as_str())
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    let mut search_result = serde_json::json!({
+        "matches": [
+            {"name": "file_write", "description": "write a file"},
+            {"name": "web_fetch", "description": "fetch a URL"}
+        ],
+        "count": 2
+    });
+    super::execution::filter_tool_search_result(&mut search_result, &discoverable);
+    assert_eq!(search_result["count"], 1);
+    assert_eq!(search_result["matches"][0]["name"], "web_fetch");
+}
+
+#[test]
+fn ca_workspace_manifest_contains_only_current_task_evidence_paths() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use crate::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
+
+            let dir = tempfile::tempdir().unwrap();
+            let old = dir.path().join("calculator_project/test_calculator.py");
+            let current = dir.path().join("agent_report.md");
+            std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+            std::fs::write(&old, "def test_old(): pass\n").unwrap();
+            std::fs::write(&current, "# AI Agent report\n").unwrap();
+            let monitor = WorkspaceMonitor::initialize(
+                WorkspaceMonitorConfig {
+                    workspace_root: dir.path().to_path_buf(),
+                    watch_enabled: false,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+            let runner = create_test_runner();
+            runner
+                .tool_executor
+                .write()
+                .set_workspace_monitor(Arc::new(monitor));
+            let ctx = TaskContext::new("iri://task/research", "audit report", 10)
+                .with_workspace_evidence_paths(vec![current.to_string_lossy().to_string()]);
+            let context = runner
+                .gather_context_data_async(AgentRole::Check, &ctx)
+                .await;
+            let manifest = context
+                .get("workspace_files")
+                .expect("CA should receive its current report evidence");
+
+            assert!(manifest.contains("agent_report.md"));
+            assert!(!manifest.contains("calculator_project"));
+            assert!(!manifest.contains("test_calculator.py"));
+        });
 }
 
 #[test]
@@ -1329,11 +1555,61 @@ fn test_agent_md_prompt_loader_fallback_injects_skills() {
         discovery_5w2h: None,
     });
 
-    let context_data = std::collections::HashMap::new();
-    let md = runner.build_agent_md(AgentRole::Do, "objective", &context_data, "deepseek-v4-pro");
+    let exact_handoff = "Use read_agent_output with iri://task/t/session/da/turn_7";
+    let context_data = std::collections::HashMap::from([
+        (
+            "original_task".to_string(),
+            "authoritative original task".to_string(),
+        ),
+        ("execution_result".to_string(), exact_handoff.to_string()),
+    ]);
+    let md = runner.build_agent_md(
+        AgentRole::Check,
+        "corrective audit",
+        &context_data,
+        "deepseek-v4-pro",
+    );
     assert!(
-        md.contains("## Available Skills") && md.contains("analyze_output"),
+        md.contains("## Available Skills"),
         "PromptLoader builtin-fallback agent.md must include injected skills, got: {}",
         md
     );
+    assert!(md.contains("authoritative original task"));
+    assert!(md.contains(exact_handoff));
+    assert_eq!(md.matches(exact_handoff).count(), 1);
+}
+
+#[test]
+fn unavailable_builtin_tools_are_not_misrepresented_as_skills() {
+    let runner = create_test_runner();
+    let tools = vec!["read_agent_output".to_string()];
+    let skills_text = AgentRunner::build_available_skills(&tools, &runner.skills, "CA", 50);
+
+    assert!(skills_text.contains("read_agent_output"));
+    assert!(!skills_text.contains("Built-in executable tool:"));
+    assert!(!skills_text.contains("kg_search:"));
+}
+
+#[tokio::test]
+async fn task_scoped_agent_emphasis_is_not_promoted_to_later_system_constraints() {
+    let runner = create_test_runner();
+    let task_iri = "iri://task/stale-emphasis";
+    let stale = "evidence window closed: do not call any tools".to_string();
+    runner
+        .save_emphasis_to_l0(&[stale.clone()], task_iri, "cycle_DA_old", 0.85)
+        .await;
+
+    let agent =
+        crate::core::agent_instance::AgentInstance::new("cycle_DA_new".to_string(), AgentRole::Do);
+    let context = TaskContext::new(task_iri, "fresh corrective execution", 8);
+    let session = crate::memory::l1_session::L1Session::new("cycle_DA_new", "DA", task_iri);
+    let prompt = runner
+        .build_system_prompt(&agent, &context, &session, "Do the fresh correction")
+        .await;
+
+    assert!(!prompt.contains(&stale));
+    assert!(runner
+        .load_emphasis_from_l0(task_iri)
+        .await
+        .contains(&stale));
 }

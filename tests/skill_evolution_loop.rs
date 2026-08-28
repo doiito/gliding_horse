@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use glidinghorse::core::policy_learning::{
+    ConstrainedPolicy, PolicyChoice, PolicyGate, PolicyObservationEvidence,
+};
 use glidinghorse::memory::l0_store::L0Store;
 use glidinghorse::skill_graph::discovery::{SkillDiscoveryEngine, Task5W2H};
 use glidinghorse::skill_graph::evolution::{
@@ -119,4 +122,74 @@ async fn evolution_probe_skill_closes_the_persistent_evidence_loop() {
     let fragments = restored_graph.get_fragments_for_skill("iri://skills/evolution_probe");
     assert_eq!(fragments.len(), 1);
     assert!(fragments[0].recommendation.contains("verified mitigation"));
+
+    // The evolved skill/knowledge treatment is still only a candidate until
+    // five distinct, fully controlled baseline/treatment pairs prove uplift.
+    let family = "planning:v3:intent=inspect;domain=knowledge_system";
+    let candidates = vec!["baseline".to_string(), "knowledge_first".to_string()];
+    let baseline = PolicyChoice {
+        context: family.to_string(),
+        action: "baseline".to_string(),
+        used_fallback: true,
+        confidence: 0.0,
+        explored: false,
+        candidates: vec!["baseline".to_string()],
+    };
+    let treatment = PolicyChoice {
+        action: "knowledge_first".to_string(),
+        used_fallback: false,
+        explored: true,
+        candidates: candidates.clone(),
+        ..baseline.clone()
+    };
+    let evidence = |pair: &str, task: &str| PolicyObservationEvidence {
+        task_iri: Some(format!("iri://task/{task}")),
+        experiment_pair_id: Some(pair.to_string()),
+        experiment_seed: Some("evolution-seed".to_string()),
+        experiment_model: Some("deterministic-test-model".to_string()),
+        experiment_config_fingerprint: Some("sha256:evolution-config".to_string()),
+        workspace_fingerprint: Some("sha256:evolution-workspace".to_string()),
+        objective_fingerprint: Some("sha256:evolution-objective".to_string()),
+        orchestration_mode: Some("pdca".to_string()),
+    };
+    let mut policy = ConstrainedPolicy::default().with_persistence(l0.clone());
+    let mut promotion = None;
+    for index in 0..5 {
+        let pair = format!("evolution-pair-{index}");
+        assert!(policy
+            .record_baseline_evidence(
+                &baseline,
+                0.3,
+                evidence(&pair, &format!("baseline-{index}")),
+            )
+            .unwrap());
+        promotion = Some(
+            policy
+                .record_reward_gated_with_evidence(
+                    &treatment,
+                    0.9,
+                    PolicyGate::default(),
+                    evidence(&pair, &format!("treatment-{index}")),
+                )
+                .unwrap(),
+        );
+    }
+    let promotion = promotion.unwrap();
+    assert!(promotion.accepted);
+    assert_eq!(promotion.samples, 5);
+    assert_eq!(policy.model_version(), 1);
+
+    // Reconstruct policy as well as graph/knowledge. A new same-family task
+    // now receives the promoted treatment without another exploration trial.
+    drop(policy);
+    let mut restarted_policy = ConstrainedPolicy::default().with_persistence(l0.clone());
+    let deployed = restarted_policy.choose(family, &candidates, "baseline");
+    assert_eq!(restarted_policy.model_version(), 1);
+    assert_eq!(deployed.action, "knowledge_first");
+    assert!(!deployed.explored);
+    assert!(!deployed.used_fallback);
+    assert!(l0
+        .retrieve("iri://learning/policy/versions/1")
+        .unwrap()
+        .is_some());
 }

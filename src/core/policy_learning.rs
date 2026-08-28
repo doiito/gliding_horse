@@ -220,6 +220,35 @@ pub fn learning_task_context(objective: &str) -> LearningTaskContext {
         .filter(|(_, alternatives)| contains_any(&normalized, alternatives))
         .map(|(canonical, _)| (*canonical).to_string())
         .collect::<Vec<_>>();
+    // Explicit non-mutation language is part of the task contract, not a
+    // mutation keyword. Without this guard, phrases such as "must not modify"
+    // and "不得修改" were grouped into intent=change, contaminating both
+    // retrieval and controlled promotion evidence for read-only tasks.
+    let explicitly_non_mutating = [
+        "do not modify",
+        "must not modify",
+        "do not change",
+        "without modifying",
+        "read only",
+        "read-only",
+        "不得修改",
+        "禁止修改",
+        "不要修改",
+        "只读",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if explicitly_non_mutating {
+        operations.retain(|operation| {
+            !matches!(
+                operation.as_str(),
+                "build" | "fix" | "implement" | "migrate" | "optimize" | "refactor" | "write"
+            )
+        });
+        if !operations.iter().any(|operation| operation == "verify") {
+            operations.push("verify".to_string());
+        }
+    }
     operations.sort();
     operations.dedup();
     modalities.sort();
@@ -435,7 +464,103 @@ pub struct PolicyObservation {
     pub explored: bool,
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// Causal/audit identity used to deduplicate outcomes and to form strict
+    /// controlled-replay pairs. Older observations deserialize as unlabelled
+    /// operational evidence for backward compatibility.
+    #[serde(default)]
+    pub evidence: PolicyObservationEvidence,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyObservationEvidence {
+    #[serde(default)]
+    pub task_iri: Option<String>,
+    #[serde(default)]
+    pub experiment_pair_id: Option<String>,
+    #[serde(default)]
+    pub experiment_seed: Option<String>,
+    #[serde(default)]
+    pub experiment_model: Option<String>,
+    #[serde(default)]
+    pub experiment_config_fingerprint: Option<String>,
+    #[serde(default)]
+    pub workspace_fingerprint: Option<String>,
+    #[serde(default)]
+    pub objective_fingerprint: Option<String>,
+    #[serde(default)]
+    pub orchestration_mode: Option<String>,
+}
+
+impl PolicyObservationEvidence {
+    fn controlled_signature(&self) -> Option<String> {
+        let values = [
+            self.experiment_seed.as_deref()?,
+            self.experiment_model.as_deref()?,
+            self.experiment_config_fingerprint.as_deref()?,
+            self.workspace_fingerprint.as_deref()?,
+            self.objective_fingerprint.as_deref()?,
+            self.orchestration_mode.as_deref()?,
+        ];
+        if values
+            .iter()
+            .any(|value| value.is_empty() || value.starts_with("unavailable:"))
+        {
+            return None;
+        }
+        Some(values.join("\u{1f}"))
+    }
+}
+
+/// Return one matched outcome per controlled pair. A pair is admissible only
+/// when both executions have complete and identical causal controls and came
+/// from distinct task runs. Reusing one pair ID therefore cannot manufacture
+/// the five independent samples required by the promotion gate.
+fn controlled_pair_rewards(
+    observations: &[&PolicyObservation],
+    candidate_action: &str,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut baseline_by_pair = std::collections::HashMap::new();
+    for observation in observations
+        .iter()
+        .copied()
+        .filter(|item| item.action == "baseline")
+    {
+        let Some(pair_id) = observation.evidence.experiment_pair_id.as_deref() else {
+            continue;
+        };
+        if observation.evidence.controlled_signature().is_some() {
+            baseline_by_pair.insert(pair_id, observation);
+        }
+    }
+    let mut seen_pairs = std::collections::HashSet::new();
+    let mut baseline_rewards = Vec::new();
+    let mut candidate_rewards = Vec::new();
+    for candidate in observations
+        .iter()
+        .copied()
+        .filter(|item| item.action == candidate_action)
+    {
+        let Some(pair_id) = candidate.evidence.experiment_pair_id.as_deref() else {
+            continue;
+        };
+        if !seen_pairs.insert(pair_id) {
+            continue;
+        }
+        let Some(baseline) = baseline_by_pair.get(pair_id).copied() else {
+            continue;
+        };
+        if baseline.evidence.controlled_signature() != candidate.evidence.controlled_signature()
+            || baseline.evidence.task_iri.is_none()
+            || candidate.evidence.task_iri.is_none()
+            || baseline.evidence.task_iri == candidate.evidence.task_iri
+        {
+            continue;
+        }
+        baseline_rewards.push(baseline.reward);
+        candidate_rewards.push(candidate.reward);
+    }
+    (baseline_rewards, candidate_rewards)
 }
 
 /// Compact trainable policy model. The feature map is deterministic so a
@@ -497,7 +622,7 @@ pub struct PolicyVersion {
 
 /// Deployment gate for learned policies. A model is promoted only when it
 /// has enough independent evidence and does not regress against the baseline.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct PolicyGate {
     pub min_samples: u32,
     pub min_improvement: f32,
@@ -515,7 +640,7 @@ impl Default for PolicyGate {
     fn default() -> Self {
         Self {
             min_samples: 5,
-            min_improvement: 0.0,
+            min_improvement: 0.01,
         }
     }
 }
@@ -739,6 +864,7 @@ pub struct ConstrainedPolicy {
     /// Exploration is bounded and only selects among safe hint-ordering arms.
     exploration_rate: f32,
     min_observations: u32,
+    gate: PolicyGate,
 }
 
 impl Default for ConstrainedPolicy {
@@ -754,6 +880,7 @@ impl Default for ConstrainedPolicy {
             // candidate trial. Promotion still requires PolicyGate's five
             // independent observations on both arms.
             min_observations: 1,
+            gate: PolicyGate::default(),
         }
     }
 }
@@ -779,13 +906,13 @@ impl ConstrainedPolicy {
                 })
                 .collect();
         }
-        // Rebuild the executable model from durable observations so v2
-        // contexts are normalized in memory before feature hashing. Arm
-        // records themselves remain untouched and auditable on disk.
-        if let Ok(observations) = Self::load_observations(&store) {
-            if !observations.is_empty() {
-                self.model = Self::replay(&observations).model;
-            }
+        // The persisted model is the only executable model after restart.
+        // Replaying every observation here would silently deploy candidate
+        // updates that the promotion gate previously rejected. Arm evidence
+        // remains separately durable and is pooled by compatible family.
+        if self.model_version > 0 && self.model.updates == 0 {
+            // Never claim that an absent/corrupt snapshot is promoted.
+            self.model_version = 0;
         }
         self.store = Some(store);
         self
@@ -794,6 +921,31 @@ impl ConstrainedPolicy {
     pub fn with_exploration(mut self, rate: f32) -> Self {
         self.exploration_rate = rate.clamp(0.0, 0.2);
         self
+    }
+
+    pub fn with_gate(mut self, gate: PolicyGate) -> Self {
+        self.gate = PolicyGate {
+            min_samples: gate.min_samples.max(1),
+            min_improvement: if gate.min_improvement.is_finite() {
+                gate.min_improvement.clamp(-2.0, 2.0)
+            } else {
+                PolicyGate::default().min_improvement
+            },
+        };
+        self
+    }
+
+    pub fn with_min_observations(mut self, samples: u32) -> Self {
+        self.min_observations = samples.max(1);
+        self
+    }
+
+    pub fn gate(&self) -> PolicyGate {
+        self.gate
+    }
+
+    pub fn min_observations(&self) -> u32 {
+        self.min_observations
     }
 
     pub fn choose(&mut self, context: &str, candidates: &[String], fallback: &str) -> PolicyChoice {
@@ -835,7 +987,7 @@ impl ConstrainedPolicy {
         };
         let baseline_pulls = pulls_for(&safe_fallback);
         let enough_baseline_evidence = baseline_pulls >= self.min_observations;
-        let gate_samples = PolicyGate::default().min_samples;
+        let gate_samples = self.gate.min_samples;
         let candidate_under_evaluation = candidates
             .iter()
             .filter(|candidate| candidate.as_str() != safe_fallback)
@@ -846,6 +998,10 @@ impl ConstrainedPolicy {
         // after the same family has an independent rule baseline and stops at
         // the promotion gate's evidence threshold.
         let should_explore = enough_baseline_evidence && candidate_under_evaluation.is_some();
+        let baseline_mean = pooled_arms
+            .get(&safe_fallback)
+            .map(ArmStats::mean)
+            .unwrap_or(0.0);
         let action = if !enough_baseline_evidence {
             safe_fallback.clone()
         } else if should_explore {
@@ -857,6 +1013,15 @@ impl ConstrainedPolicy {
         } else {
             candidates
                 .iter()
+                // A promoted model remains bounded by live empirical return.
+                // Rejected/late regressions therefore fall back safely even
+                // though their observations remain useful training evidence.
+                .filter(|candidate| {
+                    candidate.as_str() == safe_fallback
+                        || pooled_arms.get(*candidate).is_some_and(|stats| {
+                            stats.mean() - baseline_mean >= self.gate.min_improvement
+                        })
+                })
                 .max_by(|a, b| {
                     let av = model_scores.get(*a).copied().unwrap_or(0.0);
                     let bv = model_scores.get(*b).copied().unwrap_or(0.0);
@@ -869,7 +1034,7 @@ impl ConstrainedPolicy {
             .iter()
             .filter_map(|candidate| pooled_arms.get(candidate).map(ArmStats::mean))
             .fold(0.0_f32, f32::max);
-        let used_fallback = action == safe_fallback && self.model_version == 0;
+        let used_fallback = action == safe_fallback;
         PolicyChoice {
             context: context.to_string(),
             action,
@@ -885,6 +1050,43 @@ impl ConstrainedPolicy {
     }
 
     pub fn record_reward(&mut self, choice: &PolicyChoice, reward: f32) -> Result<(), String> {
+        self.record_observation(choice, reward, PolicyObservationEvidence::default(), true)?;
+        Ok(())
+    }
+
+    /// Persist a true ablation outcome without retrieving/injecting history,
+    /// training the executable model, or changing its version. This makes a
+    /// controlled baseline useful to the promotion gate while preserving the
+    /// behavioral meaning of `LearningMode::Baseline`.
+    pub fn record_baseline_evidence(
+        &mut self,
+        choice: &PolicyChoice,
+        reward: f32,
+        evidence: PolicyObservationEvidence,
+    ) -> Result<bool, String> {
+        if choice.action != "baseline" {
+            return Err("baseline evidence must use the baseline action".to_string());
+        }
+        self.record_observation(choice, reward, evidence, false)
+    }
+
+    fn record_observation(
+        &mut self,
+        choice: &PolicyChoice,
+        reward: f32,
+        evidence: PolicyObservationEvidence,
+        train_model: bool,
+    ) -> Result<bool, String> {
+        let observation_key = self.observation_key(choice, &evidence);
+        if let (Some(store), Some(key)) = (&self.store, observation_key.as_deref()) {
+            if store
+                .retrieve(key)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
         let state = self
             .states
             .entry(choice.context.clone())
@@ -902,8 +1104,10 @@ impl ConstrainedPolicy {
         state.updated_at = chrono::Utc::now();
         // The historical arm statistics remain available for auditability;
         // the trainable model is the policy used for future selections.
-        self.model
-            .train(&choice.context, &choice.action, &choice.candidates, reward);
+        if train_model {
+            self.model
+                .train(&choice.context, &choice.action, &choice.candidates, reward);
+        }
         if let Some(store) = &self.store {
             let key = format!(
                 "{PREFIX}{}",
@@ -919,10 +1123,12 @@ impl ConstrainedPolicy {
                 reward: reward.clamp(-1.0, 1.0),
                 explored: choice.explored,
                 candidates: choice.candidates.clone(),
+                evidence,
                 created_at: chrono::Utc::now(),
             };
-            let observation_key =
-                format!("{PREFIX}observations/{}", uuid::Uuid::new_v4().hyphenated());
+            let observation_key = observation_key.unwrap_or_else(|| {
+                format!("{PREFIX}observations/{}", uuid::Uuid::new_v4().hyphenated())
+            });
             let observation_content =
                 serde_json::to_string(&observation).map_err(|error| error.to_string())?;
             store
@@ -934,7 +1140,29 @@ impl ConstrainedPolicy {
                 .store(&format!("{PREFIX}model"), &model_content)
                 .map_err(|error| error.to_string())?;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn observation_key(
+        &self,
+        choice: &PolicyChoice,
+        evidence: &PolicyObservationEvidence,
+    ) -> Option<String> {
+        let unit = evidence
+            .experiment_pair_id
+            .as_deref()
+            .map(|value| format!("pair:{value}"))
+            .or_else(|| {
+                evidence
+                    .task_iri
+                    .as_deref()
+                    .map(|value| format!("task:{value}"))
+            })?;
+        let identity = format!("{}\n{}\n{}", choice.context, choice.action, unit);
+        Some(format!(
+            "{PREFIX}observations/identified/{}",
+            hex::encode(sha2::Sha256::digest(identity.as_bytes()))
+        ))
     }
 
     /// Record an auditable observation, but promote a replayed model only
@@ -947,9 +1175,24 @@ impl ConstrainedPolicy {
         reward: f32,
         gate: PolicyGate,
     ) -> Result<PolicyEvaluation, String> {
+        self.record_reward_gated_with_evidence(
+            choice,
+            reward,
+            gate,
+            PolicyObservationEvidence::default(),
+        )
+    }
+
+    pub fn record_reward_gated_with_evidence(
+        &mut self,
+        choice: &PolicyChoice,
+        reward: f32,
+        gate: PolicyGate,
+        evidence: PolicyObservationEvidence,
+    ) -> Result<PolicyEvaluation, String> {
         let baseline_model = self.model.clone();
         let baseline_version = self.model_version;
-        self.record_reward(choice, reward)?;
+        let inserted = self.record_observation(choice, reward, evidence.clone(), true)?;
         let observations = match &self.store {
             Some(store) => Self::load_observations(store)?,
             None => vec![PolicyObservation {
@@ -958,6 +1201,7 @@ impl ConstrainedPolicy {
                 reward: reward.clamp(-1.0, 1.0),
                 explored: choice.explored,
                 candidates: choice.candidates.clone(),
+                evidence: evidence.clone(),
                 created_at: chrono::Utc::now(),
             }],
         };
@@ -1024,11 +1268,20 @@ impl ConstrainedPolicy {
                 .map(|item| item.reward)
                 .collect::<Vec<_>>()
         };
-        let baseline_rewards = rewards_for("baseline");
-        let candidate_rewards = candidate_action
-            .as_deref()
-            .map(rewards_for)
-            .unwrap_or_default();
+        let (baseline_rewards, candidate_rewards) = if evidence.experiment_pair_id.is_some() {
+            candidate_action
+                .as_deref()
+                .map(|candidate| controlled_pair_rewards(&relevant, candidate))
+                .unwrap_or_default()
+        } else {
+            (
+                rewards_for("baseline"),
+                candidate_action
+                    .as_deref()
+                    .map(rewards_for)
+                    .unwrap_or_default(),
+            )
+        };
         let mean = |values: &[f32]| {
             if values.is_empty() {
                 0.0
@@ -1052,10 +1305,11 @@ impl ConstrainedPolicy {
         // history.  Replaying durable observations fixes the former behavior
         // where every rejected online update forgot all earlier samples.
         let replayed_model = Self::replay(&observations).model;
-        if evaluation.accepted {
+        if evaluation.accepted && inserted {
             self.rollback_model = Some(baseline_model);
             self.model = replayed_model;
             self.model_version = baseline_version.saturating_add(1);
+            self.persist_policy_version(&evaluation)?;
         } else {
             self.model = baseline_model;
             self.model_version = baseline_version;
@@ -1125,6 +1379,24 @@ impl ConstrainedPolicy {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    fn persist_policy_version(&self, evaluation: &PolicyEvaluation) -> Result<(), String> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let version = PolicyVersion {
+            version: self.model_version,
+            model: self.model.clone(),
+            evaluation: Some(evaluation.clone()),
+            created_at: chrono::Utc::now(),
+        };
+        store
+            .store(
+                &format!("{PREFIX}versions/{}", self.model_version),
+                &serde_json::to_string(&version).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub fn replay(observations: &[PolicyObservation]) -> Self {
@@ -1225,6 +1497,21 @@ mod tests {
         assert_eq!(tags.family, owner.family);
         assert_eq!(tags.family, "planning:v3:intent=change;domain=software");
         assert_ne!(tags.family, web_game.family);
+    }
+
+    #[test]
+    fn explicit_read_only_contract_is_not_grouped_with_mutation_tasks() {
+        let chinese =
+            learning_task_context("只读 fixture.txt，返回 ANSWER 精确值并引用证据行。不得修改。");
+        let english = learning_task_context(
+            "Read fixture.txt and return the exact ANSWER; do not modify any files.",
+        );
+        assert_eq!(chinese.family, "planning:v3:intent=inspect;domain=generic");
+        assert_eq!(english.family, chinese.family);
+        assert!(!chinese
+            .operations
+            .iter()
+            .any(|operation| { matches!(operation.as_str(), "implement" | "write" | "fix") }));
     }
 
     #[test]
@@ -1409,6 +1696,7 @@ mod tests {
                 reward: 0.2,
                 explored: false,
                 candidates: vec!["baseline".into(), "knowledge_first".into()],
+                evidence: PolicyObservationEvidence::default(),
                 created_at: now,
             },
             PolicyObservation {
@@ -1417,6 +1705,7 @@ mod tests {
                 reward: 0.9,
                 explored: true,
                 candidates: vec!["baseline".into(), "knowledge_first".into()],
+                evidence: PolicyObservationEvidence::default(),
                 created_at: now,
             },
         ];
@@ -1596,6 +1885,239 @@ mod tests {
         let restored = ConstrainedPolicy::default().with_persistence(store);
         assert_eq!(restored.model_version(), 1);
         assert_eq!(restored.model().updates, 10);
+    }
+
+    fn controlled_evidence(
+        pair_id: &str,
+        task_iri: &str,
+        workspace: &str,
+    ) -> PolicyObservationEvidence {
+        PolicyObservationEvidence {
+            task_iri: Some(task_iri.into()),
+            experiment_pair_id: Some(pair_id.into()),
+            experiment_seed: Some("seed-42".into()),
+            experiment_model: Some("test-model".into()),
+            experiment_config_fingerprint: Some("config-v1".into()),
+            workspace_fingerprint: Some(workspace.into()),
+            objective_fingerprint: Some("objective-1".into()),
+            orchestration_mode: Some("pdca".into()),
+        }
+    }
+
+    #[test]
+    fn controlled_replay_promotes_only_five_distinct_comparable_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut policy = ConstrainedPolicy::default().with_persistence(store.clone());
+        let baseline = PolicyChoice {
+            context: "planning:v3:intent=inspect;domain=document".into(),
+            action: "baseline".into(),
+            used_fallback: true,
+            confidence: 0.0,
+            explored: false,
+            candidates: vec!["baseline".into()],
+        };
+        let candidate = PolicyChoice {
+            action: "experience_first".into(),
+            used_fallback: false,
+            explored: true,
+            candidates: vec!["baseline".into(), "experience_first".into()],
+            ..baseline.clone()
+        };
+
+        // A mismatched workspace is auditable but not comparable and cannot
+        // contribute a synthetic pair.
+        policy
+            .record_baseline_evidence(
+                &baseline,
+                0.2,
+                controlled_evidence("mismatch", "task:baseline-mismatch", "workspace-a"),
+            )
+            .unwrap();
+        let mismatch = policy
+            .record_reward_gated_with_evidence(
+                &candidate,
+                0.9,
+                PolicyGate::default(),
+                controlled_evidence("mismatch", "task:candidate-mismatch", "workspace-b"),
+            )
+            .unwrap();
+        assert_eq!(mismatch.samples, 0);
+        assert!(!mismatch.accepted);
+
+        let mut final_evaluation = None;
+        for index in 0..5 {
+            let pair = format!("pair-{index}");
+            assert!(policy
+                .record_baseline_evidence(
+                    &baseline,
+                    0.3,
+                    controlled_evidence(
+                        &pair,
+                        &format!("task:baseline-{index}"),
+                        "workspace-stable",
+                    ),
+                )
+                .unwrap());
+            final_evaluation = Some(
+                policy
+                    .record_reward_gated_with_evidence(
+                        &candidate,
+                        0.9,
+                        PolicyGate::default(),
+                        controlled_evidence(
+                            &pair,
+                            &format!("task:candidate-{index}"),
+                            "workspace-stable",
+                        ),
+                    )
+                    .unwrap(),
+            );
+        }
+        let final_evaluation = final_evaluation.unwrap();
+        assert!(final_evaluation.accepted, "{final_evaluation:?}");
+        assert_eq!(final_evaluation.samples, 5);
+        assert_eq!(policy.model_version(), 1);
+
+        // Replaying an existing pair is idempotent and cannot manufacture a
+        // second model version or increase the independent sample count.
+        assert!(!policy
+            .record_baseline_evidence(
+                &baseline,
+                1.0,
+                controlled_evidence("pair-4", "task:another-baseline", "workspace-stable"),
+            )
+            .unwrap());
+        let duplicate = policy
+            .record_reward_gated_with_evidence(
+                &candidate,
+                1.0,
+                PolicyGate::default(),
+                controlled_evidence("pair-4", "task:another-candidate", "workspace-stable"),
+            )
+            .unwrap();
+        assert_eq!(duplicate.samples, 5);
+        assert_eq!(policy.model_version(), 1);
+
+        let version = store
+            .retrieve("iri://learning/policy/versions/1")
+            .unwrap()
+            .expect("promoted version must have a durable audit snapshot");
+        let version: PolicyVersion = serde_json::from_str(&version.content).unwrap();
+        assert_eq!(version.version, 1);
+        assert!(version.evaluation.unwrap().accepted);
+
+        let similar_family_candidates = vec!["baseline".into(), "experience_first".into()];
+        let selected = policy.choose(
+            "planning:v3:intent=inspect;domain=document",
+            &similar_family_candidates,
+            "baseline",
+        );
+        assert_eq!(selected.action, "experience_first");
+        assert!(
+            !selected.explored,
+            "a promoted model is deployment, not trial"
+        );
+
+        let mut restarted = ConstrainedPolicy::default().with_persistence(store);
+        let after_restart = restarted.choose(
+            "planning:v3:intent=inspect;domain=document",
+            &similar_family_candidates,
+            "baseline",
+        );
+        assert_eq!(restarted.model_version(), 1);
+        assert_eq!(after_restart.action, "experience_first");
+        assert!(!after_restart.used_fallback);
+    }
+
+    #[test]
+    fn rejected_online_update_does_not_reappear_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut policy = ConstrainedPolicy::default().with_persistence(store.clone());
+        let baseline = PolicyChoice {
+            context: "task:restart-gate".into(),
+            action: "baseline".into(),
+            used_fallback: true,
+            confidence: 0.0,
+            explored: false,
+            candidates: vec!["baseline".into(), "knowledge_first".into()],
+        };
+        let candidate = PolicyChoice {
+            action: "knowledge_first".into(),
+            used_fallback: false,
+            explored: true,
+            ..baseline.clone()
+        };
+        for _ in 0..5 {
+            policy
+                .record_reward_gated(&baseline, 0.6, PolicyGate::default())
+                .unwrap();
+        }
+        for _ in 0..5 {
+            policy
+                .record_reward_gated(&candidate, 0.9, PolicyGate::default())
+                .unwrap();
+        }
+        let promoted = policy.model().clone();
+        assert_eq!(policy.model_version(), 1);
+
+        let rejected = policy
+            .record_reward_gated(&candidate, -1.0, PolicyGate::default())
+            .unwrap();
+        assert!(!rejected.accepted);
+        assert_eq!(policy.model(), &promoted);
+        assert_eq!(policy.model_version(), 1);
+
+        let restored = ConstrainedPolicy::default().with_persistence(store);
+        assert_eq!(restored.model_version(), 1);
+        assert_eq!(restored.model(), &promoted);
+    }
+
+    #[test]
+    fn promoted_policy_falls_back_when_live_candidate_return_regresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let mut policy = ConstrainedPolicy::default().with_persistence(store);
+        let candidates = vec!["baseline".into(), "knowledge_first".into()];
+        let baseline = PolicyChoice {
+            context: "task:live-guard".into(),
+            action: "baseline".into(),
+            used_fallback: true,
+            confidence: 0.0,
+            explored: false,
+            candidates: candidates.clone(),
+        };
+        let candidate = PolicyChoice {
+            action: "knowledge_first".into(),
+            used_fallback: false,
+            explored: true,
+            ..baseline.clone()
+        };
+        for _ in 0..5 {
+            policy
+                .record_reward_gated(&baseline, 0.6, PolicyGate::default())
+                .unwrap();
+            policy
+                .record_reward_gated(&candidate, 0.9, PolicyGate::default())
+                .unwrap();
+        }
+        assert_eq!(
+            policy
+                .choose("task:live-guard", &candidates, "baseline")
+                .action,
+            "knowledge_first"
+        );
+
+        for _ in 0..4 {
+            policy
+                .record_reward_gated(&candidate, -1.0, PolicyGate::default())
+                .unwrap();
+        }
+        let guarded = policy.choose("task:live-guard", &candidates, "baseline");
+        assert_eq!(guarded.action, "baseline");
+        assert!(guarded.used_fallback);
+        assert_eq!(policy.model_version(), 1);
     }
 
     #[test]

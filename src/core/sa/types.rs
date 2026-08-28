@@ -341,9 +341,11 @@ pub fn verify_aa_needs_execution(result: &TaskResult) -> bool {
         }
     }
     let s = result.summary.to_lowercase();
-    const COMPLETION_MARKERS: [&str; 10] = [
+    const COMPLETION_MARKERS: [&str; 12] = [
         "success:",
         "aa success:",
+        "pass:",
+        "ca pass:",
         "verified-pass",
         "verified pass",
         "task already done",

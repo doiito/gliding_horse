@@ -22,6 +22,61 @@ pub struct DimensionAuditResult {
     pub details: Vec<String>,
 }
 
+fn starts_with_verdict_token(text: &str, token: &str) -> bool {
+    text.strip_prefix(token).is_some_and(|rest| {
+        rest.is_empty()
+            || rest
+                .starts_with(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '：' | '-' | '—'))
+    })
+}
+
+fn ca_summary_verdict(summary: &str) -> Option<AuditStatus> {
+    let normalized = summary
+        .trim()
+        .trim_start_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '#' | '*' | '_' | '-' | '•')
+        })
+        .to_lowercase();
+
+    if ["conditional_pass", "conditional pass"]
+        .iter()
+        .any(|token| starts_with_verdict_token(&normalized, token))
+        || normalized.starts_with("有条件通过")
+    {
+        Some(AuditStatus::Warning(
+            "CA summary verdict is conditional".to_string(),
+        ))
+    } else if [
+        "failed",
+        "fail",
+        "ca failed",
+        "ca fail",
+        "verified-fail",
+        "verified fail",
+        "verified_fail",
+    ]
+    .iter()
+    .any(|token| starts_with_verdict_token(&normalized, token))
+        || normalized.starts_with("不通过")
+    {
+        Some(AuditStatus::Fail("CA summary verdict is FAIL".to_string()))
+    } else if [
+        "pass",
+        "ca pass",
+        "verified-pass",
+        "verified pass",
+        "verified_pass",
+    ]
+    .iter()
+    .any(|token| starts_with_verdict_token(&normalized, token))
+        || starts_with_verdict_token(&normalized, "通过")
+    {
+        Some(AuditStatus::Pass)
+    } else {
+        None
+    }
+}
+
 /// Run a dimension-level audit of task results against the 5W2H specification.
 ///
 /// Evaluates each of the 7 dimensions (what, why, who, when, where, how, how_much)
@@ -101,31 +156,7 @@ pub fn audit_dimensions(
             // Prefer an explicit overall CA verdict over token matching.  The
             // per-perspective body may contain both PASS and FAIL, so only a
             // line labelled as the overall verdict is authoritative.
-            let summary_verdict = {
-                let summary = result.summary.trim().to_lowercase();
-                if summary.starts_with("conditional_pass:")
-                    || summary.starts_with("conditional pass:")
-                    || summary.starts_with("有条件通过：")
-                {
-                    Some(AuditStatus::Warning(
-                        "CA summary verdict is conditional".to_string(),
-                    ))
-                } else if summary.starts_with("fail:")
-                    || summary.starts_with("failed:")
-                    || summary.starts_with("ca fail:")
-                    || summary.starts_with("ca failed:")
-                    || summary.starts_with("不通过：")
-                {
-                    Some(AuditStatus::Fail("CA summary verdict is FAIL".to_string()))
-                } else if summary.starts_with("pass:")
-                    || summary.starts_with("ca pass:")
-                    || summary.starts_with("通过：")
-                {
-                    Some(AuditStatus::Pass)
-                } else {
-                    None
-                }
-            };
+            let summary_verdict = ca_summary_verdict(&result.summary);
             let evidence_lines: Vec<&str> = evidence_text.lines().collect();
             let labelled_verdict = evidence_lines.iter().enumerate().find_map(|(index, line)| {
                 let lower = line.to_lowercase();
@@ -161,6 +192,7 @@ pub fn audit_dimensions(
                 }
             });
             let structured_verdict = summary_verdict.or(labelled_verdict);
+            let has_structured_verdict = structured_verdict.is_some();
 
             // CA agents often summarize objective evidence instead of
             // repeating every criterion verbatim (for example, "pytest 7
@@ -225,15 +257,16 @@ pub fn audit_dimensions(
             results.push(DimensionAuditResult {
                 dimension: "why".to_string(),
                 status: detail,
-                evidence: if evidence_text.lines().any(|line| {
-                    let lower = line.to_lowercase();
-                    lower.contains("overall_verdict")
-                        || lower.contains("overall conclusion")
-                        || lower.trim_start().starts_with("verdict:")
-                        || line.contains("总体结论")
-                        || line.contains("整体结论")
-                        || line.contains("审计结论")
-                }) {
+                evidence: if has_structured_verdict
+                    || evidence_text.lines().any(|line| {
+                        let lower = line.to_lowercase();
+                        lower.contains("overall_verdict")
+                            || lower.contains("overall conclusion")
+                            || lower.trim_start().starts_with("verdict:")
+                            || line.contains("总体结论")
+                            || line.contains("整体结论")
+                            || line.contains("审计结论")
+                    }) {
                     "structured CA overall verdict from full output".to_string()
                 } else if explicit_success {
                     "explicit CA audit/test success evidence".to_string()
@@ -1288,6 +1321,53 @@ impl Default for Task5W2H {
 mod tests {
     use super::*;
 
+    fn ca_result(summary: &str) -> crate::core::agent_runner::TaskResult {
+        crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-verdict".to_string(),
+            status: "success".to_string(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: summary.to_string(),
+            output: Some(serde_json::Value::String("审计证据".to_string())),
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: Vec::new(),
+            turn_count: 1,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: None,
+        }
+    }
+
+    #[test]
+    fn ca_fullwidth_pass_prefix_is_a_structured_success_verdict() {
+        let mut five_w2h = Task5W2H::new("研究 AI Agent", "形成完整报告");
+        five_w2h.why.success_criteria = vec![
+            "报告涵盖近期AI Agent的关键进展与突破".to_string(),
+            "输出为完整的Markdown格式文档".to_string(),
+        ];
+
+        let audit = audit_dimensions(
+            &five_w2h,
+            &ca_result("PASS：报告完整，7进展/7趋势/7场景/5图均达标"),
+            "iri://task/audit-verdict",
+            None,
+        );
+        let why = audit.iter().find(|item| item.dimension == "why").unwrap();
+        assert_eq!(why.status, AuditStatus::Pass);
+        assert_eq!(
+            why.evidence,
+            "structured CA overall verdict from full output"
+        );
+    }
+
+    #[test]
+    fn verdict_prefix_requires_a_token_boundary() {
+        assert!(ca_summary_verdict("PASS：verified").is_some());
+        assert!(ca_summary_verdict("CA PASS - verified").is_some());
+        assert!(ca_summary_verdict("passage summary").is_none());
+    }
+
     #[test]
     fn test_5w2h_lifecycle_progressive_filling() {
         let mut w2h = Task5W2H::new("Create Web service", "Provide REST API");
@@ -1627,6 +1707,41 @@ mod tests {
             archive_iri: None,
         };
         let audits = audit_dimensions(&w2h, &result, "iri://task/audit-ca-summary-pass", None);
+        assert!(matches!(
+            audits
+                .iter()
+                .find(|audit| audit.dimension == "why")
+                .unwrap()
+                .status,
+            AuditStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn audit_accepts_verify_first_verified_pass_summary() {
+        let mut w2h = Task5W2H::new("Read an exact field", "Return direct evidence");
+        w2h.why.success_criteria = vec![
+            "Return the exact value".into(),
+            "Cite the matching line".into(),
+        ];
+        let result = crate::core::agent_runner::TaskResult {
+            task_iri: "iri://task/audit-verify-first".into(),
+            status: "success".into(),
+            verdict: Some(crate::core::agent_runner::TaskVerdict::Success),
+            summary: "VERIFIED-PASS: ANSWER=helios-731 at line 3".into(),
+            output: Some(serde_json::Value::String(
+                "ANSWER=helios-731\nfixture.txt:3".into(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: vec![],
+            archive_iri: None,
+        };
+        let audits = audit_dimensions(&w2h, &result, "iri://task/audit-verify-first", None);
         assert!(matches!(
             audits
                 .iter()

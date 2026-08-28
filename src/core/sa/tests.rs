@@ -361,6 +361,13 @@ mod tests {
             )),
             "the required AA SUCCESS contract must terminate verify-first"
         );
+        assert!(
+            !verify_aa_needs_execution(&result_with(
+                "PASS: ANSWER=helios-731 at line 3, file intact",
+                Some(TaskVerdict::Success)
+            )),
+            "an AA-accepted CA deliverable restored for the user must still terminate verify-first"
+        );
     }
 
     #[test]
@@ -677,6 +684,8 @@ mod tests {
 
         let mut prev_summary = None;
         let mut da_output = None;
+        let mut latest_da_result = None;
+        let mut latest_ca_result = None;
         let mut latest_ca_report = None;
         let mut previous_ca_signature = None;
         let mut repeated_ca_failures = 0;
@@ -712,6 +721,8 @@ mod tests {
                 step_2_wave,
                 &mut prev_summary,
                 &mut da_output,
+                &mut latest_da_result,
+                &mut latest_ca_result,
                 &mut latest_ca_report,
                 &mut previous_ca_signature,
                 &mut repeated_ca_failures,
@@ -761,6 +772,8 @@ mod tests {
 
         let mut prev_summary = None;
         let mut da_output = None;
+        let mut latest_da_result = None;
+        let mut latest_ca_result = None;
         let mut latest_ca_report = None;
         let mut previous_ca_signature = None;
         let mut repeated_ca_failures = 0;
@@ -796,6 +809,8 @@ mod tests {
                 step_1_wave,
                 &mut prev_summary,
                 &mut da_output,
+                &mut latest_da_result,
+                &mut latest_ca_result,
                 &mut latest_ca_report,
                 &mut previous_ca_signature,
                 &mut repeated_ca_failures,
@@ -959,6 +974,144 @@ mod tests {
         assert!(handoff.contains("read_agent_output"));
         assert!(handoff.contains("iri://task/da-handoff-large/turn_1"));
         assert!(handoff.chars().count() < 2_200);
+    }
+
+    #[test]
+    fn accepted_direct_response_returns_da_deliverable_not_aa_disposition() {
+        let mut aa_result = TaskResult {
+            task_iri: "iri://task/direct-response".to_string(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "SUCCESS: accept the report".to_string(),
+            output: Some(serde_json::Value::String(
+                "SUCCESS: accept the report".to_string(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: Some("iri://task/direct-response/session/aa/turn_2".to_string()),
+        };
+        let da_result = TaskResult {
+            task_iri: aa_result.task_iri.clone(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "完整调研报告".to_string(),
+            output: Some(serde_json::Value::String(
+                "# AI Agent 调研报告\n\n```mermaid\ngraph TD\nA-->B\n```".to_string(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 8,
+            tool_call_count: 4,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: Some("iri://task/direct-response/session/da/turn_8".to_string()),
+        };
+        let constraints = std::collections::HashMap::from([(
+            crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+            crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+        )]);
+
+        super::execution::restore_accepted_deliverable(
+            &mut aa_result,
+            Some(&da_result),
+            None,
+            &constraints,
+            &crate::core::effect::EffectPolicy::EvidenceOnly,
+            false,
+        );
+
+        assert_eq!(aa_result.status, "success");
+        assert_eq!(aa_result.summary, "完整调研报告");
+        assert!(aa_result
+            .output
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .contains("```mermaid"));
+        assert_eq!(aa_result.archive_iri, da_result.archive_iri);
+    }
+
+    #[test]
+    fn verify_first_evidence_task_returns_ca_business_evidence_after_aa_accepts() {
+        let mut final_result = TaskResult {
+            task_iri: "iri://task/evidence".to_string(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "SUCCESS: task already done".to_string(),
+            output: None,
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 1,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: None,
+        };
+        let ca_result = TaskResult {
+            task_iri: final_result.task_iri.clone(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "PASS: ANSWER=helios-731 at fixture.txt:3 verified".to_string(),
+            output: Some(serde_json::Value::String(
+                "ANSWER=helios-731 — evidence: fixture.txt:3".to_string(),
+            )),
+            jsonld_output: None,
+            artifacts: vec![],
+            errors: vec![],
+            turn_count: 2,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: Some("iri://task/evidence/session/ca/turn_2".to_string()),
+        };
+
+        super::execution::restore_accepted_deliverable(
+            &mut final_result,
+            None,
+            Some(&ca_result),
+            &std::collections::HashMap::new(),
+            &crate::core::effect::EffectPolicy::EvidenceOnly,
+            true,
+        );
+
+        assert_eq!(final_result.summary, ca_result.summary);
+        assert_eq!(final_result.output, ca_result.output);
+        assert_eq!(final_result.archive_iri, ca_result.archive_iri);
+    }
+
+    #[test]
+    fn direct_response_recheck_uses_only_the_exact_agent_output_reader() {
+        let constraints = std::collections::HashMap::from([
+            (
+                crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+            ),
+            (
+                crate::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::WORKSPACE_CONTEXT_DISABLED.to_string(),
+            ),
+        ]);
+        assert_eq!(
+            super::execution::direct_response_recheck_tools(&constraints),
+            Some(vec!["read_agent_output".to_string()])
+        );
+
+        let workspace_task = std::collections::HashMap::from([(
+            crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+            crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+        )]);
+        assert_eq!(
+            super::execution::direct_response_recheck_tools(&workspace_task),
+            None,
+            "workspace-backed CA must retain independent file/command verification"
+        );
     }
 
     fn recovery_step(id: &str, role: AgentRole, dependencies: &[&str]) -> PlanStep {

@@ -67,6 +67,81 @@ pub struct SkillDiscoveryEngine {
 }
 
 impl SkillDiscoveryEngine {
+    fn lexical_terms(text: &str) -> HashSet<String> {
+        const STOP_WORDS: &[&str] = &[
+            "and", "the", "for", "with", "from", "into", "that", "this", "task", "current",
+            "using", "only", "without", "return", "complete",
+        ];
+        text.to_lowercase()
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|term| term.chars().count() >= 3)
+            .filter(|term| !STOP_WORDS.contains(term))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Deterministic retrieval fallback for installations without a semantic
+    /// embedding provider. It requires multiple shared distinctive terms and
+    /// never turns the hash-vector availability fallback into relevance.
+    fn lexical_relevance(task: &Task5W2H, skill: &SkillGraphNode) -> Option<f32> {
+        if let (Some(task_role), Some(skill_role)) = (
+            task.who.as_deref(),
+            skill.w2h.who.required_agent_role.as_deref(),
+        ) {
+            let explicitly_allowed = skill.tags.iter().any(|tag| {
+                tag.strip_prefix("allowed-role:")
+                    .is_some_and(|role| role.eq_ignore_ascii_case(task_role))
+            });
+            if !task_role.eq_ignore_ascii_case(skill_role) && !explicitly_allowed {
+                return None;
+            }
+        }
+        if let Some(phase) = task.when_phase.as_deref() {
+            // Task5W2H.when is often a temporal value (Immediate/Scheduled),
+            // whereas skill phases are BizAgent phases. Enforce only when the
+            // caller supplied a real business phase; comparing different
+            // ontologies silently hid otherwise relevant skills.
+            let business_phase = matches!(
+                phase.to_ascii_lowercase().as_str(),
+                "plan" | "pa" | "do" | "da" | "check" | "ca" | "act" | "aa"
+            );
+            if business_phase
+                && !skill.w2h.when.applicable_phases.is_empty()
+                && !skill
+                    .w2h
+                    .when
+                    .applicable_phases
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(phase))
+            {
+                return None;
+            }
+        }
+        let task_text = [
+            task.what.as_str(),
+            task.why.as_str(),
+            task.how_approach.as_deref().unwrap_or_default(),
+        ]
+        .join(" ");
+        let mut skill_parts = vec![
+            skill.name.as_str(),
+            skill.description.as_str(),
+            skill.w2h.what.as_str(),
+            skill.w2h.why.as_str(),
+            skill.w2h.how.approach.as_str(),
+        ];
+        skill_parts.extend(skill.tags.iter().map(String::as_str));
+        let task_terms = Self::lexical_terms(&task_text);
+        let skill_terms = Self::lexical_terms(&skill_parts.join(" "));
+        let shared = task_terms.intersection(&skill_terms).count();
+        if shared < 2 {
+            return None;
+        }
+        let smaller = task_terms.len().min(skill_terms.len()).max(1);
+        let coverage = shared as f32 / smaller as f32;
+        (coverage >= 0.15).then(|| (0.55 + coverage.min(1.0) * 0.25).min(0.8))
+    }
+
     pub fn new(graph_store: Arc<SkillGraphStore>) -> Self {
         Self {
             graph_store,
@@ -207,6 +282,33 @@ impl SkillDiscoveryEngine {
                 relevance_score: score,
                 match_reasons,
                 required_dependencies: required_deps,
+            });
+        }
+
+        // Phase 1b: safe lexical overlap. The historical 5W2H query requires
+        // the skill text to contain the complete task sentence, which is too
+        // strict for accumulated/generalized skills. Multiple-term overlap
+        // gives deterministic retrieval when only fallback embeddings exist,
+        // while the threshold keeps unrelated skills out.
+        for skill in self.graph_store.list_all_skills() {
+            if seen_iris.contains(&skill.skill_iri) {
+                continue;
+            }
+            let Some(score) = Self::lexical_relevance(task, &skill) else {
+                continue;
+            };
+            seen_iris.insert(skill.skill_iri.clone());
+            let required_dependencies = self
+                .graph_store
+                .resolve_dependencies(&skill.skill_iri)
+                .into_iter()
+                .filter(|dependency| dependency != &skill.skill_iri)
+                .collect();
+            matches.push(SkillMatch {
+                skill,
+                relevance_score: score,
+                match_reasons: vec!["deterministic lexical overlap".to_string()],
+                required_dependencies,
             });
         }
 
@@ -690,6 +792,53 @@ mod tests {
             .await;
 
         assert!(matches.is_empty(), "got fabricated matches: {matches:?}");
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_retrieves_a_relevant_accumulated_skill() {
+        let store = Arc::new(SkillGraphStore::new());
+        store
+            .register_skill(
+                SkillGraphNode::new(
+                    "iri://skills/evidence-locator",
+                    "single-file evidence locator",
+                    "Read a named file once and cite the exact matching evidence line",
+                )
+                .with_5w2h(
+                    Skill5W2H::new(
+                        "Extract one exact field from one named text file",
+                        "Minimize redundant file reads while retaining evidence",
+                    )
+                    .with_agent_role("DA")
+                    .with_phase("Do"),
+                )
+                .with_tag("allowed-role:CA"),
+            )
+            .unwrap();
+        store
+            .register_skill(SkillGraphNode::new(
+                "iri://skills/unrelated",
+                "astronomy image classifier",
+                "Classify telescope pictures of distant galaxies",
+            ))
+            .unwrap();
+        let engine = SkillDiscoveryEngine::new(store);
+        let matches = engine
+            .discover_for_task(&Task5W2H {
+                what: "Read fixture.txt and extract the exact ANSWER value".to_string(),
+                why: "Cite the exact evidence line and avoid redundant file reads".to_string(),
+                who: Some("CA".to_string()),
+                when_phase: Some("Immediate".to_string()),
+                ..Task5W2H::default()
+            })
+            .await;
+
+        assert!(matches
+            .iter()
+            .any(|matched| matched.skill.skill_iri == "iri://skills/evidence-locator"));
+        assert!(!matches
+            .iter()
+            .any(|matched| matched.skill.skill_iri == "iri://skills/unrelated"));
     }
 
     #[tokio::test]

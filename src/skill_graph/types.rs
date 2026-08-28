@@ -592,6 +592,12 @@ impl SkillGraphNode {
         if !tags.contains(&meta.category) {
             tags.push(meta.category.clone());
         }
+        for role in &meta.allowed_roles {
+            let role_tag = format!("allowed-role:{role}");
+            if !tags.contains(&role_tag) {
+                tags.push(role_tag);
+            }
+        }
 
         let operation_risk = match meta.security_level.as_str() {
             "critical" => 0.9,
@@ -1869,6 +1875,8 @@ mod tests {
         assert!(node
             .tags
             .contains(&"iri://skill-types/FileOperation".to_string()));
+        assert!(node.tags.contains(&"allowed-role:PA".to_string()));
+        assert!(node.tags.contains(&"allowed-role:DA".to_string()));
         let sec = node.security_info.expect("security_info should be set");
         assert_eq!(sec.source, SkillSource::SystemBuiltin);
         assert_eq!(sec.trust_level, TrustLevel::System);

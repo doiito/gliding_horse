@@ -21,6 +21,47 @@ pub struct Settings {
     pub batch_agents: BatchSettings,
     #[serde(default)]
     pub workspace: WorkspaceSettings,
+    /// Guardrails for the generic continuous-learning policy. Applications
+    /// may supply evidence, but cannot bypass these promotion thresholds.
+    #[serde(default)]
+    pub policy_learning: PolicyLearningSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PolicyLearningSettings {
+    /// Same-family baseline outcomes required before a bounded candidate arm
+    /// may be sampled.
+    #[serde(default = "default_candidate_trial_min_baseline_samples")]
+    pub candidate_trial_min_baseline_samples: u32,
+    /// Independent baseline/candidate outcomes required on both arms before
+    /// the executable model can be promoted.
+    #[serde(default = "default_policy_promotion_min_samples")]
+    pub promotion_min_samples: u32,
+    /// Minimum candidate mean reward improvement over the baseline mean.
+    #[serde(default = "default_policy_promotion_min_improvement")]
+    pub promotion_min_improvement: f32,
+}
+
+fn default_candidate_trial_min_baseline_samples() -> u32 {
+    1
+}
+
+fn default_policy_promotion_min_samples() -> u32 {
+    5
+}
+
+fn default_policy_promotion_min_improvement() -> f32 {
+    0.01
+}
+
+impl Default for PolicyLearningSettings {
+    fn default() -> Self {
+        Self {
+            candidate_trial_min_baseline_samples: default_candidate_trial_min_baseline_samples(),
+            promotion_min_samples: default_policy_promotion_min_samples(),
+            promotion_min_improvement: default_policy_promotion_min_improvement(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -364,6 +405,15 @@ pub struct AgentExecutionBudgetSettings {
     /// Zero disables the convergence gate.
     #[serde(default = "default_pa_planning_focus_turns")]
     pub pa_planning_focus_turns: u32,
+    /// Evidence-only DA work must eventually synthesize the collected
+    /// evidence instead of searching indefinitely. At this many tool turns,
+    /// broad discovery is withdrawn while targeted source reads remain.
+    #[serde(default = "default_da_evidence_focus_turns")]
+    pub da_evidence_focus_turns: u32,
+    /// At this many evidence-only DA tool turns, remove tools and require the
+    /// final evidence-backed deliverable. Zero disables the close gate.
+    #[serde(default = "default_da_evidence_close_turns")]
+    pub da_evidence_close_turns: u32,
     #[serde(default = "default_biz_agent_max_sub_agents")]
     pub max_sub_agents: usize,
     #[serde(default = "default_ca_handoff_max_chars")]
@@ -426,6 +476,12 @@ fn default_ca_evidence_close_turns() -> u32 {
 fn default_pa_planning_focus_turns() -> u32 {
     4
 }
+fn default_da_evidence_focus_turns() -> u32 {
+    5
+}
+fn default_da_evidence_close_turns() -> u32 {
+    8
+}
 fn default_biz_agent_max_sub_agents() -> usize {
     5
 }
@@ -481,6 +537,8 @@ impl Default for AgentExecutionBudgetSettings {
             ca_evidence_focus_turns: default_ca_evidence_focus_turns(),
             ca_evidence_close_turns: default_ca_evidence_close_turns(),
             pa_planning_focus_turns: default_pa_planning_focus_turns(),
+            da_evidence_focus_turns: default_da_evidence_focus_turns(),
+            da_evidence_close_turns: default_da_evidence_close_turns(),
             max_sub_agents: default_biz_agent_max_sub_agents(),
             ca_handoff_max_chars: default_ca_handoff_max_chars(),
             recursive_handoff_max_chars: default_recursive_handoff_max_chars(),
@@ -1405,6 +1463,7 @@ impl Default for Settings {
             token_optimization: TokenOptimizationSettings::default(),
             batch_agents: BatchSettings::default(),
             workspace: WorkspaceSettings::default(),
+            policy_learning: PolicyLearningSettings::default(),
         }
     }
 }
@@ -1478,6 +1537,15 @@ impl Settings {
                     .to_string(),
             );
         }
+        if budget.da_evidence_close_turns != 0
+            && budget.da_evidence_focus_turns != 0
+            && budget.da_evidence_close_turns <= budget.da_evidence_focus_turns
+        {
+            return Err(
+                "agents.execution_budget.da_evidence_close_turns must be zero or greater than da_evidence_focus_turns"
+                    .to_string(),
+            );
+        }
         if budget.max_sub_agents == 0 {
             return Err("agents.execution_budget.max_sub_agents must be > 0".to_string());
         }
@@ -1533,6 +1601,19 @@ impl Settings {
             || self.workspace.effect_snapshot_max_bytes == 0
         {
             return Err("workspace effect snapshot limits must be > 0".to_string());
+        }
+        if self.policy_learning.candidate_trial_min_baseline_samples == 0
+            || self.policy_learning.promotion_min_samples == 0
+        {
+            return Err("policy learning sample thresholds must be > 0".to_string());
+        }
+        if !self.policy_learning.promotion_min_improvement.is_finite()
+            || !(-2.0..=2.0).contains(&self.policy_learning.promotion_min_improvement)
+        {
+            return Err(
+                "policy_learning.promotion_min_improvement must be finite and within [-2, 2]"
+                    .to_string(),
+            );
         }
         if self.tool_result_router.max_micro_tools == 0
             || self.tool_result_router.micro_tool_page_size == 0
@@ -1652,6 +1733,8 @@ mod tests {
               ca_evidence_focus_turns: 9
               ca_evidence_close_turns: 14
               pa_planning_focus_turns: 6
+              da_evidence_focus_turns: 7
+              da_evidence_close_turns: 12
               max_sub_agents: 8
               ca_handoff_max_chars: 9000
               recursive_handoff_max_chars: 5000
@@ -1681,6 +1764,8 @@ mod tests {
         assert_eq!(settings.execution_budget.ca_evidence_close_turns, 14);
         assert_eq!(settings.execution_budget.da_repair_effect_block_turns, 4);
         assert_eq!(settings.execution_budget.pa_planning_focus_turns, 6);
+        assert_eq!(settings.execution_budget.da_evidence_focus_turns, 7);
+        assert_eq!(settings.execution_budget.da_evidence_close_turns, 12);
         assert_eq!(settings.execution_budget.max_sub_agents, 8);
         assert_eq!(settings.execution_budget.ca_handoff_max_chars, 9_000);
         assert_eq!(settings.execution_budget.max_plan_steps, 18);

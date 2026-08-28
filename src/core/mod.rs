@@ -40,8 +40,8 @@ pub use five_w2h::*;
 pub use perception_store::{PerceptionEntry, PerceptionSource, PerceptionStore};
 pub use policy_learning::{
     ArmStats, ConstrainedPolicy, LearningMode, PolicyChoice, PolicyDriftReport, PolicyEvaluation,
-    PolicyGate, PolicyObservation, PolicyState, PolicyVersion, TrainablePolicyModel,
-    TrainingMetrics, TrajectoryStep,
+    PolicyGate, PolicyObservation, PolicyObservationEvidence, PolicyState, PolicyVersion,
+    TrainablePolicyModel, TrainingMetrics, TrajectoryStep,
 };
 pub use prompt_contract::{ApplicationPromptProfile, PromptAssemblyReport, PromptVariant};
 pub use prompt_loader::{PromptConfig, PromptLoader};

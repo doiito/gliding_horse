@@ -154,6 +154,54 @@ const DEFAULT_CODE_SCAN_EXCLUSIONS: &[&str] = &[
 ];
 
 const GLIDINGCODE_WORKFLOW_SKILL_IRI: &str = "iri://skills/glidingcode-workflow";
+const GLIDINGCODE_AUTO_RELATED_PREFIX: &str = "glidingcode:auto-related:";
+const LEGACY_AUTO_RELATED_PREFIX: &str = "Related via: ";
+
+fn shared_bootstrap_skill_types(
+    source: &glidinghorse::skill_graph::types::SkillGraphNode,
+    target: &glidinghorse::skill_graph::types::SkillGraphNode,
+) -> Vec<String> {
+    source
+        .tags
+        .iter()
+        .filter(|tag| tag.starts_with("iri://skill-types/"))
+        .filter(|tag| target.tags.contains(*tag))
+        .cloned()
+        .collect()
+}
+
+fn is_legacy_glidingcode_auto_link(
+    link: &glidinghorse::skill_graph::types::SkillLink,
+    registered_iris: &std::collections::HashSet<String>,
+) -> bool {
+    link.link_type == SkillLinkType::Related
+        && registered_iris.contains(&link.target_iri)
+        && link.description.starts_with(LEGACY_AUTO_RELATED_PREFIX)
+}
+
+fn is_current_glidingcode_auto_link(
+    link: &glidinghorse::skill_graph::types::SkillLink,
+    registered_iris: &std::collections::HashSet<String>,
+) -> bool {
+    link.link_type == SkillLinkType::Related
+        && registered_iris.contains(&link.target_iri)
+        && link
+            .description
+            .starts_with(GLIDINGCODE_AUTO_RELATED_PREFIX)
+}
+
+fn skill_links_equal(
+    left: &[glidinghorse::skill_graph::types::SkillLink],
+    right: &[glidinghorse::skill_graph::types::SkillLink],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.link_type == right.link_type
+                && left.target_iri == right.target_iri
+                && left.strength == right.strength
+                && left.description == right.description
+        })
+}
 
 fn glidingcode_learning_skill_node() -> glidinghorse::skill_graph::types::SkillGraphNode {
     use glidinghorse::skill_graph::types::{Skill5W2H, SkillGraphNode};
@@ -688,9 +736,10 @@ impl CodeCliEngine {
             Err(error) => warn!(%error, "Failed to recover in-flight evolution proposals"),
         }
 
-        // ── Auto-create Related links between skills sharing skill_types ──
-        // This gives the skill graph non-zero edge count (SG: N E) from startup
-        // and makes the cognitive network navigable from the beginning.
+        // ── Reconcile Related links between skills sharing skill_types ──
+        // The expected topology is computed deterministically, then each
+        // affected source is updated once. Repeated startup is therefore a
+        // no-op instead of appending reverse/duplicate edges.
         {
             // Restrict this bootstrap heuristic to the registered application
             // tool skills. Learned/generalized nodes are linked by governed
@@ -701,60 +750,82 @@ impl CodeCliEngine {
                 .into_iter()
                 .map(|skill| skill.skill_iri)
                 .collect::<std::collections::HashSet<_>>();
-            let nodes = skill_graph
+
+            let mut nodes = skill_graph
                 .list_all_skills()
                 .into_iter()
                 .filter(|skill| registered_iris.contains(&skill.skill_iri))
                 .collect::<Vec<_>>();
-            let mut link_count = 0usize;
+            nodes.sort_by(|left, right| left.skill_iri.cmp(&right.skill_iri));
+
+            let mut expected = std::collections::HashMap::<
+                String,
+                Vec<glidinghorse::skill_graph::types::SkillLink>,
+            >::new();
             for i in 0..nodes.len() {
                 for j in (i + 1)..nodes.len() {
                     let a = &nodes[i];
                     let b = &nodes[j];
-                    let shared: Vec<&str> = a
-                        .tags
-                        .iter()
-                        .filter_map(|t| {
-                            if b.tags.contains(t) {
-                                Some(t.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    // Role/category tags are retrieval and authorization
+                    // metadata, not semantic evidence that two operations are
+                    // related. Restrict topology to canonical skill-type IRIs.
+                    let shared = shared_bootstrap_skill_types(a, b);
                     if !shared.is_empty() {
                         let strength = if shared.len() >= 2 {
                             LinkStrength::Recommended
                         } else {
                             LinkStrength::Navigation
                         };
-                        let desc = format!("Related via: {}", shared.join(", "));
-                        let already_linked = a.links.iter().any(|link| {
-                            link.target_iri == b.skill_iri
-                                && link.link_type == SkillLinkType::Related
-                                && link.strength == strength
-                                && link.description == desc
-                        });
-                        if !already_linked
-                            && skill_graph
-                                .add_link(
-                                    &a.skill_iri,
-                                    &b.skill_iri,
-                                    SkillLinkType::Related,
-                                    strength,
-                                    &desc,
-                                )
-                                .is_ok()
-                        {
-                            link_count += 1;
+                        let desc =
+                            format!("{}{}", GLIDINGCODE_AUTO_RELATED_PREFIX, shared.join(", "));
+                        expected.entry(a.skill_iri.clone()).or_default().push(
+                            glidinghorse::skill_graph::types::SkillLink {
+                                link_type: SkillLinkType::Related,
+                                target_iri: b.skill_iri.clone(),
+                                strength,
+                                description: desc,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Builds before the role-aware discovery fix compared every tag.
+            // Once `allowed-role:*` became a graph tag, that produced a dense
+            // near-complete graph. Remove only old/current application-owned
+            // generated links, then install the deterministic expected set.
+            // Governed/learned links are deliberately untouched.
+            let mut repaired_sources = 0usize;
+            let mut removed_legacy_links = 0usize;
+            let expected_link_count = expected.values().map(Vec::len).sum::<usize>();
+            for mut node in nodes {
+                let before = node.links.clone();
+                node.links.retain(|link| {
+                    let legacy = is_legacy_glidingcode_auto_link(link, &registered_iris);
+                    if legacy {
+                        removed_legacy_links += 1;
+                    }
+                    !legacy && !is_current_glidingcode_auto_link(link, &registered_iris)
+                });
+                if let Some(mut generated) = expected.remove(&node.skill_iri) {
+                    generated.sort_by(|left, right| left.target_iri.cmp(&right.target_iri));
+                    node.links.extend(generated);
+                }
+                if !skill_links_equal(&before, &node.links) {
+                    match skill_graph.update_skill(node) {
+                        Ok(()) => repaired_sources += 1,
+                        Err(error) => {
+                            warn!(%error, "Failed to reconcile glidingcode auto-links")
                         }
                     }
                 }
             }
-            if link_count > 0 {
+            if repaired_sources > 0 {
                 info!(
-                    link_count = link_count,
-                    "Auto-created skill graph edges from shared types"
+                    repaired_sources,
+                    removed_legacy_links,
+                    expected_link_count,
+                    "Reconciled deterministic application skill topology"
                 );
             }
         }
@@ -951,6 +1022,7 @@ impl CodeCliEngine {
         .with_perception_store(Arc::new(runner_perception))
         .with_discovery_engine(discovery_engine.clone())
         .with_learning_mode(config.learning_mode)
+        .with_policy_learning_settings(&settings.policy_learning)
         .with_perception_ontology_bridge(ontology_bridge.clone());
 
         let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) =
@@ -1183,13 +1255,21 @@ impl CodeCliEngine {
         let task_id = uuid::Uuid::new_v4().to_string();
         let task_iri = format!("iri://task/{}", task_id);
 
-        // Collect workspace file summary once for both paths
-        let ws_summary = self
-            .workspace_monitor
-            .as_ref()
-            .and_then(|wm| wm.get_file_inventory_summary());
+        let uses_workspace = glidingcode_task_uses_workspace(user_input);
+        // External knowledge/research tasks must not pay for a code scan or
+        // receive unrelated project inventory merely because glidingcode was
+        // launched from a shared workspace.
+        let ws_summary = uses_workspace
+            .then(|| {
+                self.workspace_monitor
+                    .as_ref()
+                    .and_then(|wm| wm.get_file_inventory_summary())
+            })
+            .flatten();
 
-        self.scan_workspace_code()?;
+        if uses_workspace {
+            self.scan_workspace_code()?;
+        }
 
         let result = if let Some(ref wf_path) = self.config.workflow_path {
             let wf_jsonld = std::fs::read_to_string(wf_path)
@@ -1964,6 +2044,10 @@ impl CodeCliEngine {
                     ("/treatment/objective_fingerprint", "objective"),
                     ("/treatment/workspace_fingerprint", "workspace"),
                     ("/treatment/experiment_model", "model"),
+                    (
+                        "/treatment/experiment_config_fingerprint",
+                        "experiment_config",
+                    ),
                     ("/treatment/experiment_seed", "seed"),
                     ("/treatment/orchestration_mode", "orchestration_mode"),
                 ] {
@@ -1989,15 +2073,41 @@ impl CodeCliEngine {
             })
             .collect::<Vec<_>>();
 
+        let configured_gate = evaluations
+            .iter()
+            .rev()
+            .find_map(|evaluation| evaluation.get("policy_gate"))
+            .and_then(|value| {
+                serde_json::from_value::<glidinghorse::core::policy_learning::PolicyGate>(
+                    value.clone(),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let candidate_trial_min_baseline_samples = evaluations
+            .iter()
+            .rev()
+            .find_map(|evaluation| {
+                evaluation
+                    .get("candidate_trial_min_baseline_samples")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or_else(|| {
+                glidinghorse::config::settings::PolicyLearningSettings::default()
+                    .candidate_trial_min_baseline_samples as u64
+            });
+
         serde_json::json!({
             "evaluation_count": evaluations.len(),
             "arms": arms,
             "pairs": pairs,
             "gate": {
                 "same_family_only": true,
-                "candidate_trial_after_same_family_baseline_samples": 1,
-                "promotion_minimum_baseline_samples": 5,
-                "promotion_minimum_candidate_samples": 5,
+                "controlled_pairs_require_matching_seed_model_workspace_objective_and_orchestration": true,
+                "candidate_trial_after_same_family_baseline_samples": candidate_trial_min_baseline_samples,
+                "promotion_minimum_baseline_samples": configured_gate.min_samples,
+                "promotion_minimum_candidate_samples": configured_gate.min_samples,
+                "promotion_minimum_improvement": configured_gate.min_improvement,
                 "unpromoted_model_role": "shadow_or_bounded_candidate",
             }
         })
@@ -2094,10 +2204,12 @@ impl CodeCliEngine {
                 wm.rescan();
             }
         }
-        // Keep the code-KG precondition equivalent to the CLI task path.
-        // Scan failure is surfaced rather than silently claiming an updated
-        // code graph for a TUI/resume task.
-        self.scan_workspace_code()?;
+        let uses_workspace = glidingcode_task_uses_workspace(user_input);
+        // Keep the code-KG precondition equivalent to the CLI task path only
+        // for tasks that actually concern this workspace.
+        if uses_workspace {
+            self.scan_workspace_code()?;
+        }
         // Lazy MCP connect — connect to registered servers on first task
         if let Some(ref handle) = self.mcp_client {
             let mut guard = handle.lock().await;
@@ -2127,10 +2239,13 @@ impl CodeCliEngine {
 
         use glidinghorse::core::agent_runner::TaskContext;
 
-        let ws_summary = self
-            .workspace_monitor
-            .as_ref()
-            .and_then(|wm| wm.get_file_inventory_summary());
+        let ws_summary = uses_workspace
+            .then(|| {
+                self.workspace_monitor
+                    .as_ref()
+                    .and_then(|wm| wm.get_file_inventory_summary())
+            })
+            .flatten();
 
         let ctx = TaskContext::new(task_iri, user_input, self.config.max_iterations)
             .with_original_task(user_input);
@@ -2519,11 +2634,17 @@ fn with_glidingcode_task_constraints(
     let normalized = user_input.to_lowercase();
     let explicitly_read_only = [
         "不要修改",
+        "不得修改",
+        "禁止修改",
         "不修改任何文件",
+        "只读",
         "只读分析",
         "仅分析",
         "do not modify",
+        "must not modify",
+        "do not change",
         "without modifying",
+        "read only",
         "read-only review",
     ]
     .iter()
@@ -2575,7 +2696,29 @@ fn with_glidingcode_task_constraints(
     .iter()
     .any(|marker| normalized.contains(marker));
 
-    if explicitly_read_only {
+    let uses_workspace = glidingcode_task_uses_workspace(user_input);
+    let ctx = if uses_workspace {
+        ctx
+    } else {
+        ctx.with_constraint(
+            glidinghorse::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+            glidinghorse::core::agent_runner::WORKSPACE_CONTEXT_DISABLED,
+        )
+        .with_constraint(
+            glidinghorse::core::agent_runner::DELIVERY_MODE_CONSTRAINT,
+            glidinghorse::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE,
+        )
+    };
+    let ctx = if !uses_workspace && glidingcode_task_requires_web_research(user_input) {
+        ctx.with_constraint(
+            glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT,
+            glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH,
+        )
+    } else {
+        ctx
+    };
+
+    if !uses_workspace || explicitly_read_only {
         ctx.with_effect_policy(glidinghorse::core::effect::EffectPolicy::EvidenceOnly)
             .with_constraint("effect_policy", "evidence_only")
     } else if requests_change && conditional_change {
@@ -2595,6 +2738,164 @@ fn with_glidingcode_task_constraints(
     } else {
         ctx
     }
+}
+
+fn glidingcode_task_requires_web_research(user_input: &str) -> bool {
+    let normalized = user_input.to_lowercase();
+    [
+        "最新",
+        "近期",
+        "当前进展",
+        "发展趋势",
+        "调研",
+        "网络搜索",
+        "网上搜索",
+        "搜索最新",
+        "latest",
+        "recent",
+        "current progress",
+        "trend",
+        "research report",
+        "web search",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+/// Application-level scope classification. This is intentionally not part of
+/// glidinghorse: the kernel supports generic tasks, while glidingcode decides
+/// whether its mounted software workspace is relevant to a user request.
+fn glidingcode_task_uses_workspace(user_input: &str) -> bool {
+    let normalized = user_input.to_lowercase();
+    let workspace_markers = [
+        "工作区",
+        "代码库",
+        "仓库",
+        "源码",
+        "源代码",
+        "代码",
+        "目录",
+        "文件",
+        "项目",
+        "workspace",
+        "repository",
+        "repo",
+        "codebase",
+        "source code",
+        "directory",
+        " file",
+    ];
+    let mutation_markers = [
+        "创建",
+        "做",
+        "写",
+        "编写",
+        "实现",
+        "修复",
+        "修改",
+        "开发",
+        "优化",
+        "重构",
+        "新增",
+        "增加",
+        "删除",
+        "生成",
+        "搭建",
+        "完善",
+        "解决",
+        "implement",
+        "create",
+        "build",
+        "fix",
+        "modify",
+        "develop",
+        "optimize",
+        "refactor",
+        "add",
+        "remove",
+        "generate",
+        "write",
+    ];
+    let code_artifact_markers = [
+        "功能",
+        "实现问题",
+        "程序",
+        "应用",
+        "网页",
+        "网站",
+        "接口",
+        "模块",
+        "组件",
+        "类",
+        "函数",
+        "测试",
+        "脚本",
+        "数据库",
+        "bug",
+        "feature",
+        "application",
+        "website",
+        "api",
+        "module",
+        "component",
+        "class",
+        "function",
+        "test",
+        "script",
+        "database",
+    ];
+    let explicit_workspace = workspace_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let code_mutation = mutation_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        && code_artifact_markers
+            .iter()
+            .any(|marker| normalized.contains(marker));
+    let explicit_path = normalized
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '，' | '。'
+                        | '；'
+                        | '：'
+                        | '、'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                )
+        })
+        .any(|raw_token| {
+            let token = raw_token.trim_matches(|ch: char| {
+                ch.is_ascii_punctuation() && !matches!(ch, '/' | '\\' | '.' | '_' | '-')
+                    || matches!(ch, '，' | '。' | '；' | '：' | '、' | '“' | '”' | '‘' | '’')
+            });
+            if token.starts_with("http://") || token.starts_with("https://") {
+                return false;
+            }
+            let common_file_extension = [
+                ".txt", ".md", ".json", ".jsonld", ".yaml", ".yml", ".toml", ".xml", ".csv", ".rs",
+                ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".kt", ".c", ".h", ".cpp",
+                ".hpp", ".cs", ".php", ".rb", ".swift", ".sh", ".ps1", ".html", ".css", ".scss",
+                ".sql", ".proto", ".lock",
+            ]
+            .iter()
+            .any(|extension| token.ends_with(extension));
+            token.starts_with('/')
+                || token.starts_with("./")
+                || token.starts_with("../")
+                || token.contains('/')
+                || token.contains('\\')
+                || common_file_extension
+        });
+    explicit_workspace || code_mutation || explicit_path
 }
 
 fn with_learning_experiment_constraints(
@@ -2622,9 +2923,69 @@ fn with_learning_experiment_constraints(
     } else {
         workspace_identity_fingerprint
     };
+    let workflow_fingerprint = config
+        .workflow_path
+        .as_deref()
+        .map(std::fs::read)
+        .transpose()
+        .map(|content| {
+            content
+                .map(|bytes| format!("sha256:{}", hex::encode(&Sha256::digest(bytes)[..12])))
+                .unwrap_or_else(|| "none".to_string())
+        })
+        .unwrap_or_else(|error| {
+            format!(
+                "unavailable:sha256:{}",
+                hex::encode(&Sha256::digest(error.to_string().as_bytes())[..12])
+            )
+        });
+    let skill_catalog_fingerprint = config
+        .skill_dir
+        .as_deref()
+        .map(std::path::Path::new)
+        .map(|root| {
+            workspace_state_fingerprint(
+                root,
+                &load_code_scan_exclusions(root, &[]),
+                snapshot_max_files,
+                snapshot_max_bytes,
+            )
+            .unwrap_or_else(|error| {
+                format!(
+                    "unavailable:sha256:{}",
+                    hex::encode(&Sha256::digest(error.to_string().as_bytes())[..12])
+                )
+            })
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let experiment_config_material = format!(
+        "glidingcode={};model={};max_iterations={};max_pdca_cycles={};workflow={};skills={}",
+        env!("CARGO_PKG_VERSION"),
+        config.model,
+        config.max_iterations,
+        config.max_pdca_cycles,
+        workflow_fingerprint,
+        skill_catalog_fingerprint,
+    );
+    let experiment_config_prefix = if workflow_fingerprint.starts_with("unavailable:")
+        || skill_catalog_fingerprint.starts_with("unavailable:")
+    {
+        "unavailable:sha256:"
+    } else {
+        "sha256:"
+    };
+    let experiment_config_fingerprint = format!(
+        "{}{}",
+        experiment_config_prefix,
+        hex::encode(&Sha256::digest(experiment_config_material.as_bytes())[..12])
+    );
     ctx = ctx
         .with_constraint("learning_skill_iri", GLIDINGCODE_WORKFLOW_SKILL_IRI)
         .with_constraint("learning_model", &config.model)
+        .with_constraint(
+            "learning_experiment_config_fingerprint",
+            &experiment_config_fingerprint,
+        )
         .with_constraint("learning_workspace_fingerprint", &workspace_fingerprint);
     if let Some(pair_id) = config.learning_pair_id.as_deref() {
         ctx = ctx.with_constraint("learning_pair_id", pair_id);
@@ -2639,8 +3000,9 @@ fn with_learning_experiment_constraints(
 mod tests {
     use super::{
         collect_workspace_code_files, glidingcode_learning_skill_node, glidingcode_prompt_profile,
-        load_code_scan_exclusions, with_glidingcode_task_constraints, workspace_state_fingerprint,
-        GLIDINGCODE_WORKFLOW_SKILL_IRI,
+        glidingcode_task_uses_workspace, is_legacy_glidingcode_auto_link,
+        load_code_scan_exclusions, shared_bootstrap_skill_types, with_glidingcode_task_constraints,
+        workspace_state_fingerprint, GLIDINGCODE_WORKFLOW_SKILL_IRI,
     };
 
     #[test]
@@ -2691,6 +3053,79 @@ mod tests {
     }
 
     #[test]
+    fn research_task_is_not_misclassified_as_workspace_code_work() {
+        let research = "做一个AI Agent最新进展以及发展趋势的调研报告，需要搜索最新的趋势和场景，使用markdown格式输出，涉及图形使用mermaid格式，给出完整报告";
+        assert!(!glidingcode_task_uses_workspace(research));
+
+        let ctx = glidinghorse::core::agent_runner::TaskContext::new("t", research, 10);
+        let ctx = with_glidingcode_task_constraints(ctx, research);
+        assert!(!ctx.workspace_context_enabled());
+        assert_eq!(
+            ctx.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::EvidenceOnly
+        );
+        assert_eq!(
+            ctx.constraints
+                .get(glidinghorse::core::agent_runner::DELIVERY_MODE_CONSTRAINT)
+                .map(String::as_str),
+            Some(glidinghorse::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE)
+        );
+        assert_eq!(
+            ctx.constraints
+                .get(glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT)
+                .map(String::as_str),
+            Some(glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH)
+        );
+        assert!(!glidingcode_task_uses_workspace(
+            "编写一份量子计算趋势报告并直接输出 Markdown"
+        ));
+        let generated_report =
+            glidinghorse::core::agent_runner::TaskContext::new("t2", "report", 10);
+        let generated_report = with_glidingcode_task_constraints(
+            generated_report,
+            "编写一份量子计算趋势报告并直接输出 Markdown",
+        );
+        assert_eq!(
+            generated_report.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::EvidenceOnly,
+            "output-only research must not be upgraded to a workspace mutation"
+        );
+
+        assert!(glidingcode_task_uses_workspace(
+            "分析本工作区源码并修复实现问题"
+        ));
+        assert!(glidingcode_task_uses_workspace(
+            "修改 /workspace/app/src/main.rs"
+        ));
+        assert!(glidingcode_task_uses_workspace(
+            "只读 fixture.txt，返回 ANSWER 精确值并引用证据行。不得修改。"
+        ));
+        assert!(glidingcode_task_uses_workspace(
+            "inspect src/runtime/agent.rs without modifying it"
+        ));
+        assert!(!glidingcode_task_uses_workspace(
+            "调研 https://example.com 上的最新行业趋势并直接输出报告"
+        ));
+        assert!(glidingcode_task_uses_workspace(
+            "写一个网页版即时战略游戏程序并进行测试"
+        ));
+
+        let exact_read_only = "只读检查工作区中的 fixture.txt，仅返回 ANSWER= 后的精确值，并引用对应证据行；不得修改任何文件。";
+        let exact_read_only_ctx = glidinghorse::core::agent_runner::TaskContext::new(
+            "read-only-task",
+            exact_read_only,
+            10,
+        );
+        let exact_read_only_ctx =
+            with_glidingcode_task_constraints(exact_read_only_ctx, exact_read_only);
+        assert_eq!(
+            exact_read_only_ctx.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::EvidenceOnly,
+            "explicit prohibitions must override the embedded Chinese mutation verb"
+        );
+    }
+
+    #[test]
     fn validated_knowledge_has_a_non_executable_application_skill_home() {
         let node = glidingcode_learning_skill_node();
         assert_eq!(node.skill_iri, GLIDINGCODE_WORKFLOW_SKILL_IRI);
@@ -2699,6 +3134,48 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag == "non-executable-learning-skill"));
+    }
+
+    #[test]
+    fn bootstrap_topology_uses_skill_types_not_role_or_category_metadata() {
+        use glidinghorse::skill_graph::types::{
+            LinkStrength, SkillGraphNode, SkillLink, SkillLinkType,
+        };
+
+        let source = SkillGraphNode::new("iri://skills/source", "source", "source")
+            .with_tag("file")
+            .with_tag("allowed-role:DA")
+            .with_tag("iri://skill-types/ReadOperation");
+        let unrelated = SkillGraphNode::new("iri://skills/unrelated", "unrelated", "unrelated")
+            .with_tag("file")
+            .with_tag("allowed-role:DA")
+            .with_tag("iri://skill-types/WriteOperation");
+        assert!(shared_bootstrap_skill_types(&source, &unrelated).is_empty());
+
+        let related = SkillGraphNode::new("iri://skills/related", "related", "related")
+            .with_tag("allowed-role:CA")
+            .with_tag("iri://skill-types/ReadOperation");
+        assert_eq!(
+            shared_bootstrap_skill_types(&source, &related),
+            vec!["iri://skill-types/ReadOperation"]
+        );
+
+        let legacy = SkillLink {
+            link_type: SkillLinkType::Related,
+            target_iri: unrelated.skill_iri.clone(),
+            strength: LinkStrength::Navigation,
+            description: "Related via: file, allowed-role:DA".to_string(),
+        };
+        let registered = [source.skill_iri.clone(), unrelated.skill_iri.clone()]
+            .into_iter()
+            .collect();
+        assert!(is_legacy_glidingcode_auto_link(&legacy, &registered));
+
+        let governed = SkillLink {
+            description: "validated learned relation".to_string(),
+            ..legacy
+        };
+        assert!(!is_legacy_glidingcode_auto_link(&governed, &registered));
     }
 
     #[test]
@@ -2718,6 +3195,7 @@ mod tests {
                     "experiment_pair_id": "pair-1",
                     "experiment_seed": "fixed-42",
                     "experiment_model": "deepseek-test",
+                    "experiment_config_fingerprint": "sha256:config",
                     "workspace_fingerprint": "sha256:workspace",
                     "objective_fingerprint": "sha256:objective",
                     "orchestration_mode": "pdca"
@@ -2789,6 +3267,11 @@ mod tests {
             summary["pairs"][0]["issues"][0],
             "missing_or_mismatched_workspace"
         );
+        assert!(summary["pairs"][0]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue == "missing_or_mismatched_experiment_config"));
     }
 
     #[test]

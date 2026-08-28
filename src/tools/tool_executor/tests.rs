@@ -16,6 +16,51 @@ mod tests {
     }
 
     #[test]
+    fn archived_agent_output_hides_foreign_session_tool_references() {
+        let mut value = json!({
+            "content": "Call read_full_result_call_00_foreign for the rest",
+            "nested": [
+                "read_full_result_abc-123",
+                "iri://tool-result/call_01_stale",
+                "https://agent-os.org/ontology/tool-result/call_02_stale"
+            ]
+        });
+        let count = redact_session_tool_references(&mut value);
+        assert_eq!(count, 4);
+        let rendered = value.to_string();
+        assert!(!rendered.contains("read_full_result_call_00_foreign"));
+        assert!(!rendered.contains("read_full_result_abc-123"));
+        assert!(!rendered.contains("iri://tool-result/call_01_stale"));
+        assert!(!rendered.contains("ontology/tool-result/call_02_stale"));
+        assert!(rendered.contains("session-scoped result reader omitted"));
+        assert!(rendered.contains("session-scoped tool result omitted"));
+    }
+
+    #[test]
+    fn agent_turn_reader_returns_stable_character_pages_without_nested_references() {
+        let mut node = json!({
+            "@type": "AgentTurn",
+            "role": "DA",
+            "cycle_id": "cycle-1",
+            "content": "甲乙read_full_result_foreign丙丁iri://tool-result/stale戊己"
+        });
+        let page = agent_turn_content_page(
+            &mut node,
+            &json!({"char_offset": 0, "char_limit": 12}),
+            "iri://task/t/session/s/turn_1",
+        )
+        .unwrap();
+        assert_eq!(page["char_offset"], 0);
+        assert_eq!(page["returned_chars"], 12);
+        assert!(page["next_char_offset"].as_u64().is_some());
+        assert!(!page["content"]
+            .as_str()
+            .unwrap()
+            .contains("read_full_result_foreign"));
+        assert!(!node.to_string().contains("iri://tool-result/stale"));
+    }
+
+    #[test]
     fn test_permission_policy_denies_dangerous_tool() {
         rt().block_on(async {
             let mut executor = ToolExecutor::new();
@@ -159,6 +204,44 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(capped_page["returned"], 3);
+        });
+    }
+
+    #[test]
+    fn micro_tool_character_pages_bound_single_line_json_results() {
+        rt().block_on(async {
+            let mut executor = ToolExecutor::new();
+            let storage_key = "iri://tool-result/long-json";
+            executor.store_micro_tool_data(storage_key, json!({"content": "abcdefghij"}));
+            executor.register_micro_tool(
+                "read_full_result_long_json",
+                MicroToolContext {
+                    call_id: "long_json".to_string(),
+                    storage_key: storage_key.to_string(),
+                    tool_name: "rag_search".to_string(),
+                    entity_types: vec![],
+                    preview_size: 4,
+                },
+            );
+
+            let first = executor
+                .execute("read_full_result_long_json", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(first["content"], "abcd");
+            assert_eq!(first["returned_chars"], 4);
+            assert_eq!(first["next_char_offset"], 4);
+            assert_eq!(first["truncated"], true);
+
+            let second = executor
+                .execute(
+                    "read_full_result_long_json",
+                    json!({"char_offset": first["next_char_offset"]}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(second["content"], "efgh");
+            assert_eq!(second["next_char_offset"], 8);
         });
     }
 

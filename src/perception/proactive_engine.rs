@@ -653,13 +653,14 @@ impl ProactiveEngine {
                 if let Some(ref hs) = self.hyperspace {
                     let hs_tags = experience.tags.clone();
                     if let Err(error) = hs
-                        .upsert_with_metadata(
+                        .upsert_recallable_with_metadata(
                             &iri,
                             &hs_content,
                             &hs_tags,
                             Some(experience.success_rating as f32),
                             Some(&["Experience".to_string()]),
                             None,
+                            false,
                         )
                         .await
                     {

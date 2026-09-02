@@ -18,7 +18,9 @@ use rand::Rng;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
+use crate::error::EngineError;
 use crate::hyper_vector::EmbeddingVector;
+use crate::hyper_vector::MetricKind;
 use crate::metric::Metric;
 
 /// HNSW configuration.
@@ -58,7 +60,7 @@ impl From<&Node> for SerializableNode {
     fn from(n: &Node) -> Self {
         Self {
             coords: n.vector.coords.clone(),
-            metric_tag: n.vector.metric as u32,
+            metric_tag: n.vector.metric.tag(),
             alpha: n.vector.alpha,
             neighbors0: n.neighbors0.clone(),
             neighbors_upper: n.neighbors_upper.clone(),
@@ -68,12 +70,23 @@ impl From<&Node> for SerializableNode {
 }
 
 impl SerializableNode {
-    pub fn to_embedding(&self, metric_kind: crate::hyper_vector::MetricKind) -> EmbeddingVector {
-        EmbeddingVector {
-            coords: self.coords.clone(),
-            metric: metric_kind,
-            alpha: self.alpha,
+    pub fn to_embedding(&self, metric_kind: MetricKind) -> Result<EmbeddingVector, EngineError> {
+        let encoded_metric = MetricKind::from_tag(self.metric_tag)?;
+        if encoded_metric != metric_kind {
+            return Err(EngineError::InvalidVector(format!(
+                "snapshot node metric {:?} does not match configured metric {:?}",
+                encoded_metric, metric_kind
+            )));
         }
+        let vector = EmbeddingVector::new(self.coords.clone(), metric_kind)?;
+        if !self.alpha.is_finite()
+            || (self.alpha - vector.alpha).abs() > 1e-12_f64.max(1e-10 * vector.alpha.abs())
+        {
+            return Err(EngineError::InvalidVector(
+                "snapshot node cached alpha does not match its coordinates".into(),
+            ));
+        }
+        Ok(vector)
     }
 }
 
@@ -569,19 +582,25 @@ impl IncrementalHNSW {
     }
 
     /// Import nodes from a snapshot.
-    pub fn import_nodes(&mut self, nodes: Vec<Option<SerializableNode>>) {
+    pub fn import_nodes(
+        &mut self,
+        nodes: Vec<Option<SerializableNode>>,
+    ) -> Result<(), EngineError> {
         let metric_kind = self.metric.kind();
         self.nodes = nodes
             .into_iter()
             .map(|sn| {
-                sn.map(|s| Node {
-                    vector: s.to_embedding(metric_kind),
-                    neighbors0: s.neighbors0,
-                    neighbors_upper: s.neighbors_upper,
-                    level: s.level,
+                sn.map(|s| {
+                    Ok(Node {
+                        vector: s.to_embedding(metric_kind)?,
+                        neighbors0: s.neighbors0,
+                        neighbors_upper: s.neighbors_upper,
+                        level: s.level,
+                    })
                 })
+                .transpose()
             })
-            .collect();
+            .collect::<Result<Vec<_>, EngineError>>()?;
         self.fix_entry_point();
         self.fix_max_layer();
         // Resize visited_gen
@@ -589,6 +608,7 @@ impl IncrementalHNSW {
             self.visited_gen.len().max(self.nodes.len()).max(1024),
             || AtomicUsize::new(0),
         );
+        Ok(())
     }
 }
 
@@ -604,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_empty_search() {
-        let mut idx = IncrementalHNSW::new(Box::new(CosineMetric), HnswConfig::default());
+        let idx = IncrementalHNSW::new(Box::new(CosineMetric), HnswConfig::default());
         assert!(idx.search(&v(vec![1.0, 0.0]), 5).is_empty());
     }
 
@@ -686,7 +706,7 @@ mod tests {
 
         // Re-import into fresh index
         let mut idx2 = IncrementalHNSW::new(Box::new(CosineMetric), HnswConfig::default());
-        idx2.import_nodes(exported);
+        idx2.import_nodes(exported).unwrap();
         assert_eq!(idx2.len(), 2);
         assert!(idx2.contains(0));
         assert!(idx2.contains(1));

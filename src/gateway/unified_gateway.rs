@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::config::settings::GatewaySettings;
+use crate::gateway::{RateLimiter, ResponseCache};
 use crate::llm::stream_processor::MessageStream;
 use crate::CoreError;
 
@@ -84,6 +86,19 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// Transport metadata for one completed gateway request.  It deliberately
+/// excludes request/response bodies so callers can correlate execution traces
+/// without duplicating potentially sensitive model payloads in logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayCallMetadata {
+    pub endpoint: String,
+    pub attempts: u32,
+    pub cache_hit: bool,
+    pub latency_ms: u64,
+    pub http_status: Option<u16>,
+    pub provider_response_id: Option<String>,
+}
+
 pub struct UnifiedGateway {
     base_url: RwLock<String>,
     api_key: RwLock<String>,
@@ -94,6 +109,9 @@ pub struct UnifiedGateway {
     timeout_seconds: u64,
     max_retries: u32,
     retry_base_ms: u64,
+    rate_limiter: RateLimiter,
+    response_cache: ResponseCache,
+    response_cache_enabled: AtomicBool,
     /// Explicit endpoint selection. When enabled, requests are sent to
     /// `{base_url}/v1/responses`; model capability is owned by the configured
     /// provider rather than a kernel-side model-name allowlist.
@@ -118,6 +136,9 @@ impl UnifiedGateway {
             timeout_seconds: settings.timeout_seconds,
             max_retries: settings.max_retries,
             retry_base_ms: settings.retry_base_ms,
+            rate_limiter: RateLimiter::default(),
+            response_cache: ResponseCache::default(),
+            response_cache_enabled: AtomicBool::new(false),
             use_responses_api: RwLock::new(settings.use_responses_api),
         })
     }
@@ -163,6 +184,22 @@ impl UnifiedGateway {
         tools: Option<Vec<Value>>,
         tool_choice: Option<&str>,
     ) -> Result<ChatCompletionResponse, CoreError> {
+        self.chat_with_params_traced(model, messages, temperature, max_tokens, tools, tool_choice)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Same request as [`Self::chat_with_params`], with transport metadata for
+    /// durable task tracing.  The metadata never contains model payloads.
+    pub async fn chat_with_params_traced(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tools: Option<Vec<Value>>,
+        tool_choice: Option<&str>,
+    ) -> Result<(ChatCompletionResponse, GatewayCallMetadata), CoreError> {
         let messages = Self::sanitize_tool_messages(messages);
         // Pre-validate messages: check for empty content that might cause 400 errors
         for (i, msg) in messages.iter().enumerate() {
@@ -185,7 +222,7 @@ impl UnifiedGateway {
                 tool_choice,
                 false,
             );
-            return self.send_responses_request(&url, body).await;
+            return self.send_responses_request_traced(&url, body).await;
         }
 
         let url = format!("{}/v1/chat/completions", self.base_url.read().unwrap());
@@ -203,7 +240,7 @@ impl UnifiedGateway {
             body["tools"] = serde_json::json!(t);
             body["tool_choice"] = Self::parse_tool_choice(tool_choice.unwrap_or("auto"));
         }
-        self.send_request(&url, body).await
+        self.send_request_traced(&url, body).await
     }
 
     /// Serialize a tool_choice string into the JSON value the API expects.
@@ -224,6 +261,16 @@ impl UnifiedGateway {
         url: &str,
         body: Value,
     ) -> Result<ChatCompletionResponse, CoreError> {
+        self.send_request_traced(url, body)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn send_request_traced(
+        &self,
+        url: &str,
+        body: Value,
+    ) -> Result<(ChatCompletionResponse, GatewayCallMetadata), CoreError> {
         self.send_with_retry(url, body, |json| {
             serde_json::from_value(json.clone()).map_err(|e| CoreError::Internal {
                 message: format!("Failed to parse LLM response JSON: {}", e),
@@ -237,6 +284,16 @@ impl UnifiedGateway {
         url: &str,
         body: Value,
     ) -> Result<ChatCompletionResponse, CoreError> {
+        self.send_responses_request_traced(url, body)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn send_responses_request_traced(
+        &self,
+        url: &str,
+        body: Value,
+    ) -> Result<(ChatCompletionResponse, GatewayCallMetadata), CoreError> {
         self.send_with_retry(url, body, Self::parse_responses_response)
             .await
     }
@@ -246,20 +303,59 @@ impl UnifiedGateway {
         url: &str,
         body: Value,
         parse: F,
-    ) -> Result<ChatCompletionResponse, CoreError>
+    ) -> Result<(ChatCompletionResponse, GatewayCallMetadata), CoreError>
     where
         F: Fn(&Value) -> Result<ChatCompletionResponse, CoreError>,
     {
+        let started_at = Instant::now();
+        let endpoint = if url.ends_with("/v1/responses") {
+            "responses"
+        } else {
+            "chat_completions"
+        }
+        .to_string();
         let mut last_error = None;
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        self.rate_limiter.acquire(model, 1).await;
+
+        let cache_key = (self.response_cache_enabled.load(Ordering::Relaxed)
+            && body.get("tools").is_none())
+        .then(|| ResponseCache::build_request_key(url, &body));
+        if let Some(cached) = cache_key
+            .as_deref()
+            .and_then(|key| self.response_cache.get(key))
+        {
+            return parse(&cached).map(|response| {
+                let provider_response_id = response.id.clone();
+                (
+                    response,
+                    GatewayCallMetadata {
+                        endpoint,
+                        attempts: 0,
+                        cache_hit: true,
+                        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                            as u64,
+                        http_status: None,
+                        provider_response_id,
+                    },
+                )
+            });
+        }
+        let mut retry_delay = None;
 
         for attempt in 0..=self.max_retries {
-            if attempt > 0 {
-                let backoff = Duration::from_millis(self.retry_base_ms * u64::pow(2, attempt - 1));
-                tokio::time::sleep(backoff).await;
-                debug!(attempt, "Retrying LLM API call");
+            if let Some(delay) = retry_delay.take() {
+                tokio::time::sleep(delay).await;
+                debug!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "Retrying LLM API call"
+                );
             }
 
-            let req_body = body.clone();
             let req = self
                 .client
                 .post(url)
@@ -268,34 +364,29 @@ impl UnifiedGateway {
                     format!("Bearer {}", self.api_key.read().unwrap()),
                 )
                 .header("Content-Type", "application/json")
-                .json(&req_body);
+                .json(&body);
 
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        let response_text = match resp.text().await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(error = %e, "Failed to read LLM response body");
-                                last_error = Some(CoreError::Internal {
-                                    message: format!("Failed to read response body: {}", e),
-                                });
-                                continue;
+                        let response_text = resp.text().await.map_err(|e| {
+                            warn!(error = %e, "Failed to read LLM response body");
+                            CoreError::Internal {
+                                message: format!("Failed to read response body: {e}"),
                             }
-                        };
+                        })?;
                         let json: Value = match serde_json::from_str(&response_text) {
                             Ok(v) => v,
                             Err(e) => {
                                 warn!(error = %e, response_len = response_text.len(), "Failed to parse LLM response");
-                                last_error = Some(CoreError::Internal {
+                                return Err(CoreError::Internal {
                                     message: format!(
                                         "Failed to parse LLM response: {} (response length: {})",
                                         e,
                                         response_text.len()
                                     ),
                                 });
-                                continue;
                             }
                         };
                         match parse(&json) {
@@ -305,30 +396,43 @@ impl UnifiedGateway {
                                     usage = ?result.usage.as_ref().map(|u| u.total_tokens),
                                     "LLM API call successful"
                                 );
-                                return Ok(result);
+                                if let Some(key) = &cache_key {
+                                    self.response_cache.set(key, json);
+                                }
+                                let provider_response_id = result.id.clone();
+                                return Ok((
+                                    result,
+                                    GatewayCallMetadata {
+                                        endpoint,
+                                        attempts: attempt.saturating_add(1),
+                                        cache_hit: false,
+                                        latency_ms: started_at
+                                            .elapsed()
+                                            .as_millis()
+                                            .min(u128::from(u64::MAX))
+                                            as u64,
+                                        http_status: Some(status.as_u16()),
+                                        provider_response_id,
+                                    },
+                                ));
                             }
                             Err(e) => {
                                 warn!(error = %e, "Failed to convert LLM response");
-                                last_error = Some(e);
+                                return Err(e);
                             }
                         }
                     } else {
-                        let text = resp.text().await.unwrap_or_default();
-                        // Embed a preview of the request body into the error message
-                        // for debugging 4xx errors directly from the TUI / result display.
-                        let req_body_str =
-                            serde_json::to_string_pretty(&req_body).unwrap_or_default();
-                        let req_preview: String = req_body_str.chars().take(8000).collect();
-                        warn!(status = %status, body = %text, req_preview = %req_preview, "LLM API error");
+                        let retry_after = Self::retry_after(resp.headers());
+                        let retryable = Self::is_retryable_status(status);
+                        warn!(status = %status, retryable, "LLM API returned an error status");
                         last_error = Some(CoreError::Internal {
-                            message: format!(
-                                "LLM API error ({}): {}\nrequest_preview(8k)={}",
-                                status, text, req_preview
-                            ),
+                            message: format!("LLM API error ({status})"),
                         });
-                        if status.is_client_error() {
+                        if !retryable || attempt == self.max_retries {
                             break;
                         }
+                        retry_delay =
+                            Some(retry_after.unwrap_or_else(|| self.retry_backoff(attempt)));
                     }
                 }
                 Err(e) => {
@@ -336,6 +440,9 @@ impl UnifiedGateway {
                     last_error = Some(CoreError::Internal {
                         message: format!("LLM API request failed: {}", e),
                     });
+                    if attempt < self.max_retries {
+                        retry_delay = Some(self.retry_backoff(attempt));
+                    }
                 }
             }
         }
@@ -343,6 +450,38 @@ impl UnifiedGateway {
         Err(last_error.unwrap_or_else(|| CoreError::Internal {
             message: "LLM API call failed after all retries".to_string(),
         }))
+    }
+
+    fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+        let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+        if let Ok(seconds) = value.trim().parse::<u64>() {
+            return Some(Duration::from_secs(seconds.min(300)));
+        }
+        let timestamp = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+        let delay = timestamp.signed_duration_since(chrono::Utc::now());
+        (delay.num_milliseconds() > 0)
+            .then(|| Duration::from_millis(delay.num_milliseconds().min(300_000) as u64))
+    }
+
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+    }
+
+    fn retry_backoff(&self, attempt: u32) -> Duration {
+        const MAX_BACKOFF_MS: u64 = 30_000;
+        let multiplier = 1u64.checked_shl(attempt.min(20)).unwrap_or(u64::MAX);
+        let base = self
+            .retry_base_ms
+            .saturating_mul(multiplier)
+            .min(MAX_BACKOFF_MS);
+        let jitter_bound = (base / 4).max(1);
+        let jitter = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::from(duration.subsec_nanos()) % jitter_bound)
+            .unwrap_or(0);
+        Duration::from_millis(base.saturating_add(jitter).min(MAX_BACKOFF_MS))
     }
 
     pub fn set_base_url(&self, url: String) {
@@ -377,6 +516,16 @@ impl UnifiedGateway {
     /// Toggle Responses API usage at runtime.
     pub fn set_use_responses_api(&self, enabled: bool) {
         *self.use_responses_api.write().unwrap() = enabled;
+    }
+
+    /// Enable deterministic response caching explicitly. It remains disabled
+    /// by default and requests containing tools are never cached.
+    pub fn set_response_cache_enabled(&self, enabled: bool) {
+        self.response_cache_enabled
+            .store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.response_cache.clear();
+        }
     }
 
     fn should_use_responses_api(&self, model: &str) -> bool {
@@ -737,6 +886,11 @@ impl UnifiedGateway {
         url: &str,
         body: Value,
     ) -> Result<MessageStream, CoreError> {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        self.rate_limiter.acquire(model, 1).await;
         let req = self
             .client
             .post(url)
@@ -754,9 +908,8 @@ impl UnifiedGateway {
 
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
             return Err(CoreError::Internal {
-                message: format!("Stream API error ({}): {}", status, text),
+                message: format!("Stream API error ({status})"),
             });
         }
 
@@ -768,6 +921,52 @@ impl UnifiedGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_policy_includes_transient_client_statuses_only() {
+        assert!(UnifiedGateway::is_retryable_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(UnifiedGateway::is_retryable_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(UnifiedGateway::is_retryable_status(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(!UnifiedGateway::is_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(!UnifiedGateway::is_retryable_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[test]
+    fn retry_after_seconds_is_bounded() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "999".parse().unwrap());
+        assert_eq!(
+            UnifiedGateway::retry_after(&headers),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn gateway_debug_redacts_api_key() {
+        let settings = GatewaySettings {
+            base_url: "http://localhost:3000".to_string(),
+            api_key: "super-secret".to_string(),
+            default_model: "model".to_string(),
+            timeout_seconds: 30,
+            max_retries: 1,
+            retry_base_ms: 10,
+            use_responses_api: false,
+            model_mapping: HashMap::new(),
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn test_model_mapping() {
@@ -1025,6 +1224,7 @@ mod tests {
     // blip) even when HTTP status is 2xx, which surfaces as a transport decode
     // error mid-body. Retry a bounded number of times with backoff before
     // failing so the suite stays deterministic; logic assertions are unchanged.
+    #[cfg(feature = "live-tests")]
     async fn collect_stream_retrying(
         gateway: &UnifiedGateway,
         model: &str,
@@ -1048,6 +1248,7 @@ mod tests {
         Err(last_err.unwrap_or_else(|| "unknown error".to_string()))
     }
 
+    #[cfg(feature = "live-tests")]
     fn live_gateway() -> Option<UnifiedGateway> {
         let api_key = std::env::var("DEEPSEEK_API_KEY").ok()?;
         let settings = GatewaySettings {
@@ -1063,6 +1264,7 @@ mod tests {
         Some(UnifiedGateway::new(&settings).unwrap())
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_responses_api_live_non_streaming() {
         let Some(gateway) = live_gateway() else {
@@ -1103,6 +1305,7 @@ mod tests {
         assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_responses_api_live_streaming() {
         let Some(gateway) = live_gateway() else {
@@ -1125,6 +1328,7 @@ mod tests {
         assert!(!response.content.is_empty());
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_responses_api_live_tool_call() {
         let Some(gateway) = live_gateway() else {

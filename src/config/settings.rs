@@ -25,6 +25,10 @@ pub struct Settings {
     /// may supply evidence, but cannot bypass these promotion thresholds.
     #[serde(default)]
     pub policy_learning: PolicyLearningSettings,
+    /// Direction-aware regression monitor for promoted retrieval treatments.
+    /// It can only freeze a family-scoped policy; recovery remains explicit.
+    #[serde(default)]
+    pub learning_health: LearningHealthSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -60,6 +64,52 @@ impl Default for PolicyLearningSettings {
             candidate_trial_min_baseline_samples: default_candidate_trial_min_baseline_samples(),
             promotion_min_samples: default_policy_promotion_min_samples(),
             promotion_min_improvement: default_policy_promotion_min_improvement(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LearningHealthSettings {
+    #[serde(default = "default_learning_health_baseline_window")]
+    pub baseline_window: usize,
+    #[serde(default = "default_learning_health_recent_window")]
+    pub recent_window: usize,
+    #[serde(default = "default_learning_health_min_samples")]
+    pub min_samples_per_window: usize,
+    #[serde(default = "default_learning_health_min_signal")]
+    pub min_signal_strength: f64,
+    #[serde(default = "default_learning_health_max_observations")]
+    pub max_family_observations: usize,
+}
+
+fn default_learning_health_baseline_window() -> usize {
+    12
+}
+
+fn default_learning_health_recent_window() -> usize {
+    8
+}
+
+fn default_learning_health_min_samples() -> usize {
+    5
+}
+
+fn default_learning_health_min_signal() -> f64 {
+    1.96
+}
+
+fn default_learning_health_max_observations() -> usize {
+    128
+}
+
+impl Default for LearningHealthSettings {
+    fn default() -> Self {
+        Self {
+            baseline_window: default_learning_health_baseline_window(),
+            recent_window: default_learning_health_recent_window(),
+            min_samples_per_window: default_learning_health_min_samples(),
+            min_signal_strength: default_learning_health_min_signal(),
+            max_family_observations: default_learning_health_max_observations(),
         }
     }
 }
@@ -172,7 +222,7 @@ impl Default for WorkspaceSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct GatewaySettings {
     pub base_url: String,
     pub api_key: String,
@@ -190,6 +240,22 @@ pub struct GatewaySettings {
 
 fn default_retry_base_ms() -> u64 {
     500
+}
+
+impl std::fmt::Debug for GatewaySettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewaySettings")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("default_model", &self.default_model)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("max_retries", &self.max_retries)
+            .field("retry_base_ms", &self.retry_base_ms)
+            .field("use_responses_api", &self.use_responses_api)
+            .field("model_mapping", &self.model_mapping)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -609,12 +675,36 @@ impl Default for AgentSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct ApiSettings {
     pub grpc_addr: String,
     pub http_addr: String,
     pub enable_metrics: bool,
     pub metrics_port: u16,
+    /// Bearer token protecting all gRPC methods and non-health HTTP routes.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Explicit assertion that a trusted reverse proxy terminates TLS before a
+    /// non-loopback listener. The built-in servers do not terminate TLS.
+    #[serde(default)]
+    pub external_tls_terminated: bool,
+}
+
+impl std::fmt::Debug for ApiSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiSettings")
+            .field("grpc_addr", &self.grpc_addr)
+            .field("http_addr", &self.http_addr)
+            .field("enable_metrics", &self.enable_metrics)
+            .field("metrics_port", &self.metrics_port)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("external_tls_terminated", &self.external_tls_terminated)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1448,10 +1538,12 @@ impl Default for Settings {
             },
             agents: AgentSettings::default(),
             api: ApiSettings {
-                grpc_addr: "0.0.0.0:50051".to_string(),
-                http_addr: "0.0.0.0:8080".to_string(),
+                grpc_addr: "127.0.0.1:50051".to_string(),
+                http_addr: "127.0.0.1:8080".to_string(),
                 enable_metrics: true,
                 metrics_port: 9090,
+                auth_token: None,
+                external_tls_terminated: false,
             },
             output: OutputSettings {
                 directory: "./data/output".to_string(),
@@ -1464,6 +1556,7 @@ impl Default for Settings {
             batch_agents: BatchSettings::default(),
             workspace: WorkspaceSettings::default(),
             policy_learning: PolicyLearningSettings::default(),
+            learning_health: LearningHealthSettings::default(),
         }
     }
 }
@@ -1497,6 +1590,37 @@ impl Settings {
         }
         if self.agents.max_iterations == 0 {
             return Err("agents.max_iterations must be > 0".to_string());
+        }
+        let grpc_addr = self
+            .api
+            .grpc_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| format!("api.grpc_addr must be a socket address: {error}"))?;
+        let http_addr = self
+            .api
+            .http_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| format!("api.http_addr must be a socket address: {error}"))?;
+        let binds_remotely = !grpc_addr.ip().is_loopback() || !http_addr.ip().is_loopback();
+        if binds_remotely {
+            if !self.api.external_tls_terminated {
+                return Err(
+                    "non-loopback API listeners require api.external_tls_terminated=true behind a trusted TLS reverse proxy"
+                        .to_string(),
+                );
+            }
+            if self
+                .api
+                .auth_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .is_none()
+            {
+                return Err(
+                    "non-loopback API listeners require a non-empty api.auth_token".to_string(),
+                );
+            }
         }
         let budget = &self.agents.execution_budget;
         for (role, limit) in [
@@ -1615,6 +1739,17 @@ impl Settings {
                     .to_string(),
             );
         }
+        if self.learning_health.baseline_window == 0
+            || self.learning_health.recent_window == 0
+            || self.learning_health.min_samples_per_window == 0
+            || self.learning_health.max_family_observations == 0
+            || self.learning_health.min_samples_per_window > self.learning_health.baseline_window
+            || self.learning_health.min_samples_per_window > self.learning_health.recent_window
+            || !self.learning_health.min_signal_strength.is_finite()
+            || self.learning_health.min_signal_strength < 0.0
+        {
+            return Err("learning_health windows and signal thresholds are invalid".to_string());
+        }
         if self.tool_result_router.max_micro_tools == 0
             || self.tool_result_router.micro_tool_page_size == 0
             || self.tool_result_router.micro_tool_max_page_size
@@ -1641,6 +1776,63 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.gateway.api_key = "test-key".to_string();
+        settings
+    }
+
+    #[test]
+    fn api_defaults_bind_only_to_loopback() {
+        let settings = valid_settings();
+        assert!(settings.validate().is_ok());
+        assert!(settings
+            .api
+            .grpc_addr
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .ip()
+            .is_loopback());
+        assert!(settings
+            .api
+            .http_addr
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .ip()
+            .is_loopback());
+    }
+
+    #[test]
+    fn remote_api_bind_requires_tls_assertion_and_authentication() {
+        let mut settings = valid_settings();
+        settings.api.http_addr = "0.0.0.0:8080".to_string();
+        let error = settings.validate().unwrap_err();
+        assert!(error.contains("external_tls_terminated"));
+
+        settings.api.external_tls_terminated = true;
+        let error = settings.validate().unwrap_err();
+        assert!(error.contains("api.auth_token"));
+
+        settings.api.auth_token = Some("strong-test-token".to_string());
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_api_address_is_rejected() {
+        let mut settings = valid_settings();
+        settings.api.grpc_addr = "not-an-address".to_string();
+        assert!(settings.validate().unwrap_err().contains("api.grpc_addr"));
+    }
+
+    #[test]
+    fn api_debug_redacts_bearer_token() {
+        let mut settings = valid_settings();
+        settings.api.auth_token = Some("top-secret-token".to_string());
+        let debug = format!("{:?}", settings.api);
+        assert!(!debug.contains("top-secret-token"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn test_logging_settings_test_default() {

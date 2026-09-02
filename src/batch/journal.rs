@@ -124,7 +124,7 @@ impl BatchEventEnvelope {
             payload: self.payload,
             timestamp: self.received_at,
             sequence: self.sequence,
-            type_mask: 0,
+            type_mask: Default::default(),
             priority: crate::core::event_bus::EventPriority::Normal,
         }
     }
@@ -145,7 +145,7 @@ mod tests {
             payload_json_ld: "payload".into(),
             timestamp: Utc::now(),
             sequence: 7,
-            type_mask: 1,
+            type_mask: Default::default(),
             priority: EventPriority::Normal,
         }
     }

@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
 use crate::core::agent_instance::AgentRole;
@@ -165,17 +166,11 @@ fn eligible_policy_candidates(
     knowledge_count: usize,
     experience_count: usize,
 ) -> Vec<String> {
-    let mut candidates = vec!["baseline".to_string()];
-    if knowledge_count > 0 {
-        candidates.push("knowledge_first".to_string());
-    }
-    if experience_count > 0 {
-        candidates.push("experience_first".to_string());
-    }
-    if skill_count > 0 {
-        candidates.push("skill_first".to_string());
-    }
-    candidates
+    crate::core::retrieval_policy::RetrievalPolicyArm::candidate_names(
+        skill_count,
+        knowledge_count,
+        experience_count,
+    )
 }
 
 /// Materialize the treatment selected by the constrained policy. `baseline`
@@ -190,25 +185,9 @@ fn policy_treatment_hints(
     max_hint_chars: usize,
     max_total_chars: usize,
 ) -> Vec<String> {
-    let mut hints = Vec::new();
-    match action {
-        "experience_first" => {
-            hints.extend_from_slice(experience);
-            hints.extend_from_slice(knowledge);
-            hints.extend_from_slice(skills);
-        }
-        "knowledge_first" => {
-            hints.extend_from_slice(knowledge);
-            hints.extend_from_slice(experience);
-            hints.extend_from_slice(skills);
-        }
-        "skill_first" => {
-            hints.extend_from_slice(skills);
-            hints.extend_from_slice(experience);
-            hints.extend_from_slice(knowledge);
-        }
-        _ => {}
-    }
+    let arm = crate::core::retrieval_policy::RetrievalPolicyArm::parse(action)
+        .unwrap_or(crate::core::retrieval_policy::RetrievalPolicyArm::Baseline);
+    let hints = arm.order_hints(experience, skills, knowledge);
     dedup_hints(hints, max_hints, max_hint_chars, max_total_chars)
 }
 
@@ -397,6 +376,17 @@ fn policy_reward_breakdown(
     }
 }
 
+/// The CA/AA evidence writer uses this same deterministic task key. Keeping
+/// the derivation here avoids putting execution payloads into learning records
+/// merely to discover whether independent verification was completed.
+fn task_audit_evidence_iri(task_iri: &str) -> String {
+    format!(
+        "{}{}",
+        crate::core::policy_learning::AUDIT_EVIDENCE_PREFIX,
+        hex::encode(Sha256::digest(task_iri.as_bytes()))
+    )
+}
+
 impl SupervisorAgent {
     #[instrument(skip(self, user_input), fields(task_iri = %task_iri))]
     pub async fn process_task(
@@ -506,7 +496,16 @@ impl SupervisorAgent {
                     }
                 }
             }
-            tracing::info!(task_iri = %task_iri, what = %five_w2h.what, "5W2H initialization complete");
+            let what_sha256 = format!(
+                "sha256:{}",
+                hex::encode(&Sha256::digest(five_w2h.what.as_bytes())[..12])
+            );
+            tracing::info!(
+                task_iri = %task_iri,
+                what_chars = five_w2h.what.chars().count(),
+                %what_sha256,
+                "5W2H initialization complete"
+            );
         }
 
         // start_cycle already performed perception once. Reusing its result
@@ -1043,6 +1042,11 @@ impl SupervisorAgent {
             } else {
                 None
             };
+            let resumed_state = if cycle_num == 0 {
+                ctx.resumed_state.clone()
+            } else {
+                None
+            };
 
             // Generate a detailed fallback only after verify-first actually
             // fails. This preserves full PA→DA quality while removing the
@@ -1140,6 +1144,7 @@ impl SupervisorAgent {
                     five_w2h.clone(),
                     &five_w2h_iri,
                     resumed,
+                    resumed_state,
                     cycle_feedback.clone(),
                     ctx.effective_effect_policy(),
                     ctx.constraints.clone(),
@@ -1383,7 +1388,29 @@ impl SupervisorAgent {
             elapsed_ms,
             workspace_mutation_required,
         );
+        // A terminal status asserted by an LLM is not learning evidence on its
+        // own.  The execution path stores this compact CA/AA record before it
+        // returns here; if it is absent or not reusable, a claimed successful
+        // task cannot promote a retrieval treatment.
+        let audit_iri = task_audit_evidence_iri(task_iri);
+        let independent_ca_aa_pass = self
+            .runner
+            .l0_store
+            .retrieve(&audit_iri)
+            .ok()
+            .flatten()
+            .and_then(|entry| {
+                serde_json::from_str::<crate::core::policy_learning::TaskAuditKnowledgeEvidence>(
+                    &entry.content,
+                )
+                .ok()
+            })
+            .is_some_and(|audit| audit.reusable_success());
+        let terminal_success = matches!(result.status.as_str(), "success" | "completed");
+        let successful_learning_evidence = !terminal_success || independent_ca_aa_pass;
+        let policy_model_version_before = self.policy_learning.model_version();
         let mut evaluation = None;
+        let evidence_iri = format!("iri://learning/evaluations/{}", uuid::Uuid::new_v4());
         let observation_evidence = crate::core::policy_learning::PolicyObservationEvidence {
             task_iri: Some(task_iri.to_string()),
             experiment_pair_id: treatment.experiment_pair_id.clone(),
@@ -1395,7 +1422,7 @@ impl SupervisorAgent {
             orchestration_mode: Some(treatment.orchestration_mode.clone()),
         };
         let mut policy_observation_recorded = false;
-        if self.learning_mode.updates_learning() {
+        if self.learning_mode.updates_learning() && successful_learning_evidence {
             let task_result = serde_json::json!({
                 "status": &result.status,
                 "summary": &result.summary,
@@ -1424,7 +1451,8 @@ impl SupervisorAgent {
         } else if matches!(
             self.learning_mode,
             crate::core::policy_learning::LearningMode::Baseline
-        ) {
+        ) && successful_learning_evidence
+        {
             // A baseline run remains a true behavioral ablation: no history
             // retrieval/injection, perception update, or model training. Its
             // immutable outcome is nevertheless required for a controlled
@@ -1439,6 +1467,221 @@ impl SupervisorAgent {
                     task_iri = %task_iri,
                     %error,
                     "Controlled baseline evidence persistence failed"
+                ),
+            }
+        } else if terminal_success {
+            tracing::info!(
+                task_iri = %task_iri,
+                "Skipped positive learning observation without independent CA/AA evidence"
+            );
+        }
+
+        let mut trajectory_evidence_iris = vec![evidence_iri.clone()];
+        if independent_ca_aa_pass {
+            trajectory_evidence_iris.push(audit_iri.clone());
+        }
+        let trajectory = crate::core::learning_trajectory::LearningTrajectory {
+            schema_version: crate::core::learning_trajectory::LEARNING_TRAJECTORY_SCHEMA_VERSION,
+            task_iri: task_iri.to_string(),
+            task_family: policy_choice.context.clone(),
+            mode: self.learning_mode,
+            policy_action: policy_choice.action.clone(),
+            policy_candidates: policy_choice.candidates.clone(),
+            policy_model_version: self.policy_learning.model_version(),
+            policy_explored: policy_choice.explored,
+            selected_skill_iris: treatment.skill_iris_observed.clone(),
+            selected_knowledge_fragment_iris: treatment.knowledge_fragment_iris_observed.clone(),
+            evidence_iris: trajectory_evidence_iris,
+            tool_steps: result
+                .tracked_actions
+                .iter()
+                .map(crate::core::learning_trajectory::TrajectoryToolStep::from)
+                .collect(),
+            outcome: crate::core::learning_trajectory::LearningTrajectoryOutcome {
+                terminal_status: result.status.clone(),
+                reward: reward.total,
+                prompt_tokens,
+                completion_tokens,
+                elapsed_ms,
+                independent_ca_aa_pass,
+            },
+            created_at: chrono::Utc::now(),
+        };
+        let trajectory_iri = match self.learning_trajectories.persist(&trajectory) {
+            Ok(crate::core::learning_trajectory::TrajectoryPersistResult::Stored { iri })
+            | Ok(crate::core::learning_trajectory::TrajectoryPersistResult::AlreadyPresent {
+                iri,
+            }) => Some(iri),
+            Err(error) => {
+                tracing::warn!(task_iri = %task_iri, %error, "Learning trajectory persistence failed");
+                None
+            }
+        };
+
+        // The constrained policy remains the authoritative promotion gate.
+        // This secondary lifecycle record makes every promoted version
+        // inspectable and provides a one-way automatic freeze path.
+        let mut evolution_delta_iri = None;
+        if independent_ca_aa_pass {
+            if let Some(policy_evaluation) = evaluation.as_ref().filter(|report| report.accepted) {
+                if let (Some(action), Some(trajectory_iri)) = (
+                    policy_evaluation.candidate_action.as_deref(),
+                    trajectory_iri.as_deref(),
+                ) {
+                    if crate::core::retrieval_policy::RetrievalPolicyArm::parse(action).is_some_and(
+                        |arm| arm != crate::core::retrieval_policy::RetrievalPolicyArm::Baseline,
+                    ) {
+                        let candidate_revision = self.policy_learning.model_version();
+                        if candidate_revision > policy_model_version_before {
+                            let base_revision = candidate_revision.saturating_sub(1);
+                            match crate::core::evolution_delta_gate::EvolutionDelta::proposed_policy(
+                                task_iri,
+                                &policy_choice.context,
+                                action,
+                                base_revision,
+                                candidate_revision,
+                                vec![audit_iri.clone(), trajectory_iri.to_string()],
+                            ) {
+                                Ok(delta) => {
+                                    let delta_id = delta.delta_id.clone();
+                                    let delta_iri = delta.storage_iri();
+                                    let lifecycle = self
+                                    .evolution_gate
+                                    .propose(&delta)
+                                    .and_then(|_| {
+                                        self.evolution_gate.transition(
+                                            &delta_id,
+                                            crate::core::evolution_delta_gate::EvolutionDeltaState::ShadowValidated,
+                                            "paired baseline and candidate evidence accepted by policy gate",
+                                            false,
+                                        )
+                                    })
+                                    .and_then(|_| {
+                                        self.evolution_gate.transition(
+                                            &delta_id,
+                                            crate::core::evolution_delta_gate::EvolutionDeltaState::Active,
+                                            "constrained policy promotion applied the candidate revision",
+                                            false,
+                                        )
+                                    });
+                                    match lifecycle {
+                                        Ok(_) => evolution_delta_iri = Some(delta_iri),
+                                        Err(error) => tracing::warn!(
+                                            task_iri = %task_iri,
+                                            %error,
+                                            "Evolution delta lifecycle persistence failed"
+                                        ),
+                                    }
+                                }
+                                Err(error) => tracing::warn!(
+                                    task_iri = %task_iri,
+                                    %error,
+                                    "Refused invalid evolution delta"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut health_report = None;
+        let mut frozen_delta_ids = Vec::new();
+        if self.learning_mode.updates_learning()
+            && policy_observation_recorded
+            && crate::core::retrieval_policy::RetrievalPolicyArm::parse(&policy_choice.action)
+                .is_some_and(|arm| {
+                    arm != crate::core::retrieval_policy::RetrievalPolicyArm::Baseline
+                })
+        {
+            let failed_actions = result
+                .tracked_actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action.status,
+                        crate::core::tracked_action::ActionStatus::Failed
+                    )
+                })
+                .count();
+            let tool_failure_rate = if result.tracked_actions.is_empty() {
+                0.0
+            } else {
+                failed_actions as f64 / result.tracked_actions.len() as f64
+            };
+            let observation = crate::core::learning_health::LearningHealthObservation {
+                schema_version: crate::core::learning_health::LEARNING_HEALTH_SCHEMA_VERSION,
+                task_iri: task_iri.to_string(),
+                task_family: policy_choice.context.clone(),
+                policy_action: policy_choice.action.clone(),
+                policy_model_version: self.policy_learning.model_version(),
+                metrics: vec![
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "reward".into(),
+                        value: reward.total as f64,
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "terminal_success".into(),
+                        value: if terminal_success && independent_ca_aa_pass {
+                            1.0
+                        } else {
+                            0.0
+                        },
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "verified_evidence".into(),
+                        value: if independent_ca_aa_pass { 1.0 } else { 0.0 },
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "tool_failure_rate".into(),
+                        value: tool_failure_rate,
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "elapsed_ms".into(),
+                        value: elapsed_ms as f64,
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "total_tokens".into(),
+                        value: prompt_tokens.saturating_add(completion_tokens) as f64,
+                    },
+                ],
+                created_at: chrono::Utc::now(),
+            };
+            match self.learning_health.record_and_assess(&observation) {
+                Ok((_, report)) => {
+                    if let Some(reason) = report.freeze_reason() {
+                        match self
+                            .policy_learning
+                            .freeze_context(&policy_choice.context, &reason)
+                        {
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                task_iri = %task_iri,
+                                %error,
+                                "Policy safety freeze persistence failed"
+                            ),
+                        }
+                        match self
+                            .evolution_gate
+                            .freeze_active_retrieval_family(&policy_choice.context, &reason)
+                        {
+                            Ok(deltas) => {
+                                frozen_delta_ids =
+                                    deltas.into_iter().map(|delta| delta.delta_id).collect()
+                            }
+                            Err(error) => tracing::warn!(
+                                task_iri = %task_iri,
+                                %error,
+                                "Evolution delta freeze persistence failed"
+                            ),
+                        }
+                    }
+                    health_report = Some(report);
+                }
+                Err(error) => tracing::warn!(
+                    task_iri = %task_iri,
+                    %error,
+                    "Learning health observation persistence failed"
                 ),
             }
         }
@@ -1468,12 +1711,16 @@ impl SupervisorAgent {
             "reward": reward,
             "policy_evaluation": evaluation,
             "policy_observation_recorded": policy_observation_recorded,
+            "independent_ca_aa_pass": independent_ca_aa_pass,
+            "learning_trajectory_iri": trajectory_iri,
+            "evolution_delta_iri": evolution_delta_iri,
+            "learning_health": health_report,
+            "frozen_evolution_delta_ids": frozen_delta_ids,
             "policy_gate": self.policy_learning.gate(),
             "candidate_trial_min_baseline_samples": self.policy_learning.min_observations(),
             "model_version": self.policy_learning.model_version(),
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
-        let evidence_iri = format!("iri://learning/evaluations/{}", uuid::Uuid::new_v4());
         if let Err(error) = self
             .runner
             .l0_store

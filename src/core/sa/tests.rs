@@ -1199,4 +1199,64 @@ mod tests {
         assert!(!super::event_requires_blocked_intervention("AGENT_ERROR"));
         assert!(super::event_requires_blocked_intervention("AGENT_BLOCKED"));
     }
+
+    #[test]
+    fn supplementary_workspace_delivery_replaces_direct_response_contract() {
+        let mut constraints = HashMap::from([
+            (
+                crate::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::WORKSPACE_CONTEXT_DISABLED.to_string(),
+            ),
+            (
+                crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+            ),
+        ]);
+        let mut effect_policy = crate::core::effect::EffectPolicy::EvidenceOnly;
+
+        super::execution::apply_workspace_delivery_contract(
+            &mut constraints,
+            &mut effect_policy,
+            "AI_Agent_Research_Report.md",
+        );
+
+        assert!(!constraints
+            .contains_key(crate::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT));
+        assert_eq!(
+            constraints
+                .get(crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT)
+                .map(String::as_str),
+            Some(crate::core::agent_runner::DELIVERY_MODE_WORKSPACE_ARTIFACT)
+        );
+        assert_eq!(
+            constraints
+                .get(crate::core::agent_runner::DELIVERY_TARGET_PATH_CONSTRAINT)
+                .map(String::as_str),
+            Some("AI_Agent_Research_Report.md")
+        );
+        assert_eq!(
+            effect_policy,
+            crate::core::effect::EffectPolicy::required_workspace_mutation()
+        );
+    }
+
+    #[test]
+    fn workspace_delivery_input_is_detected_without_an_llm_classifier() {
+        assert_eq!(
+            super::intervention::workspace_delivery_target_from_supplement("文件输出到当前工作区")
+                .as_deref(),
+            Some(super::intervention::DEFAULT_WORKSPACE_DELIVERY_PATH)
+        );
+        assert_eq!(
+            super::intervention::workspace_delivery_target_from_supplement(
+                "请输出到当前工作区的 final-report.md"
+            )
+            .as_deref(),
+            Some("final-report.md")
+        );
+        assert!(
+            super::intervention::workspace_delivery_target_from_supplement("继续检索最新的趋势")
+                .is_none()
+        );
+    }
 }

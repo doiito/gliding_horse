@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::core::agent_instance::AgentRole;
@@ -306,7 +307,17 @@ impl SupervisorAgent {
 
         self.active_cycles.insert(cycle_id.clone(), cycle);
 
-        info!(cycle_id = %cycle_id, task_iri = %task_iri, input = %user_input, "Cycle started");
+        let user_input_sha256 = format!(
+            "sha256:{}",
+            hex::encode(&Sha256::digest(user_input.as_bytes())[..12])
+        );
+        info!(
+            cycle_id = %cycle_id,
+            task_iri = %task_iri,
+            user_input_chars = user_input.chars().count(),
+            %user_input_sha256,
+            "Cycle started"
+        );
 
         self.event_bus
             .emit(
@@ -315,7 +326,8 @@ impl SupervisorAgent {
                 "SA",
                 &serde_json::json!({
                     "cycle_id": &cycle_id,
-                    "user_input": user_input,
+                    "user_input_chars": user_input.chars().count(),
+                    "user_input_sha256": user_input_sha256,
                 })
                 .to_string(),
             )

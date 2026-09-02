@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -46,7 +46,12 @@ pub struct TaskContextData {
 /// LLM configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
+    /// Legacy in-memory field. Never serialized to the durable queue.
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub api_key: String,
+    /// Reference resolved by the worker, e.g. `env:DEEPSEEK_API_KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     pub base_url: String,
     pub model: String,
 }
@@ -55,8 +60,9 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            base_url: "https://api.deepseek.com".to_string(),
-            model: "deepseek-v4-flash".to_string(),
+            credential_ref: None,
+            base_url: String::new(),
+            model: String::new(),
         }
     }
 }
@@ -182,50 +188,51 @@ use yaque::queue::{Receiver, Sender};
 
 /// Activity-side task queue
 pub struct TaskQueue {
-    task_sender: Sender,
-    result_receiver: Receiver,
     base_path: String,
-    pending_results: HashMap<String, AgentOsResult>,
+    last_task_id: Option<String>,
 }
 
 impl TaskQueue {
     /// Create a new task queue (full version, holds both sender and receiver)
     pub fn new(base_path: &str) -> Result<Self, QueueError> {
-        let task_path = format!("{}/tasks", base_path);
-        let result_path = format!("{}/results", base_path);
-
-        let task_sender = Sender::open(&task_path)?;
-        let result_receiver = Receiver::open(&result_path)?;
-
         Ok(Self {
-            task_sender,
-            result_receiver,
             base_path: base_path.to_string(),
-            pending_results: HashMap::new(),
+            last_task_id: None,
         })
     }
 
     /// Create a client queue (only sends tasks, receives results)
     pub fn new_client(base_path: &str) -> Result<Self, QueueError> {
-        let task_path = format!("{}/tasks", base_path);
-        let result_path = format!("{}/results", base_path);
-
-        let task_sender = Sender::open(&task_path)?;
-        let result_receiver = Receiver::open(&result_path)?;
-
         Ok(Self {
-            task_sender,
-            result_receiver,
             base_path: base_path.to_string(),
-            pending_results: HashMap::new(),
+            last_task_id: None,
         })
     }
 
     /// Send task
     pub async fn send_task(&mut self, task: &AgentOsTask) -> Result<(), QueueError> {
         let data = serde_json::to_vec(task)?;
+        let task_path = format!("{}/tasks", self.base_path);
+        let mut task_sender = None;
+        for attempt in 0..100 {
+            match Sender::open(&task_path) {
+                Ok(sender) => {
+                    task_sender = Some(sender);
+                    break;
+                }
+                Err(error) if attempt < 99 => {
+                    tracing::debug!(attempt, error = %error, "Task queue sender busy; retrying");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(QueueError::Io(error)),
+            }
+        }
         tracing::info!(task_id = %task.task_id, task_iri = %task.task_iri, data_len = data.len(), "Sending task to queue");
-        self.task_sender.send(data).await?;
+        task_sender
+            .ok_or_else(|| QueueError::Queue("Unable to acquire task sender".to_string()))?
+            .send(data)
+            .await?;
+        self.last_task_id = Some(task.task_id.clone());
         tracing::info!(task_id = %task.task_id, "Task sent successfully");
         Ok(())
     }
@@ -238,47 +245,21 @@ impl TaskQueue {
     ) -> Result<Option<AgentOsResult>, QueueError> {
         tracing::info!(expected_task_id = %task_id, "Starting to wait for result");
 
-        if let Some(result) = self.pending_results.remove(task_id) {
-            tracing::info!(task_id = %task_id, "Found matching result from cache");
-            return Ok(Some(result));
+        let result_path = format!("{}/results/by-task/{}", self.base_path, task_id);
+        let mut receiver = Receiver::open(&result_path)?;
+        let guard = match tokio::time::timeout(timeout, receiver.recv()).await {
+            Ok(result) => result.map_err(|error| QueueError::Queue(error.to_string()))?,
+            Err(_) => return Ok(None),
+        };
+        let result: AgentOsResult = serde_json::from_slice(&*guard)?;
+        guard.commit()?;
+        if result.task_id != task_id {
+            return Err(QueueError::Queue(format!(
+                "Result queue routing mismatch: expected {}, got {}",
+                task_id, result.task_id
+            )));
         }
-
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let remaining = deadline.duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!(expected_task_id = %task_id, "Timed out waiting for result");
-                return Ok(None);
-            }
-
-            match tokio::time::timeout(remaining, self.result_receiver.recv()).await {
-                Ok(guard_result) => {
-                    let guard = guard_result.map_err(|e| QueueError::Queue(e.to_string()))?;
-                    let result: AgentOsResult = serde_json::from_slice(&*guard)?;
-                    let _ = guard.commit();
-
-                    tracing::info!(
-                        expected_task_id = %task_id,
-                        got_task_id = %result.task_id,
-                        status = %result.status,
-                        "Result received"
-                    );
-
-                    if result.task_id == task_id {
-                        tracing::info!(task_id = %task_id, "Result matched, returning");
-                        return Ok(Some(result));
-                    } else {
-                        tracing::warn!(expected_task_id = %task_id, got_task_id = %result.task_id, "Result does not match, caching");
-                        self.pending_results.insert(result.task_id.clone(), result);
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(expected_task_id = %task_id, "Timed out receiving result");
-                    return Ok(None);
-                }
-            }
-        }
+        Ok(Some(result))
     }
 
     /// Receive result (with timeout, no task_id matching)
@@ -286,17 +267,10 @@ impl TaskQueue {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<AgentOsResult>, QueueError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        let guard = tokio::time::timeout_at(deadline, self.result_receiver.recv())
-            .await
-            .map_err(|_| QueueError::Timeout)?
-            .map_err(|e| QueueError::Queue(e.to_string()))?;
-
-        let result: AgentOsResult = serde_json::from_slice(&*guard)?;
-        let _ = guard.commit();
-        tracing::debug!(task_id = %result.task_id, status = %result.status, "Result received");
-        Ok(Some(result))
+        let task_id = self.last_task_id.clone().ok_or_else(|| {
+            QueueError::Queue("No task has been sent by this queue client".to_string())
+        })?;
+        self.recv_result_for_task(&task_id, timeout).await
     }
 
     /// Get queue base path
@@ -308,44 +282,120 @@ impl TaskQueue {
 /// Worker-side task queue
 pub struct WorkerQueue {
     task_receiver: Receiver,
-    result_sender: Sender,
     base_path: String,
+    recovered_claims: VecDeque<ClaimedTask>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaimedTask {
+    pub task: AgentOsTask,
+    claim_path: std::path::PathBuf,
 }
 
 impl WorkerQueue {
     /// Create a new Worker queue
     pub fn new(base_path: &str) -> Result<Self, QueueError> {
         let task_path = format!("{}/tasks", base_path);
-        let result_path = format!("{}/results", base_path);
-
         let task_receiver = Receiver::open(&task_path)?;
-        let result_sender = Sender::open(&result_path)?;
+        let recovered_claims = Self::load_recovered_claims(base_path)?;
 
         Ok(Self {
             task_receiver,
-            result_sender,
             base_path: base_path.to_string(),
+            recovered_claims,
         })
     }
 
-    /// Receive task
-    pub async fn recv_task(&mut self) -> Result<AgentOsTask, QueueError> {
+    fn load_recovered_claims(base_path: &str) -> Result<VecDeque<ClaimedTask>, QueueError> {
+        let inflight = std::path::Path::new(base_path).join("inflight");
+        std::fs::create_dir_all(&inflight)?;
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&inflight)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        paths.sort();
+        let mut recovered = VecDeque::new();
+        for claim_path in paths {
+            let data = std::fs::read(&claim_path)?;
+            let task: AgentOsTask = serde_json::from_slice(&data)?;
+            recovered.push_back(ClaimedTask { task, claim_path });
+        }
+        Ok(recovered)
+    }
+
+    pub(crate) async fn claim_next(&mut self) -> Result<ClaimedTask, QueueError> {
+        if let Some(claim) = self.recovered_claims.pop_front() {
+            tracing::info!(task_id = %claim.task.task_id, "Recovered inflight task claim");
+            return Ok(claim);
+        }
+        let base_path = self.base_path.clone();
         let guard = self
             .task_receiver
             .recv()
             .await
             .map_err(|e| QueueError::Queue(e.to_string()))?;
         let task: AgentOsTask = serde_json::from_slice(&*guard)?;
-        let _ = guard.commit();
-        tracing::debug!(task_id = %task.task_id, "Task received");
-        Ok(task)
+        let inflight = std::path::Path::new(&base_path).join("inflight");
+        tokio::fs::create_dir_all(&inflight).await?;
+        let claim_path = inflight.join(format!("{}.json", task.task_id));
+        let temp_path = inflight.join(format!("{}.{}.tmp", task.task_id, uuid::Uuid::new_v4()));
+        let data = serde_json::to_vec(&task)?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&data).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp_path, &claim_path).await?;
+        guard.commit()?;
+        tracing::debug!(task_id = %task.task_id, path = %claim_path.display(), "Task durably claimed");
+        Ok(ClaimedTask { task, claim_path })
+    }
+
+    pub(crate) async fn persist_result(
+        base_path: &str,
+        result: &AgentOsResult,
+    ) -> Result<(), QueueError> {
+        let data = serde_json::to_vec(result)?;
+        let result_path = format!("{}/results/by-task/{}", base_path, result.task_id);
+        let mut result_sender = Sender::open(&result_path)?;
+        result_sender.send(data).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn complete_claim(claim: &ClaimedTask) -> Result<(), QueueError> {
+        match tokio::fs::remove_file(&claim.claim_path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(QueueError::Io(error)),
+        }
+    }
+
+    /// Execute one task with at-least-once delivery. The queue message is
+    /// committed only after its routed result has been durably enqueued.
+    pub async fn process_next<F, Fut>(&mut self, execute: F) -> Result<AgentOsResult, QueueError>
+    where
+        F: FnOnce(AgentOsTask) -> Fut,
+        Fut: std::future::Future<Output = AgentOsResult>,
+    {
+        let claim = self.claim_next().await?;
+        let result = execute(claim.task.clone()).await;
+        Self::persist_result(&self.base_path, &result).await?;
+        Self::complete_claim(&claim).await?;
+        Ok(result)
     }
 
     /// Send result
     pub async fn send_result(&mut self, result: &AgentOsResult) -> Result<(), QueueError> {
         let data = serde_json::to_vec(result)?;
+        let result_path = format!("{}/results/by-task/{}", self.base_path, result.task_id);
+        let mut result_sender = Sender::open(&result_path)?;
         tracing::info!(task_id = %result.task_id, status = %result.status, data_len = data.len(), "Sending result to queue");
-        self.result_sender.send(data).await?;
+        result_sender.send(data).await?;
         tracing::info!(task_id = %result.task_id, "Result sent successfully");
         Ok(())
     }
@@ -489,12 +539,14 @@ mod tests {
         );
 
         task_queue.send_task(&task).await.unwrap();
-
-        let received = worker_queue.recv_task().await.unwrap();
-        assert_eq!(received.task_iri, "iri://task/test");
-
-        let result = AgentOsResult::success(task.task_id.clone(), "completed".to_string());
-        worker_queue.send_result(&result).await.unwrap();
+        let expected_task_id = task.task_id.clone();
+        worker_queue
+            .process_next(|received| async move {
+                assert_eq!(received.task_iri, "iri://task/test");
+                AgentOsResult::success(received.task_id, "completed".to_string())
+            })
+            .await
+            .unwrap();
 
         let received_result = task_queue
             .recv_result_timeout(Duration::from_secs(5))
@@ -502,5 +554,157 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received_result.status, "success");
+        assert_eq!(received_result.task_id, expected_task_id);
+    }
+
+    #[test]
+    fn task_serialization_never_persists_raw_api_key() {
+        let mut llm = LlmConfig::default();
+        llm.api_key = "raw-secret-must-not-persist".to_string();
+        llm.credential_ref = Some("env:WORKER_MODEL_KEY".to_string());
+        let task = AgentOsTask::new(
+            "iri://task/secret".to_string(),
+            "test".to_string(),
+            TaskContextData {
+                stage_id: String::new(),
+                stage_type: String::new(),
+                project_id: String::new(),
+                project_dir: String::new(),
+                user_requirement: String::new(),
+                prev_outputs: HashMap::new(),
+                llm_config: llm,
+            },
+        );
+        let serialized = serde_json::to_string(&task).unwrap();
+        assert!(!serialized.contains("raw-secret-must-not-persist"));
+        assert!(serialized.contains("env:WORKER_MODEL_KEY"));
+    }
+
+    #[tokio::test]
+    async fn uncommitted_task_is_delivered_again_after_worker_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+        let mut client = TaskQueue::new_client(base_path).unwrap();
+        let task = AgentOsTask::new(
+            "iri://task/retry".to_string(),
+            "retry".to_string(),
+            TaskContextData {
+                stage_id: String::new(),
+                stage_type: String::new(),
+                project_id: String::new(),
+                project_dir: String::new(),
+                user_requirement: String::new(),
+                prev_outputs: HashMap::new(),
+                llm_config: LlmConfig::default(),
+            },
+        );
+        client.send_task(&task).await.unwrap();
+
+        let mut first_worker = WorkerQueue::new(base_path).unwrap();
+        let crashed = tokio::spawn(async move {
+            first_worker
+                .process_next(|_| async move { panic!("simulated worker crash") })
+                .await
+        })
+        .await;
+        assert!(crashed.is_err());
+
+        let mut recovered_worker = WorkerQueue::new(base_path).unwrap();
+        recovered_worker
+            .process_next(|received| async move {
+                AgentOsResult::success(received.task_id, "recovered".to_string())
+            })
+            .await
+            .unwrap();
+        let result = client
+            .recv_result_for_task(&task.task_id, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.summary, "recovered");
+    }
+
+    #[tokio::test]
+    async fn results_are_isolated_by_task_queue() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+        let context = || TaskContextData {
+            stage_id: String::new(),
+            stage_type: String::new(),
+            project_id: String::new(),
+            project_dir: String::new(),
+            user_requirement: String::new(),
+            prev_outputs: HashMap::new(),
+            llm_config: LlmConfig::default(),
+        };
+        let first = AgentOsTask::new("iri://task/one".into(), "one".into(), context());
+        let second = AgentOsTask::new("iri://task/two".into(), "two".into(), context());
+        let mut first_client = TaskQueue::new_client(base_path).unwrap();
+        let mut second_client = TaskQueue::new_client(base_path).unwrap();
+        first_client.send_task(&first).await.unwrap();
+        second_client.send_task(&second).await.unwrap();
+        let mut worker = WorkerQueue::new(base_path).unwrap();
+        for _ in 0..2 {
+            worker
+                .process_next(|task| async move {
+                    let summary = task.prompt.clone();
+                    AgentOsResult::success(task.task_id, summary)
+                })
+                .await
+                .unwrap();
+        }
+        let second_result = second_client
+            .recv_result_for_task(&second.task_id, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
+        let first_result = first_client
+            .recv_result_for_task(&first.task_id, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_result.summary, "two");
+        assert_eq!(first_result.summary, "one");
+    }
+
+    #[tokio::test]
+    async fn durable_claims_allow_parallel_processing() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+        let context = || TaskContextData {
+            stage_id: String::new(),
+            stage_type: String::new(),
+            project_id: String::new(),
+            project_dir: String::new(),
+            user_requirement: String::new(),
+            prev_outputs: HashMap::new(),
+            llm_config: LlmConfig::default(),
+        };
+        let first = AgentOsTask::new("iri://task/parallel-one".into(), "one".into(), context());
+        let second = AgentOsTask::new("iri://task/parallel-two".into(), "two".into(), context());
+        let mut client = TaskQueue::new_client(base_path).unwrap();
+        client.send_task(&first).await.unwrap();
+        client.send_task(&second).await.unwrap();
+        let mut dispatcher = WorkerQueue::new(base_path).unwrap();
+        let first_claim = dispatcher.claim_next().await.unwrap();
+        let second_claim = dispatcher.claim_next().await.unwrap();
+        assert!(first_claim.claim_path.exists());
+        assert!(second_claim.claim_path.exists());
+
+        let rendezvous = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let first_rendezvous = rendezvous.clone();
+        let first_job = async {
+            first_rendezvous.wait().await;
+            WorkerQueue::complete_claim(&first_claim).await.unwrap();
+        };
+        let second_rendezvous = rendezvous.clone();
+        let second_job = async {
+            second_rendezvous.wait().await;
+            WorkerQueue::complete_claim(&second_claim).await.unwrap();
+        };
+        let joined = async { tokio::join!(first_job, second_job, rendezvous.wait()) };
+        tokio::time::timeout(Duration::from_secs(2), joined)
+            .await
+            .expect("both durable claims must reach the rendezvous concurrently");
     }
 }

@@ -1,24 +1,40 @@
 # Rust build outputs (all levels)
 target/
 target*/
+**/target/
 
 # Generated protobuf files
 apps/gliding_code/target/
 
-# PR resources
-PR-res/
+# PR resources: ignore imported/reference material, but keep the maintained
+# audit report available for a normal commit.
+PR-res/*
+!PR-res/PROJECT_AUDIT_REPORT_2026-08-31.md
+!PR-res/SNAPSHOT_AND_LLM_TRACE_AUDIT_2026-08-31.md
+!PR-res/RUVECTOR_GLIDING_HORSE_INTEGRATION_REPORT_2026-09-01.md
+!PR-res/RUVECTOR_SECONDARY_IMPLEMENTATION_RESEARCH_2026-09-01.md
+!PR-res/P1_P2_RETRIEVAL_EVIDENCE_ANN_IMPLEMENTATION_REPORT_2026-09-01.md
 
 # application data
 data/
 
 # logs
 logs/
+*.log
 
 # trae data
 .trae*/
 
 # project data
 .gliding_*/
+**/.gliding_horse/
+
+# Local agent, analysis, and sandbox state
+/.agents/
+/.codex/
+/.codegraph/
+/.sandbox-home/
+/.sandbox-tmp/
 
 # omo data
 .omo*/
@@ -54,9 +70,37 @@ Thumbs.db
 # Python (used by some tooling)
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Node (used by some tooling)
 node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.vsix
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Cargo lock
-Cargo.lock
+# Runtime and test databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Go test/build artifacts
+*.test
+*.prof
+
+# This is an application workspace: keep the root lockfile, ignore nested
+# lockfiles accidentally produced by running Cargo inside member directories.
+**/Cargo.lock
+!/Cargo.lock
+
+# .env.example files are intentionally tracked project inputs.

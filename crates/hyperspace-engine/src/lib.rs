@@ -27,6 +27,7 @@ pub mod hnsw;
 pub mod hybrid;
 pub mod hyper_vector;
 pub mod jsonld_meta;
+pub mod lexical;
 pub mod metric;
 pub mod snapshot;
 pub mod storage;
@@ -40,10 +41,14 @@ pub use filter::{compile_filter, CompiledFilter, FilterEvaluation, JsonLdFilter}
 pub use hnsw::{HnswConfig, IncrementalHNSW, SerializableNode};
 pub use hyper_vector::{EmbeddingVector, MetricKind};
 pub use jsonld_meta::JsonLdMetadataIndex;
+pub use lexical::{normalized_terms, LexicalIndex, LEXICAL_RECALL_FLAG};
 pub use metric::{
     metric_from_kind, CosineMetric, EuclideanMetric, LorentzMetric, Metric, PoincareMetric,
 };
-pub use snapshot::{load_snapshot, save_snapshot, EngineSnapshot};
+pub use snapshot::{
+    load_snapshot, load_snapshot_with_fallback, save_snapshot, save_snapshot_generational,
+    save_snapshot_with_metric, EngineSnapshot, LoadedSnapshot,
+};
 pub use storage::VectorStore;
 pub use tangent::TangentCache;
 pub use wal::{EngineWal, WalOp, WalSyncMode};

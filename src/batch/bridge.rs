@@ -126,7 +126,7 @@ mod tests {
             payload_json_ld: String::new(),
             timestamp: chrono::Utc::now(),
             sequence: 1,
-            type_mask: 0,
+            type_mask: Default::default(),
             priority: EventPriority::Normal,
         }
     }
@@ -159,7 +159,7 @@ mod tests {
 
         for et in BATCH_EVENT_TYPES {
             let mask = bus.register_type(et);
-            assert!(mask > 0, "Type {} should be registered", et);
+            assert!(!mask.is_empty(), "Type {} should be registered", et);
         }
     }
 

@@ -20,7 +20,7 @@ use crate::tools::hooks::{
 use crate::tools::workspace_monitor::{WorkspaceMonitor, WorkspaceMonitorConfig};
 use crate::tools::SkillRegistry;
 
-use super::task_queue::{AgentOsResult, AgentOsTask, QueueError, WorkerQueue};
+use super::task_queue::{AgentOsResult, AgentOsTask, ClaimedTask, QueueError, WorkerQueue};
 
 /// Agent OS Worker Configuration
 #[derive(Clone)]
@@ -146,8 +146,9 @@ impl WorkerConfig {
 /// Agent OS Worker
 pub struct AgentOsWorker {
     config: WorkerConfig,
-    queue: WorkerQueue,
+    queue: Option<WorkerQueue>,
     sa: SupervisorAgent,
+    gateway_settings: GatewaySettings,
     approval_notifier: Option<Arc<ChannelApprovalNotifier>>,
     prefetch_engine: Option<Arc<PrefetchEngine>>,
     blackboard: Arc<Blackboard>,
@@ -158,7 +159,19 @@ pub struct AgentOsWorker {
 impl AgentOsWorker {
     /// Create a new Worker
     pub fn new(config: WorkerConfig) -> Result<Self, QueueError> {
-        let queue = WorkerQueue::new(&config.queue_base_path)?;
+        Self::new_with_queue(config, true)
+    }
+
+    fn new_processor(config: WorkerConfig) -> Result<Self, QueueError> {
+        Self::new_with_queue(config, false)
+    }
+
+    fn new_with_queue(config: WorkerConfig, attach_queue: bool) -> Result<Self, QueueError> {
+        let queue = if attach_queue {
+            Some(WorkerQueue::new(&config.queue_base_path)?)
+        } else {
+            None
+        };
 
         let l0 = Arc::new(
             L0Store::new(&config.l0_path)
@@ -328,6 +341,7 @@ impl AgentOsWorker {
             config,
             queue,
             sa,
+            gateway_settings,
             approval_notifier,
             prefetch_engine: Some(prefetch),
             blackboard,
@@ -354,18 +368,21 @@ impl AgentOsWorker {
         }
 
         loop {
-            match self.queue.recv_task().await {
-                Ok(task) => {
-                    info!(task_id = %task.task_id, task_iri = %task.task_iri, "Task received");
-
-                    let result = self.execute_task(task).await;
-
-                    if let Err(e) = self.queue.send_result(&result).await {
-                        error!(error = %e, "Failed to send result");
-                    }
+            let sa = &mut self.sa;
+            let config = &self.config;
+            let gateway_settings = &self.gateway_settings;
+            let queue = self.queue.as_mut().ok_or_else(|| {
+                QueueError::Queue("Processor-only worker has no task receiver".to_string())
+            })?;
+            match queue
+                .process_next(|task| Self::execute_task(sa, config, gateway_settings, task))
+                .await
+            {
+                Ok(result) => {
+                    info!(task_id = %result.task_id, status = %result.status, "Task result persisted and acknowledged");
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to receive task");
+                    error!(error = %e, "Failed to process task; queue delivery rolled back");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
@@ -373,13 +390,23 @@ impl AgentOsWorker {
     }
 
     /// Execute a single task
-    async fn execute_task(&mut self, task: AgentOsTask) -> AgentOsResult {
+    async fn execute_task(
+        sa: &mut SupervisorAgent,
+        config: &WorkerConfig,
+        gateway_settings: &GatewaySettings,
+        task: AgentOsTask,
+    ) -> AgentOsResult {
         let start = Instant::now();
         let original_task_id = task.task_id.clone();
 
         info!(task_id = %original_task_id, "Starting task execution");
 
-        match self.sa.process_task(&task.prompt, &task.task_iri).await {
+        if let Err(error) = Self::apply_task_context(sa, config, gateway_settings, &task) {
+            return AgentOsResult::failure(original_task_id, error);
+        }
+        let prompt = Self::build_task_prompt(&task);
+
+        match sa.process_task(&prompt, &task.task_iri).await {
             Ok(task_result) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 info!(
@@ -413,13 +440,148 @@ impl AgentOsWorker {
             }
         }
     }
+
+    fn apply_task_context(
+        sa: &SupervisorAgent,
+        config: &WorkerConfig,
+        defaults: &GatewaySettings,
+        task: &AgentOsTask,
+    ) -> Result<(), String> {
+        sa.set_model(&defaults.default_model);
+        sa.set_base_url(&defaults.base_url);
+        if !defaults.api_key.is_empty() {
+            sa.set_api_key(&defaults.api_key);
+        }
+
+        if !task.context.project_dir.is_empty() {
+            let configured = config.workspace_root.as_ref().ok_or_else(|| {
+                "Task specifies project_dir but worker has no AGENT_OS_WORKSPACE_ROOT".to_string()
+            })?;
+            let configured = std::fs::canonicalize(configured).map_err(|error| {
+                format!("Configured workspace root cannot be resolved: {error}")
+            })?;
+            let requested = std::fs::canonicalize(&task.context.project_dir)
+                .map_err(|error| format!("Task project_dir cannot be resolved: {error}"))?;
+            if requested != configured {
+                return Err(format!(
+                    "Task project_dir '{}' does not match worker workspace '{}'",
+                    requested.display(),
+                    configured.display()
+                ));
+            }
+        }
+
+        let llm = &task.context.llm_config;
+        if !llm.base_url.is_empty() {
+            let url = reqwest::Url::parse(&llm.base_url)
+                .map_err(|error| format!("Invalid task LLM base_url: {error}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err("Task LLM base_url must use http or https".to_string());
+            }
+            sa.set_base_url(&llm.base_url);
+        }
+        if !llm.model.is_empty() {
+            sa.set_model(&llm.model);
+        }
+        if let Some(reference) = llm.credential_ref.as_deref() {
+            let variable = reference.strip_prefix("env:").ok_or_else(|| {
+                "Only env:VARIABLE credential references are supported".to_string()
+            })?;
+            if variable.is_empty()
+                || !variable
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                return Err("Invalid environment credential reference".to_string());
+            }
+            let key = std::env::var(variable)
+                .map_err(|_| format!("Credential environment variable '{variable}' is not set"))?;
+            sa.set_api_key(&key);
+        }
+        Ok(())
+    }
+
+    fn build_task_prompt(task: &AgentOsTask) -> String {
+        let mut prompt = task.prompt.clone();
+        let context = &task.context;
+        if !context.user_requirement.is_empty() && context.user_requirement != task.prompt {
+            prompt.push_str("\n\nUser requirement:\n");
+            prompt.push_str(&context.user_requirement);
+        }
+        if !context.stage_id.is_empty() || !context.stage_type.is_empty() {
+            prompt.push_str(&format!(
+                "\n\nStage context: id={}, type={}, project_id={}",
+                context.stage_id, context.stage_type, context.project_id
+            ));
+        }
+        if !context.prev_outputs.is_empty() {
+            if let Ok(serialized) = serde_json::to_string(&context.prev_outputs) {
+                let bounded = crate::utils::text::safe_truncate(&serialized, 32_000);
+                prompt.push_str("\n\nPrevious stage outputs:\n");
+                prompt.push_str(bounded);
+            }
+        }
+        prompt
+    }
 }
 
 /// Helper function to start a Worker
 pub async fn run_worker(config: WorkerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut worker = AgentOsWorker::new(config)?;
-    worker.run().await?;
-    Ok(())
+    let concurrency = config.concurrency.max(1);
+    let (task_tx, task_rx) =
+        tokio::sync::mpsc::channel::<ClaimedTask>(concurrency.saturating_mul(2).max(1));
+    let task_rx = Arc::new(tokio::sync::Mutex::new(task_rx));
+    for worker_index in 0..concurrency {
+        let mut processor_config = config.clone();
+        processor_config.l0_path = std::path::Path::new(&config.l0_path)
+            .join(format!("worker-{worker_index}"))
+            .to_string_lossy()
+            .into_owned();
+        let mut processor = AgentOsWorker::new_processor(processor_config)?;
+        let task_rx = task_rx.clone();
+        let queue_base_path = config.queue_base_path.clone();
+        if let Some(prefetch) = processor.prefetch_engine.clone() {
+            prefetch.spawn_consumer(processor.event_bus.clone(), processor.blackboard.clone());
+        }
+        tokio::spawn(async move {
+            info!(worker_index, "Starting isolated worker slot");
+            loop {
+                let claim = {
+                    let mut receiver = task_rx.lock().await;
+                    receiver.recv().await
+                };
+                let Some(claim) = claim else {
+                    return;
+                };
+                let result = AgentOsWorker::execute_task(
+                    &mut processor.sa,
+                    &processor.config,
+                    &processor.gateway_settings,
+                    claim.task.clone(),
+                )
+                .await;
+                match WorkerQueue::persist_result(&queue_base_path, &result).await {
+                    Ok(()) => {
+                        if let Err(error) = WorkerQueue::complete_claim(&claim).await {
+                            error!(task_id = %result.task_id, error = %error, "Result persisted but inflight claim cleanup failed");
+                        }
+                    }
+                    Err(error) => {
+                        error!(task_id = %result.task_id, error = %error, "Result persistence failed; inflight claim retained for recovery");
+                    }
+                }
+            }
+        });
+    }
+
+    let mut dispatcher = WorkerQueue::new(&config.queue_base_path)?;
+    loop {
+        let claim = dispatcher.claim_next().await?;
+        task_tx
+            .send(claim)
+            .await
+            .map_err(|_| "All worker slots exited")?;
+    }
 }
 
 #[cfg(test)]
@@ -460,5 +622,33 @@ mod tests {
         let worker = AgentOsWorker::new(config);
         assert!(worker.is_ok());
         assert!(worker.unwrap().approval_notifier.is_some());
+    }
+
+    #[test]
+    fn test_isolated_worker_slots_use_partitioned_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WorkerConfig {
+            queue_base_path: temp_dir.path().join("queue").to_str().unwrap().to_string(),
+            l0_path: temp_dir.path().join("l0").to_str().unwrap().to_string(),
+            concurrency: 2,
+            ..Default::default()
+        };
+
+        let mut first_config = config.clone();
+        first_config.l0_path = temp_dir
+            .path()
+            .join("l0/worker-0")
+            .to_string_lossy()
+            .into_owned();
+        let mut second_config = config;
+        second_config.l0_path = temp_dir
+            .path()
+            .join("l0/worker-1")
+            .to_string_lossy()
+            .into_owned();
+        let first = AgentOsWorker::new_processor(first_config);
+        let second = AgentOsWorker::new_processor(second_config);
+        assert!(first.is_ok());
+        assert!(second.is_ok());
     }
 }

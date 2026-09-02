@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.4-blue)](https://github.com/doiito/gliding_horse/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/doiito/gliding_horse/releases)
 
 ---
 
@@ -26,9 +26,9 @@
 
 ---
 
-## 🎉 v0.1.4.preview Release
+## Historical v0.1.4.preview Notes
 
-We are proud to announce the **v0.1.4.preview release** of Gliding Horse Agent OS — a major stability and intelligence release with significant architectural refactoring and 85 file changes (+6134 / −4127 lines).
+These are retained historical preview notes. The authoritative current workspace version is declared once in `[workspace.package]` in `Cargo.toml`.
 
 **Highlights:**
 

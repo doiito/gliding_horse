@@ -559,6 +559,8 @@ pub(super) fn authoritative_task_contract(
             .join("\n")
     };
     let delivery = crate::core::agent_runner::direct_response_delivery_contract(constraints)
+        .map(str::to_string)
+        .or_else(|| crate::core::agent_runner::workspace_artifact_delivery_contract(constraints))
         .map(|contract| format!("\n\nDelivery contract:\n- {contract}"))
         .unwrap_or_default();
     let capability = crate::core::agent_runner::required_capability_contract(constraints)
@@ -567,6 +569,35 @@ pub(super) fn authoritative_task_contract(
     format!(
         "## Authoritative Task Contract\nOriginal user request (verbatim):\n{user_input}\n\nDeclared success criteria:\n{criteria}{delivery}{capability}\n\nContract rule: planning and recovery may clarify execution steps, but must not add, remove, strengthen, weaken, or reinterpret requirements. Preserve exact quantities and scope."
     )
+}
+
+/// Apply a structured, user-issued artifact delivery update between plan
+/// steps.  This is deliberately separate from plan text: otherwise the
+/// original direct-response constraint continues to override a later TUI
+/// instruction to write a file.
+pub(super) fn apply_workspace_delivery_contract(
+    constraints: &mut std::collections::HashMap<String, String>,
+    task_effect_policy: &mut crate::core::effect::EffectPolicy,
+    target_path: &str,
+) {
+    constraints.remove(crate::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT);
+    constraints.insert(
+        crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+        crate::core::agent_runner::DELIVERY_MODE_WORKSPACE_ARTIFACT.to_string(),
+    );
+    constraints.insert(
+        crate::core::agent_runner::DELIVERY_TARGET_PATH_CONSTRAINT.to_string(),
+        target_path.to_string(),
+    );
+    constraints.insert(
+        "required_effect".to_string(),
+        "workspace_mutation".to_string(),
+    );
+    constraints.insert(
+        "effect_policy".to_string(),
+        "required_workspace_mutation".to_string(),
+    );
+    *task_effect_policy = crate::core::effect::EffectPolicy::required_workspace_mutation();
 }
 
 #[derive(Default)]
@@ -824,6 +855,18 @@ impl TaskExecutionFacts {
         }
         paths
     }
+
+    /// A late TUI delivery update is valid even after the original DA has
+    /// completed.  Evidence paths can be absolute (tool tracking) or
+    /// workspace-relative (artifact envelopes), so accept an exact match or a
+    /// path ending at the requested relative target.
+    fn contains_workspace_artifact(&self, target_path: &str) -> bool {
+        let target = std::path::Path::new(target_path);
+        self.workspace_evidence_paths().iter().any(|path| {
+            let candidate = std::path::Path::new(path);
+            candidate == target || candidate.ends_with(target)
+        })
+    }
 }
 
 /// Re-dispatch on failure up to `retry_count` times, sleeping `retry_delay_secs`
@@ -1041,7 +1084,7 @@ impl SupervisorAgent {
         let prev_summary = if prev_summary.is_none() {
             if let Some(ref sched) = self.scheduler {
                 match sched
-                    .context_request_with_decay(role, &context.task_iri, 0.5)
+                    .context_request_with_decay_query(role, &context.context_recall_query(), 0.5)
                     .await
                 {
                     Ok(recalled) if !recalled.trim().is_empty() => Some(recalled),
@@ -1236,9 +1279,10 @@ impl SupervisorAgent {
         mut five_w2h: crate::core::five_w2h::Task5W2H,
         five_w2h_iri: &str,
         resumed_messages: Option<Vec<crate::gateway::unified_gateway::ChatMessage>>,
+        resumed_state: Option<crate::core::checkpoint::TaskResumeState>,
         initial_prev_summary: Option<String>,
-        task_effect_policy: crate::core::effect::EffectPolicy,
-        task_constraints: std::collections::HashMap<String, String>,
+        mut task_effect_policy: crate::core::effect::EffectPolicy,
+        mut task_constraints: std::collections::HashMap<String, String>,
     ) -> Result<TaskResult, CoreError> {
         let cycle_id = self
             .active_cycles
@@ -1305,21 +1349,29 @@ impl SupervisorAgent {
         let mut local_repairs_used = 0u32;
         let mut previous_ca_signature: Option<Vec<String>> = None;
         let mut repeated_ca_failures = 0u32;
-        let authoritative_contract =
+        let mut authoritative_contract =
             authoritative_task_contract(user_input, &five_w2h, &task_constraints);
 
         // Resume mode: determine which phase to start from
         // Load latest checkpoint from L0 to resolve phase tags
         let resume_skip_phases: Vec<AgentRole> = if resumed_messages.is_some() {
-            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
-                self.runner.l0_store.clone(),
-            );
-            let skip_roles = cm
-                .restore_latest_with_skip_roles(task_iri)
-                .ok()
-                .flatten()
-                .map(|(_, roles)| roles)
-                .unwrap_or_else(|| vec!["Plan".to_string()]);
+            let skip_roles = if let Some(state) = &resumed_state {
+                crate::core::checkpoint::compute_skip_roles_from_phase(
+                    &state.checkpoint_name,
+                    state.current_role.as_deref(),
+                )
+            } else {
+                // Compatibility fallback for callers that supplied an
+                // ad-hoc message history instead of a RestoredTask.
+                let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
+                    self.runner.l0_store.clone(),
+                );
+                cm.restore_latest_with_skip_roles(task_iri)
+                    .ok()
+                    .flatten()
+                    .map(|(_, roles)| roles)
+                    .unwrap_or_else(|| vec!["Plan".to_string()])
+            };
             skip_roles
                 .iter()
                 .filter_map(|r| match r.as_str() {
@@ -1338,15 +1390,18 @@ impl SupervisorAgent {
         // Resume mode: prefer restoring from checkpoint's prev_summary field
         // If no prev_summary in checkpoint, extract PA output from history messages
         let resume_prev_summary: Option<String> = if resumed_messages.is_some() {
-            // Try to read saved prev_summary from L0 checkpoint
-            let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
-                self.runner.l0_store.clone(),
-            );
-            let from_cp: Option<String> = cm
-                .restore_latest(task_iri)
-                .ok()
-                .flatten()
-                .and_then(|cp| cp.prev_summary);
+            let from_cp = resumed_state
+                .as_ref()
+                .and_then(|state| state.prev_summary.clone())
+                .or_else(|| {
+                    let cm = crate::core::checkpoint::CheckpointManager::with_persistence(
+                        self.runner.l0_store.clone(),
+                    );
+                    cm.restore_latest(task_iri)
+                        .ok()
+                        .flatten()
+                        .and_then(|cp| cp.prev_summary)
+                });
             if from_cp.is_some() {
                 from_cp
             } else {
@@ -1597,8 +1652,23 @@ impl SupervisorAgent {
                 }
 
                 // ── Supplementary input processing & pause check ──
-                self.check_and_process_supplementary_inputs(task_iri, &step.role, &step.objective)
+                let supplementary = self
+                    .check_and_process_supplementary_inputs(task_iri, &step.role, &step.objective)
                     .await?;
+                if let Some(target_path) = supplementary.workspace_delivery_target {
+                    apply_workspace_delivery_contract(
+                        &mut task_constraints,
+                        &mut task_effect_policy,
+                        &target_path,
+                    );
+                    authoritative_contract =
+                        authoritative_task_contract(user_input, &five_w2h, &task_constraints);
+                    info!(
+                        task_iri = %task_iri,
+                        target_path,
+                        "Applied supplementary workspace delivery contract"
+                    );
+                }
                 // Cycle timeout check
                 {
                     let now = chrono::Utc::now();
@@ -1847,14 +1917,17 @@ impl SupervisorAgent {
                 };
                 if is_first_executed_step {
                     if let Some(ref msgs) = resumed_messages {
-                        let turn_count =
-                            msgs.iter().filter(|m| m.role == "assistant").count() as u32;
-                        let tool_count = msgs
-                            .iter()
-                            .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
-                            .count() as u32;
-                        context =
-                            context.with_resumed_messages(msgs.clone(), turn_count, tool_count);
+                        context = if let Some(state) = resumed_state.clone() {
+                            context.with_resumed_checkpoint(msgs.clone(), state)
+                        } else {
+                            let turn_count =
+                                msgs.iter().filter(|m| m.role == "assistant").count() as u32;
+                            let tool_count = msgs
+                                .iter()
+                                .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
+                                .count() as u32;
+                            context.with_resumed_messages(msgs.clone(), turn_count, tool_count)
+                        };
                     }
                 }
                 if let Some(ref pv) = prev_summary {
@@ -2039,6 +2112,173 @@ impl SupervisorAgent {
                     return Ok(failed_task);
                 }
             }
+        }
+
+        // A user can change the delivery target while CA or AA is already
+        // running.  At that point the original DAG has no remaining DA node,
+        // so merely changing the constraints would acknowledge the input but
+        // never create the requested file.  Drain once more after the DAG and
+        // synthesize a narrow DA→CA reconciliation only when exact artifact
+        // evidence is still absent.
+        let mut delivery_reconciled_after_dag = false;
+        let supplementary = self
+            .check_and_process_supplementary_inputs(
+                task_iri,
+                &AgentRole::Act,
+                "Final delivery reconciliation",
+            )
+            .await?;
+        if let Some(target_path) = supplementary.workspace_delivery_target {
+            apply_workspace_delivery_contract(
+                &mut task_constraints,
+                &mut task_effect_policy,
+                &target_path,
+            );
+            authoritative_contract =
+                authoritative_task_contract(user_input, &five_w2h, &task_constraints);
+            info!(
+                task_iri = %task_iri,
+                target_path,
+                "Applied supplementary workspace delivery contract after DAG completion"
+            );
+        }
+
+        let delivery_target = task_constraints
+            .get(crate::core::agent_runner::DELIVERY_TARGET_PATH_CONSTRAINT)
+            .cloned();
+        if let Some(target_path) =
+            delivery_target.filter(|target| !execution_facts.contains_workspace_artifact(target))
+        {
+            self.event_bus
+                .emit(
+                    task_iri,
+                    "DELIVERY_RECONCILIATION_STARTED",
+                    "SA",
+                    &serde_json::json!({"target_path": target_path}).to_string(),
+                )
+                .await;
+            self.emit_sa_thought(
+                task_iri,
+                &format!(
+                    "Late delivery instruction requires a verified workspace artifact at {target_path}"
+                ),
+                "reconcile_workspace_delivery",
+            )
+            .await;
+
+            let handoff = latest_da_result
+                .as_ref()
+                .map(|result| {
+                    result_handoff(
+                        result,
+                        AgentRole::Do,
+                        self.runner
+                            .agent_settings
+                            .execution_budget
+                            .ca_handoff_max_chars,
+                    )
+                })
+                .or_else(|| prev_summary.clone())
+                .unwrap_or_else(|| {
+                    "No prior DA handoff is available; construct the complete deliverable from the original task."
+                        .to_string()
+                });
+            let da_objective = format!(
+                "## Late Delivery Reconciliation\n\n{}\n\nThe user added a workspace delivery requirement after the original plan began. Create the complete final deliverable at the exact workspace-relative path `{target_path}` using `file_write`. Preserve valid prior work from the handoff below, but do not return a chat-only answer. After writing, state the exact path and what was verified.\n\n## Prior Work Handoff\n{handoff}",
+                authoritative_contract,
+            );
+            let da_context = TaskContext::new(
+                task_iri,
+                &da_objective,
+                self.effective_max_iterations(&cycle_id),
+            )
+            .with_original_task(user_input)
+            .with_constraints(task_constraints.clone())
+            .with_effect_policy(crate::core::effect::EffectPolicy::required_workspace_mutation())
+            .with_cycle_id(&cycle_id)
+            .with_prev_summary(&handoff)
+            .with_workspace_evidence_paths(execution_facts.workspace_evidence_paths());
+
+            let da_result = self
+                .dispatch_agent(AgentRole::Do, da_context, &cycle_id, None, 0)
+                .await?;
+            execution_facts.record(&da_result);
+            if da_result.status == "failed" {
+                self.event_bus
+                    .emit(
+                        task_iri,
+                        "DELIVERY_RECONCILIATION_FAILED",
+                        "SA",
+                        &serde_json::json!({"target_path": target_path, "reason": da_result.summary})
+                            .to_string(),
+                    )
+                    .await;
+                let mut failed_result = da_result;
+                execution_facts.apply_to(&mut failed_result);
+                return Ok(failed_result);
+            }
+
+            let da_handoff = result_handoff(
+                &da_result,
+                AgentRole::Do,
+                self.runner
+                    .agent_settings
+                    .execution_budget
+                    .ca_handoff_max_chars,
+            );
+            da_output = Some(da_handoff.clone());
+            latest_da_result = Some(da_result.clone());
+            let ca_objective = format!(
+                "## Verify Late Workspace Delivery\n\n{}\n\nIndependently verify that `{target_path}` now exists in the current workspace. Read the exact file, confirm it is the requested complete Markdown deliverable, and report evidence. Do not accept a chat-only answer or a differently named file.\n\n## DA Handoff\n{da_handoff}",
+                authoritative_contract,
+            );
+            let ca_context = TaskContext::new(
+                task_iri,
+                &ca_objective,
+                self.effective_max_iterations(&cycle_id),
+            )
+            .with_original_task(user_input)
+            .with_constraints(task_constraints.clone())
+            .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly)
+            .with_allowed_tools(vec!["file_read".to_string()])
+            .with_cycle_id(&cycle_id)
+            .with_prev_summary(&da_handoff)
+            .with_workspace_evidence_paths(execution_facts.workspace_evidence_paths());
+            let mut ca_result = self
+                .dispatch_agent(AgentRole::Check, ca_context, &cycle_id, None, 0)
+                .await?;
+            let mut ca_report = apply_ca_dimension_audit(
+                &five_w2h,
+                &mut ca_result,
+                task_iri,
+                self.runner.causal_engine.as_ref().map(|ce| ce.as_ref()),
+            );
+            crate::core::recovery::track_non_convergence(
+                &mut ca_report,
+                &mut previous_ca_signature,
+                &mut repeated_ca_failures,
+            );
+            execution_facts.record(&ca_result);
+            latest_ca_report = Some(ca_report);
+            latest_ca_result = Some(ca_result.clone());
+            prev_summary = Some(result_handoff(
+                &ca_result,
+                AgentRole::Check,
+                self.runner
+                    .agent_settings
+                    .execution_budget
+                    .ca_handoff_max_chars,
+            ));
+            last_result = Some(ca_result);
+            delivery_reconciled_after_dag = true;
+            self.event_bus
+                .emit(
+                    task_iri,
+                    "DELIVERY_RECONCILIATION_COMPLETED",
+                    "SA",
+                    &serde_json::json!({"target_path": target_path}).to_string(),
+                )
+                .await;
         }
 
         // ── CA→DA correction loop ──
@@ -2259,7 +2499,7 @@ impl SupervisorAgent {
 
         // A correction invalidates any earlier AA evidence. Once CA has
         // converged, make one fresh final decision from the latest audit.
-        if correction_count > 0
+        if (correction_count > 0 || delivery_reconciled_after_dag)
             && latest_ca_report
                 .as_ref()
                 .is_some_and(|report| !report.failed())
@@ -2797,7 +3037,9 @@ impl SupervisorAgent {
             };
 
             let supplement_data = {
-                let pending = self.supplement_store.take_pending(task_iri);
+                // A checkpoint must never consume a user instruction.  The
+                // next AgentRunner turn owns consumption via take_pending().
+                let pending = self.supplement_store.snapshot_pending(task_iri);
                 if pending.is_empty() {
                     None
                 } else {
@@ -3750,5 +3992,16 @@ mod terminal_status_tests {
         assert_eq!(aa.tracked_actions.len(), 1);
         assert_eq!(aa.tracked_actions[0].tool_name, "file_write");
         assert_eq!(aa.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn workspace_delivery_reconciliation_recognizes_absolute_artifact_path() {
+        let mut facts = TaskExecutionFacts::default();
+        facts
+            .artifacts
+            .push(serde_json::json!({"path": "/tmp/tui-workspace/AI_Agent_Research_Report.md"}));
+
+        assert!(facts.contains_workspace_artifact("AI_Agent_Research_Report.md"));
+        assert!(!facts.contains_workspace_artifact("other-report.md"));
     }
 }

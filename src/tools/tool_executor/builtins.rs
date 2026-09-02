@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use futures::StreamExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -282,36 +285,174 @@ fn is_build_or_vendored_dir(path: &std::path::Path) -> bool {
     matches!(name, Some(name) if EXCLUDED.contains(&name))
 }
 
-pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
-    let params: WebFetchInput =
-        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    let started = Instant::now();
+const MAX_WEB_FETCH_BYTES: usize = 10_000_000;
+const MAX_WEB_FETCH_REDIRECTS: usize = 10;
 
-    let client = reqwest::Client::builder()
+pub(super) fn is_public_web_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || a == 0
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (b == 18 || b == 19))
+                || a >= 240)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4() {
+                return is_public_web_ip(IpAddr::V4(v4));
+            }
+            let segments = ip.segments();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
+    }
+}
+
+pub(super) async fn validated_web_target(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Only http:// and https:// URLs are allowed".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL must contain a hostname".to_string())?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return Err("Localhost targets are blocked by web_fetch".to_string());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL uses an unsupported port".to_string())?;
+    let addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| format!("DNS resolution failed for {host}: {error}"))?
+            .collect()
+    };
+    if addresses.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
+    }
+    if let Some(blocked) = addresses
+        .iter()
+        .find(|address| !is_public_web_ip(address.ip()))
+    {
+        return Err(format!(
+            "Private, local, or reserved network target is blocked: {}",
+            blocked.ip()
+        ));
+    }
+    Ok(addresses)
+}
+
+async fn send_validated_web_request(url: &reqwest::Url) -> Result<reqwest::Response, String> {
+    let addresses = validated_web_target(url).await?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL must contain a hostname".to_string())?;
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    let client = builder
         .build()
-        .map_err(|e| format!("HTTP client: {}", e))?;
+        .map_err(|error| format!("HTTP client: {error}"))?;
 
-    let mut last_err = String::new();
-    let mut resp = None;
+    let mut last_error = None;
     for attempt in 0..3 {
-        match client.get(&params.url).send().await {
-            Ok(r) => {
-                resp = Some(r);
-                break;
-            }
-            Err(e) => {
-                last_err = format!("Request (attempt {}/3): {}", attempt + 1, e);
-                tracing::warn!("Web fetch attempt {}/3 failed: {}", attempt + 1, e);
+        match client.get(url.clone()).send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_error = Some(error.to_string());
                 if attempt < 2 {
                     tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
                 }
             }
         }
     }
-    let resp = resp.ok_or_else(|| last_err)?;
+    Err(format!(
+        "Request failed after 3 attempts: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+pub(super) async fn read_limited_web_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response.content_length().unwrap_or(0) > MAX_WEB_FETCH_BYTES as u64 {
+        return Err(format!(
+            "Content too large (declared size exceeds {} bytes)",
+            MAX_WEB_FETCH_BYTES
+        ));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_WEB_FETCH_BYTES as u64) as usize,
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("Failed to read response body: {error}"))?;
+        let new_size = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| "Content size overflow".to_string())?;
+        if new_size > MAX_WEB_FETCH_BYTES {
+            return Err(format!(
+                "Content too large (stream exceeded {} bytes)",
+                MAX_WEB_FETCH_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
+    let params: WebFetchInput =
+        serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+    let started = Instant::now();
+
+    let mut current_url = reqwest::Url::parse(&params.url)
+        .map_err(|error| format!("Invalid URL '{}': {error}", params.url))?;
+    let mut redirect_count = 0usize;
+    let resp = loop {
+        let response = send_validated_web_request(&current_url).await?;
+        if response.status().is_redirection() {
+            if redirect_count >= MAX_WEB_FETCH_REDIRECTS {
+                return Err(format!(
+                    "Too many redirects (maximum {})",
+                    MAX_WEB_FETCH_REDIRECTS
+                ));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| "Redirect response is missing Location header".to_string())?
+                .to_str()
+                .map_err(|error| format!("Invalid redirect Location header: {error}"))?;
+            current_url = current_url
+                .join(location)
+                .map_err(|error| format!("Invalid redirect target: {error}"))?;
+            redirect_count += 1;
+            continue;
+        }
+        break response;
+    };
 
     let code = resp.status().as_u16();
     if code >= 400 {
@@ -329,26 +470,8 @@ pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
         .unwrap_or("")
         .to_string();
 
-    let content_length = resp.content_length().unwrap_or(0);
-    if content_length > 10_000_000 {
-        return Err(format!(
-            "Content too large ({} bytes, max 10MB). Use a more specific URL or bash curl for chunked download.",
-            content_length
-        ));
-    }
-
-    let body = match resp.bytes().await {
-        Ok(b) => {
-            if b.len() > 10_000_000 {
-                return Err(format!(
-            "Content too large ({} bytes, max 10MB). Use a more specific URL or bash curl for chunked download.",
-                    b.len()
-                ));
-            }
-            String::from_utf8_lossy(&b).to_string()
-        }
-        Err(e) => return Err(format!("Failed to read response body: {}", e)),
-    };
+    let body_bytes = read_limited_web_body(resp).await?;
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
 
     let content = if ct.contains("html") {
         html_to_text(&body)
@@ -357,7 +480,7 @@ pub(super) async fn execute_web_fetch(input: Value) -> Result<Value, String> {
     };
 
     Ok(json!({
-        "url": params.url, "status_code": code,
+        "url": current_url.as_str(), "status_code": code,
         "content": content, "content_type": ct,
         "duration_ms": started.elapsed().as_millis(),
     }))
@@ -444,8 +567,9 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
     if std::env::var("EXA_API_KEY").is_ok() {
         let result = execute_exa_search(&params.query, started).await;
         match result {
-            Ok(v) => {
+            Ok(mut v) => {
                 if v.get("error").is_none() {
+                    filter_search_response(&mut v, &params);
                     return Ok(v);
                 }
                 tracing::warn!(
@@ -553,20 +677,7 @@ pub(super) async fn execute_web_search(input: Value) -> Result<Value, String> {
                 }));
             }
 
-            if let Some(ref allowed) = params.allowed_domains {
-                results.retain(|r| {
-                    r["url"].as_str().map_or(false, |url| {
-                        allowed.iter().any(|d| url.contains(d.as_str()))
-                    })
-                });
-            }
-            if let Some(ref blocked) = params.blocked_domains {
-                results.retain(|r| {
-                    r["url"].as_str().map_or(true, |url| {
-                        !blocked.iter().any(|d| url.contains(d.as_str()))
-                    })
-                });
-            }
+            filter_search_results(&mut results, &params);
             results.truncate(8);
             Ok(json!({
                 "query": params.query,
@@ -806,159 +917,208 @@ pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
     Ok(json!({"path": dir, "entries": entries, "count": entries.len()}))
 }
 
+#[derive(Debug, Clone)]
+struct BackgroundProcessRecord {
+    command: String,
+    status: String,
+    finished_at: Option<Instant>,
+}
+
+static BACKGROUND_PROCESSES: Lazy<std::sync::Mutex<HashMap<u32, BackgroundProcessRecord>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct OutputCapture {
+    text: String,
+    total_bytes: usize,
+    truncated: bool,
+}
+
+async fn read_bounded_output<R>(mut reader: R) -> OutputCapture
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut captured = Vec::with_capacity(MAX_OUTPUT_BYTES);
+    let mut total_bytes = 0usize;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                total_bytes = total_bytes.saturating_add(read);
+                let remaining = MAX_OUTPUT_BYTES.saturating_sub(captured.len());
+                captured.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+        }
+    }
+    let truncated = total_bytes > captured.len();
+    let mut text = String::from_utf8_lossy(&captured).into_owned();
+    if truncated {
+        text.push_str(&format!(
+            "\n...[output truncated: {} bytes total]",
+            total_bytes
+        ));
+    }
+    OutputCapture {
+        text,
+        total_bytes,
+        truncated,
+    }
+}
+
+async fn join_output_capture(
+    task: Option<tokio::task::JoinHandle<OutputCapture>>,
+) -> OutputCapture {
+    match task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => OutputCapture::default(),
+    }
+}
+
+fn register_background_process(task_id: u32, command: String, mut child: tokio::process::Child) {
+    {
+        let mut registry = BACKGROUND_PROCESSES
+            .lock()
+            .expect("background process registry poisoned");
+        registry.retain(|_, record| {
+            record
+                .finished_at
+                .is_none_or(|finished| finished.elapsed() < std::time::Duration::from_secs(300))
+        });
+        registry.insert(
+            task_id,
+            BackgroundProcessRecord {
+                command,
+                status: "running".to_string(),
+                finished_at: None,
+            },
+        );
+    }
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        if let Ok(mut registry) = BACKGROUND_PROCESSES.lock() {
+            if let Some(record) = registry.get_mut(&task_id) {
+                record.status = match status {
+                    Ok(status) => format!("exited:{}", status.code().unwrap_or(-1)),
+                    Err(error) => format!("wait_error:{error}"),
+                };
+                record.finished_at = Some(Instant::now());
+                tracing::debug!(background_task_id = task_id, command = %record.command,
+                    status = %record.status, "Background process reaped");
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn background_process_status(task_id: u32) -> Option<String> {
+    BACKGROUND_PROCESSES
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&task_id).map(|record| record.status.clone()))
+}
+
 pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
-    // Windows: delegate to execute_powershell, LLM doesn't need to know
     #[cfg(windows)]
     {
         let params: BashInput =
-            serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
+            serde_json::from_value(input).map_err(|e| format!("Invalid input: {e}"))?;
         let ps_input = serde_json::to_value(PowerShellInput {
             command: params.command,
             timeout: params.timeout,
             description: params.description,
-            run_in_background: None,
+            run_in_background: params.run_in_background,
         })
-        .map_err(|e| format!("Serialize error: {}", e))?;
+        .map_err(|e| format!("Serialize error: {e}"))?;
         return execute_powershell(ps_input).await;
     }
 
-    // Unix: execute via sh -c (or unshare sandbox launcher when active)
     #[cfg(not(windows))]
     {
         let params: BashInput =
-            serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-        use std::sync::{Arc, Mutex};
-        use std::thread;
+            serde_json::from_value(input).map_err(|e| format!("Invalid input: {e}"))?;
         let timeout_ms = params.timeout.unwrap_or(60_000);
-        let cwd = std::env::current_dir().map_err(|e| format!("Current dir error: {}", e))?;
+        let cwd = std::env::current_dir().map_err(|e| format!("Current dir error: {e}"))?;
         let sandbox_status = sandbox_status_for_input(&params, &cwd);
         let sandbox_status_json = serde_json::to_value(&sandbox_status)
-            .map_err(|e| format!("Sandbox status serialize error: {}", e))?;
+            .map_err(|e| format!("Sandbox status serialize error: {e}"))?;
 
-        // Background execution: spawn detached and return immediately.
         if params.run_in_background.unwrap_or(false) {
-            let mut cmd = prepare_bash_spawn(&params.command, &cwd, &sandbox_status)?;
-            let spawned = cmd
+            let mut command = prepare_bash_spawn(&params.command, &cwd, &sandbox_status)?;
+            command
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("Spawn error: {}", e))?;
+                .stderr(std::process::Stdio::null());
+            let mut command = tokio::process::Command::from(command);
+            command.kill_on_drop(true);
+            let child = command.spawn().map_err(|e| format!("Spawn error: {e}"))?;
+            let task_id = child
+                .id()
+                .ok_or_else(|| "Spawned background process has no PID".to_string())?;
+            register_background_process(task_id, params.command.clone(), child);
             return Ok(json!({
                 "command": params.command,
-                "background_task_id": spawned.id().to_string(),
+                "background_task_id": task_id.to_string(),
+                "background_status": "running",
                 "sandbox_status": sandbox_status_json,
             }));
         }
 
-        // Self-protection: the DA often cleans up spawned processes with
-        // `pkill -f <name>`; because the agent's own command line embeds the
-        // task prompt (which may contain the same <name>), a full-command-line
-        // match kills the agent itself. Wrap the command so pkill/killall
-        // resolve targets via pgrep and exclude the agent PID + wrapper shell.
         let guarded_command = self_protect_bash_command(&params.command);
-
-        let spawn_child = |cmd: &str| -> Result<std::process::Child, String> {
-            prepare_bash_spawn(cmd, &cwd, &sandbox_status)?
-                .spawn()
-                .map_err(|e| format!("Spawn error: {}", e))
-        };
-
-        let spawn_readers =
-            |child: &mut std::process::Child| -> (Arc<Mutex<String>>, Arc<Mutex<String>>) {
-                let out_buf = Arc::new(Mutex::new(String::new()));
-                let err_buf = Arc::new(Mutex::new(String::new()));
-                if let Some(stdout) = child.stdout.take() {
-                    let buf = out_buf.clone();
-                    thread::spawn(move || {
-                        if let Ok(output) = std::io::read_to_string(stdout) {
-                            *buf.lock().expect("out_buf Mutex poisoned") = output;
-                        }
-                    });
+        let mut command = tokio::process::Command::from(prepare_bash_spawn(
+            &guarded_command,
+            &cwd,
+            &sandbox_status,
+        )?);
+        command.kill_on_drop(true);
+        let mut child = command.spawn().map_err(|e| format!("Spawn error: {e}"))?;
+        let pid = child.id();
+        let stdout_task = child
+            .stdout
+            .take()
+            .map(|out| tokio::spawn(read_bounded_output(out)));
+        let stderr_task = child
+            .stderr
+            .take()
+            .map(|err| tokio::spawn(read_bounded_output(err)));
+        let started = Instant::now();
+        let wait_result =
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.wait()).await;
+        let (status, timed_out) = match wait_result {
+            Ok(result) => (Some(result.map_err(|e| format!("Wait error: {e}"))?), false),
+            Err(_) => {
+                if let Some(pid) = pid {
+                    kill_process_group_by_id(pid).await;
                 }
-                if let Some(stderr) = child.stderr.take() {
-                    let buf = err_buf.clone();
-                    thread::spawn(move || {
-                        if let Ok(output) = std::io::read_to_string(stderr) {
-                            *buf.lock().expect("err_buf Mutex poisoned") = output;
-                        }
-                    });
-                }
-                (out_buf, err_buf)
-            };
-
-        let mut child = spawn_child(&guarded_command)?;
-        let (mut stdout_buf, mut stderr_buf) = spawn_readers(&mut child);
-
-        let mut start = std::time::Instant::now();
-        let mut max_dur = std::time::Duration::from_millis(timeout_ms);
-        let mut attempts = 0u32;
-        let result = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // brief pause for reader threads to finish
-                    thread::sleep(std::time::Duration::from_millis(50));
-                    let stdout_raw = stdout_buf
-                        .lock()
-                        .expect("stdout_buf Mutex poisoned")
-                        .clone();
-                    let stderr_raw = stderr_buf
-                        .lock()
-                        .expect("stderr_buf Mutex poisoned")
-                        .clone();
-                    let (stdout, truncated) = truncate_output(&stdout_raw);
-                    let (stderr, _) = truncate_output(&stderr_raw);
-                    let original_size = stdout_raw.len() + stderr_raw.len();
-                    let code = status.code().unwrap_or(-1);
-                    break json!({
-                        "command": params.command, "exit_code": code,
-                        "stdout": stdout, "stderr": stderr,
-                        "duration_ms": start.elapsed().as_millis() as u64,
-                        "truncated": truncated,
-                        "original_size": original_size,
-                        "sandbox_status": sandbox_status_json,
-                    });
-                }
-                Ok(None) => {
-                    if start.elapsed() > max_dur {
-                        if attempts == 0 {
-                            tracing::warn!(
-                                "[execute_bash] command timed out after {}ms, retrying with {}ms timeout",
-                                timeout_ms, timeout_ms * 2,
-                            );
-                            let _ = child.kill();
-                            kill_process_group(&child);
-                            child = spawn_child(&guarded_command)?;
-                            let (o, e) = spawn_readers(&mut child);
-                            stdout_buf = o;
-                            stderr_buf = e;
-                            max_dur = std::time::Duration::from_millis(timeout_ms * 2);
-                            start = std::time::Instant::now();
-                            attempts = 1;
-                            continue;
-                        }
-                        let _ = child.kill();
-                        kill_process_group(&child);
-                        let stdout = stdout_buf
-                            .lock()
-                            .expect("stdout_buf Mutex poisoned")
-                            .clone();
-                        let stderr = stderr_buf
-                            .lock()
-                            .expect("stderr_buf Mutex poisoned")
-                            .clone();
-                        break json!({
-                            "command": params.command, "timed_out": true,
-                            "stdout": stdout, "stderr": stderr,
-                            "error": format!("Timeout after {}ms", timeout_ms * 2),
-                        });
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => break json!({"command": params.command, "error": e.to_string()}),
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (None, true)
             }
         };
-        Ok(result)
+        let stdout = join_output_capture(stdout_task).await;
+        let stderr = join_output_capture(stderr_task).await;
+        let original_size = stdout.total_bytes.saturating_add(stderr.total_bytes);
+        if timed_out {
+            return Ok(json!({
+                "command": params.command, "timed_out": true,
+                "stdout": stdout.text, "stderr": stderr.text,
+                "truncated": stdout.truncated || stderr.truncated,
+                "original_size": original_size,
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "error": format!("Timeout after {}ms", timeout_ms),
+                "sandbox_status": sandbox_status_json,
+            }));
+        }
+        Ok(json!({
+            "command": params.command,
+            "exit_code": status.and_then(|status| status.code()).unwrap_or(-1),
+            "stdout": stdout.text, "stderr": stderr.text,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "truncated": stdout.truncated || stderr.truncated,
+            "original_size": original_size,
+            "sandbox_status": sandbox_status_json,
+        }))
     }
 }
 
@@ -998,6 +1158,8 @@ fn prepare_bash_spawn(
         let mut c = Command::new(launcher.program);
         c.args(launcher.args);
         c.current_dir(cwd);
+        c.env_clear();
+        c.envs(crate::tools::process_env::sanitized_child_environment(true));
         c.envs(launcher.env);
         c.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1009,6 +1171,8 @@ fn prepare_bash_spawn(
     }
     let mut c = Command::new("sh");
     c.arg("-lc").arg(command).current_dir(cwd);
+    c.env_clear();
+    c.envs(crate::tools::process_env::sanitized_child_environment(true));
     if sandbox_status.filesystem_active {
         c.env("HOME", cwd.join(".sandbox-home"));
         c.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -1025,6 +1189,7 @@ fn prepare_bash_spawn(
 const MAX_OUTPUT_BYTES: usize = 16_384;
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
+#[cfg(test)]
 pub(super) fn truncate_output(s: &str) -> (String, bool) {
     if s.len() <= MAX_OUTPUT_BYTES {
         return (s.to_string(), false);
@@ -1095,15 +1260,16 @@ killall() {{
 }
 
 #[cfg(unix)]
-fn kill_process_group(child: &std::process::Child) {
-    let pgid = child.id();
-    let _ = std::process::Command::new("kill")
-        .arg(format!("-{}", pgid))
-        .output();
+async fn kill_process_group_by_id(process_group_id: u32) {
+    let _ = tokio::process::Command::new("kill")
+        .arg("--")
+        .arg(format!("-{process_group_id}"))
+        .status()
+        .await;
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_child: &std::process::Child) {}
+async fn kill_process_group_by_id(_process_group_id: u32) {}
 
 /// Check if a path is within the current working directory (workspace).
 /// Returns an error if the path is outside the workspace.
@@ -1240,54 +1406,66 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
 
     let timeout_ms = params.timeout.unwrap_or(60_000);
 
-    let mut child = std::process::Command::new(&exe_path)
+    let mut command = tokio::process::Command::new(&exe_path);
+    command
         .args(["-NoProfile", "-NonInteractive", "-Command", &params.command])
+        .env_clear()
+        .envs(crate::tools::process_env::sanitized_child_environment(true))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Spawn error: {}", e))?;
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| format!("Spawn error: {}", e))?;
 
-    let start = std::time::Instant::now();
-    let max_dur = std::time::Duration::from_millis(timeout_ms);
-
-    let result = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|out| std::io::read_to_string(out).unwrap_or_default())
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|err| std::io::read_to_string(err).unwrap_or_default())
-                    .unwrap_or_default();
-                let code = status.code().unwrap_or(-1);
-                break json!({
-                    "command": params.command, "exit_code": code,
-                    "stdout": stdout, "stderr": stderr,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                    "shell": exe,
-                });
-            }
-            Ok(None) => {
-                if start.elapsed() > max_dur {
-                    let _ = child.kill();
-                    break json!({
-                        "command": params.command, "timed_out": true,
-                        "error": format!("Timeout after {}ms", timeout_ms),
-                        "shell": exe,
-                    });
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => {
-                break json!({"command": params.command, "error": e.to_string(), "shell": exe})
-            }
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(read_bounded_output(stdout)));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_bounded_output(stderr)));
+    let started = Instant::now();
+    let wait_result =
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.wait()).await;
+    let (status, timed_out) = match wait_result {
+        Ok(result) => (
+            Some(result.map_err(|error| format!("Wait error: {error}"))?),
+            false,
+        ),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (None, true)
         }
     };
-    Ok(result)
+    let stdout = join_output_capture(stdout_task).await;
+    let stderr = join_output_capture(stderr_task).await;
+    let original_size = stdout.total_bytes.saturating_add(stderr.total_bytes);
+
+    if timed_out {
+        return Ok(json!({
+            "command": params.command,
+            "timed_out": true,
+            "stdout": stdout.text,
+            "stderr": stderr.text,
+            "truncated": stdout.truncated || stderr.truncated,
+            "original_size": original_size,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "error": format!("Timeout after {}ms", timeout_ms),
+            "shell": exe,
+        }));
+    }
+
+    Ok(json!({
+        "command": params.command,
+        "exit_code": status.and_then(|status| status.code()).unwrap_or(-1),
+        "stdout": stdout.text,
+        "stderr": stderr.text,
+        "truncated": stdout.truncated || stderr.truncated,
+        "original_size": original_size,
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "shell": exe,
+    }))
 }
 
 fn which_powershell(exe: &str) -> Option<String> {
@@ -1519,13 +1697,125 @@ fn extract_quoted_str(input: &str) -> Option<(String, &str)> {
 }
 
 fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => "+".to_string(),
-            c => format!("%{:02X}", c as u8),
-        })
-        .collect()
+    let mut encoded = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            b' ' => encoded.push('+'),
+            byte => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn normalized_domain(pattern: &str) -> Option<String> {
+    let trimmed = pattern.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        return url.host_str().map(|host| host.to_ascii_lowercase());
+    }
+    let domain = trimmed.trim_start_matches('.').to_ascii_lowercase();
+    if domain.contains('/') || domain.contains(':') || domain.contains(char::is_whitespace) {
+        None
+    } else {
+        Some(domain)
+    }
+}
+
+fn domain_matches(url: &str, pattern: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    let Some(domain) = normalized_domain(pattern) else {
+        return false;
+    };
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn filter_search_results(results: &mut Vec<Value>, params: &WebSearchInput) {
+    if let Some(allowed) = &params.allowed_domains {
+        results.retain(|result| {
+            result["url"]
+                .as_str()
+                .is_some_and(|url| allowed.iter().any(|domain| domain_matches(url, domain)))
+        });
+    }
+    if let Some(blocked) = &params.blocked_domains {
+        results.retain(|result| {
+            result["url"]
+                .as_str()
+                .is_none_or(|url| !blocked.iter().any(|domain| domain_matches(url, domain)))
+        });
+    }
+}
+
+fn filter_search_response(response: &mut Value, params: &WebSearchInput) {
+    if let Some(results) = response.get_mut("results").and_then(Value::as_array_mut) {
+        filter_search_results(results, params);
+        results.truncate(8);
+    }
+}
+
+#[cfg(test)]
+mod web_search_filter_tests {
+    use super::*;
+
+    #[test]
+    fn form_encoding_uses_utf8_bytes() {
+        assert_eq!(
+            urlencode("滑翔 🐎 rust"),
+            "%E6%BB%91%E7%BF%94+%F0%9F%90%8E+rust"
+        );
+    }
+
+    #[test]
+    fn domain_filter_matches_only_host_or_subdomain() {
+        assert!(domain_matches(
+            "https://docs.example.com/path?next=evil.test",
+            "example.com"
+        ));
+        assert!(domain_matches(
+            "https://example.com/path",
+            "https://example.com"
+        ));
+        assert!(!domain_matches(
+            "https://example.com.evil.test/example.com",
+            "example.com"
+        ));
+        assert!(!domain_matches(
+            "https://evil.test/?target=example.com",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn allowed_and_blocked_domains_share_the_same_filter() {
+        let params = WebSearchInput {
+            query: "test".to_string(),
+            allowed_domains: Some(vec!["example.com".to_string()]),
+            blocked_domains: Some(vec!["private.example.com".to_string()]),
+        };
+        let mut results = vec![
+            json!({"url": "https://www.example.com/public"}),
+            json!({"url": "https://private.example.com/secret"}),
+            json!({"url": "https://example.com.evil.test/"}),
+        ];
+        filter_search_results(&mut results, &params);
+        assert_eq!(
+            results,
+            vec![json!({"url": "https://www.example.com/public"})]
+        );
+    }
 }
 
 pub(super) async fn execute_create_skill(

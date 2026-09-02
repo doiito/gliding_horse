@@ -34,6 +34,9 @@ pub struct CliConfig {
     pub gateway: GatewaySettings,
     pub model: String,
     pub workspace: String,
+    /// ReAct turn ceiling for each individual agent invocation. A task can
+    /// invoke several agents across PDCA cycles, so this is not a global task
+    /// turn budget.
     pub max_iterations: u32,
     pub max_pdca_cycles: u32,
     /// Controlled continuous-learning treatment for this process.
@@ -60,6 +63,8 @@ pub struct CliConfig {
 
 impl CliConfig {
     pub fn from_env_and_args(
+        api_key_override: Option<String>,
+        api_url_override: Option<String>,
         model: String,
         workspace: String,
         max_iterations: u32,
@@ -68,16 +73,76 @@ impl CliConfig {
         workflow_path: Option<String>,
         skill_dir: Option<String>,
     ) -> Self {
-        let api_key = std::env::var("DEEPSEEK_API_KEY")
-            .or_else(|_| std::env::var("AGENT_OS_GATEWAY_API_KEY"))
-            .unwrap_or_else(|_| {
-                eprintln!("错误: 请设置 DEEPSEEK_API_KEY 或 AGENT_OS_GATEWAY_API_KEY 环境变量");
-                std::process::exit(1);
+        Self::from_env_and_args_with_api_key_requirement(
+            api_key_override,
+            api_url_override,
+            model,
+            workspace,
+            max_iterations,
+            max_pdca_cycles,
+            learning_mode,
+            workflow_path,
+            skill_dir,
+            true,
+        )
+    }
+
+    /// Build configuration for a local-only management command. The resulting
+    /// gateway has no credential and must not be used to execute an LLM task.
+    /// This keeps evidence verification and local diagnostics usable during an
+    /// incident even when secrets are intentionally unavailable.
+    pub fn from_env_and_args_without_required_api_key(
+        api_key_override: Option<String>,
+        api_url_override: Option<String>,
+        model: String,
+        workspace: String,
+        max_iterations: u32,
+        max_pdca_cycles: u32,
+        learning_mode: glidinghorse::core::policy_learning::LearningMode,
+        workflow_path: Option<String>,
+        skill_dir: Option<String>,
+    ) -> Self {
+        Self::from_env_and_args_with_api_key_requirement(
+            api_key_override,
+            api_url_override,
+            model,
+            workspace,
+            max_iterations,
+            max_pdca_cycles,
+            learning_mode,
+            workflow_path,
+            skill_dir,
+            false,
+        )
+    }
+
+    fn from_env_and_args_with_api_key_requirement(
+        api_key_override: Option<String>,
+        api_url_override: Option<String>,
+        model: String,
+        workspace: String,
+        max_iterations: u32,
+        max_pdca_cycles: u32,
+        learning_mode: glidinghorse::core::policy_learning::LearningMode,
+        workflow_path: Option<String>,
+        skill_dir: Option<String>,
+        require_api_key: bool,
+    ) -> Self {
+        let api_key = api_key_override
+            .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+            .or_else(|| std::env::var("AGENT_OS_GATEWAY_API_KEY").ok())
+            .unwrap_or_else(|| {
+                if require_api_key {
+                    eprintln!("错误: 请设置 DEEPSEEK_API_KEY 或 AGENT_OS_GATEWAY_API_KEY 环境变量");
+                    std::process::exit(1);
+                }
+                String::new()
             });
 
-        let base_url = std::env::var("DEEPSEEK_API_URL")
-            .or_else(|_| std::env::var("AGENT_OS_GATEWAY_BASE_URL"))
-            .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
+        let base_url = api_url_override
+            .or_else(|| std::env::var("DEEPSEEK_API_URL").ok())
+            .or_else(|| std::env::var("AGENT_OS_GATEWAY_BASE_URL").ok())
+            .unwrap_or_else(|| "https://api.deepseek.com".to_string());
 
         let model = if model.is_empty() {
             "deepseek-v4-flash".to_string()

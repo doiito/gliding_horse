@@ -61,6 +61,16 @@ impl ResponseCache {
         format!("{}:{:x}", model, hasher.finish())
     }
 
+    /// Build a key from the complete endpoint and serialized request body.
+    pub fn build_request_key(url: &str, body: &Value) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(url.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(body).unwrap_or_default());
+        format!("request:{:x}", hasher.finalize())
+    }
+
     /// Look up a cache entry
     pub fn get(&self, key: &str) -> Option<Value> {
         let mut entries = self.entries.write();

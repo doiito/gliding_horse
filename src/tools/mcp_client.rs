@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +65,8 @@ struct StdioProcess {
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     buffer: String,
+    timeout: Duration,
+    pending_responses: HashMap<u64, JsonRpcResponse>,
 }
 
 impl StdioProcess {
@@ -72,14 +74,17 @@ impl StdioProcess {
     async fn spawn(config: &McpStdioServerConfig) -> Result<Self, CoreError> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
-        // Inherit parent env, then overlay config-specific vars (so PATH etc. are preserved)
-        cmd.envs(std::env::vars());
-        cmd.envs(&config.env);
+        cmd.env_clear();
+        cmd.envs(crate::tools::process_env::sanitized_child_environment(
+            false,
+        ));
+        crate::tools::process_env::overlay_explicit_environment(&mut cmd, &config.env);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         // Discard stderr — MCP server logs (startup banners, usage stats) would
         // corrupt the TUI display if inherited. Errors surface via JSON-RPC.
         cmd.stderr(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| CoreError::Internal {
             message: format!("Failed to start MCP server '{}': {}", config.command, e),
@@ -97,6 +102,8 @@ impl StdioProcess {
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
             buffer: String::new(),
+            timeout: Duration::from_millis(config.tool_call_timeout_ms.unwrap_or(30_000).max(1)),
+            pending_responses: HashMap::new(),
         })
     }
 
@@ -105,6 +112,26 @@ impl StdioProcess {
         &mut self,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, CoreError> {
+        let timeout = self.timeout;
+        match tokio::time::timeout(timeout, self.send_request_inner(request)).await {
+            Ok(result) => result,
+            Err(_) => Err(CoreError::Internal {
+                message: format!(
+                    "MCP stdio request '{}' timed out after {}ms",
+                    request.method,
+                    timeout.as_millis()
+                ),
+            }),
+        }
+    }
+
+    async fn send_request_inner(
+        &mut self,
+        request: &JsonRpcRequest,
+    ) -> Result<JsonRpcResponse, CoreError> {
+        if let Some(response) = self.pending_responses.remove(&request.id) {
+            return Ok(response);
+        }
         let json_str = serde_json::to_string(request).map_err(|e| CoreError::Internal {
             message: format!("JSON serialization failed: {}", e),
         })?;
@@ -126,31 +153,45 @@ impl StdioProcess {
             message: format!("Failed to flush MCP stdin: {}", e),
         })?;
 
-        // Read response line from stdout
-        self.buffer.clear();
-        self.stdout
-            .read_line(&mut self.buffer)
-            .await
-            .map_err(|e| CoreError::Internal {
-                message: format!("Failed to read MCP stdout: {}", e),
-            })?;
-
-        if self.buffer.is_empty() {
-            return Err(CoreError::Internal {
-                message: "MCP server stdout closed".to_string(),
-            });
+        loop {
+            self.buffer.clear();
+            self.stdout
+                .read_line(&mut self.buffer)
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("Failed to read MCP stdout: {}", e),
+                })?;
+            if self.buffer.is_empty() {
+                return Err(CoreError::Internal {
+                    message: "MCP server stdout closed".to_string(),
+                });
+            }
+            let value: Value =
+                serde_json::from_str(self.buffer.trim()).map_err(|e| CoreError::Internal {
+                    message: format!(
+                        "Failed to parse MCP message: {} (raw: {})",
+                        e,
+                        self.buffer.trim()
+                    ),
+                })?;
+            let Some(response_id) = value.get("id").and_then(Value::as_u64) else {
+                debug!(method = ?value.get("method"), "Ignoring MCP notification");
+                continue;
+            };
+            let response: JsonRpcResponse =
+                serde_json::from_value(value).map_err(|e| CoreError::Internal {
+                    message: format!("Failed to parse MCP response: {e}"),
+                })?;
+            if response_id == request.id {
+                return Ok(response);
+            }
+            if self.pending_responses.len() >= 128 {
+                return Err(CoreError::Internal {
+                    message: "Too many out-of-order MCP responses".to_string(),
+                });
+            }
+            self.pending_responses.insert(response_id, response);
         }
-
-        let response: JsonRpcResponse =
-            serde_json::from_str(self.buffer.trim()).map_err(|e| CoreError::Internal {
-                message: format!(
-                    "Failed to parse MCP response: {} (raw: {})",
-                    e,
-                    self.buffer.trim()
-                ),
-            })?;
-
-        Ok(response)
     }
 
     /// Check if the process is still alive.
@@ -165,7 +206,9 @@ pub struct McpClient {
     servers: HashMap<String, McpServerState>,
     processes: HashMap<String, StdioProcess>,
     stdio_configs: HashMap<String, McpStdioServerConfig>,
+    http_headers: HashMap<String, BTreeMap<String, String>>,
     http_client: Client,
+    request_timeout: Duration,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -183,7 +226,9 @@ impl McpClient {
             servers: HashMap::new(),
             processes: HashMap::new(),
             stdio_configs: HashMap::new(),
+            http_headers: HashMap::new(),
             http_client,
+            request_timeout: Duration::from_secs(timeout_secs.max(1)),
             next_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -195,6 +240,15 @@ impl McpClient {
 
     /// Register an HTTP MCP server by URL.
     pub fn register_server(&mut self, name: &str, server_url: &str) {
+        self.register_http_server(name, server_url, BTreeMap::new());
+    }
+
+    fn register_http_server(
+        &mut self,
+        name: &str,
+        server_url: &str,
+        headers: BTreeMap<String, String>,
+    ) {
         info!(server = %name, url = %server_url, transport = "http", "registering MCP server");
         self.servers.insert(
             name.to_string(),
@@ -208,6 +262,7 @@ impl McpClient {
                 error: None,
             },
         );
+        self.http_headers.insert(name.to_string(), headers);
     }
 
     /// Register a stdio MCP server (spawns subprocess on connect).
@@ -226,14 +281,18 @@ impl McpClient {
             },
         );
         // Store config alongside server state for later spawning
-        self.stdio_configs.insert(name.to_string(), config.clone());
+        let mut config = config.clone();
+        config
+            .tool_call_timeout_ms
+            .get_or_insert(self.request_timeout.as_millis().min(u128::from(u64::MAX)) as u64);
+        self.stdio_configs.insert(name.to_string(), config);
     }
 
     /// Register an MCP server from a generic `McpServerConfig` enum.
     pub fn register_from_config(&mut self, name: &str, config: &McpServerConfig) {
         match config {
             McpServerConfig::Http(http_cfg) => {
-                self.register_server(name, &http_cfg.url);
+                self.register_http_server(name, &http_cfg.url, http_cfg.headers.clone());
             }
             McpServerConfig::Stdio(stdio_cfg) => {
                 self.register_stdio_server(name, stdio_cfg);
@@ -261,7 +320,7 @@ impl McpClient {
     }
 
     async fn connect_http(&mut self, name: &str) -> Result<Vec<McpTool>, CoreError> {
-        let url = {
+        let (url, headers) = {
             let state = self
                 .servers
                 .get_mut(name)
@@ -269,7 +328,10 @@ impl McpClient {
                     message: format!("MCP server not registered: {}", name),
                 })?;
             state.status = "connecting".to_string();
-            state.url.clone()
+            (
+                state.url.clone(),
+                self.http_headers.get(name).cloned().unwrap_or_default(),
+            )
         };
 
         let request = JsonRpcRequest {
@@ -279,7 +341,7 @@ impl McpClient {
             id: self.next_request_id(),
         };
 
-        let tools = match self.send_rpc_http(&url, &request).await {
+        let tools = match self.send_rpc_http(&url, &headers, &request).await {
             Ok(response) => self.handle_connect_response(name, response).await,
             Err(e) => self.handle_connect_fallback(name, e).await,
         };
@@ -328,6 +390,7 @@ impl McpClient {
                     }
                     Err(e) => {
                         let _ = process.child.kill().await;
+                        let _ = process.child.wait().await;
                         Ok(self.handle_connect_fallback(name, e).await)
                     }
                 }
@@ -451,7 +514,8 @@ impl McpClient {
                     .get(server)
                     .map(|s| s.url.clone())
                     .unwrap_or_default();
-                self.call_tool_http(&url, &request).await
+                let headers = self.http_headers.get(server).cloned().unwrap_or_default();
+                self.call_tool_http(&url, &headers, &request).await
             }
             "stdio" => self.call_tool_stdio(server, &request).await,
             _ => Err(CoreError::Internal {
@@ -463,9 +527,10 @@ impl McpClient {
     async fn call_tool_http(
         &self,
         url: &str,
+        headers: &BTreeMap<String, String>,
         request: &JsonRpcRequest,
     ) -> Result<Value, CoreError> {
-        match self.send_rpc_http(url, request).await {
+        match self.send_rpc_http(url, headers, request).await {
             Ok(response) => Self::handle_call_response(response),
             Err(e) => Err(e),
         }
@@ -476,23 +541,34 @@ impl McpClient {
         server: &str,
         request: &JsonRpcRequest,
     ) -> Result<Value, CoreError> {
-        let process = self
-            .processes
-            .get_mut(server)
-            .ok_or_else(|| CoreError::Internal {
-                message: format!("MCP Stdio process not found: {}", server),
-            })?;
-
-        if !process.is_alive() {
-            return Err(CoreError::Internal {
-                message: format!("MCP Stdio process for server '{}' has exited", server),
-            });
+        let result = {
+            let process = self
+                .processes
+                .get_mut(server)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("MCP Stdio process not found: {}", server),
+                })?;
+            if !process.is_alive() {
+                return Err(CoreError::Internal {
+                    message: format!("MCP Stdio process for server '{}' has exited", server),
+                });
+            }
+            process.send_request(request).await
+        };
+        if result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("timed out"))
+        {
+            if let Some(mut process) = self.processes.remove(server) {
+                let _ = process.child.kill().await;
+                let _ = process.child.wait().await;
+            }
+            if let Some(state) = self.servers.get_mut(server) {
+                state.status = "error_timeout".to_string();
+                state.error = Some("MCP stdio request timed out; process terminated".to_string());
+            }
         }
-
-        process
-            .send_request(request)
-            .await
-            .and_then(Self::handle_call_response)
+        result.and_then(Self::handle_call_response)
     }
 
     fn handle_call_response(response: JsonRpcResponse) -> Result<Value, CoreError> {
@@ -512,18 +588,29 @@ impl McpClient {
     async fn send_rpc_http(
         &self,
         url: &str,
+        headers: &BTreeMap<String, String>,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, CoreError> {
-        let response = self
-            .http_client
-            .post(url)
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| CoreError::Internal {
-                message: format!("MCP HTTP request failed: {}", e),
-            })?;
+        let mut request_builder = self.http_client.post(url);
+        for (name, value) in headers {
+            request_builder = request_builder.header(name, value);
+        }
+        let response =
+            request_builder
+                .json(request)
+                .send()
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("MCP HTTP request failed: {}", e),
+                })?;
 
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(CoreError::Internal {
+                message: format!("MCP HTTP request failed with {status}: {body}"),
+            });
+        }
         let rpc_response: JsonRpcResponse =
             response.json().await.map_err(|e| CoreError::Internal {
                 message: format!("MCP response parse failed: {}", e),
@@ -653,10 +740,8 @@ impl Default for McpClient {
     }
 }
 
-// We can't implement Drop with async cleanup, so we rely on the engine
-// to call kill_all_processes() explicitly.
-// For now, in the non-async Drop, we just let the processes die when
-// the Child handle is dropped (tokio sends SIGKILL on Drop).
+// Engine shutdown performs kill + wait. `kill_on_drop(true)` on every stdio
+// command is the abnormal-exit fallback when async shutdown cannot run.
 
 #[cfg(test)]
 mod tests {
@@ -698,15 +783,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_from_config_http() {
+        let headers = std::collections::BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer test-token".to_string(),
+        )]);
         let config = McpServerConfig::Http(McpRemoteServerConfig {
             url: "http://localhost:9999/mcp".to_string(),
-            headers: std::collections::BTreeMap::new(),
+            headers: headers.clone(),
         });
         let mut client = McpClient::new();
         client.register_from_config("test-http", &config);
         let state = client.get_server("test-http").unwrap();
         assert_eq!(state.transport, "http");
         assert_eq!(state.url, "http://localhost:9999/mcp");
+        assert_eq!(client.http_headers.get("test-http"), Some(&headers));
     }
 
     #[tokio::test]
@@ -722,5 +812,99 @@ mod tests {
         let state = client.get_server("test-stdio").unwrap();
         assert_eq!(state.transport, "stdio");
         assert!(client.stdio_configs.contains_key("test-stdio"));
+        assert_eq!(
+            client.stdio_configs["test-stdio"].tool_call_timeout_ms,
+            Some(30_000)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_request_timeout_is_enforced_and_bounded() {
+        let config = McpStdioServerConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "read _; sleep 5".to_string()],
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: Some(40),
+        };
+        let mut process = StdioProcess::spawn(&config).await.unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: JSON_RPC_VERSION.to_string(),
+            method: "tools/list".to_string(),
+            params: json!({}),
+            id: 1,
+        };
+        let started = std::time::Instant::now();
+        let error = process.send_request(&request).await.unwrap_err();
+        assert!(error.to_string().contains("timed out after 40ms"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = process.child.kill().await;
+        let _ = process.child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_request_ignores_notifications_and_matches_response_id() {
+        let script = concat!(
+            "read _; ",
+            "printf '%s\\n' ",
+            "'{\"jsonrpc\":\"2.0\",\"method\":\"progress\",\"params\":{}}' ",
+            "'{\"jsonrpc\":\"2.0\",\"result\":{\"wrong\":true},\"id\":99}' ",
+            "'{\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":42}'"
+        );
+        let config = McpStdioServerConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            tool_call_timeout_ms: Some(1_000),
+        };
+        let mut process = StdioProcess::spawn(&config).await.unwrap();
+        let request = JsonRpcRequest {
+            jsonrpc: JSON_RPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: json!({}),
+            id: 42,
+        };
+        let response = process.send_request(&request).await.unwrap();
+        assert_eq!(response.id, 42);
+        assert_eq!(response.result, Some(json!({"ok": true})));
+        assert!(process.pending_responses.contains_key(&99));
+        let _ = process.child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn http_mcp_sends_configured_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer test-token"));
+            let body = r#"{"jsonrpc":"2.0","result":{"tools":[]},"id":1}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut client = McpClient::new();
+        client.register_from_config(
+            "authenticated",
+            &McpServerConfig::Http(McpRemoteServerConfig {
+                url: format!("http://{address}/mcp"),
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer test-token".to_string(),
+                )]),
+            }),
+        );
+        let tools = client.connect("authenticated").await.unwrap();
+        assert!(tools.is_empty());
+        server.await.unwrap();
     }
 }

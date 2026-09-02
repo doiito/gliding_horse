@@ -1,210 +1,255 @@
-//! Tangent-space pruning for Poincaré search.
+//! Optional Poincaré candidate pruning with exact-distance re-ranking.
 //!
-//! Maps Poincaré ball points to tangent space at the Fréchet mean
-//! using the proper exponential/logarithmic maps, performs Euclidean
-//! filtering, then provides candidates for exact Poincaré re-ranking.
-//!
-//! Reference: ruvector's TangentCache pattern, enhanced with proper
-//! gyrovector space operations.
+//! A cache is local to one immutable candidate set.  It is never an index of
+//! record: callers must re-rank the returned IDs with exact Poincaré distance
+//! before exposing results.  Construction and every mutation validate metric,
+//! dimension and identifier consistency.
 
-use crate::hyper_vector::{l2_squared, EmbeddingVector};
+use std::collections::HashSet;
+
+use crate::error::EngineError;
+use crate::hyper_vector::{checked_l2_squared, checked_norm_squared, EmbeddingVector, MetricKind};
 use crate::metric::{exp_map, log_map};
 
-/// Compute the Fréchet mean (Karcher mean) of Poincaré vectors via
-/// gradient descent.
-pub fn frechet_mean(vectors: &[EmbeddingVector], curvature: f64) -> Vec<f64> {
-    if vectors.is_empty() {
-        return vec![];
-    }
-    let dim = vectors[0].coords.len();
-    let n = vectors.len() as f64;
+const MAX_CENTROID_ITERATIONS: usize = 16;
+const CENTROID_CONVERGENCE: f64 = 1e-10;
 
-    // Start at Euclidean mean (good initial guess for Poincaré ball)
-    let mut mean: Vec<f64> = vec![0.0; dim];
-    for v in vectors {
-        for (i, &c) in v.coords.iter().enumerate() {
-            mean[i] += c;
+/// Compute a Fréchet mean in the Poincaré ball using bounded gradient steps.
+pub fn frechet_mean(vectors: &[EmbeddingVector], curvature: f64) -> Result<Vec<f64>, EngineError> {
+    let dimension = validate_poincare_collection(vectors, curvature)?;
+    let count = vectors.len() as f64;
+    let mut mean = vec![0.0; dimension];
+    for vector in vectors {
+        for (target, coordinate) in mean.iter_mut().zip(&vector.coords) {
+            *target += coordinate / count;
         }
     }
-    for m in &mut mean {
-        *m /= n;
-    }
+    // The Poincaré ball is convex; an arithmetic average of interior points
+    // stays in the ball. Reconstructing validates finite values and the bound.
+    let mut mean = EmbeddingVector::new(mean, MetricKind::Poincare)?.coords;
 
-    // One step of gradient descent in Poincaré geometry:
-    // mean_new = exp_mean(learning_rate * sum(log_mean(v_i)))
-    // This gives a much better estimate than Euclidean mean alone.
-    let lr = 0.5;
-    let mut sum_tangent = vec![0.0; dim];
-    for v in vectors {
-        let tv = log_map(&mean, &v.coords, curvature);
-        for (s, t) in sum_tangent.iter_mut().zip(tv.iter()) {
-            *s += t;
+    for _ in 0..MAX_CENTROID_ITERATIONS {
+        let mut average_tangent = vec![0.0; dimension];
+        for vector in vectors {
+            let tangent = log_map(&mean, &vector.coords, curvature)?;
+            for (accumulator, coordinate) in average_tangent.iter_mut().zip(tangent) {
+                *accumulator += coordinate / count;
+            }
         }
+        if checked_norm_squared(&average_tangent)?.sqrt() <= CENTROID_CONVERGENCE {
+            break;
+        }
+        let next = exp_map(&mean, &average_tangent, curvature)?;
+        if checked_l2_squared(&mean, &next)?.sqrt() <= CENTROID_CONVERGENCE {
+            mean = next;
+            break;
+        }
+        mean = next;
     }
-    // Scale by lr / n
-    for s in &mut sum_tangent {
-        *s *= lr / n;
-    }
-    exp_map(&mean, &sum_tangent, curvature)
+    Ok(mean)
 }
 
-/// Tangent-space cache for pruning Poincaré search.
-///
-/// Builds tangent vectors at the Fréchet mean once, then uses
-/// Euclidean distance in tangent space for fast candidate filtering.
+/// Candidate-local tangent-space cache.
+#[derive(Debug, Clone)]
 pub struct TangentCache {
-    /// Fréchet mean of all vectors (in Poincaré ball).
-    pub centroid: Vec<f64>,
-    /// Tangent vectors at centroid (one per input vector).
-    pub tangent_vectors: Vec<Vec<f64>>,
-    /// Curvature parameter.
-    pub curvature: f64,
+    centroid: Vec<f64>,
+    tangent_vectors: Vec<Vec<f64>>,
+    ids: Vec<u32>,
+    curvature: f64,
+    dimension: usize,
 }
 
 impl TangentCache {
-    /// Build the cache from vectors.
-    ///
-    /// O(n * d) for centroid computation + O(n * d) for tangent mapping.
-    pub fn build(vectors: &[EmbeddingVector], curvature: f64) -> Self {
-        let centroid = frechet_mean(vectors, curvature);
-        let tangent_vectors: Vec<Vec<f64>> = vectors
+    /// Build a cache from a single candidate set with stable IDs.
+    pub fn build(
+        candidates: &[(u32, EmbeddingVector)],
+        curvature: f64,
+    ) -> Result<Self, EngineError> {
+        if candidates.is_empty() {
+            return Err(EngineError::InvalidVector(
+                "cannot build a tangent cache from an empty candidate set".into(),
+            ));
+        }
+        let ids = candidates.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let unique = ids.iter().copied().collect::<HashSet<_>>();
+        if unique.len() != ids.len() {
+            return Err(EngineError::InvalidVector(
+                "tangent cache candidate IDs must be unique".into(),
+            ));
+        }
+        let vectors = candidates
             .iter()
-            .map(|v| log_map(&centroid, &v.coords, curvature))
-            .collect();
-        Self {
+            .map(|(_, vector)| vector.clone())
+            .collect::<Vec<_>>();
+        let dimension = validate_poincare_collection(&vectors, curvature)?;
+        let centroid = frechet_mean(&vectors, curvature)?;
+        let tangent_vectors = vectors
+            .iter()
+            .map(|vector| log_map(&centroid, &vector.coords, curvature))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             centroid,
             tangent_vectors,
+            ids,
             curvature,
+            dimension,
+        })
+    }
+
+    /// Add one validated candidate. Duplicate IDs are rejected rather than
+    /// silently replacing a vector and desynchronising the cache.
+    pub fn insert(&mut self, id: u32, vector: &EmbeddingVector) -> Result<(), EngineError> {
+        self.validate_vector(vector)?;
+        if self.ids.contains(&id) {
+            return Err(EngineError::InvalidVector(format!(
+                "tangent cache already contains candidate ID {id}"
+            )));
         }
+        self.tangent_vectors
+            .push(log_map(&self.centroid, &vector.coords, self.curvature)?);
+        self.ids.push(id);
+        Ok(())
     }
 
-    /// Incrementally update the cache with a single new vector.
-    /// Note: This does NOT recompute the centroid (would be O(n*d)).
-    /// For batch updates, rebuild the cache.
-    pub fn insert(&mut self, vector: &EmbeddingVector) {
-        let tv = log_map(&self.centroid, &vector.coords, self.curvature);
-        self.tangent_vectors.push(tv);
+    /// Remove a candidate and its vector atomically. Returns false when the ID
+    /// is absent, preserving an idempotent removal boundary.
+    pub fn remove(&mut self, id: u32) -> bool {
+        let Some(index) = self.ids.iter().position(|candidate| *candidate == id) else {
+            return false;
+        };
+        self.ids.swap_remove(index);
+        self.tangent_vectors.swap_remove(index);
+        true
     }
 
-    /// Remove the tangent vector at the given index.
-    pub fn remove(&mut self, idx: usize) {
-        if idx < self.tangent_vectors.len() {
-            self.tangent_vectors.remove(idx);
-        }
-    }
-
-    /// Two-step search: Euclidean filter → caller does exact re-ranking.
-    ///
-    /// Returns up to `top_k * prune_factor` candidate IDs sorted by
-    /// Euclidean distance in tangent space.
+    /// Return candidate IDs ordered by tangent-space distance. The caller must
+    /// exact-rerank these IDs in the source metric before using them.
     pub fn search_with_pruning(
         &self,
         query: &EmbeddingVector,
-        all_ids: &[u32],
         top_k: usize,
         prune_factor: usize,
-    ) -> Vec<u32> {
-        if self.tangent_vectors.is_empty() || all_ids.is_empty() {
-            return Vec::new();
+    ) -> Result<Vec<u32>, EngineError> {
+        self.validate_vector(query)?;
+        if top_k == 0 || self.tangent_vectors.is_empty() {
+            return Ok(Vec::new());
         }
-
-        let q_tangent = log_map(&self.centroid, &query.coords, self.curvature);
-        let mut candidates: Vec<(u32, f64)> = all_ids
+        let query_tangent = log_map(&self.centroid, &query.coords, self.curvature)?;
+        let mut candidates = self
+            .ids
             .iter()
+            .copied()
             .zip(self.tangent_vectors.iter())
-            .map(|(&id, tv)| (id, l2_squared(&q_tangent, tv)))
-            .collect();
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(top_k * prune_factor);
-        candidates.into_iter().map(|(id, _)| id).collect()
+            .map(|(id, tangent)| Ok((id, checked_l2_squared(&query_tangent, tangent)?)))
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
+        let cap = top_k
+            .saturating_mul(prune_factor.max(1))
+            .min(candidates.len());
+        candidates.truncate(cap);
+        Ok(candidates.into_iter().map(|(id, _)| id).collect())
     }
 
-    /// Number of cached tangent vectors.
     pub fn len(&self) -> usize {
-        self.tangent_vectors.len()
+        self.ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tangent_vectors.is_empty()
+        self.ids.is_empty()
+    }
+
+    fn validate_vector(&self, vector: &EmbeddingVector) -> Result<(), EngineError> {
+        if vector.metric != MetricKind::Poincare {
+            return Err(EngineError::InvalidVector(
+                "tangent cache accepts only Poincare vectors".into(),
+            ));
+        }
+        if vector.coords.len() != self.dimension {
+            return Err(EngineError::InvalidVector(format!(
+                "tangent cache vector dimension {} does not match {}",
+                vector.coords.len(),
+                self.dimension
+            )));
+        }
+        vector.validate()
     }
 }
 
-/// Check if the Poincaré ball is the active metric space.
-pub fn is_poincare(metric_kind: &crate::hyper_vector::MetricKind) -> bool {
-    matches!(metric_kind, crate::hyper_vector::MetricKind::Poincare)
+/// Whether this optional optimisation applies to an engine metric.
+pub fn is_poincare(metric_kind: &MetricKind) -> bool {
+    matches!(metric_kind, MetricKind::Poincare)
+}
+
+fn validate_poincare_collection(
+    vectors: &[EmbeddingVector],
+    curvature: f64,
+) -> Result<usize, EngineError> {
+    let Some(first) = vectors.first() else {
+        return Err(EngineError::InvalidVector(
+            "Poincare collection must not be empty".into(),
+        ));
+    };
+    if first.metric != MetricKind::Poincare {
+        return Err(EngineError::InvalidVector(
+            "tangent cache requires Poincare vectors".into(),
+        ));
+    }
+    first.validate()?;
+    let dimension = first.coords.len();
+    for vector in vectors.iter().skip(1) {
+        if vector.metric != MetricKind::Poincare || vector.coords.len() != dimension {
+            return Err(EngineError::InvalidVector(
+                "Poincare collection mixes metrics or dimensions".into(),
+            ));
+        }
+        vector.validate()?;
+    }
+    // `log_map` validates the requested curvature. Trigger it here even when
+    // the collection holds valid curvature-one vectors.
+    crate::hyper_vector::validate_curvature(curvature)?;
+    for vector in vectors {
+        crate::hyper_vector::validate_poincare_coordinates(&vector.coords, curvature)?;
+    }
+    Ok(dimension)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MetricKind;
 
-    fn v(coords: Vec<f64>) -> EmbeddingVector {
-        EmbeddingVector::new_unchecked(coords, MetricKind::Poincare)
+    fn vector(x: f64, y: f64) -> EmbeddingVector {
+        EmbeddingVector::new(vec![x, y], MetricKind::Poincare).unwrap()
     }
 
     #[test]
-    fn test_frechet_mean_euclidean_start() {
-        let v1 = v(vec![0.1, 0.2]);
-        let v2 = v(vec![0.3, 0.1]);
-        let mean = frechet_mean(&[v1, v2], 1.0);
-        assert_eq!(mean.len(), 2);
-        // Euclidean mean would be (0.2, 0.15)
-        assert!((mean[0] - 0.2).abs() < 0.1);
-        assert!((mean[1] - 0.15).abs() < 0.1);
+    fn cache_keeps_ids_and_vectors_in_sync() {
+        let mut cache =
+            TangentCache::build(&[(10, vector(0.1, 0.1)), (20, vector(0.2, 0.1))], 1.0).unwrap();
+        cache.insert(30, &vector(0.3, 0.1)).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert!(cache.remove(20));
+        assert!(!cache.remove(20));
+        let result = cache.search_with_pruning(&vector(0.1, 0.1), 2, 2).unwrap();
+        assert!(!result.contains(&20));
+        assert!(result.contains(&10));
     }
 
     #[test]
-    fn test_tangent_cache_build() {
-        let vectors: Vec<EmbeddingVector> = (0..10)
-            .map(|i| {
-                let x = (i as f64) * 0.05 + 0.1;
-                v(vec![x, x * 0.5])
-            })
-            .collect();
-        let cache = TangentCache::build(&vectors, 1.0);
-        assert_eq!(cache.len(), 10);
-        assert_eq!(cache.tangent_vectors.len(), 10);
+    fn cache_rejects_mixed_metrics_dimensions_and_ids() {
+        let cosine = EmbeddingVector::new(vec![0.1, 0.1], MetricKind::Cosine).unwrap();
+        assert!(TangentCache::build(&[(1, cosine)], 1.0).is_err());
+        assert!(TangentCache::build(&[(1, vector(0.1, 0.1)), (1, vector(0.2, 0.1))], 1.0).is_err());
+        let cache = TangentCache::build(&[(1, vector(0.1, 0.1))], 1.0).unwrap();
+        let invalid_query = EmbeddingVector::new(vec![0.1, 0.1], MetricKind::Cosine).unwrap();
+        assert!(cache.search_with_pruning(&invalid_query, 1, 2).is_err());
     }
 
     #[test]
-    fn test_tangent_cache_pruning() {
-        let vectors: Vec<EmbeddingVector> = (0..20)
-            .map(|i| {
-                let x = (i as f64) * 0.04;
-                v(vec![x, x])
-            })
-            .collect();
-        let cache = TangentCache::build(&vectors, 1.0);
-        let query = v(vec![0.2, 0.2]);
-        let ids: Vec<u32> = (0..20).collect();
-        let result = cache.search_with_pruning(&query, &ids, 3, 2);
-        assert!(!result.is_empty());
-        assert!(result.len() <= 6);
-        // The closest in tangent space should include id_5 (x=0.2)
-        assert!(
-            result.contains(&5),
-            "result should contain the point closest to query"
-        );
-    }
-
-    #[test]
-    fn test_insert_after_build() {
-        let v1 = v(vec![0.1, 0.1]);
-        let v2 = v(vec![0.2, 0.2]);
-        let mut cache = TangentCache::build(&[v1], 1.0);
-        assert_eq!(cache.len(), 1);
-        cache.insert(&v2);
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn test_remove() {
-        let v1 = v(vec![0.1, 0.1]);
-        let v2 = v(vec![0.2, 0.2]);
-        let mut cache = TangentCache::build(&[v1, v2], 1.0);
-        assert_eq!(cache.len(), 2);
-        cache.remove(0);
-        assert_eq!(cache.len(), 1);
+    fn frechet_mean_is_valid_and_deterministic() {
+        let points = vec![vector(0.1, 0.1), vector(0.2, 0.1), vector(0.3, 0.1)];
+        let first = frechet_mean(&points, 1.0).unwrap();
+        let second = frechet_mean(&points, 1.0).unwrap();
+        EmbeddingVector::new(first.clone(), MetricKind::Poincare).unwrap();
+        assert_eq!(first, second);
     }
 }

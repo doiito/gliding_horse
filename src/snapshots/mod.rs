@@ -26,8 +26,7 @@
 //!
 //! Named `snapshots` (not `temporal`) because this module is primarily a
 //! **versioned snapshot system** for the skill graph. The temporal hyperedge
-//! functionality is secondary. For time-series tensor storage or temporal
-//! coherence decay, see the `ruvector-temporal-*` crates in `PR-res/ruvector/`.
+//! functionality is secondary; it is not a general time-series tensor store.
 
 pub mod timeline;
 pub mod types;

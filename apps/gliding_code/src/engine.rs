@@ -1023,6 +1023,7 @@ impl CodeCliEngine {
         .with_discovery_engine(discovery_engine.clone())
         .with_learning_mode(config.learning_mode)
         .with_policy_learning_settings(&settings.policy_learning)
+        .with_learning_health_settings(&settings.learning_health)
         .with_perception_ontology_bridge(ontology_bridge.clone());
 
         let (prompt_tokens, completion_tokens, last_prompt_tokens, last_completion_tokens) =
@@ -1129,6 +1130,15 @@ impl CodeCliEngine {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(handle) = self.mcp_client.take() {
+            let mut guard = handle.lock().await;
+            if let Some(mut client) = guard.take() {
+                client.kill_all_processes().await;
+            }
+        }
     }
 
     pub fn api_key(&self) -> &str {
@@ -1328,9 +1338,12 @@ impl CodeCliEngine {
 
         // Every interactive entry reaches the same transport-neutral terminal
         // event before product-specific evolution and persistence follow-ups.
-        glidinghorse::core::TaskFinalizer::new(self.event_bus.clone())
-            .finalize(&task_iri, &result)
-            .await;
+        glidinghorse::core::TaskFinalizer::with_evidence_ledger(
+            self.event_bus.clone(),
+            self.l0.clone(),
+        )
+        .finalize(&task_iri, &result)
+        .await;
 
         // Record post-task metrics for skill evolution + causal analysis
         if let (true, Ok(mut ee)) = (
@@ -1881,19 +1894,9 @@ impl CodeCliEngine {
     pub fn list_learning_evaluations_from_config(
         config: &CliConfig,
     ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let Some(base) = config.data_dir.as_deref() else {
+        let Some(l0) = Self::open_workspace_l0_from_config(config)? else {
             return Ok(Vec::new());
         };
-        let workspace = std::fs::canonicalize(&config.workspace)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace));
-        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
-        let l0_path = std::path::Path::new(base)
-            .join(format!("workspace-{}", hex::encode(&digest[..12])))
-            .join("l0");
-        if !l0_path.exists() {
-            return Ok(Vec::new());
-        }
-        let l0 = L0Store::new(&l0_path.to_string_lossy())?;
         let mut results = l0
             .scan_iri_prefix("iri://learning/evaluations/", 10_000)?
             .into_iter()
@@ -1905,6 +1908,230 @@ impl CodeCliEngine {
                 .cmp(&right.get("timestamp").and_then(serde_json::Value::as_str))
         });
         Ok(results)
+    }
+
+    /// List durable independent-label retrieval verdicts without starting the
+    /// LLM, embedding service, graph, watcher, or TUI.
+    pub fn list_offline_retrieval_evaluations_from_config(
+        config: &CliConfig,
+    ) -> anyhow::Result<Vec<glidinghorse::core::offline_retrieval_eval::OfflineRetrievalEvaluation>>
+    {
+        let Some(l0) = Self::open_workspace_l0_from_config(config)? else {
+            return Ok(Vec::new());
+        };
+        Ok(
+            glidinghorse::core::offline_retrieval_eval::OfflineRetrievalEvaluator::new(l0)
+                .list(10_000)?,
+        )
+    }
+
+    /// Verify a sealed task evidence chain without starting an LLM, embedding
+    /// service, watcher, graph store, or TUI.
+    pub fn verify_task_evidence_from_config(
+        config: &CliConfig,
+        task_iri: &str,
+    ) -> anyhow::Result<glidinghorse::core::TaskEvidenceVerification> {
+        let l0 = Self::open_workspace_l0_from_config(config)?.ok_or_else(|| {
+            anyhow::anyhow!("no local task evidence store exists for this workspace")
+        })?;
+        Ok(glidinghorse::core::TaskExecutionJournal::open(l0, task_iri)?.verify()?)
+    }
+
+    /// Operator-triggered, read-only ANN probe. It persists aggregate audit
+    /// evidence and recommendation but never applies maintenance itself.
+    pub async fn inspect_ann_health(
+        &self,
+    ) -> anyhow::Result<glidinghorse::core::AnnHealthEvidence> {
+        let monitor =
+            glidinghorse::core::AnnHealthMonitor::new(self.l0.clone(), self.vector_store.clone());
+        Ok(monitor
+            .inspect_and_record(&glidinghorse::memory::AnnHealthProbeConfig::default())
+            .await?)
+    }
+
+    /// List the latest family-scoped health reports without initializing the
+    /// LLM, embedding service, graph, watcher, or TUI.
+    pub fn list_learning_health_from_config(
+        config: &CliConfig,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let Some(l0) = Self::open_workspace_l0_from_config(config)? else {
+            return Ok(Vec::new());
+        };
+        let mut reports = l0
+            .scan_iri_prefix(
+                glidinghorse::core::learning_health::LEARNING_HEALTH_REPORT_PREFIX,
+                10_000,
+            )?
+            .into_iter()
+            .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+            .collect::<Vec<serde_json::Value>>();
+        reports.sort_by(|left, right| {
+            left.get("generated_at")
+                .and_then(serde_json::Value::as_str)
+                .cmp(
+                    &right
+                        .get("generated_at")
+                        .and_then(serde_json::Value::as_str),
+                )
+        });
+        Ok(reports)
+    }
+
+    /// List lifecycle records created when a constrained retrieval policy is
+    /// promoted. These are distinct from application skill proposals.
+    pub fn list_learning_deltas_from_config(
+        config: &CliConfig,
+    ) -> anyhow::Result<Vec<glidinghorse::core::evolution_delta_gate::EvolutionDelta>> {
+        let Some(l0) = Self::open_workspace_l0_from_config(config)? else {
+            return Ok(Vec::new());
+        };
+        Ok(glidinghorse::core::evolution_delta_gate::EvolutionDeltaGate::new(l0).list(10_000)?)
+    }
+
+    /// Human-approved rollback of a frozen learning delta. It records a
+    /// durable lifecycle transition only; the affected policy family remains
+    /// frozen at baseline until a new controlled evaluation is reviewed.
+    pub fn rollback_learning_delta_from_config(
+        config: &CliConfig,
+        delta_id: &str,
+        approver: &str,
+        comment: Option<&str>,
+    ) -> anyhow::Result<glidinghorse::core::evolution_delta_gate::EvolutionDelta> {
+        let l0 = Self::open_workspace_l0_from_config(config)?
+            .ok_or_else(|| anyhow::anyhow!("no local learning store exists for this workspace"))?;
+        Ok(
+            glidinghorse::core::evolution_delta_gate::EvolutionDeltaGate::new(l0)
+                .rollback_frozen_with_approval(delta_id, approver, comment)?,
+        )
+    }
+
+    /// Execute a caller-supplied, IRI-labelled candidate-graph experiment and
+    /// persist only its two independent quality verdicts.  Vectors remain in
+    /// the input file and never enter the workspace L0 store.
+    pub fn evaluate_candidate_graph_rerank_from_config(
+        config: &CliConfig,
+        input_path: &str,
+    ) -> anyhow::Result<glidinghorse::core::offline_graph_rerank::CandidateGraphRerankAdmission>
+    {
+        let experiment = Self::load_candidate_graph_rerank_experiment(input_path)?;
+        let execution = experiment.execute().map_err(anyhow::Error::msg)?;
+        let l0 = Self::open_or_create_workspace_l0_from_config(config)?;
+        let evaluator =
+            glidinghorse::core::offline_retrieval_eval::OfflineRetrievalEvaluator::new(l0);
+        Ok(execution.evaluate_and_persist(&evaluator)?)
+    }
+
+    /// Create a durable proposal from a graph-rerank verdict that was already
+    /// independently admitted.  The result remains `Proposed`; no runtime
+    /// query path reads it, and later state transitions still require the
+    /// existing shadow-validation and health gates.
+    pub fn propose_candidate_graph_rerank_from_config(
+        config: &CliConfig,
+        input_path: &str,
+    ) -> anyhow::Result<glidinghorse::core::evolution_delta_gate::EvolutionDelta> {
+        let input = Self::read_bounded_regular_file(input_path)?;
+        let proposal = serde_json::from_str::<
+            glidinghorse::core::offline_graph_rerank::CandidateGraphRerankDeltaProposal,
+        >(&input)
+        .map_err(|error| {
+            anyhow::anyhow!("invalid candidate graph rerank proposal JSON: {error}")
+        })?;
+        proposal.validate().map_err(anyhow::Error::msg)?;
+        let l0 = Self::open_or_create_workspace_l0_from_config(config)?;
+        let evaluator =
+            glidinghorse::core::offline_retrieval_eval::OfflineRetrievalEvaluator::new(l0.clone());
+        let evaluation = evaluator
+            .load(&proposal.evaluation_id)?
+            .ok_or_else(|| anyhow::anyhow!("offline graph rerank evaluation was not found"))?;
+        if !evaluation.admitted {
+            return Err(anyhow::anyhow!(
+                "offline graph rerank evaluation is not admitted: {}",
+                evaluation.rejection_reasons.join(", ")
+            ));
+        }
+        if evaluation.candidate_id != proposal.candidate_id {
+            return Err(anyhow::anyhow!(
+                "proposal candidate ID does not match its admitted evaluation"
+            ));
+        }
+        let delta =
+            glidinghorse::core::evolution_delta_gate::EvolutionDelta::proposed_retrieval_reranker(
+                &proposal.source_task_iri,
+                &proposal.task_family,
+                proposal.base_revision,
+                proposal.candidate_revision,
+                vec![evaluation.storage_iri()],
+            )
+            .map_err(anyhow::Error::msg)?;
+        glidinghorse::core::evolution_delta_gate::EvolutionDeltaGate::new(l0).propose(&delta)?;
+        Ok(delta)
+    }
+
+    fn open_workspace_l0_from_config(config: &CliConfig) -> anyhow::Result<Option<Arc<L0Store>>> {
+        let Some(l0_path) = Self::workspace_l0_path_from_config(config)? else {
+            return Ok(None);
+        };
+        if !l0_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(L0Store::new(&l0_path.to_string_lossy())?)))
+    }
+
+    /// This write-capable helper is deliberately used only by explicit offline
+    /// evaluation/proposal commands. Read-only management commands retain the
+    /// no-create fast path above.
+    fn open_or_create_workspace_l0_from_config(config: &CliConfig) -> anyhow::Result<Arc<L0Store>> {
+        let l0_path = Self::workspace_l0_path_from_config(config)?
+            .ok_or_else(|| anyhow::anyhow!("no local data directory is configured"))?;
+        Ok(Arc::new(L0Store::new(&l0_path.to_string_lossy())?))
+    }
+
+    fn workspace_l0_path_from_config(
+        config: &CliConfig,
+    ) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let Some(base) = config.data_dir.as_deref() else {
+            return Ok(None);
+        };
+        let workspace = std::fs::canonicalize(&config.workspace)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace));
+        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+        let l0_path = std::path::Path::new(base)
+            .join(format!("workspace-{}", hex::encode(&digest[..12])))
+            .join("l0");
+        Ok(Some(l0_path))
+    }
+
+    fn load_candidate_graph_rerank_experiment(
+        input_path: &str,
+    ) -> anyhow::Result<glidinghorse::core::offline_graph_rerank::CandidateGraphRerankExperiment>
+    {
+        let input = Self::read_bounded_regular_file(input_path)?;
+        serde_json::from_str(&input).map_err(|error| {
+            anyhow::anyhow!("invalid candidate graph rerank experiment JSON: {error}")
+        })
+    }
+
+    fn read_bounded_regular_file(input_path: &str) -> anyhow::Result<String> {
+        const MAX_EXPERIMENT_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+        let path = std::path::Path::new(input_path);
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            anyhow::anyhow!("cannot inspect input file '{}': {error}", path.display())
+        })?;
+        if !metadata.is_file() {
+            return Err(anyhow::anyhow!(
+                "input path must name a regular file: {}",
+                path.display()
+            ));
+        }
+        if metadata.len() > MAX_EXPERIMENT_INPUT_BYTES {
+            return Err(anyhow::anyhow!(
+                "input file exceeds the {} MiB safety limit",
+                MAX_EXPERIMENT_INPUT_BYTES / (1024 * 1024)
+            ));
+        }
+        std::fs::read_to_string(path).map_err(|error| {
+            anyhow::anyhow!("cannot read input file '{}': {error}", path.display())
+        })
     }
 
     /// Aggregate treatment evidence by normalized family/mode/action and
@@ -2152,17 +2379,21 @@ impl CodeCliEngine {
     pub async fn resume_task(&mut self, task_iri: &str) -> anyhow::Result<TaskResult> {
         let cm =
             glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone());
-        let cp = cm
-            .restore_latest(task_iri)?
+        let restored = cm
+            .restore_task(task_iri)?
             .ok_or_else(|| anyhow::anyhow!("没有找到 task_iri={} 的 checkpoint", task_iri))?;
-
-        let _agent_state: serde_json::Value = serde_json::from_str(&cp.agent_state_json)?;
 
         let resume_input = format!(
             "继续执行之前中断的任务。上次进度: {}\n\n请从上次中断处继续。",
-            cp.name
+            restored.state.checkpoint_name
         );
-        self.process_task_with_iri(&resume_input, task_iri).await
+        self.process_task_with_iri_and_resume_state(
+            &resume_input,
+            task_iri,
+            Some(restored.messages),
+            Some(restored.state),
+        )
+        .await
     }
 
     /// 从 checkpoint 恢复任务，包含完整的历史上下文消息
@@ -2172,8 +2403,21 @@ impl CodeCliEngine {
         resumed_messages: Vec<glidinghorse::gateway::unified_gateway::ChatMessage>,
     ) -> anyhow::Result<TaskResult> {
         let resume_input = "继续执行之前中断的任务。请从上次中断处继续。".to_string();
-        self.process_task_with_iri_and_messages(&resume_input, task_iri, Some(resumed_messages))
+        let restored =
+            glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone())
+                .restore_task(task_iri)?;
+        if let Some(restored) = restored {
+            self.process_task_with_iri_and_resume_state(
+                &resume_input,
+                task_iri,
+                Some(restored.messages),
+                Some(restored.state),
+            )
             .await
+        } else {
+            self.process_task_with_iri_and_messages(&resume_input, task_iri, Some(resumed_messages))
+                .await
+        }
     }
 
     /// Process a task with an externally-generated task IRI so the caller
@@ -2193,6 +2437,20 @@ impl CodeCliEngine {
         user_input: &str,
         task_iri: &str,
         resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
+    ) -> anyhow::Result<TaskResult> {
+        self.process_task_with_iri_and_resume_state(user_input, task_iri, resumed_messages, None)
+            .await
+    }
+
+    /// Process a task from a canonical checkpoint state.  This is distinct
+    /// from ordinary multi-turn chat history: only an explicit restored state
+    /// may advance persisted counters or cause SA to skip completed phases.
+    pub async fn process_task_with_iri_and_resume_state(
+        &mut self,
+        user_input: &str,
+        task_iri: &str,
+        resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
+        resumed_state: Option<glidinghorse::core::checkpoint::TaskResumeState>,
     ) -> anyhow::Result<TaskResult> {
         self.ensure_embedding_healthy().await;
         self.ensure_skill_vectors_indexed().await;
@@ -2267,15 +2525,17 @@ impl CodeCliEngine {
         } else {
             ctx
         };
-        let ctx = if let Some(msgs) = resumed_messages {
-            let turn_count = msgs.iter().filter(|m| m.role == "assistant").count() as u32;
-            let tool_count = msgs
-                .iter()
-                .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
-                .count() as u32;
-            ctx.with_resumed_messages(msgs, turn_count, tool_count)
-        } else {
-            ctx
+        let ctx = match (resumed_messages, resumed_state) {
+            (Some(messages), Some(state)) => ctx.with_resumed_checkpoint(messages, state),
+            (Some(messages), None) => {
+                let turn_count = messages.iter().filter(|m| m.role == "assistant").count() as u32;
+                let tool_count = messages
+                    .iter()
+                    .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
+                    .count() as u32;
+                ctx.with_resumed_messages(messages, turn_count, tool_count)
+            }
+            (None, _) => ctx,
         };
 
         let result = self
@@ -2295,9 +2555,12 @@ impl CodeCliEngine {
         // transport-neutral terminal event and task-KG record consistent with
         // the CLI path; CLI-specific AST/evolution follow-ups remain owned by
         // `process_task` until they are separately made context-independent.
-        glidinghorse::core::TaskFinalizer::new(self.event_bus.clone())
-            .finalize(task_iri, &result)
-            .await;
+        glidinghorse::core::TaskFinalizer::with_evidence_ledger(
+            self.event_bus.clone(),
+            self.l0.clone(),
+        )
+        .finalize(task_iri, &result)
+        .await;
         let post_task_started = Instant::now();
         self.record_tui_task_evolution(task_iri, user_input, &result)
             .await;
@@ -2319,7 +2582,7 @@ impl CodeCliEngine {
         if self.timeline.pending_mutations() > 0 || self.timeline.snapshot_count() == 0 {
             let backend = SkillGraphSnapshotBackend::new(self.skill_graph.clone());
             self.timeline
-                .create_snapshot(&backend, &format!("task:{}", result.status.as_str()));
+                .create_snapshot(&backend, &format!("task:{}", result.status.as_str()))?;
         } else {
             debug!(task_iri = %task_iri, "Skipped unchanged skill-graph timeline snapshot");
         }
@@ -3002,7 +3265,14 @@ mod tests {
         collect_workspace_code_files, glidingcode_learning_skill_node, glidingcode_prompt_profile,
         glidingcode_task_uses_workspace, is_legacy_glidingcode_auto_link,
         load_code_scan_exclusions, shared_bootstrap_skill_types, with_glidingcode_task_constraints,
-        workspace_state_fingerprint, GLIDINGCODE_WORKFLOW_SKILL_IRI,
+        workspace_state_fingerprint, CodeCliEngine, GLIDINGCODE_WORKFLOW_SKILL_IRI,
+    };
+    use crate::config::CliConfig;
+    use glidinghorse::core::{
+        CandidateGraphMetric, CandidateGraphRerankCandidate, CandidateGraphRerankCase,
+        CandidateGraphRerankConfig, CandidateGraphRerankDeltaProposal,
+        CandidateGraphRerankExperiment, EvolutionDeltaState, EvolutionDeltaTarget, LearningMode,
+        CANDIDATE_GRAPH_RERANK_SCHEMA_VERSION,
     };
 
     #[test]
@@ -3305,5 +3575,103 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(relative, vec!["src/nested/kept.rs"]);
+    }
+
+    #[test]
+    fn admitted_graph_rerank_can_only_create_a_proposed_delta() {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let input_path = workspace.path().join("graph-rerank-experiment.json");
+        let proposal_path = workspace.path().join("graph-rerank-proposal.json");
+        let mut config = CliConfig::from_env_and_args(
+            Some("offline-test-key".into()),
+            Some("http://offline.test".into()),
+            "offline-test-model".into(),
+            workspace.path().to_string_lossy().to_string(),
+            1,
+            1,
+            LearningMode::Baseline,
+            None,
+            None,
+        );
+        config.data_dir = Some(data.path().to_string_lossy().to_string());
+
+        let cases = (0..20)
+            .map(|index| {
+                let relevant = format!("iri://evidence/relevant-{index}");
+                CandidateGraphRerankCase {
+                    case_id: format!("case-{index}"),
+                    task_iri: format!("iri://task/graph-rerank-{index}"),
+                    task_family: "planning:v3:intent=inspect;domain=document".into(),
+                    relevant_iris: vec![relevant.clone()],
+                    query_vector: vec![1.0, 0.0],
+                    candidates: vec![
+                        CandidateGraphRerankCandidate {
+                            iri: relevant,
+                            vector: vec![0.0, 1.0],
+                            initial_score: 0.70,
+                        },
+                        CandidateGraphRerankCandidate {
+                            iri: format!("iri://evidence/peer-{index}"),
+                            vector: vec![0.0, 0.98],
+                            initial_score: 0.95,
+                        },
+                        CandidateGraphRerankCandidate {
+                            iri: format!("iri://evidence/distractor-{index}"),
+                            vector: vec![1.0, 0.0],
+                            initial_score: 0.20,
+                        },
+                    ],
+                }
+            })
+            .collect();
+        let experiment = CandidateGraphRerankExperiment {
+            schema_version: CANDIDATE_GRAPH_RERANK_SCHEMA_VERSION,
+            experiment_id: "graph-rerank-cli-admitted-v1".into(),
+            candidate_id: "candidate-graph-diffusion-cli-v1".into(),
+            config: CandidateGraphRerankConfig {
+                metric: CandidateGraphMetric::Cosine,
+                neighbour_count: 1,
+                self_weight: 0.50,
+                rounds: 1,
+                max_candidates: 3,
+            },
+            cases,
+        };
+        std::fs::write(&input_path, serde_json::to_string(&experiment).unwrap()).unwrap();
+
+        let admission = CodeCliEngine::evaluate_candidate_graph_rerank_from_config(
+            &config,
+            &input_path.to_string_lossy(),
+        )
+        .unwrap();
+        let graph_evaluation = admission.graph_diffusion_vs_exact_reference;
+        assert!(graph_evaluation.admitted, "{graph_evaluation:?}");
+
+        let proposal = CandidateGraphRerankDeltaProposal {
+            evaluation_id: graph_evaluation.evaluation_id,
+            candidate_id: "candidate-graph-diffusion-cli-v1".into(),
+            source_task_iri: "iri://task/graph-rerank-0".into(),
+            task_family: "planning:v3:intent=inspect;domain=document".into(),
+            base_revision: 7,
+            candidate_revision: 8,
+        };
+        std::fs::write(&proposal_path, serde_json::to_string(&proposal).unwrap()).unwrap();
+        let delta = CodeCliEngine::propose_candidate_graph_rerank_from_config(
+            &config,
+            &proposal_path.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(
+            delta.target,
+            EvolutionDeltaTarget::RetrievalRerankerCandidate
+        );
+        assert_eq!(delta.state, EvolutionDeltaState::Proposed);
+        assert_eq!(
+            CodeCliEngine::list_learning_deltas_from_config(&config)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

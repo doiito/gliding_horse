@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tracing::debug;
 
 use crate::core::agent_instance::AgentRole;
-use crate::core::timeline::TimeRange;
 use crate::memory::consistency_engine::ConsistencyEngine;
+use crate::memory::context_recall::ContextRecallQuery;
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::memory::l0_store::L0Store;
 use crate::memory::l1_session::L1Session;
@@ -23,6 +25,9 @@ pub struct MemoryScheduler {
     sessions: parking_lot::RwLock<HashMap<String, L1Session>>,
     /// Optional HyperspaceStore for time-decayed vector search
     hyperspace: Option<Arc<HyperspaceStore>>,
+    /// P1 lexical+dense fusion starts in shadow mode. An explicit operator
+    /// admission can enable it after independent retrieval evaluation.
+    fused_recall_enabled: AtomicBool,
 }
 
 impl MemoryScheduler {
@@ -59,6 +64,7 @@ impl MemoryScheduler {
             memory_bus,
             sessions: parking_lot::RwLock::new(HashMap::new()),
             hyperspace,
+            fused_recall_enabled: AtomicBool::new(false),
         }
     }
 
@@ -67,67 +73,8 @@ impl MemoryScheduler {
         agent_role: AgentRole,
         task_iri: &str,
     ) -> Result<String, CoreError> {
-        let frame_name = match agent_role {
-            AgentRole::Plan => "pa_init",
-            AgentRole::Do => "da_input",
-            AgentRole::Check => "ca_review",
-            AgentRole::Act => "aa_decision",
-        };
-
-        // Read-time generation validation is the correctness backstop. Events
-        // accelerate invalidation, but a missed/lagged event cannot expose a
-        // stale L2/L3 projection through the scheduler.
-        let existing_nodes = self.blackboard.query_nodes(task_iri)?;
-        for node in &existing_nodes {
-            self.consistency.on_l2_read(&node.iri)?;
-        }
-
-        let params = HashMap::new();
-        let projection_result = self.projection.project(task_iri, frame_name, params).await;
-
-        match projection_result {
-            Ok(result) => {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
-                    if let Some(artifacts) = parsed.get("artifacts").and_then(|a| a.as_array()) {
-                        if !artifacts.is_empty() {
-                            return Ok(result);
-                        }
-                    }
-                } else {
-                    return Ok(result);
-                }
-            }
-            Err(_) => {}
-        }
-
-        let nodes = self.blackboard.query_nodes(task_iri)?;
-        if !nodes.is_empty() {
-            let contents: Vec<String> = nodes.iter().map(|n| n.json_ld.clone()).collect();
-            return Ok(contents.join("\n"));
-        }
-
-        // Healthy HyperspaceStore → time-windowed vector recall before the pure L0 scan
-        if let Some(ref hs) = self.hyperspace {
-            if hs.embedding_provider() != "fallback" {
-                let now = chrono::Utc::now();
-                let window = TimeRange::after(now - chrono::Duration::hours(24));
-                if let Ok(entries) = hs.search_by_time(task_iri, &window, 10).await {
-                    if !entries.is_empty() {
-                        let contents: Vec<String> =
-                            entries.iter().map(|r| r.text.clone()).collect();
-                        return Ok(contents.join("\n"));
-                    }
-                }
-            }
-        }
-
-        let results = self.l0_store.search(task_iri, 10)?;
-        if !results.is_empty() {
-            let contents: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
-            return Ok(contents.join("\n"));
-        }
-
-        Ok(String::new())
+        self.on_context_request_with_query(agent_role, &ContextRecallQuery::legacy(task_iri))
+            .await
     }
 
     pub fn on_l1_overflow(&self, session_id: &str) -> Result<usize, CoreError> {
@@ -158,22 +105,125 @@ impl MemoryScheduler {
         task_iri: &str,
         decay_lambda: f64,
     ) -> Result<String, CoreError> {
+        self.context_request_with_decay_query(
+            agent_role,
+            &ContextRecallQuery::legacy(task_iri),
+            decay_lambda,
+        )
+        .await
+    }
+
+    /// Typed recall path. The task IRI remains a scope/audit key; only
+    /// `semantic_text` is passed to vector or lexical retrieval.
+    pub async fn context_request_with_decay_query(
+        &self,
+        agent_role: AgentRole,
+        query: &ContextRecallQuery,
+        decay_lambda: f64,
+    ) -> Result<String, CoreError> {
         if let Some(ref hs) = self.hyperspace {
             let filter = crate::memory::hyperspace_store::HybridSearchFilter::new();
-            let results = hs
-                .search_with_time_decay(task_iri, &filter, decay_lambda, 10)
-                .await?;
-            if !results.is_empty() {
-                let contents: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
-                return Ok(contents.join("\n"));
+            if !query.is_empty() {
+                let fused_results = hs
+                    .search_fused_recall(&query.semantic_text, &filter, decay_lambda, 10)
+                    .await?;
+                if self.fused_recall_enabled.load(Ordering::Acquire) {
+                    if !fused_results.is_empty() {
+                        let contents: Vec<String> =
+                            fused_results.iter().map(|r| r.text.clone()).collect();
+                        return Ok(contents.join("\n"));
+                    }
+                } else {
+                    debug!(
+                        task_iri = %query.task_iri,
+                        query_version = query.query_version,
+                        field_sources = ?query.field_sources,
+                        fused_candidate_count = fused_results.len(),
+                        "Fused retrieval evaluated in shadow mode"
+                    );
+                    let baseline = hs
+                        .search_with_time_decay(&query.semantic_text, &filter, decay_lambda, 10)
+                        .await?;
+                    if !baseline.is_empty() {
+                        return Ok(baseline
+                            .iter()
+                            .map(|entry| entry.text.clone())
+                            .collect::<Vec<_>>()
+                            .join("\n"));
+                    }
+                }
             }
         }
-        self.on_context_request(agent_role, task_iri).await
+        // Legacy read paths still use task IRI for graph scope. Query text is
+        // used for content matching when it is available.
+        self.on_context_request_with_query(agent_role, query).await
+    }
+
+    async fn on_context_request_with_query(
+        &self,
+        agent_role: AgentRole,
+        query: &ContextRecallQuery,
+    ) -> Result<String, CoreError> {
+        let task_iri = &query.task_iri;
+        let frame_name = match agent_role {
+            AgentRole::Plan => "pa_init",
+            AgentRole::Do => "da_input",
+            AgentRole::Check => "ca_review",
+            AgentRole::Act => "aa_decision",
+        };
+        let existing_nodes = self.blackboard.query_nodes(task_iri)?;
+        for node in &existing_nodes {
+            self.consistency.on_l2_read(&node.iri)?;
+        }
+        let params = HashMap::new();
+        if let Ok(result) = self.projection.project(task_iri, frame_name, params).await {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+                if parsed
+                    .get("artifacts")
+                    .and_then(|artifacts| artifacts.as_array())
+                    .is_some_and(|artifacts| !artifacts.is_empty())
+                {
+                    return Ok(result);
+                }
+            } else {
+                return Ok(result);
+            }
+        }
+        let nodes = self.blackboard.query_nodes(task_iri)?;
+        if !nodes.is_empty() {
+            return Ok(nodes
+                .iter()
+                .map(|node| node.json_ld.clone())
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
+        let content_query = if query.is_empty() {
+            task_iri.as_str()
+        } else {
+            query.semantic_text.as_str()
+        };
+        let results = self.l0_store.search(content_query, 10)?;
+        Ok(results
+            .iter()
+            .map(|entry| entry.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     /// Attach a HyperspaceStore at runtime (for delayed injection).
     pub fn with_hyperspace_store(&mut self, hs: Arc<HyperspaceStore>) {
         self.hyperspace = Some(hs);
+    }
+
+    /// Enable only after a separately labelled offline evaluation and explicit
+    /// review. Disabling immediately returns the scheduler to semantic-only
+    /// baseline while retaining shadow diagnostics.
+    pub fn set_fused_recall_enabled(&self, enabled: bool) {
+        self.fused_recall_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn fused_recall_enabled(&self) -> bool {
+        self.fused_recall_enabled.load(Ordering::Acquire)
     }
 
     pub fn on_session_close(&self, session_id: &str) -> Result<(), CoreError> {
@@ -261,14 +311,39 @@ impl MemoryScheduler {
         thought: &str,
         content: &str,
     ) -> Result<String, CoreError> {
-        let sessions = self.sessions.read();
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| CoreError::Internal {
-                message: format!("Session not found: {}", session_id),
-            })?;
-        let iri = session.archive_full_to_l0(&self.l0_store, role, thought, content)?;
-        if let Err(e) = self.consistency.on_l0_update(&iri).await {
+        self.archive_to_l0_with_update(session_id, role, thought, content, |iri| async move {
+            self.consistency.on_l0_update(&iri).await
+        })
+        .await
+    }
+
+    async fn archive_to_l0_with_update<F, Fut>(
+        &self,
+        session_id: &str,
+        role: &str,
+        thought: &str,
+        content: &str,
+        on_update: F,
+    ) -> Result<String, CoreError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = Result<(), CoreError>>,
+    {
+        // Keep synchronous session access in its own scope. In particular, the
+        // parking_lot read guard must not survive into the asynchronous
+        // consistency notification below: doing so blocks session writers and
+        // makes this future non-Send if that notification ever suspends.
+        let iri = {
+            let sessions = self.sessions.read();
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| CoreError::Internal {
+                    message: format!("Session not found: {}", session_id),
+                })?;
+            session.archive_full_to_l0(&self.l0_store, role, thought, content)?
+        };
+
+        if let Err(e) = on_update(iri.clone()).await {
             tracing::warn!("Consistency on_l0_update failed: {}", e);
         }
         Ok(iri)
@@ -300,7 +375,9 @@ mod tests {
     use crate::memory::l2_blackboard::Blackboard;
     use crate::memory::l3_projection::ProjectionEngine;
     use crate::memory::memory_bus::MemoryBus;
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     fn setup_scheduler() -> (Arc<MemoryScheduler>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -400,6 +477,66 @@ mod tests {
         let (scheduler, _dir) = setup_scheduler();
         let result = scheduler.on_task_complete("iri://task_complete").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_releases_session_lock_before_async_consistency_update() {
+        let (scheduler, _dir) = setup_scheduler();
+        let session_id = scheduler.create_session("a1", "DA", "iri://task/archive", 1000);
+        let update_started = Arc::new(Notify::new());
+        let release_update = Arc::new(Notify::new());
+
+        let archive_scheduler = scheduler.clone();
+        let archive_session_id = session_id.clone();
+        let update_started_for_task = update_started.clone();
+        let release_update_for_task = release_update.clone();
+        let archive_task = tokio::spawn(async move {
+            archive_scheduler
+                .archive_to_l0_with_update(
+                    &archive_session_id,
+                    "DA",
+                    "reasoning",
+                    "archived content",
+                    move |_| async move {
+                        update_started_for_task.notify_one();
+                        release_update_for_task.notified().await;
+                        Ok(())
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), update_started.notified())
+            .await
+            .expect("archive did not reach the asynchronous consistency update");
+
+        // Hold the consistency future at an actual suspension point. A writer
+        // must still acquire the sessions lock while that future is pending.
+        let writer_scheduler = scheduler.clone();
+        let writer_session_id = session_id.clone();
+        let mut writer_task = tokio::task::spawn_blocking(move || {
+            writer_scheduler.remove_session(&writer_session_id)
+        });
+        let writer_result = tokio::time::timeout(Duration::from_secs(1), &mut writer_task).await;
+
+        // Always release the archive task before asserting so a regression
+        // cannot leave the test runtime waiting on a blocked task.
+        release_update.notify_one();
+        let archive_iri = archive_task
+            .await
+            .expect("archive task panicked")
+            .expect("archive failed");
+
+        let removed = match writer_result {
+            Ok(join_result) => join_result.expect("session writer panicked"),
+            Err(_) => {
+                let _ = writer_task.await;
+                panic!("session writer was blocked by the pending consistency update");
+            }
+        };
+
+        assert!(removed.is_some());
+        assert!(archive_iri.starts_with("iri://archive/task/archive/DA/"));
     }
 
     #[tokio::test]

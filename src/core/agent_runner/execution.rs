@@ -645,6 +645,7 @@ pub(super) fn final_turn_limit_notice(
 
 use crate::core::agent_instance::{AgentInstance, AgentRole, AgentStatus};
 use crate::core::execution_event::{ExecutionEvent, ExecutionEventKind};
+use crate::core::execution_journal::{TaskExecutionJournal, TaskExecutionJournalKind};
 use crate::gateway::unified_gateway::ChatMessage;
 use crate::jsonld::{JsonLdContext, JsonLdNode};
 use crate::memory::l1_session::L1Session;
@@ -653,6 +654,51 @@ use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
 use super::{TaskContext, TaskResult, TaskVerdict};
+
+fn append_execution_journal_event(
+    journal: &Option<TaskExecutionJournal>,
+    event: TaskExecutionJournalKind,
+) {
+    if let Some(journal) = journal {
+        if let Err(error) = journal.append(event) {
+            // Tracing must never turn an otherwise valid agent operation into
+            // a failed task, but an operator still needs a visible signal that
+            // the durable audit trail is incomplete.
+            warn!(%error, "Failed to append task execution journal event");
+        }
+    }
+}
+
+fn record_checkpoint_commit(
+    journal: &Option<TaskExecutionJournal>,
+    checkpoint: &crate::core::checkpoint::CheckpointData,
+) {
+    append_execution_journal_event(
+        journal,
+        TaskExecutionJournalKind::CheckpointCommitted {
+            checkpoint_iri: checkpoint.checkpoint_iri.clone(),
+            checkpoint_name: checkpoint.name.clone(),
+        },
+    );
+}
+
+fn journal_error_class(error: &CoreError) -> &'static str {
+    match error {
+        CoreError::NodeTooLarge { .. } => "node_too_large",
+        CoreError::ProjectionTooLarge { .. } => "projection_too_large",
+        CoreError::InvalidJsonLd { .. } => "invalid_json_ld",
+        CoreError::NodeNotFound { .. } => "node_not_found",
+        CoreError::TaskNotFound { .. } => "task_not_found",
+        CoreError::SkillNotFound { .. } => "skill_not_found",
+        CoreError::FrameNotFound { .. } => "frame_not_found",
+        CoreError::ValidationFailed { .. } => "validation_failed",
+        CoreError::SparqlError { .. } => "sparql_error",
+        CoreError::StorageError { .. } => "storage_error",
+        CoreError::OxigraphSyncFailed { .. } => "oxigraph_sync_failed",
+        CoreError::Internal { .. } => "internal",
+        CoreError::PermissionDenied { .. } => "permission_denied",
+    }
+}
 
 /// Replace (never accumulate) the transient workspace delta message when the
 /// monitor generation advances. Full file content remains out of prompt and
@@ -1093,8 +1139,12 @@ Output the summary report directly, not in JSON format."#,
         if ctx.workspace_context_enabled() && agent.role != AgentRole::Check {
             let executor = self.tool_executor.read();
             if let Some(wm) = executor.get_workspace_monitor() {
-                wm.snapshots()
-                    .create_snapshot("pre_task", Some(&ctx.task_iri));
+                if let Err(error) = wm
+                    .snapshots()
+                    .create_snapshot("pre_task", Some(&ctx.task_iri))
+                {
+                    warn!(task_iri = %ctx.task_iri, %error, "Failed to create pre-task workspace snapshot");
+                }
                 wm.inject_file_perception(Some(&ctx.objective));
             }
         }
@@ -1235,6 +1285,16 @@ Output the summary report directly, not in JSON format."#,
         let mut consecutive_effectless_tool_turns = 0u32;
         let checkpoint_manager =
             crate::core::checkpoint::CheckpointManager::with_persistence(self.l0_store.clone());
+        let execution_journal = match TaskExecutionJournal::new(
+            self.l0_store.clone(),
+            &ctx.task_iri,
+        ) {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                warn!(%error, "Task execution journal is unavailable; continuing without durable trace");
+                None
+            }
+        };
 
         // Track the richest content turn (used for passing archive_iri across agents, pointing to substantive content rather than final turn summary)
         let mut best_content_len: usize = 0;
@@ -1288,7 +1348,7 @@ Output the summary report directly, not in JSON format."#,
 
         // Initial checkpoint: record task start state
         let start_role_str = agent.role.to_string();
-        if let Err(e) = checkpoint_manager.create_ext(
+        match checkpoint_manager.create_ext(
             &ctx.task_iri,
             &format!("start_{}", agent.role),
             "[]",
@@ -1312,7 +1372,8 @@ Output the summary report directly, not in JSON format."#,
             None,
             None,
         ) {
-            warn!("[checkpoint] initial save failed: {}", e);
+            Ok(checkpoint) => record_checkpoint_commit(&execution_journal, &checkpoint),
+            Err(error) => warn!("[checkpoint] initial save failed: {}", error),
         }
 
         // Soft limit state: progressive prompts, no hard truncation (DA and AA use 3-stage degradation)
@@ -1401,7 +1462,7 @@ Output the summary report directly, not in JSON format."#,
                     }).to_string();
                     let action_str =
                         serde_json::to_string(&action_tracker.actions).unwrap_or_default();
-                    if let Err(e) = checkpoint_manager.create_ext(
+                    match checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("max_turns_{}", agent.role),
                         "[]",
@@ -1419,7 +1480,8 @@ Output the summary report directly, not in JSON format."#,
                         Some(&action_str),
                         None,
                     ) {
-                        warn!("[checkpoint] max_turns save failed: {}", e);
+                        Ok(checkpoint) => record_checkpoint_commit(&execution_journal, &checkpoint),
+                        Err(error) => warn!("[checkpoint] max_turns save failed: {}", error),
                     }
                     messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -1443,7 +1505,7 @@ Output the summary report directly, not in JSON format."#,
                     }).to_string();
                     let action_str =
                         serde_json::to_string(&action_tracker.actions).unwrap_or_default();
-                    let _ = checkpoint_manager.create_ext(
+                    match checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("force_end_{}", agent.role),
                         "[]",
@@ -1464,7 +1526,10 @@ Output the summary report directly, not in JSON format."#,
                         Some(&tool_error_str),
                         Some(&action_str),
                         None,
-                    );
+                    ) {
+                        Ok(checkpoint) => record_checkpoint_commit(&execution_journal, &checkpoint),
+                        Err(error) => warn!("[checkpoint] force_end save failed: {}", error),
+                    }
                     // Fallback: if no turn has substantive content, aggregate tool results via LLM
                     let (force_summary, force_output, force_archive) = if !best_content_str
                         .is_empty()
@@ -1529,7 +1594,7 @@ Output the summary report directly, not in JSON format."#,
                 })
                 .to_string();
                 let action_str = serde_json::to_string(&action_tracker.actions).unwrap_or_default();
-                if let Err(e) = checkpoint_manager.create_ext(
+                match checkpoint_manager.create_ext(
                     &ctx.task_iri,
                     &format!("turn_{}_{}", agent.role, turn),
                     "[]",
@@ -1553,7 +1618,11 @@ Output the summary report directly, not in JSON format."#,
                     Some(&action_str),
                     None,
                 ) {
-                    warn!("[checkpoint] periodic save failed (turn={}): {}", turn, e);
+                    Ok(checkpoint) => record_checkpoint_commit(&execution_journal, &checkpoint),
+                    Err(error) => warn!(
+                        "[checkpoint] periodic save failed (turn={}): {}",
+                        turn, error
+                    ),
                 }
             }
 
@@ -1868,14 +1937,140 @@ Output the summary report directly, not in JSON format."#,
                 self.discoverable_tool_definitions_for_task_context(&agent.role.to_string(), &ctx),
             ));
             let request_tools = (!current_tools.is_empty()).then_some(current_tools);
-
-            let response = self
+            let request_id = format!(
+                "llm_{}_{}_{}",
+                agent.agent_id,
+                turn,
+                uuid::Uuid::new_v4().hyphenated()
+            );
+            let request_payload = serde_json::to_string(&json!({
+                "messages": &request_messages,
+                "tools": &request_tools,
+            }))
+            .unwrap_or_default();
+            let mut advertised_tool_names = advertised_tools.iter().cloned().collect::<Vec<_>>();
+            advertised_tool_names.sort();
+            let request_reference = execution_journal
+                .as_ref()
+                .map(|journal| journal.payload_reference(&request_payload))
+                .unwrap_or_else(|| {
+                    crate::core::execution_journal::PayloadReference::metadata_only(
+                        &request_payload,
+                    )
+                });
+            append_execution_journal_event(
+                &execution_journal,
+                TaskExecutionJournalKind::LlmRequestPrepared {
+                    request_id: request_id.clone(),
+                    role: agent.role.to_string(),
+                    turn,
+                    model: model.clone(),
+                    message_count: request_messages.len(),
+                    advertised_tool_names,
+                    request: request_reference,
+                },
+            );
+            if let Some(event_bus) = &self.event_bus {
+                let _ = event_bus
+                    .emit(
+                        &ctx.task_iri,
+                        "LLM_REQUEST_STARTED",
+                        &agent.agent_id,
+                        &serde_json::json!({
+                            "role": agent.role.to_string(),
+                            "turn": turn,
+                            "request_id": request_id,
+                            "model": model,
+                            "operation": "正在等待模型响应",
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
+            let llm_started_at = std::time::Instant::now();
+            let (response, gateway_metadata) = match self
                 .gateway
-                .chat_with_params(&model, request_messages, None, None, request_tools, None)
+                .chat_with_params_traced(&model, request_messages, None, None, request_tools, None)
                 .await
-                .map_err(|e| CoreError::Internal {
-                    message: e.to_string(),
-                })?;
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(event_bus) = &self.event_bus {
+                        let _ = event_bus
+                            .emit(
+                                &ctx.task_iri,
+                                "LLM_REQUEST_FAILED",
+                                &agent.agent_id,
+                                &serde_json::json!({
+                                    "role": agent.role.to_string(),
+                                    "turn": turn,
+                                    "request_id": request_id,
+                                    "operation": "模型请求失败",
+                                    "error": error.to_string(),
+                                })
+                                .to_string(),
+                            )
+                            .await;
+                    }
+                    append_execution_journal_event(
+                        &execution_journal,
+                        TaskExecutionJournalKind::LlmRequestFailed {
+                            request_id,
+                            latency_ms: llm_started_at
+                                .elapsed()
+                                .as_millis()
+                                .min(u128::from(u64::MAX))
+                                as u64,
+                            error_class: journal_error_class(&error).to_string(),
+                        },
+                    );
+                    return Err(CoreError::Internal {
+                        message: error.to_string(),
+                    });
+                }
+            };
+            let response_payload = serde_json::to_string(&response).unwrap_or_default();
+            let response_reference = execution_journal
+                .as_ref()
+                .map(|journal| journal.payload_reference(&response_payload))
+                .unwrap_or_else(|| {
+                    crate::core::execution_journal::PayloadReference::metadata_only(
+                        &response_payload,
+                    )
+                });
+            append_execution_journal_event(
+                &execution_journal,
+                TaskExecutionJournalKind::LlmResponseReceived {
+                    request_id,
+                    provider_response_id: gateway_metadata.provider_response_id.clone(),
+                    endpoint: gateway_metadata.endpoint,
+                    attempts: gateway_metadata.attempts,
+                    cache_hit: gateway_metadata.cache_hit,
+                    latency_ms: gateway_metadata.latency_ms,
+                    http_status: gateway_metadata.http_status,
+                    prompt_tokens: response.usage.as_ref().map(|usage| usage.prompt_tokens),
+                    completion_tokens: response.usage.as_ref().map(|usage| usage.completion_tokens),
+                    response: response_reference,
+                },
+            );
+            if let Some(event_bus) = &self.event_bus {
+                let _ = event_bus
+                    .emit(
+                        &ctx.task_iri,
+                        "LLM_REQUEST_COMPLETED",
+                        &agent.agent_id,
+                        &serde_json::json!({
+                            "role": agent.role.to_string(),
+                            "turn": turn,
+                            "operation": "模型响应已收到",
+                            "latency_ms": gateway_metadata.latency_ms,
+                            "attempts": gateway_metadata.attempts,
+                            "cache_hit": gateway_metadata.cache_hit,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
 
             // Accumulate token usage
             if let Some(ref usage) = response.usage {
@@ -1924,6 +2119,88 @@ Output the summary report directly, not in JSON format."#,
                 finish,
                 choice.message.tool_calls.is_some(),
             );
+
+            if let Some(ref event_bus) = self.event_bus {
+                let completion_tokens = response
+                    .usage
+                    .as_ref()
+                    .map(|usage| usage.completion_tokens)
+                    .unwrap_or(0);
+                if !raw_content.is_empty() {
+                    let event = ExecutionEvent {
+                        event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+                        task_iri: ctx.task_iri.clone(),
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                        event: ExecutionEventKind::LlmContent(
+                            crate::core::execution_event::LlmContent {
+                                agent_id: agent.agent_id.clone(),
+                                role: agent.role.to_string(),
+                                content_delta: raw_content.clone(),
+                                is_reasoning: false,
+                                token_count: completion_tokens,
+                            },
+                        ),
+                    };
+                    let _ = event_bus
+                        .emit(
+                            &ctx.task_iri,
+                            "LLM_CONTENT",
+                            &agent.agent_id,
+                            &serde_json::to_string(&event).unwrap_or_default(),
+                        )
+                        .await;
+                }
+                if let Some(reasoning) =
+                    reasoning_content.as_deref().filter(|text| !text.is_empty())
+                {
+                    let event = ExecutionEvent {
+                        event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+                        task_iri: ctx.task_iri.clone(),
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                        event: ExecutionEventKind::LlmContent(
+                            crate::core::execution_event::LlmContent {
+                                agent_id: agent.agent_id.clone(),
+                                role: agent.role.to_string(),
+                                content_delta: reasoning.to_string(),
+                                is_reasoning: true,
+                                token_count: 0,
+                            },
+                        ),
+                    };
+                    let _ = event_bus
+                        .emit(
+                            &ctx.task_iri,
+                            "LLM_CONTENT",
+                            &agent.agent_id,
+                            &serde_json::to_string(&event).unwrap_or_default(),
+                        )
+                        .await;
+                }
+                if let Some(usage) = response.usage.as_ref() {
+                    let event = ExecutionEvent {
+                        event_id: format!("evt_{}", uuid::Uuid::new_v4().hyphenated()),
+                        task_iri: ctx.task_iri.clone(),
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                        event: ExecutionEventKind::TokenUsage(
+                            crate::core::execution_event::TokenUsage {
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                total_tokens: usage.total_tokens,
+                                model: model.clone(),
+                                turn,
+                            },
+                        ),
+                    };
+                    let _ = event_bus
+                        .emit(
+                            &ctx.task_iri,
+                            "TOKEN_USAGE",
+                            &agent.agent_id,
+                            &serde_json::to_string(&event).unwrap_or_default(),
+                        )
+                        .await;
+                }
+            }
 
             debug!(
                 "[turn {}] LLM response: finish={}, content_len={}, has_reasoning={}",
@@ -2009,6 +2286,22 @@ Output the summary report directly, not in JSON format."#,
                     .await;
             }
 
+            if let Some(event_bus) = &self.event_bus {
+                let _ = event_bus
+                    .emit(
+                        &ctx.task_iri,
+                        "TURN_PERSISTENCE_STARTED",
+                        &agent.agent_id,
+                        &serde_json::json!({
+                            "role": agent.role.to_string(),
+                            "turn": turn,
+                            "operation": "正在保存 Thought 与执行状态",
+                        })
+                        .to_string(),
+                    )
+                    .await;
+            }
+
             // Save emphasis content to L0 persistent memory
             if !parsed.emphasis.is_empty() {
                 let dedup_threshold = self
@@ -2025,15 +2318,58 @@ Output the summary report directly, not in JSON format."#,
                 .await;
             }
 
-            // Archive to L0: save full response + thought content
-            let l0_iri = sess
-                .archive_full_to_l0(
-                    &self.l0_store,
+            // Archive to L0: save full response + thought content. This is a
+            // bounded background write: an embedded database stall must not
+            // hide the next action forever behind the visible Thought event.
+            let l0_iri = match self
+                .archive_full_turn_to_l0_bounded(
+                    sess,
                     &agent.role.to_string(),
                     &parsed.thought.clone().unwrap_or_default(),
                     &parsed.content,
                 )
-                .ok();
+                .await
+            {
+                Ok(iri) => {
+                    if let Some(event_bus) = &self.event_bus {
+                        let _ = event_bus
+                            .emit(
+                                &ctx.task_iri,
+                                "TURN_PERSISTENCE_COMPLETED",
+                                &agent.agent_id,
+                                &serde_json::json!({
+                                    "role": agent.role.to_string(),
+                                    "turn": turn,
+                                    "operation": "Thought 已归档到 L0",
+                                    "archive_iri": iri,
+                                })
+                                .to_string(),
+                            )
+                            .await;
+                    }
+                    Some(iri)
+                }
+                Err(error) => {
+                    warn!(%error, role = %agent.role, turn, "L0 turn archive degraded");
+                    if let Some(event_bus) = &self.event_bus {
+                        let _ = event_bus
+                            .emit(
+                                &ctx.task_iri,
+                                "TURN_PERSISTENCE_FAILED",
+                                &agent.agent_id,
+                                &serde_json::json!({
+                                    "role": agent.role.to_string(),
+                                    "turn": turn,
+                                    "operation": "L0 归档失败，继续执行",
+                                    "error": error.to_string(),
+                                })
+                                .to_string(),
+                            )
+                            .await;
+                    }
+                    None
+                }
+            };
             debug!(
                 "[L0] archived: {:?}, has_reasoning={}, is_valid_json={}",
                 l0_iri, parsed.has_native_reasoning, parsed.is_valid_json
@@ -2107,6 +2443,22 @@ Output the summary report directly, not in JSON format."#,
                 }
                 Err(e) => {
                     warn!("[L2] failed to write node {}: {:?}", node_iri, e);
+                    if let Some(event_bus) = &self.event_bus {
+                        let _ = event_bus
+                            .emit(
+                                &ctx.task_iri,
+                                "TURN_PERSISTENCE_FAILED",
+                                &agent.agent_id,
+                                &serde_json::json!({
+                                    "role": agent.role.to_string(),
+                                    "turn": turn,
+                                    "operation": "L2 图镜像失败，继续执行",
+                                    "error": e.to_string(),
+                                })
+                                .to_string(),
+                            )
+                            .await;
+                    }
                 }
             }
 
@@ -2215,7 +2567,7 @@ Output the summary report directly, not in JSON format."#,
                     }).to_string();
                     let action_str =
                         serde_json::to_string(&action_tracker.actions).unwrap_or_default();
-                    if let Err(e) = checkpoint_manager.create_ext(
+                    match checkpoint_manager.create_ext(
                         &ctx.task_iri,
                         &format!("finish_{}", agent.role),
                         &nodes_str,
@@ -2233,7 +2585,8 @@ Output the summary report directly, not in JSON format."#,
                         Some(&action_str),
                         None,
                     ) {
-                        warn!("[checkpoint] finish save failed: {}", e);
+                        Ok(checkpoint) => record_checkpoint_commit(&execution_journal, &checkpoint),
+                        Err(error) => warn!("[checkpoint] finish save failed: {}", error),
                     }
 
                     // Point to the turn with the longest content (not the last summary),
@@ -2648,6 +3001,25 @@ Output the summary report directly, not in JSON format."#,
 
                             let started_at = std::time::Instant::now();
                             let args_clone = args.clone();
+                            let arguments_payload =
+                                serde_json::to_string(&args_clone).unwrap_or_default();
+                            let arguments_reference = execution_journal
+                                .as_ref()
+                                .map(|journal| journal.payload_reference(&arguments_payload))
+                                .unwrap_or_else(|| {
+                                    crate::core::execution_journal::PayloadReference::metadata_only(
+                                        &arguments_payload,
+                                    )
+                                });
+                            append_execution_journal_event(
+                                &execution_journal,
+                                TaskExecutionJournalKind::ToolExecutionStarted {
+                                    call_id: c.id.clone(),
+                                    tool_name: name.clone(),
+                                    turn,
+                                    arguments: arguments_reference,
+                                },
+                            );
                             let effect_snapshot =
                                 (is_substantive_workspace_effect(name, &args_clone)
                                     && !matches!(name.as_str(), "file_write" | "file_edit"))
@@ -2688,6 +3060,28 @@ Output the summary report directly, not in JSON format."#,
                                 started_at.elapsed().as_secs_f64(),
                             );
                             let raw_result_str = serde_json::to_string(&result).unwrap_or_default();
+                            let tool_duration_ms =
+                                started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                            let result_reference = execution_journal
+                                .as_ref()
+                                .map(|journal| journal.payload_reference(&raw_result_str))
+                                .unwrap_or_else(|| {
+                                    crate::core::execution_journal::PayloadReference::metadata_only(
+                                        &raw_result_str,
+                                    )
+                                });
+                            append_execution_journal_event(
+                                &execution_journal,
+                                TaskExecutionJournalKind::ToolExecutionFinished {
+                                    call_id: c.id.clone(),
+                                    tool_name: name.clone(),
+                                    success: !crate::core::tracked_action::tool_result_failed(
+                                        &result,
+                                    ),
+                                    duration_ms: tool_duration_ms,
+                                    result: result_reference,
+                                },
+                            );
 
                             if agent.role == AgentRole::Do
                                 && matches!(name.as_str(), "bash" | "powershell" | "code_execute")
@@ -2708,6 +3102,13 @@ Output the summary report directly, not in JSON format."#,
                             {
                                 effect_succeeded_this_turn = true;
                                 action_tracker.mark_last_substantive_effect();
+                                append_execution_journal_event(
+                                    &execution_journal,
+                                    TaskExecutionJournalKind::WorkspaceMutationCommitted {
+                                        call_id: c.id.clone(),
+                                        tool_name: name.clone(),
+                                    },
+                                );
                             }
 
                             let mut result_str =
@@ -2752,7 +3153,8 @@ Output the summary report directly, not in JSON format."#,
                                                     &result,
                                                 ),
                                             result_size_bytes: result_str.len() as u32,
-                                            duration_ms: 0,
+                                            duration_ms: tool_duration_ms.min(u64::from(u32::MAX))
+                                                as u32,
                                             agent_id: agent.agent_id.clone(),
                                         },
                                     ),

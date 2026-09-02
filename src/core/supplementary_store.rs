@@ -83,6 +83,28 @@ impl SupplementaryInputStore {
         pending
     }
 
+    /// Return an audit snapshot of inputs that have not yet been injected
+    /// into an AgentRunner turn.
+    ///
+    /// Checkpointing must use this instead of [`Self::take_pending`]. A
+    /// checkpoint is observational; consuming here would silently discard a
+    /// user's instruction before the next agent receives it.
+    pub fn snapshot_pending(&self, task_iri: &str) -> Vec<SupplementEntry> {
+        let map = self
+            .pending
+            .lock()
+            .expect("SupplementaryInputStore lock poisoned");
+        map.get(task_iri)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| !entry.consumed)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Check if there are unconsumed supplementary inputs
     pub fn has_pending(&self, task_iri: &str) -> bool {
         let map = self
@@ -165,6 +187,25 @@ mod tests {
             0,
             "consumed entries should not be returned again"
         );
+    }
+
+    #[test]
+    fn snapshot_pending_does_not_consume_instruction() {
+        let store = SupplementaryInputStore::new();
+        store.store(
+            "iri://task/checkpoint",
+            "write report to workspace",
+            None,
+            0.9,
+        );
+
+        let snapshot = store.snapshot_pending("iri://task/checkpoint");
+        assert_eq!(snapshot.len(), 1);
+        assert!(store.has_pending("iri://task/checkpoint"));
+
+        let injected = store.take_pending("iri://task/checkpoint");
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].content, "write report to workspace");
     }
 
     #[test]

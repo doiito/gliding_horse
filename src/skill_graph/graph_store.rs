@@ -64,10 +64,11 @@ impl SkillGraphStore {
     /// Record a structural mutation against the attached TimelineStore (if any).
     /// No SnapshotBackend is supplied, so this only appends to the incremental
     /// mutation log — the engine still takes explicit full snapshots per task.
-    fn emit_mutation(&self, mutation: GraphMutation) {
+    fn emit_mutation(&self, mutation: GraphMutation) -> Result<(), CoreError> {
         if let Some(ref tl) = self.timeline {
-            tl.record_mutation(mutation, None);
+            tl.record_mutation(mutation, None)?;
         }
+        Ok(())
     }
 
     pub fn with_blackboard(mut self, blackboard: Arc<Blackboard>) -> Self {
@@ -221,7 +222,7 @@ impl SkillGraphStore {
 
     pub fn register_skill(&self, skill: SkillGraphNode) -> Result<(), CoreError> {
         let iri = skill.skill_iri.clone();
-        info!("Registering skill to graph: {} ({})", skill.name, iri);
+        debug!("Registering skill to graph: {} ({})", skill.name, iri);
 
         if let Some(_blackboard) = &self.blackboard {
             let json_ld = skill.to_json_ld();
@@ -231,7 +232,7 @@ impl SkillGraphStore {
 
         self.index.index_skill(&skill);
         self.skills.write().insert(iri.clone(), skill.clone());
-        self.emit_mutation(GraphMutation::SkillRegistered(skill.clone()));
+        self.emit_mutation(GraphMutation::SkillRegistered(skill.clone()))?;
 
         // P0-1: sync to Oxigraph
         if let Some(skill) = self.skills.read().get(&iri) {
@@ -300,7 +301,7 @@ impl SkillGraphStore {
                     jsonld_types: vec!["skill:Skill".to_string()],
                 })?;
             }
-            self.emit_mutation(GraphMutation::SkillUpdated { old, new: skill });
+            self.emit_mutation(GraphMutation::SkillUpdated { old, new: skill })?;
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -345,7 +346,7 @@ impl SkillGraphStore {
         // P0-1: sync delete from Oxigraph
         self.sync_skill_delete(skill_iri);
         info!("Skill removed from graph: {}", skill_iri);
-        self.emit_mutation(GraphMutation::SkillRemoved(removed));
+        self.emit_mutation(GraphMutation::SkillRemoved(removed))?;
         Ok(())
     }
 
@@ -405,7 +406,7 @@ impl SkillGraphStore {
             target: target_iri.to_string(),
             link_type,
             source_after: source,
-        });
+        })?;
         Ok(())
     }
 
@@ -445,7 +446,7 @@ impl SkillGraphStore {
             source: source_iri.to_string(),
             target: target_iri.to_string(),
             link_type,
-        });
+        })?;
         Ok(())
     }
 
@@ -621,7 +622,7 @@ impl SkillGraphStore {
         let moc_iri = moc.moc_iri.clone();
         info!("Registering MOC node: {} ({})", moc.name, moc_iri);
         self.mocs.write().insert(moc_iri, moc.clone());
-        self.emit_mutation(GraphMutation::MOCAdded(moc));
+        self.emit_mutation(GraphMutation::MOCAdded(moc))?;
         Ok(())
     }
 
@@ -637,7 +638,7 @@ impl SkillGraphStore {
     /// snapshot restoration, which must replace (rather than merge) state.
     pub fn remove_moc(&self, moc_iri: &str) -> Result<(), CoreError> {
         if self.mocs.write().remove(moc_iri).is_some() {
-            self.emit_mutation(GraphMutation::MOCRemoved(moc_iri.to_string()));
+            self.emit_mutation(GraphMutation::MOCRemoved(moc_iri.to_string()))?;
             Ok(())
         } else {
             Err(CoreError::NodeNotFound {
@@ -981,7 +982,7 @@ impl SkillGraphStore {
         let id = hyperedge.hyperedge_id.clone();
         info!("Registering hyperedge: {} ({})", hyperedge.name, id);
         self.hyperedges.write().insert(id, hyperedge.clone());
-        self.emit_mutation(GraphMutation::HyperedgeAdded(hyperedge));
+        self.emit_mutation(GraphMutation::HyperedgeAdded(hyperedge))?;
         Ok(())
     }
 
@@ -996,7 +997,7 @@ impl SkillGraphStore {
     pub fn remove_hyperedge(&self, hyperedge_id: &str) -> Result<(), CoreError> {
         if self.hyperedges.write().remove(hyperedge_id).is_some() {
             info!("Hyperedge removed: {}", hyperedge_id);
-            self.emit_mutation(GraphMutation::HyperedgeRemoved(hyperedge_id.to_string()));
+            self.emit_mutation(GraphMutation::HyperedgeRemoved(hyperedge_id.to_string()))?;
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {
@@ -1360,7 +1361,7 @@ impl SkillGraphStore {
                 .write()
                 .insert(skill_iri.to_string(), new.clone());
             info!("Skill marked as deprecated: {}", skill_iri);
-            self.emit_mutation(GraphMutation::SkillUpdated { old, new });
+            self.emit_mutation(GraphMutation::SkillUpdated { old, new })?;
             Ok(())
         } else {
             Err(CoreError::SkillNotFound {

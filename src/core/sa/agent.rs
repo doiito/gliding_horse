@@ -5,6 +5,9 @@ use tokio::sync::broadcast;
 
 use crate::core::agent_runner::AgentRunner;
 use crate::core::event_bus::{Event, EventBus};
+use crate::core::evolution_delta_gate::EvolutionDeltaGate;
+use crate::core::learning_health::LearningHealthMonitor;
+use crate::core::learning_trajectory::LearningTrajectoryStore;
 use crate::core::perception_store::PerceptionStore;
 use crate::core::policy_learning::ConstrainedPolicy;
 use crate::core::relevance_tracker::RelevanceTracker;
@@ -62,6 +65,15 @@ pub struct SupervisorAgent {
     /// Constrained contextual policy; it may rank hints but never overrides
     /// CA/AA, governance, security, or terminal-state rules.
     pub(super) policy_learning: ConstrainedPolicy,
+    /// Privacy-minimised terminal trajectories.  These are append-only task
+    /// evidence, never a second execution journal.
+    pub(super) learning_trajectories: LearningTrajectoryStore,
+    /// Direction-aware monitor which can freeze a learned treatment when its
+    /// own family-scoped evidence regresses.
+    pub(super) learning_health: LearningHealthMonitor,
+    /// Auditable lifecycle for promoted learning deltas.  It does not mutate
+    /// a graph, index, tool permission, or external system by itself.
+    pub(super) evolution_gate: EvolutionDeltaGate,
     /// Whether accumulated experience is injected and allowed to update the
     /// online policy for this execution.
     pub(super) learning_mode: crate::core::policy_learning::LearningMode,
@@ -129,6 +141,9 @@ impl SupervisorAgent {
             approval_wait_secs: 5,
             discovery_engine: None,
             policy_learning: ConstrainedPolicy::default().with_persistence(runner.l0_store.clone()),
+            learning_trajectories: LearningTrajectoryStore::new(runner.l0_store.clone()),
+            learning_health: LearningHealthMonitor::new(runner.l0_store.clone()),
+            evolution_gate: EvolutionDeltaGate::new(runner.l0_store.clone()),
             learning_mode: crate::core::policy_learning::LearningMode::Active,
         }
     }
@@ -209,6 +224,24 @@ impl SupervisorAgent {
                 min_samples: settings.promotion_min_samples,
                 min_improvement: settings.promotion_min_improvement,
             });
+        self
+    }
+
+    pub fn with_learning_health_settings(
+        mut self,
+        settings: &crate::config::settings::LearningHealthSettings,
+    ) -> Self {
+        let mut config = crate::core::learning_health::LearningHealthMonitorConfig::default();
+        config.baseline_window = settings.baseline_window;
+        config.recent_window = settings.recent_window;
+        config.min_samples_per_window = settings.min_samples_per_window;
+        config.min_signal_strength = settings.min_signal_strength;
+        config.max_family_observations = settings.max_family_observations;
+        self.learning_health = crate::core::learning_health::LearningHealthMonitor::with_config(
+            self.runner.l0_store.clone(),
+            config,
+        )
+        .expect("settings validation guarantees a valid learning health monitor");
         self
     }
 

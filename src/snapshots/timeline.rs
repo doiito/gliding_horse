@@ -1,5 +1,5 @@
 use chrono::Utc;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,6 +44,10 @@ pub struct TimelineStore {
     snapshot_frequency: u64,
     /// Maximum number of full snapshots to retain
     max_full_snapshots: usize,
+    /// Serializes mutation-log commits, full snapshots and rollback
+    /// convergence.  It prevents a snapshot from compacting a mutation log
+    /// while another thread is still appending the corresponding record.
+    commit_lock: Mutex<()>,
     l0_store: Option<Arc<L0Store>>,
 }
 
@@ -65,6 +69,7 @@ impl TimelineStore {
             mutation_count: AtomicU64::new(0),
             snapshot_frequency,
             max_full_snapshots,
+            commit_lock: Mutex::new(()),
             l0_store: None,
         }
     }
@@ -82,17 +87,14 @@ impl TimelineStore {
         format!("iri://timeline/mutation/{sequence:020}")
     }
 
-    fn persist_mutation(&self, record: &TimelineMutationRecord) {
+    fn persist_mutation(&self, record: &TimelineMutationRecord) -> Result<(), crate::CoreError> {
         let Some(l0_store) = &self.l0_store else {
-            return;
+            return Ok(());
         };
-        let content = match serde_json::to_string(record) {
-            Ok(content) => content,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to serialize timeline mutation");
-                return;
-            }
-        };
+        let content =
+            serde_json::to_string(record).map_err(|error| crate::CoreError::StorageError {
+                message: format!("Failed to serialize timeline mutation: {error}"),
+            })?;
         let now = Utc::now();
         let entry = L0Entry {
             iri: Self::mutation_key(record.sequence),
@@ -109,22 +111,17 @@ impl TimelineStore {
             jsonld_context: None,
             jsonld_types: vec!["timeline:GraphMutation".to_string()],
         };
-        if let Err(error) = l0_store.store_entry(&entry) {
-            tracing::warn!(%error, sequence = record.sequence, "Failed to persist timeline mutation");
-        }
+        l0_store.store_entry(&entry)
     }
 
-    fn persist_snapshot(&self, snapshot: &GraphSnapshot) {
+    fn persist_snapshot(&self, snapshot: &GraphSnapshot) -> Result<(), crate::CoreError> {
         let Some(l0_store) = &self.l0_store else {
-            return;
+            return Ok(());
         };
-        let content = match serde_json::to_string(snapshot) {
-            Ok(content) => content,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to serialize timeline snapshot");
-                return;
-            }
-        };
+        let content =
+            serde_json::to_string(snapshot).map_err(|error| crate::CoreError::StorageError {
+                message: format!("Failed to serialize timeline snapshot: {error}"),
+            })?;
         let now = Utc::now();
         let entry = L0Entry {
             iri: Self::snapshot_key(&snapshot.snapshot_id),
@@ -141,13 +138,12 @@ impl TimelineStore {
             jsonld_context: None,
             jsonld_types: vec!["timeline:GraphSnapshot".to_string()],
         };
-        if let Err(error) = l0_store.store_entry(&entry) {
-            tracing::warn!(%error, "Failed to persist timeline snapshot");
-        }
+        l0_store.store_entry(&entry)
     }
 
     /// Rebuild in-memory metadata from durable full snapshots.
     pub fn load_persisted(&self) -> Result<usize, crate::CoreError> {
+        let _commit = self.commit_lock.lock();
         let Some(l0_store) = &self.l0_store else {
             return Ok(0);
         };
@@ -214,6 +210,7 @@ impl TimelineStore {
     /// records after the latest full snapshot.  A snapshot is required because
     /// fragments and any pre-snapshot history are intentionally compacted.
     pub fn reconstruct_latest(&self) -> Result<Option<GraphSnapshot>, crate::CoreError> {
+        let _commit = self.commit_lock.lock();
         let Some(meta) = self
             .snapshots
             .read()
@@ -297,30 +294,48 @@ impl TimelineStore {
         }
     }
 
-    /// Record a mutation. If the mutation count exceeds `snapshot_frequency`,
-    /// automatically triggers a full snapshot (optional, requires backend ref).
-    pub fn record_mutation(&self, mutation: GraphMutation, backend: Option<&dyn SnapshotBackend>) {
-        let count = self.mutation_count.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Always store the mutation
+    /// Record a mutation and durably commit its incremental record before it
+    /// becomes visible to timeline readers.  Callers receive persistence
+    /// failures instead of a warning-only, non-reconstructable timeline.
+    pub fn record_mutation(
+        &self,
+        mutation: GraphMutation,
+        backend: Option<&dyn SnapshotBackend>,
+    ) -> Result<(), crate::CoreError> {
+        let _commit = self.commit_lock.lock();
+        let count = self.mutation_count.load(Ordering::SeqCst).saturating_add(1);
         let record = TimelineMutationRecord {
             sequence: count,
             mutation,
         };
-        self.persist_mutation(&record);
+        self.persist_mutation(&record)?;
         self.mutations_since_last_full.write().push(record);
+        self.mutation_count.store(count, Ordering::SeqCst);
 
-        // Check if we need a full snapshot
-        if count % self.snapshot_frequency == 0 {
+        if self.snapshot_frequency > 0 && count % self.snapshot_frequency == 0 {
             if let Some(backend) = backend {
-                self.create_snapshot(backend, &format!("auto-{}", count));
+                self.create_snapshot_locked(backend, &format!("auto-{}", count))?;
             }
         }
+        Ok(())
     }
 
     /// Create an explicit full snapshot of the current graph state.
-    /// Returns the snapshot_id.
-    pub fn create_snapshot(&self, backend: &dyn SnapshotBackend, label: &str) -> String {
+    /// Returns the snapshot_id only after the durable snapshot has committed.
+    pub fn create_snapshot(
+        &self,
+        backend: &dyn SnapshotBackend,
+        label: &str,
+    ) -> Result<String, crate::CoreError> {
+        let _commit = self.commit_lock.lock();
+        self.create_snapshot_locked(backend, label)
+    }
+
+    fn create_snapshot_locked(
+        &self,
+        backend: &dyn SnapshotBackend,
+        label: &str,
+    ) -> Result<String, crate::CoreError> {
         let nodes = backend.snapshot();
 
         // Deserialize SnapshotNodes into typed collections
@@ -382,7 +397,10 @@ impl TimelineStore {
             mutation_count: meta.mutation_count,
             compressed: false,
         };
-        self.persist_snapshot(&snapshot);
+        // Persist before exposing the metadata or compacting incremental
+        // records. A process crash or L0 failure therefore leaves the old
+        // reconstructable timeline intact.
+        self.persist_snapshot(&snapshot)?;
 
         info!(
             "TimelineStore: created snapshot {} ({} skills, {} hyperedges, label={})",
@@ -416,11 +434,12 @@ impl TimelineStore {
         // GC old snapshots
         self.gc();
 
-        snapshot_id
+        Ok(snapshot_id)
     }
 
     /// Push a full snapshot directly (for loading from persistence).
     pub fn push_snapshot(&self, snapshot: GraphSnapshot) {
+        let _commit = self.commit_lock.lock();
         let meta = SnapshotMeta {
             snapshot_id: snapshot.snapshot_id,
             timestamp: snapshot.timestamp,
@@ -457,6 +476,7 @@ impl TimelineStore {
         target_snapshot: &GraphSnapshot,
         backend: &dyn SnapshotBackend,
     ) -> Result<(), String> {
+        let _commit = self.commit_lock.lock();
         info!(
             "TimelineStore: rolling back to snapshot {} ({} skills, {} hyperedges)",
             target_snapshot.snapshot_id,
@@ -518,6 +538,15 @@ impl TimelineStore {
             "TimelineStore: rollback to {} complete",
             target_snapshot.snapshot_id
         );
+        // A rollback changes the live backend without adding a graph mutation.
+        // Commit a new full snapshot at the current monotonic sequence so a
+        // restart reconstructs the post-rollback state rather than replaying
+        // an abandoned forward branch.
+        self.create_snapshot_locked(
+            backend,
+            &format!("rollback:{}", target_snapshot.snapshot_id),
+        )
+        .map_err(|error| format!("persist rollback convergence snapshot: {error}"))?;
         Ok(())
     }
 
@@ -735,7 +764,7 @@ mod tests {
     fn test_create_snapshot() {
         let backend = test_backend();
         let timeline = TimelineStore::new(100, 10);
-        let id = timeline.create_snapshot(&backend, "test-snap");
+        let id = timeline.create_snapshot(&backend, "test-snap").unwrap();
         assert!(!id.is_empty());
 
         let metas = timeline.list_snapshots();
@@ -749,7 +778,7 @@ mod tests {
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let backend = test_backend();
         let timeline = TimelineStore::new(100, 10).with_l0_store(l0.clone());
-        let id = timeline.create_snapshot(&backend, "persistent");
+        let id = timeline.create_snapshot(&backend, "persistent").unwrap();
 
         let rebuilt = TimelineStore::new(100, 10).with_l0_store(l0);
         assert_eq!(rebuilt.load_persisted().unwrap(), 1);
@@ -763,15 +792,17 @@ mod tests {
         let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
         let backend = test_backend();
         let timeline = TimelineStore::new(100, 10).with_l0_store(l0.clone());
-        timeline.create_snapshot(&backend, "base");
-        timeline.record_mutation(
-            GraphMutation::SkillRegistered(SkillGraphNode::new(
-                "iri://skills/recovered",
-                "Recovered",
-                "from log",
-            )),
-            None,
-        );
+        timeline.create_snapshot(&backend, "base").unwrap();
+        timeline
+            .record_mutation(
+                GraphMutation::SkillRegistered(SkillGraphNode::new(
+                    "iri://skills/recovered",
+                    "Recovered",
+                    "from log",
+                )),
+                None,
+            )
+            .unwrap();
 
         let rebuilt = TimelineStore::new(100, 10).with_l0_store(l0);
         rebuilt.load_persisted().unwrap();
@@ -804,7 +835,7 @@ mod tests {
             ))
             .unwrap();
         let backend = SkillGraphSnapshotBackend::new(store.clone());
-        timeline.create_snapshot(&backend, "base");
+        timeline.create_snapshot(&backend, "base").unwrap();
 
         store
             .add_link(
@@ -843,16 +874,20 @@ mod tests {
         // frequency=2 → every 2 mutations triggers auto snapshot
         let timeline = TimelineStore::new(2, 10);
 
-        timeline.record_mutation(
-            GraphMutation::SkillRegistered(SkillGraphNode::new("iri://skills/c", "C", "C")),
-            Some(&backend),
-        );
+        timeline
+            .record_mutation(
+                GraphMutation::SkillRegistered(SkillGraphNode::new("iri://skills/c", "C", "C")),
+                Some(&backend),
+            )
+            .unwrap();
         assert_eq!(timeline.snapshot_count(), 0); // not yet (count=1)
 
-        timeline.record_mutation(
-            GraphMutation::SkillRegistered(SkillGraphNode::new("iri://skills/d", "D", "D")),
-            Some(&backend),
-        );
+        timeline
+            .record_mutation(
+                GraphMutation::SkillRegistered(SkillGraphNode::new("iri://skills/d", "D", "D")),
+                Some(&backend),
+            )
+            .unwrap();
         assert_eq!(timeline.snapshot_count(), 1); // triggered at count=2
     }
 
@@ -933,15 +968,102 @@ mod tests {
                 .len(),
             1
         );
+        assert!(timeline
+            .list_snapshots()
+            .iter()
+            .any(|meta| meta.label.starts_with("rollback:rollback-target")));
+    }
+
+    #[test]
+    fn rollback_commits_a_convergence_snapshot_for_restart_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let backend = test_backend();
+        let timeline = TimelineStore::new(100, 10).with_l0_store(l0.clone());
+        let baseline_id = timeline.create_snapshot(&backend, "baseline").unwrap();
+        let baseline = timeline.load_snapshot(&baseline_id).unwrap().unwrap();
+
+        backend
+            .store()
+            .register_skill(SkillGraphNode::new(
+                "iri://skills/forward",
+                "Forward",
+                "forward",
+            ))
+            .unwrap();
+        timeline
+            .record_mutation(
+                GraphMutation::SkillRegistered(SkillGraphNode::new(
+                    "iri://skills/forward",
+                    "Forward",
+                    "forward",
+                )),
+                None,
+            )
+            .unwrap();
+        timeline.rollback(&baseline, &backend).unwrap();
+
+        let rebuilt = TimelineStore::new(100, 10).with_l0_store(l0);
+        rebuilt.load_persisted().unwrap();
+        let reconstructed = rebuilt.reconstruct_latest().unwrap().unwrap();
+        assert!(!reconstructed
+            .skills
+            .iter()
+            .any(|skill| skill.skill_iri == "iri://skills/forward"));
+        assert!(rebuilt
+            .list_snapshots()
+            .iter()
+            .any(|meta| meta.label.starts_with("rollback:")));
+    }
+
+    #[test]
+    fn concurrent_mutations_receive_unique_durable_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let timeline = Arc::new(TimelineStore::new(1_000_000, 10).with_l0_store(l0.clone()));
+        let workers = 8;
+        let per_worker = 20;
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let timeline = timeline.clone();
+            handles.push(std::thread::spawn(move || {
+                for index in 0..per_worker {
+                    timeline
+                        .record_mutation(
+                            GraphMutation::SkillRegistered(SkillGraphNode::new(
+                                &format!("iri://skills/concurrent-{worker}-{index}"),
+                                "Concurrent",
+                                "mutation",
+                            )),
+                            None,
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let expected = (workers * per_worker) as u64;
+        assert_eq!(timeline.total_mutations(), expected);
+        assert_eq!(timeline.pending_mutations(), expected as usize);
+        assert_eq!(
+            l0.scan_iri_prefix("iri://timeline/mutation/", usize::MAX)
+                .unwrap()
+                .len(),
+            expected as usize
+        );
     }
 
     #[test]
     fn test_diff_tracking() {
         let timeline = TimelineStore::new(100, 10);
-        timeline.record_mutation(
-            GraphMutation::SkillRegistered(SkillGraphNode::new("iri://skills/a", "A", "A")),
-            None,
-        );
+        timeline
+            .record_mutation(
+                GraphMutation::SkillRegistered(SkillGraphNode::new("iri://skills/a", "A", "A")),
+                None,
+            )
+            .unwrap();
         assert_eq!(timeline.total_mutations(), 1);
         assert_eq!(timeline.pending_mutations(), 1);
     }
@@ -960,7 +1082,9 @@ mod tests {
                     "",
                 ))
                 .unwrap();
-            timeline.create_snapshot(&backend, &format!("snap-{}", i));
+            timeline
+                .create_snapshot(&backend, &format!("snap-{}", i))
+                .unwrap();
         }
 
         assert!(timeline.snapshot_count() <= 3);
@@ -973,7 +1097,9 @@ mod tests {
         let backend = test_backend();
         let timeline = TimelineStore::new(100, 2).with_l0_store(l0.clone());
         for index in 0..5 {
-            timeline.create_snapshot(&backend, &format!("durable-{index}"));
+            timeline
+                .create_snapshot(&backend, &format!("durable-{index}"))
+                .unwrap();
         }
 
         assert_eq!(timeline.snapshot_count(), 2);

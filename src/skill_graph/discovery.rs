@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::memory::hyperspace_store::HyperspaceStore;
@@ -183,13 +184,14 @@ impl SkillDiscoveryEngine {
             .join("\n");
 
         vector_store
-            .upsert_with_metadata(
+            .upsert_recallable_with_metadata(
                 &skill.skill_iri,
                 &text,
                 &skill.tags,
                 Some(skill.graph_meta.success_rate),
                 Some(&vec!["skill:Skill".to_string()]),
                 Some("graph:skills"),
+                true,
             )
             .await
             .map(|_| ())
@@ -207,7 +209,15 @@ impl SkillDiscoveryEngine {
     }
 
     pub async fn discover_for_task(&self, task: &Task5W2H) -> Vec<SkillMatch> {
-        info!("Discovering skills for task: what={}", task.what);
+        let what_sha256 = format!(
+            "sha256:{}",
+            hex::encode(&Sha256::digest(task.what.as_bytes())[..12])
+        );
+        info!(
+            what_chars = task.what.chars().count(),
+            %what_sha256,
+            "Discovering skills for task"
+        );
 
         let mut seen_iris = HashSet::new();
         let mut matches: Vec<SkillMatch> = Vec::new();

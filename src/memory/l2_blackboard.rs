@@ -327,6 +327,37 @@ impl Blackboard {
         }
     }
 
+    /// Submit a graph-mirror mutation with bounded backpressure.  The former
+    /// blocking `send` could suspend an agent turn forever when the Oxigraph
+    /// worker stalled.  We still give the worker a short chance to drain so
+    /// normal bursts retain their ordering and durability guarantees.
+    fn enqueue_sync_command(&self, mut command: SyncCommand, iri: &str) -> Result<(), CoreError> {
+        const MAX_BACKPRESSURE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + MAX_BACKPRESSURE_WAIT;
+        loop {
+            match self.sync_sender.try_send(command) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    command = returned;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(CoreError::OxigraphSyncFailed {
+                            message: format!(
+                                "L2 Oxigraph outbox remained full for {} ms; skipped asynchronous mirror for {iri} to keep the agent responsive",
+                                MAX_BACKPRESSURE_WAIT.as_millis()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(CoreError::OxigraphSyncFailed {
+                        message: "L2 Oxigraph worker disconnected".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     fn enqueue_upsert(
         &self,
         iri: &str,
@@ -335,30 +366,28 @@ impl Blackboard {
     ) -> Result<(u64, DurabilityClass), CoreError> {
         let generation = self.next_generation(iri, false);
         let durability = Self::durability_from_json(&parsed);
-        self.sync_sender
-            .send(SyncCommand::Upsert {
+        self.enqueue_sync_command(
+            SyncCommand::Upsert {
                 iri: iri.to_string(),
                 parsed,
                 graph,
                 generation,
-            })
-            .map_err(|e| CoreError::OxigraphSyncFailed {
-                message: format!("L2 Oxigraph worker disconnected: {e}"),
-            })?;
+            },
+            iri,
+        )?;
         Ok((generation, durability))
     }
 
     fn enqueue_delete(&self, iri: &str, graph: Option<String>) -> Result<u64, CoreError> {
         let generation = self.next_generation(iri, true);
-        self.sync_sender
-            .send(SyncCommand::Delete {
+        self.enqueue_sync_command(
+            SyncCommand::Delete {
                 iri: iri.to_string(),
                 graph,
                 generation,
-            })
-            .map_err(|e| CoreError::OxigraphSyncFailed {
-                message: format!("L2 Oxigraph worker disconnected: {e}"),
-            })?;
+            },
+            iri,
+        )?;
         Ok(generation)
     }
 
@@ -2142,7 +2171,8 @@ impl PermissionMatrix {
 
 impl Drop for Blackboard {
     fn drop(&mut self) {
-        let _ = self.sync_sender.send(SyncCommand::Shutdown);
+        // Drop must not deadlock while a bounded worker queue is saturated.
+        let _ = self.sync_sender.try_send(SyncCommand::Shutdown);
         if let Ok(worker) = self.sync_worker.get_mut() {
             if let Some(handle) = worker.take() {
                 let _ = handle.join();

@@ -999,6 +999,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_bash_environment_excludes_sensitive_names() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({"command": "env"}))
+                .await
+                .unwrap();
+            assert_eq!(result["exit_code"], 0);
+            let environment = result["stdout"].as_str().unwrap_or("").to_ascii_uppercase();
+            for sensitive in [
+                "API_KEY=",
+                "APIKEY=",
+                "ACCESS_KEY=",
+                "SECRET=",
+                "TOKEN=",
+                "PASSWORD=",
+                "PASSWD=",
+                "PRIVATE_KEY=",
+                "CREDENTIAL=",
+                "AUTHORIZATION=",
+                "COOKIE=",
+            ] {
+                assert!(
+                    !environment.contains(sensitive),
+                    "sensitive environment key was inherited: {sensitive}"
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_bash_sandbox_status_reported() {
         rt().block_on(async {
             let result = super::builtins::execute_bash(json!({
@@ -1082,6 +1112,86 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_bash_background_process_is_reaped() {
+        rt().block_on(async {
+            let result = super::builtins::execute_bash(json!({
+                "command": "exit 7",
+                "run_in_background": true,
+            }))
+            .await
+            .unwrap();
+            let task_id: u32 = result["background_task_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            for _ in 0..50 {
+                if super::builtins::background_process_status(task_id).as_deref()
+                    == Some("exited:7")
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!(
+                "background process was not reaped: {:?}",
+                super::builtins::background_process_status(task_id)
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_timeout_does_not_replay_command() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("attempts");
+            let command = format!("printf x >> '{}'; sleep 2", marker.display());
+            let result = super::builtins::execute_bash(json!({
+                "command": command,
+                "timeout": 300,
+            }))
+            .await
+            .unwrap();
+
+            assert_eq!(result["timed_out"], true);
+            assert_eq!(
+                std::fs::read_to_string(marker).unwrap_or_default(),
+                "x",
+                "command must execute exactly once: {result:?}"
+            );
+            assert_eq!(result["error"], "Timeout after 300ms");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_wait_does_not_block_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = std::time::Instant::now();
+            let command = super::builtins::execute_bash(json!({
+                "command": "sleep 0.2",
+                "timeout": 1000,
+            }));
+            let timer = async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                started.elapsed()
+            };
+            let (_, timer_elapsed) = tokio::join!(command, timer);
+            assert!(
+                timer_elapsed < std::time::Duration::from_millis(100),
+                "runtime timer was blocked for {:?}",
+                timer_elapsed
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_bash_output_truncated_at_16k() {
         rt().block_on(async {
             let result = super::builtins::execute_bash(json!({
@@ -1127,5 +1237,79 @@ mod tests {
         let (out, truncated) = super::builtins::truncate_output(&"a".repeat(16_385));
         assert!(truncated);
         assert!(out.contains("[output truncated"));
+    }
+
+    #[test]
+    fn test_web_fetch_network_policy_rejects_non_public_addresses() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            "fc00::1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ] {
+            assert!(!super::builtins::is_public_web_ip(ip), "must block {ip}");
+        }
+        assert!(super::builtins::is_public_web_ip(
+            "8.8.8.8".parse().unwrap()
+        ));
+        assert!(super::builtins::is_public_web_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_web_fetch_rejects_localhost_before_connecting() {
+        rt().block_on(async {
+            let result = super::builtins::execute_web_fetch(json!({
+                "url": "http://127.0.0.1:9/private"
+            }))
+            .await;
+            assert!(result
+                .unwrap_err()
+                .contains("Private, local, or reserved network target"));
+        });
+    }
+
+    #[test]
+    fn test_web_fetch_streaming_limit_rejects_chunked_oversize_body() {
+        rt().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let body = vec![b'a'; 10_000_001];
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                stream
+                    .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&body).await.unwrap();
+                stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            });
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+
+            let error = super::builtins::read_limited_web_body(response)
+                .await
+                .unwrap_err();
+            assert!(error.contains("stream exceeded 10000000 bytes"));
+            server.await.unwrap();
+        });
     }
 }

@@ -907,11 +907,13 @@ ProactiveEngine validates execution against 5W2H constraints:
 |----------|-------|-----------|
 | **File Operations** | `file_read`, `file_write`, `file_edit`, `file_list`, `glob_search`, `grep_search` | Symlink detection, path traversal prevention |
 | **Network** | `WebFetch`, `WebSearch` (DuckDuckGo fallback chain) | TLS enforcement, proxy support |
-| **Execution** | `Bash`, `PowerShell` (sandboxed with timeout) | Configurable timeouts, restricted paths |
+| **Execution** | `Bash`, `PowerShell` (timeout; optional namespace sandbox) | Bounded output and configurable isolation |
 | **Knowledge Import** | `knowledge_import_json`, `knowledge_import_url`, `knowledge_import_directory` | Auto-graphification to RDF |
 | **Knowledge Graph** | `knowledge_extract`, `knowledge_query`, `kg_search`, `kg_neighbors`, `knowledge_extract_code` | SPARQL queries, AST parsing |
 | **Skill Management** | `create_skill`, `convert_skill`, `list_skills` | LLM-powered skill generation |
 | **Ontology** | `ontology_register`, `knowledge_bridge` | Cross-domain semantic alignment |
+
+> Security boundary: shell namespace/filesystem isolation is opt-in and may be unavailable under host or container permission constraints. Every shell result reports `sandbox_status`; execution without an active sandbox must not be treated as safe for untrusted code. The deterministic hash embedding backend is likewise a degraded availability fallback, not a semantic embedding equivalent.
 
 **Micro-Tool Innovation**: For large tool results (>8KB), system automatically generates conversational micro-tools:
 

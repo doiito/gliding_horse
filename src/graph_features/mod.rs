@@ -11,9 +11,8 @@
 //! # Design Note
 //!
 //! Named `graph_features` (not `gnn`) because this module performs **graph topology
-//! feature extraction and geometric aggregation** — not neural network training.
-//! For actual GNN layers with learned weights and backpropagation, see the
-//! `ruvector-gnn` crate in `PR-res/ruvector/`.
+//! feature extraction and geometric aggregation** — not neural network training
+//! or learned-weight backpropagation.
 
 pub mod features;
 pub mod similarity;

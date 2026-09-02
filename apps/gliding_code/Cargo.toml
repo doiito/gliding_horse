@@ -1,6 +1,6 @@
 [package]
 name = "code_cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 [[bin]]
@@ -28,6 +28,7 @@ hex = "0.4"
 
 rustyline = "14"
 ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+ratatui-core = { version = "0.1.2", default-features = false }
 crossterm = "0.28"
 tui-markdown = "0.3"
 mermaid-rs-renderer = { version = "0.2", default-features = false }

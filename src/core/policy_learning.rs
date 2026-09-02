@@ -445,6 +445,16 @@ pub struct PolicyState {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A durable, family-scoped circuit breaker for the executable policy.
+/// Freezing never deletes observations or changes a model; it only forces the
+/// safe baseline until an explicit operator-approved unfreeze occurs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyFreeze {
+    pub context: String,
+    pub reason: String,
+    pub frozen_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyChoice {
     pub context: String,
@@ -857,6 +867,7 @@ impl TrainablePolicyModel {
 #[derive(Clone)]
 pub struct ConstrainedPolicy {
     states: HashMap<String, PolicyState>,
+    frozen_contexts: HashMap<String, PolicyFreeze>,
     store: Option<Arc<L0Store>>,
     model: TrainablePolicyModel,
     model_version: u64,
@@ -871,6 +882,7 @@ impl Default for ConstrainedPolicy {
     fn default() -> Self {
         Self {
             states: HashMap::new(),
+            frozen_contexts: HashMap::new(),
             store: None,
             model: TrainablePolicyModel::default(),
             model_version: 0,
@@ -897,6 +909,11 @@ impl ConstrainedPolicy {
                         None
                     } else if entry.iri == format!("{PREFIX}version") {
                         self.model_version = entry.content.parse::<u64>().unwrap_or(0);
+                        None
+                    } else if entry.iri.starts_with(&format!("{PREFIX}freeze/")) {
+                        if let Ok(freeze) = serde_json::from_str::<PolicyFreeze>(&entry.content) {
+                            self.frozen_contexts.insert(freeze.context.clone(), freeze);
+                        }
                         None
                     } else {
                         serde_json::from_str::<PolicyState>(&entry.content)
@@ -948,6 +965,59 @@ impl ConstrainedPolicy {
         self.min_observations
     }
 
+    /// Force one normalized task family to its rule baseline. This is an
+    /// idempotent, durable circuit breaker used by LearningHealthMonitor.
+    pub fn freeze_context(&mut self, context: &str, reason: &str) -> Result<bool, String> {
+        let context = canonicalize_learning_family_key(context);
+        if context.trim().is_empty() {
+            return Err("cannot freeze an empty policy context".into());
+        }
+        if self.frozen_contexts.contains_key(&context) {
+            return Ok(false);
+        }
+        let freeze = PolicyFreeze {
+            context: context.clone(),
+            reason: reason.chars().take(240).collect(),
+            frozen_at: chrono::Utc::now(),
+        };
+        if let Some(store) = &self.store {
+            let key = format!(
+                "{PREFIX}freeze/{}",
+                hex::encode(sha2::Sha256::digest(context.as_bytes()))
+            );
+            store
+                .store(
+                    &key,
+                    &serde_json::to_string(&freeze).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        self.frozen_contexts.insert(context, freeze);
+        Ok(true)
+    }
+
+    /// Remove a previously recorded freeze after an explicit recovery review.
+    /// Callers must keep the approval evidence in their evolution record.
+    pub fn unfreeze_context(&mut self, context: &str) -> Result<bool, String> {
+        let context = canonicalize_learning_family_key(context);
+        if self.frozen_contexts.remove(&context).is_none() {
+            return Ok(false);
+        }
+        if let Some(store) = &self.store {
+            let key = format!(
+                "{PREFIX}freeze/{}",
+                hex::encode(sha2::Sha256::digest(context.as_bytes()))
+            );
+            store.delete(&key).map_err(|error| error.to_string())?;
+        }
+        Ok(true)
+    }
+
+    pub fn freeze(&self, context: &str) -> Option<&PolicyFreeze> {
+        let context = canonicalize_learning_family_key(context);
+        self.frozen_contexts.get(&context)
+    }
+
     pub fn choose(&mut self, context: &str, candidates: &[String], fallback: &str) -> PolicyChoice {
         let model_scores: HashMap<String, f32> = candidates
             .iter()
@@ -961,6 +1031,16 @@ impl ConstrainedPolicy {
                 .cloned()
                 .unwrap_or_else(|| fallback.to_string())
         };
+        if self.freeze(context).is_some() {
+            return PolicyChoice {
+                context: context.to_string(),
+                action: safe_fallback,
+                used_fallback: true,
+                confidence: 0.0,
+                explored: false,
+                candidates: candidates.to_vec(),
+            };
+        }
         // Pool legacy v2 and current v3 evidence only when both normalize to
         // the same generic intervention family. The original per-task raw
         // features remain in audit evidence and are not erased by pooling.
@@ -1460,6 +1540,32 @@ mod tests {
         assert_eq!(choice.action, "baseline");
         assert!(choice.used_fallback);
         assert!(!choice.explored);
+    }
+
+    #[test]
+    fn frozen_context_is_durable_and_forces_the_safe_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let candidates = vec!["baseline".into(), "experience_first".into()];
+        let context = "planning:v3:intent=inspect;domain=document";
+        let mut policy = ConstrainedPolicy::default().with_persistence(store.clone());
+        assert!(policy.freeze_context(context, "health_regression").unwrap());
+        assert!(!policy.freeze_context(context, "duplicate").unwrap());
+        let choice = policy.choose(context, &candidates, "baseline");
+        assert_eq!(choice.action, "baseline");
+        assert!(choice.used_fallback);
+        assert!(!choice.explored);
+        drop(policy);
+
+        let mut restored = ConstrainedPolicy::default().with_persistence(store);
+        assert_eq!(
+            restored
+                .freeze(context)
+                .map(|freeze| freeze.reason.as_str()),
+            Some("health_regression")
+        );
+        assert!(restored.unfreeze_context(context).unwrap());
+        assert!(restored.freeze(context).is_none());
     }
 
     #[test]

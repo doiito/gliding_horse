@@ -1,0 +1,51 @@
+name: Core Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: core-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Format, lint, test and smoke-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace version consistency
+        run: bash scripts/check_version_consistency.sh
+
+      - name: Reject critical async regressions
+        run: >-
+          cargo clippy --workspace --all-targets --locked --
+          -A warnings
+          -D clippy::await_holding_lock
+          -D clippy::future_not_send
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Smoke-check Gliding Code CLI
+        run: |
+          cargo run --locked -p code_cli --bin glidingcode -- --help
+          test "$(cargo run --quiet --locked -p code_cli --bin glidingcode -- --version)" = "glidingcode 0.1.0"

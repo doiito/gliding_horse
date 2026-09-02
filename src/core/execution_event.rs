@@ -236,6 +236,10 @@ impl ExecutionEventEmitter {
         };
         self.emit(event.clone());
         self.emit_to_event_bus(
+            "LLM_CONTENT",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
+        self.emit_to_event_bus(
             "PHASE_CHANGE",
             &serde_json::to_string(&event).unwrap_or_default(),
         );
@@ -263,6 +267,10 @@ impl ExecutionEventEmitter {
             }),
         };
         self.emit(event.clone());
+        self.emit_to_event_bus(
+            "TOKEN_USAGE",
+            &serde_json::to_string(&event).unwrap_or_default(),
+        );
         self.emit_to_event_bus(
             "AGENT_STATUS",
             &serde_json::to_string(&event).unwrap_or_default(),

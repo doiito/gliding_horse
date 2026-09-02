@@ -489,7 +489,6 @@ impl Default for HookManager {
 // ============================================================
 
 use chrono::{DateTime, Utc};
-use tokio::sync::mpsc;
 
 /// Approval condition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,17 +685,14 @@ pub trait ApprovalNotifier: Send + Sync {
 /// Channel-based approval notifier (for testing and in-process communication)
 pub struct ChannelApprovalNotifier {
     pending: Arc<RwLock<HashMap<String, ApprovalState>>>,
-    response_tx: mpsc::Sender<ApprovalResponse>,
-    response_rx: parking_lot::Mutex<Option<mpsc::Receiver<ApprovalResponse>>>,
+    waiters: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl ChannelApprovalNotifier {
     pub fn new() -> Self {
-        let (response_tx, response_rx) = mpsc::channel(100);
         Self {
             pending: Arc::new(RwLock::new(HashMap::new())),
-            response_tx,
-            response_rx: parking_lot::Mutex::new(Some(response_rx)),
+            waiters: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -710,11 +706,15 @@ impl ChannelApprovalNotifier {
     }
 
     pub async fn submit_response(&self, response: ApprovalResponse) {
-        let mut pending = self.pending.write();
-        if let Some(state) = pending.get_mut(&response.request_id) {
-            state.response = Some(response.clone());
+        {
+            let mut pending = self.pending.write();
+            if let Some(state) = pending.get_mut(&response.request_id) {
+                state.response = Some(response.clone());
+            }
         }
-        let _ = self.response_tx.send(response).await;
+        if let Some(waiter) = self.waiters.lock().get(&response.request_id).cloned() {
+            waiter.notify_one();
+        }
     }
 }
 
@@ -739,6 +739,10 @@ impl ApprovalNotifier for ChannelApprovalNotifier {
                 processed: false,
             },
         );
+        self.waiters
+            .lock()
+            .entry(request.request_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
         Ok(())
     }
 
@@ -747,39 +751,37 @@ impl ApprovalNotifier for ChannelApprovalNotifier {
         request_id: &str,
         timeout: std::time::Duration,
     ) -> Option<ApprovalResponse> {
-        let rx = {
-            let mut guard = self.response_rx.lock();
-            guard.take()
-        };
-
-        if let Some(mut rx) = rx {
-            let result = tokio::time::timeout(timeout, async {
-                while let Some(response) = rx.recv().await {
-                    if response.request_id == request_id {
-                        return Some(response);
-                    }
-                }
-                None
-            })
-            .await
-            .ok()
-            .flatten();
-
-            let mut guard = self.response_rx.lock();
-            *guard = Some(rx);
-
-            if let Some(ref response) = result {
+        let waiter = self
+            .waiters
+            .lock()
+            .entry(request_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = waiter.notified();
+            if let Some(response) = {
                 let mut pending = self.pending.write();
-                if let Some(state) = pending.get_mut(&response.request_id) {
-                    state.response = Some(response.clone());
-                    state.processed = true;
-                }
+                pending.get_mut(request_id).and_then(|state| {
+                    let response = state.response.clone();
+                    if response.is_some() {
+                        state.processed = true;
+                    }
+                    response
+                })
+            } {
+                self.waiters.lock().remove(request_id);
+                return Some(response);
             }
-
-            return result;
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                self.waiters.lock().remove(request_id);
+                return None;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.waiters.lock().remove(request_id);
+                return None;
+            }
         }
-
-        None
     }
 }
 
@@ -809,33 +811,10 @@ impl HumanApprovalHook {
         if !self.config.enabled {
             return false;
         }
-
-        for point in &self.config.approval_points {
-            if point.hook_point != ctx.hook_point {
-                continue;
-            }
-
-            match &point.condition {
-                ApprovalCondition::Always => return true,
-                ApprovalCondition::OnFailure => {
-                    if ctx.error.is_some() {
-                        return true;
-                    }
-                }
-                ApprovalCondition::OnStageComplete => {
-                    if let Some(stage) = ctx.data.get("stage_id").and_then(|v| v.as_str()) {
-                        if point.stages.is_empty() || point.stages.iter().any(|s| s == stage) {
-                            return true;
-                        }
-                    }
-                }
-                ApprovalCondition::Custom(_) => {
-                    // TODO: implement custom condition evaluation
-                }
-            }
-        }
-
-        false
+        self.config
+            .approval_points
+            .iter()
+            .any(|point| Self::point_matches(point, ctx))
     }
 
     fn create_request(&self, ctx: &HookContext) -> ApprovalRequest {
@@ -872,18 +851,72 @@ impl HumanApprovalHook {
     }
 
     fn find_matching_point(&self, ctx: &HookContext) -> Option<&ApprovalPoint> {
-        self.config.approval_points.iter().find(|point| {
-            if point.hook_point != ctx.hook_point {
-                return false;
-            }
-            match &point.condition {
-                ApprovalCondition::Always => true,
-                ApprovalCondition::OnFailure => ctx.error.is_some(),
-                ApprovalCondition::OnStageComplete => ctx.data.get("stage_id").is_some(),
-                ApprovalCondition::Custom(_) => false,
-            }
-        })
+        self.config
+            .approval_points
+            .iter()
+            .find(|point| Self::point_matches(point, ctx))
     }
+
+    fn point_matches(point: &ApprovalPoint, ctx: &HookContext) -> bool {
+        if point.hook_point != ctx.hook_point {
+            return false;
+        }
+        match &point.condition {
+            ApprovalCondition::Always => true,
+            ApprovalCondition::OnFailure => ctx.error.is_some(),
+            ApprovalCondition::OnStageComplete => ctx
+                .data
+                .get("stage_id")
+                .and_then(Value::as_str)
+                .is_some_and(|stage| {
+                    point.stages.is_empty() || point.stages.iter().any(|item| item == stage)
+                }),
+            ApprovalCondition::Custom(expression) => custom_condition_matches(expression, ctx),
+        }
+    }
+}
+
+/// Evaluate the deliberately small, deterministic custom approval DSL.
+/// Supported forms are `error`, `no_error`, `data.KEY`, `metadata.KEY`, and
+/// `data.KEY == JSON_VALUE` (likewise for metadata). Unknown expressions fail
+/// closed by not requesting approval and emit a warning.
+fn custom_condition_matches(expression: &str, ctx: &HookContext) -> bool {
+    let expression = expression.trim();
+    match expression {
+        "error" => return ctx.error.is_some(),
+        "no_error" => return ctx.error.is_none(),
+        _ => {}
+    }
+
+    let (path, expected) = expression
+        .split_once("==")
+        .map_or((expression, None), |(path, value)| {
+            (path.trim(), Some(value.trim()))
+        });
+    let value = path
+        .strip_prefix("data.")
+        .and_then(|key| ctx.data.get(key))
+        .or_else(|| {
+            path.strip_prefix("metadata.")
+                .and_then(|key| ctx.metadata.get(key))
+        });
+    let Some(value) = value else {
+        tracing::warn!(condition = %expression, "Unknown or missing custom approval condition path");
+        return false;
+    };
+    let Some(expected) = expected else {
+        return match value {
+            Value::Null => false,
+            Value::Bool(value) => *value,
+            Value::String(value) => !value.is_empty(),
+            Value::Array(value) => !value.is_empty(),
+            Value::Object(value) => !value.is_empty(),
+            Value::Number(_) => true,
+        };
+    };
+    let expected_value = serde_json::from_str(expected)
+        .unwrap_or_else(|_| Value::String(expected.trim_matches(['\'', '"']).to_string()));
+    value == &expected_value
 }
 
 #[async_trait]
@@ -959,6 +992,98 @@ impl Hook for HumanApprovalHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_approval_conditions_use_deterministic_context_expressions() {
+        let mut context = HookContext::new(HookPoint::PhaseEnd, "agent", "DA")
+            .with_data("risk", serde_json::json!("high"))
+            .with_data("requires_review", serde_json::json!(true));
+        context
+            .metadata
+            .insert("attempt".to_string(), serde_json::json!(3));
+
+        assert!(custom_condition_matches("data.requires_review", &context));
+        assert!(custom_condition_matches("data.risk == \"high\"", &context));
+        assert!(custom_condition_matches("metadata.attempt == 3", &context));
+        assert!(custom_condition_matches("no_error", &context));
+        assert!(!custom_condition_matches("data.risk == \"low\"", &context));
+        assert!(!custom_condition_matches("data.missing", &context));
+    }
+
+    #[test]
+    fn stage_filter_is_consistent_for_selection_and_triggering() {
+        let point = ApprovalPoint {
+            hook_point: HookPoint::PhaseEnd,
+            condition: ApprovalCondition::OnStageComplete,
+            stages: vec!["review".to_string()],
+            ..ApprovalPoint::default()
+        };
+        let review = HookContext::new(HookPoint::PhaseEnd, "agent", "DA")
+            .with_data("stage_id", serde_json::json!("review"));
+        let build = HookContext::new(HookPoint::PhaseEnd, "agent", "DA")
+            .with_data("stage_id", serde_json::json!("build"));
+        assert!(HumanApprovalHook::point_matches(&point, &review));
+        assert!(!HumanApprovalHook::point_matches(&point, &build));
+    }
+
+    #[tokio::test]
+    async fn approval_responses_are_routed_to_concurrent_waiters() {
+        let notifier = Arc::new(ChannelApprovalNotifier::new());
+        let first = ApprovalRequest::new(
+            "iri://task/one".into(),
+            "stage-one".into(),
+            "approve one".into(),
+            vec!["approve".into(), "reject".into()],
+        );
+        let second = ApprovalRequest::new(
+            "iri://task/two".into(),
+            "stage-two".into(),
+            "approve two".into(),
+            vec!["approve".into(), "reject".into()],
+        );
+        notifier.notify(&first).await.unwrap();
+        notifier.notify(&second).await.unwrap();
+
+        let first_waiter = {
+            let notifier = notifier.clone();
+            let request_id = first.request_id.clone();
+            tokio::spawn(async move {
+                notifier
+                    .wait_for_response(&request_id, std::time::Duration::from_secs(1))
+                    .await
+            })
+        };
+        let second_waiter = {
+            let notifier = notifier.clone();
+            let request_id = second.request_id.clone();
+            tokio::spawn(async move {
+                notifier
+                    .wait_for_response(&request_id, std::time::Duration::from_secs(1))
+                    .await
+            })
+        };
+        notifier
+            .submit_response(ApprovalResponse::rejected(
+                second.request_id.clone(),
+                second.stage_id.clone(),
+                None,
+            ))
+            .await;
+        notifier
+            .submit_response(ApprovalResponse::approved(
+                first.request_id.clone(),
+                first.stage_id.clone(),
+                None,
+            ))
+            .await;
+
+        let first_response = first_waiter.await.unwrap().unwrap();
+        let second_response = second_waiter.await.unwrap().unwrap();
+        assert_eq!(first_response.request_id, first.request_id);
+        assert!(first_response.approved);
+        assert_eq!(second_response.request_id, second.request_id);
+        assert!(!second_response.approved);
+    }
 
     #[tokio::test]
     async fn test_hook_manager() {

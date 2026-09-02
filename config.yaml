@@ -44,6 +44,15 @@ policy_learning:
   # Require a measurable positive gain; equality is not an upward promotion.
   promotion_min_improvement: 0.01
 
+# Family-scoped regression detector for promoted retrieval hint order. A
+# degradation freezes only that learned treatment; any rollback needs approval.
+learning_health:
+  baseline_window: 12
+  recent_window: 8
+  min_samples_per_window: 5
+  min_signal_strength: 1.96
+  max_family_observations: 128
+
 memory:
   l0:
     path: "/tmp/agent_os_data/l0"
@@ -140,10 +149,15 @@ agents:
   max_projection_size: 500
 
 api:
-  grpc_addr: "0.0.0.0:50051"
-  http_addr: "0.0.0.0:8080"
+  # Secure by default: use loopback listeners for direct access. To expose
+  # either endpoint, put it behind a trusted TLS reverse proxy, set both
+  # external_tls_terminated: true and a strong auth_token.
+  grpc_addr: "127.0.0.1:50051"
+  http_addr: "127.0.0.1:8080"
   enable_metrics: true
   metrics_port: 9090
+  auth_token: null
+  external_tls_terminated: false
 
 output:
   directory: "/tmp/agent_os_data/output"

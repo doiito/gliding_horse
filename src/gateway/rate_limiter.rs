@@ -45,11 +45,12 @@ impl TokenBucket {
         }
     }
 
-    fn wait_time(&self) -> Option<Duration> {
-        if self.tokens > 0.0 {
+    fn wait_time_for(&self, count: u64) -> Option<Duration> {
+        let missing = count as f64 - self.tokens;
+        if missing <= 0.0 {
             return None;
         }
-        Some(Duration::from_secs_f64(1.0 / self.rate.max(0.001)))
+        Some(Duration::from_secs_f64(missing / self.rate.max(0.001)))
     }
 }
 
@@ -75,7 +76,7 @@ impl RateLimiter {
     pub fn wait_if_needed(&self, model: &str, count: u64) -> Option<Duration> {
         let wait = {
             let buckets = self.buckets.read();
-            buckets.get(model).and_then(|b| b.wait_time())
+            buckets.get(model).and_then(|b| b.wait_time_for(count))
         };
         if let Some(dur) = wait {
             let h = tokio::runtime::Handle::try_current();
@@ -100,7 +101,7 @@ impl RateLimiter {
     pub async fn wait_if_needed_async(&self, model: &str, count: u64) -> Option<Duration> {
         let wait = {
             let buckets = self.buckets.read();
-            buckets.get(model).and_then(|b| b.wait_time())
+            buckets.get(model).and_then(|b| b.wait_time_for(count))
         };
         if let Some(dur) = wait {
             tokio::time::sleep(dur).await;
@@ -110,6 +111,24 @@ impl RateLimiter {
             None
         } else {
             Some(Duration::from_millis(100))
+        }
+    }
+
+    /// Acquire capacity asynchronously, rechecking after each wait.
+    pub async fn acquire(&self, model: &str, count: u64) {
+        let count = count.min(self.default_burst.max(1));
+        loop {
+            let wait = {
+                let mut buckets = self.buckets.write();
+                let bucket = buckets
+                    .entry(model.to_string())
+                    .or_insert_with(|| TokenBucket::new(self.default_rate, self.default_burst));
+                if bucket.try_consume(count) {
+                    return;
+                }
+                bucket.wait_time_for(count)
+            };
+            tokio::time::sleep(wait.unwrap_or(Duration::from_millis(1))).await;
         }
     }
 

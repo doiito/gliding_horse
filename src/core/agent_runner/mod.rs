@@ -75,6 +75,11 @@ pub const WORKSPACE_CONTEXT_DISABLED: &str = "disabled";
 /// such as "report", "build", or "output".
 pub const DELIVERY_MODE_CONSTRAINT: &str = "delivery_mode";
 pub const DELIVERY_MODE_DIRECT_RESPONSE: &str = "direct_response";
+/// A workspace-scoped artifact is the user-visible deliverable.  The path is
+/// carried separately so applications can resolve it relative to their own
+/// workspace root without teaching the kernel about application paths.
+pub const DELIVERY_MODE_WORKSPACE_ARTIFACT: &str = "workspace_artifact";
+pub const DELIVERY_TARGET_PATH_CONSTRAINT: &str = "delivery_target_path";
 
 /// Application-declared external evidence capability. The kernel exposes and
 /// enforces the generic capability; each application decides whether a task
@@ -91,6 +96,23 @@ pub(crate) fn direct_response_delivery_contract(
         .then_some(
             "Delivery mode is direct_response: the final deliverable must be returned in the agent response. A filesystem path, file artifact, or invented graph IRI is neither required nor valid acceptance evidence unless the original user request explicitly requires one.",
         )
+}
+
+pub(crate) fn workspace_artifact_delivery_contract(
+    constraints: &HashMap<String, String>,
+) -> Option<String> {
+    (constraints
+        .get(DELIVERY_MODE_CONSTRAINT)
+        .is_some_and(|mode| mode == DELIVERY_MODE_WORKSPACE_ARTIFACT))
+    .then(|| {
+        let target = constraints
+            .get(DELIVERY_TARGET_PATH_CONSTRAINT)
+            .map(String::as_str)
+            .unwrap_or("deliverable.md");
+        format!(
+            "Delivery mode is workspace_artifact: DA must create the complete final deliverable at workspace-relative path `{target}` with file_write. CA must read that exact file and verify its format and requested content. The final response must report the verified path; a chat-only answer is incomplete."
+        )
+    })
 }
 
 pub(crate) fn required_capability_contract(
@@ -135,6 +157,9 @@ pub struct TaskContext {
     pub resumed_turn_count: u32,
     /// Tool call count restored from checkpoint
     pub resumed_tool_count: u32,
+    /// Validated, versioned checkpoint state.  This carries phase and
+    /// orchestration facts that cannot be reconstructed from chat messages.
+    pub resumed_state: Option<crate::core::checkpoint::TaskResumeState>,
     /// JSON-LD workflow definition (optional, replaces LLM-generated plan)
     pub workflow_jsonld: Option<String>,
     /// Expected output (passed from PlanStep, for DA/CA reference)
@@ -174,6 +199,7 @@ impl TaskContext {
             resumed_messages: None,
             resumed_turn_count: 0,
             resumed_tool_count: 0,
+            resumed_state: None,
             workflow_jsonld: None,
             expected_output: String::new(),
             success_criteria: String::new(),
@@ -188,6 +214,32 @@ impl TaskContext {
     pub fn with_cycle_id(mut self, cycle_id: &str) -> Self {
         self.cycle_id = cycle_id.to_string();
         self
+    }
+
+    /// Build a bounded recall query from semantic task inputs. `task_iri`
+    /// remains correlation metadata and is never used as default query text.
+    pub fn context_recall_query(&self) -> crate::memory::ContextRecallQuery {
+        let what = self
+            .five_w2h_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.what.as_str())
+            .unwrap_or("");
+        let why = self
+            .five_w2h_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.why.description.as_str())
+            .unwrap_or("");
+        crate::memory::ContextRecallQuery::from_fields(
+            &self.task_iri,
+            [
+                ("objective", self.objective.as_str()),
+                ("original_task", self.original_task.as_deref().unwrap_or("")),
+                ("five_w2h_what", what),
+                ("five_w2h_why", why),
+                ("expected_output", self.expected_output.as_str()),
+                ("success_criteria", self.success_criteria.as_str()),
+            ],
+        )
     }
 
     pub fn with_step_info(mut self, expected_output: &str, success_criteria: &str) -> Self {
@@ -270,6 +322,21 @@ impl TaskContext {
         self
     }
 
+    /// Restore a task from the canonical checkpoint reader.  The message
+    /// history remains available to the model while the structured state is
+    /// forwarded to SA for phase and counter restoration.
+    pub fn with_resumed_checkpoint(
+        mut self,
+        messages: Vec<ChatMessage>,
+        state: crate::core::checkpoint::TaskResumeState,
+    ) -> Self {
+        self.resumed_turn_count = state.turn;
+        self.resumed_tool_count = state.tool_call_count;
+        self.resumed_messages = Some(messages);
+        self.resumed_state = Some(state);
+        self
+    }
+
     pub fn add_completed_step(&mut self, step: &str) {
         self.completed_steps.push(step.to_string());
         if let Some(pos) = self.pending_steps.iter().position(|s| s == step) {
@@ -326,6 +393,7 @@ impl Default for TaskContext {
             resumed_messages: None,
             resumed_turn_count: 0,
             resumed_tool_count: 0,
+            resumed_state: None,
             workflow_jsonld: None,
             expected_output: String::new(),
             success_criteria: String::new(),
@@ -434,6 +502,10 @@ pub struct AgentRunner {
     pub root_cause_engine: Option<Arc<RootCauseEngine>>,
     /// Supplementary input store (SA writes → AgentRunner consumes at CycleStart)
     pub supplement_store: crate::core::supplementary_store::SupplementaryInputStore,
+    /// At most one bounded archival write may be in flight. A stalled embedded
+    /// database writer must degrade archival rather than freeze every agent
+    /// turn that follows it.
+    pub l0_archive_gate: Arc<tokio::sync::Semaphore>,
     /// Perception content store (system components write → injected into messages header during exec() initial assembly)
     pub perception_store: crate::core::perception_store::PerceptionStore,
     /// Embedding service (for computing turn embedding and relevance_score)
@@ -529,6 +601,7 @@ impl AgentRunner {
             methodology_gate,
             root_cause_engine,
             supplement_store: crate::core::supplementary_store::SupplementaryInputStore::new(),
+            l0_archive_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             perception_store: crate::core::perception_store::PerceptionStore::new(),
             embedder: None,
             relevance_tracker: None,

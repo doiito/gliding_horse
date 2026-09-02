@@ -467,7 +467,11 @@ impl AgentOSService {
             checkpoints: self.checkpoints.clone(),
             config,
         });
-        crate::api::http::build_router(core, self.unified_graph.store())
+        crate::api::http::build_router(
+            core,
+            self.unified_graph.store(),
+            self.settings.api.auth_token.clone(),
+        )
     }
 
     /// Async start BatchAgent system + background maintenance tasks. Call before gRPC serve.
@@ -666,6 +670,9 @@ impl AgentOSService {
             Some(self.prefetch.clone()),
             Some(self.scheduler.clone()),
         );
+        sa = sa
+            .with_policy_learning_settings(&settings.policy_learning)
+            .with_learning_health_settings(&settings.learning_health);
         sa
     }
 
@@ -945,9 +952,18 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
                         }
 
                         if let Some((core_event, proto_event)) = convert_event_bus_to_grpc(&event) {
-                            let mut states = states_clone.write().await;
-                            if let Some(state) = states.get_mut(&task_iri_clone) {
-                                state.update_from_event(&core_event);
+                            {
+                                let mut states = states_clone.write().await;
+                                if let Some(state) = states.get_mut(&task_iri_clone) {
+                                    state.update_from_event(&core_event);
+                                }
+                            }
+                            if !should_stream_execution_event(
+                                &core_event,
+                                include_thought,
+                                include_tool_calls,
+                            ) {
+                                continue;
                             }
                             if tx_clone.send(Ok(proto_event)).await.is_err() {
                                 break;
@@ -1015,7 +1031,10 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         let task_iri = req.task_iri;
 
         let states = self.execution_states.read().await;
-        let state = states.get(&task_iri).cloned().unwrap_or_default();
+        let state = states
+            .get(&task_iri)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("active task not found: {task_iri}")))?;
 
         let details = ExecutionDetails {
             task_iri: task_iri.clone(),
@@ -1049,7 +1068,10 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         let task_iri = req.task_iri;
 
         let states = self.execution_states.read().await;
-        let state = states.get(&task_iri).cloned().unwrap_or_default();
+        let state = states
+            .get(&task_iri)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("active task not found: {task_iri}")))?;
 
         let status = RealtimeStatus {
             task_iri: task_iri.clone(),
@@ -1096,29 +1118,27 @@ impl seapp::se_kernel_service_server::SeKernelService for AgentOSService {
         &self,
         _request: Request<ValidateContractRequest>,
     ) -> Result<Response<ValidateContractResponse>, Status> {
-        Ok(Response::new(ValidateContractResponse {
-            valid: true,
-            violations: vec![],
-        }))
+        Err(Status::unimplemented(
+            "contract validation is not implemented",
+        ))
     }
 
     async fn flatten_to_frontend(
         &self,
         _request: Request<FlattenRequest>,
     ) -> Result<Response<FlattenResponse>, Status> {
-        Ok(Response::new(FlattenResponse {
-            frontend_json: "{}".to_string(),
-        }))
+        Err(Status::unimplemented(
+            "frontend flattening is not implemented",
+        ))
     }
 
     async fn submit_human_approval(
         &self,
         _request: Request<SubmitApprovalRequest>,
     ) -> Result<Response<SubmitApprovalResponse>, Status> {
-        Ok(Response::new(SubmitApprovalResponse {
-            success: true,
-            message: "ok".to_string(),
-        }))
+        Err(Status::unimplemented(
+            "human approval submission is not wired",
+        ))
     }
 }
 
@@ -1133,6 +1153,40 @@ fn convert_event_bus_to_grpc(
 
     let event_type = EventType::from_str(&event.event_type);
     let timestamp = event.timestamp.timestamp_millis();
+
+    // Rich execution events are already serialized by AgentRunner and
+    // ExecutionEventEmitter.  Preserve that payload rather than collapsing it
+    // into the legacy EventType subset, which previously discarded THOUGHT,
+    // TOOL_CALL and TOOL_RESULT updates from streaming clients.
+    if let EventType::Custom(name) = &event_type {
+        if matches!(
+            name.as_str(),
+            "PHASE_CHANGE"
+                | "AGENT_STATUS"
+                | "LLM_CONTENT"
+                | "TOOL_CALL"
+                | "TOOL_RESULT"
+                | "THOUGHT"
+                | "TOKEN_USAGE"
+                | "EXECUTION_ERROR"
+                | "COMPLETION"
+        ) {
+            let core_event = serde_json::from_str::<CoreExecutionEvent>(&event.payload).ok()?;
+            // The event bus routing key is authoritative.  Do not allow an
+            // embedded payload to project an execution event into another
+            // task's stream.
+            if core_event.task_iri != event.task_iri {
+                return None;
+            }
+            let proto_event = seapp::ExecutionEvent {
+                event_id: core_event.event_id.clone(),
+                task_iri: core_event.task_iri.clone(),
+                timestamp: core_event.timestamp,
+                event: Some(kind_to_proto_event(core_event.event.clone())),
+            };
+            return Some((core_event, proto_event));
+        }
+    }
 
     let kind = match event_type {
         EventType::PlanStarted => {
@@ -1265,6 +1319,19 @@ fn convert_event_bus_to_grpc(
     Some((core_event, proto_event))
 }
 
+fn should_stream_execution_event(
+    event: &crate::core::execution_event::ExecutionEvent,
+    include_thought: bool,
+    include_tool_calls: bool,
+) -> bool {
+    match &event.event {
+        ExecutionEventKind::Thought(_) => include_thought,
+        ExecutionEventKind::LlmContent(content) if content.is_reasoning => include_thought,
+        ExecutionEventKind::ToolCall(_) | ExecutionEventKind::ToolResult(_) => include_tool_calls,
+        _ => true,
+    }
+}
+
 fn kind_to_proto_event(kind: ExecutionEventKind) -> seapp::execution_event::Event {
     use seapp::execution_event::Event;
 
@@ -1390,6 +1457,70 @@ fn clean_content(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn serialized_execution_bus_event(
+        kind: ExecutionEventKind,
+        event_type: &str,
+    ) -> crate::core::event_bus::Event {
+        let execution_event = crate::core::execution_event::ExecutionEvent {
+            event_id: "evt-projected".into(),
+            task_iri: "iri://task/projected".into(),
+            timestamp: 42,
+            event: kind,
+        };
+        let payload = serde_json::to_string(&execution_event).unwrap();
+        crate::core::event_bus::Event {
+            event_id: "bus-projected".into(),
+            task_iri: "iri://task/projected".into(),
+            event_type: event_type.into(),
+            source_agent_iri: "agent://do".into(),
+            payload_json_ld: payload.clone(),
+            payload,
+            timestamp: chrono::Utc::now(),
+            sequence: 1,
+            type_mask: Default::default(),
+            priority: crate::core::event_bus::EventPriority::Normal,
+        }
+    }
+
+    #[test]
+    fn grpc_projection_preserves_serialized_tool_execution_events() {
+        let bus_event = serialized_execution_bus_event(
+            ExecutionEventKind::ToolResult(crate::core::execution_event::ToolResult {
+                call_id: "call-1".into(),
+                tool_name: "file_write".into(),
+                result: "{\"changed\":true}".into(),
+                success: true,
+                result_size_bytes: 16,
+                duration_ms: 23,
+                agent_id: "DA".into(),
+            }),
+            "TOOL_RESULT",
+        );
+
+        let (core, proto) = convert_event_bus_to_grpc(&bus_event).unwrap();
+        assert!(matches!(core.event, ExecutionEventKind::ToolResult(_)));
+        assert!(proto.event.is_some());
+        assert!(should_stream_execution_event(&core, false, true));
+        assert!(!should_stream_execution_event(&core, false, false));
+    }
+
+    #[test]
+    fn grpc_projection_filters_reasoning_without_dropping_state_events() {
+        let bus_event = serialized_execution_bus_event(
+            ExecutionEventKind::LlmContent(crate::core::execution_event::LlmContent {
+                agent_id: "DA".into(),
+                role: "Do".into(),
+                content_delta: "private reasoning".into(),
+                is_reasoning: true,
+                token_count: 3,
+            }),
+            "LLM_CONTENT",
+        );
+        let (core, _) = convert_event_bus_to_grpc(&bus_event).unwrap();
+        assert!(!should_stream_execution_event(&core, false, true));
+        assert!(should_stream_execution_event(&core, true, false));
+    }
 
     #[test]
     fn root_grpc_bootstrap_populates_missing_registry_skills_without_overwrite() {

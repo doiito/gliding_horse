@@ -6,6 +6,9 @@ use serde_json::json;
 
 use crate::core::agent_runner::TaskResult;
 use crate::core::event_bus::EventBus;
+use crate::core::execution_journal::TaskExecutionJournal;
+use crate::memory::l0_store::L0Store;
+use tracing::warn;
 
 /// Emits the canonical terminal task event after an executor returns a result.
 ///
@@ -14,15 +17,39 @@ use crate::core::event_bus::EventBus;
 /// status, errors and action-level evidence irrespective of transport.
 pub struct TaskFinalizer {
     event_bus: Arc<EventBus>,
+    l0: Option<Arc<L0Store>>,
 }
 
 impl TaskFinalizer {
     pub fn new(event_bus: Arc<EventBus>) -> Self {
-        Self { event_bus }
+        Self {
+            event_bus,
+            l0: None,
+        }
+    }
+
+    /// Enable task evidence sealing for product entry points that own the L0
+    /// store. The legacy constructor stays available for transports without
+    /// durable task trace ownership.
+    pub fn with_evidence_ledger(event_bus: Arc<EventBus>, l0: Arc<L0Store>) -> Self {
+        Self {
+            event_bus,
+            l0: Some(l0),
+        }
     }
 
     /// Publish a `TASK_FINALIZED` event and return its event ID.
     pub async fn finalize(&self, task_iri: &str, result: &TaskResult) -> String {
+        if let Some(l0) = &self.l0 {
+            match TaskExecutionJournal::open(l0.clone(), task_iri)
+                .and_then(|journal| journal.seal(&result.status))
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    warn!(task_iri = %task_iri, %error, "Failed to seal task evidence during finalization")
+                }
+            }
+        }
         let actions = result
             .tracked_actions
             .iter()

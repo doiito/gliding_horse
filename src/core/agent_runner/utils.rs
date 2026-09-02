@@ -26,6 +26,71 @@ use super::execution::{
 use super::{LlmParsedResponse, TaskContext, TaskResult};
 
 impl super::AgentRunner {
+    /// Persist an AgentRunner response without allowing a stalled embedded L0
+    /// writer to freeze the ReAct loop. The in-flight permit stays owned by
+    /// the blocking task after a timeout, so later turns degrade archival
+    /// immediately instead of accumulating blocked writers behind redb's
+    /// single-writer lock.
+    pub(super) async fn archive_full_turn_to_l0_bounded(
+        &self,
+        session: &L1Session,
+        role: &str,
+        thought: &str,
+        content_json: &str,
+    ) -> Result<String, CoreError> {
+        const ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let permit = self
+            .l0_archive_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoreError::Internal {
+                message: "L0 archive still in progress; skipped this non-critical turn archive"
+                    .to_string(),
+            })?;
+        let iri = format!(
+            "iri://archive/{}/{}/{}",
+            session
+                .task_iri()
+                .strip_prefix("iri://")
+                .unwrap_or(session.task_iri()),
+            role,
+            uuid::Uuid::new_v4().hyphenated()
+        );
+        let archived_content = serde_json::from_str::<Value>(content_json)
+            .unwrap_or_else(|_| Value::String(content_json.to_string()));
+        let payload = json!({
+            "@id": &iri,
+            "@type": "LLMResponse",
+            "role": role,
+            "agent_id": session.agent_id(),
+            "session_id": session.session_id(),
+            "thought": thought,
+            "content": archived_content,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string();
+        let store = self.l0_store.clone();
+        let write_iri = iri.clone();
+        let write = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            store.store(&write_iri, &payload).map(|_| write_iri)
+        });
+
+        match tokio::time::timeout(ARCHIVE_TIMEOUT, write).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(CoreError::Internal {
+                message: format!("L0 archive worker failed: {error}"),
+            }),
+            Err(_) => Err(CoreError::Internal {
+                message: format!(
+                    "L0 archive exceeded {} seconds; task execution continues",
+                    ARCHIVE_TIMEOUT.as_secs()
+                ),
+            }),
+        }
+    }
+
     pub(super) fn effective_response_content(
         content: &str,
         reasoning_content: Option<&str>,
@@ -326,49 +391,96 @@ impl super::AgentRunner {
             .as_ref()
             .map(|c| c.max_items)
             .unwrap_or(50);
-        let items: Vec<&String> = emphasis_items.iter().take(max_items).collect();
-
-        // Load existing emphasis content for deduplication
-        let existing = self.load_emphasis_from_l0(task_iri).await;
-
-        for content in items {
-            // Deduplication check
-            let is_duplicate = existing.iter().any(|existing_content| {
-                let similarity = Self::calculate_similarity(content, existing_content);
-                similarity >= dedup_threshold
-            });
-
-            if is_duplicate {
-                debug!(
-                    "[L0] Skipping duplicate emphasis content: {}",
-                    content.chars().take(50).collect::<String>()
-                );
-                continue;
+        let items: Vec<String> = emphasis_items.iter().take(max_items).cloned().collect();
+        let task_iri = task_iri.to_string();
+        let agent_id = agent_id.to_string();
+        let store = self.l0_store.clone();
+        let permit = match self.l0_archive_gate.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("Skipped emphasis persistence because an L0 archive is already in flight");
+                return;
             }
+        };
 
-            let iri = format!(
-                "iri://emphasis/{}/{}",
-                task_iri.strip_prefix("iri://").unwrap_or(task_iri),
-                uuid::Uuid::new_v4()
+        let persist = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut existing = Vec::new();
+            let scan_prefix = format!(
+                "iri://emphasis/{}",
+                task_iri.strip_prefix("iri://").unwrap_or(&task_iri)
             );
-            let node = json!({
-                "@id": &iri,
-                "@type": "EmphasisContent",
-                "content": content,
-                "task_iri": task_iri,
-                "agent_id": agent_id,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "permanent": true
-            });
-
-            if let Err(e) = self.l0_store.store(&iri, &node.to_string()) {
-                warn!("Failed to save emphasis content to L0: {}", e);
-            } else {
-                info!("[L0] Saved emphasis content: {} -> {}", agent_id, &iri);
+            if let Ok(entries) = store.scan_iri_prefix(&scan_prefix, 200) {
+                for entry in entries {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&entry.content) {
+                        if let Some(content) =
+                            parsed.get("content").and_then(|value| value.as_str())
+                        {
+                            existing.push(content.to_string());
+                        }
+                    }
+                }
             }
+            if let Ok(nodes) = store.search_by_tags(&[String::from("emphasis")]) {
+                for node in nodes {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&node.content) {
+                        if parsed.get("task_iri").is_none() {
+                            if let Some(content) =
+                                parsed.get("content").and_then(|value| value.as_str())
+                            {
+                                if !existing.iter().any(|candidate| candidate == content) {
+                                    existing.push(content.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut saved = 0usize;
+            for content in items {
+                let is_duplicate = existing.iter().any(|existing_content| {
+                    Self::calculate_similarity(&content, existing_content) >= dedup_threshold
+                });
+                if is_duplicate {
+                    continue;
+                }
+                let iri = format!(
+                    "iri://emphasis/{}/{}",
+                    task_iri.strip_prefix("iri://").unwrap_or(&task_iri),
+                    uuid::Uuid::new_v4()
+                );
+                let node = json!({
+                    "@id": &iri,
+                    "@type": "EmphasisContent",
+                    "content": content,
+                    "task_iri": task_iri,
+                    "agent_id": agent_id,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "permanent": true
+                });
+                match store.store(&iri, &node.to_string()) {
+                    Ok(()) => {
+                        saved += 1;
+                    }
+                    Err(error) => {
+                        warn!(%error, iri = %iri, "Failed to save emphasis content to L0")
+                    }
+                }
+            }
+            saved
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), persist).await {
+            Ok(Ok(saved)) => {
+                info!(saved, "Saved emphasis content to L0");
+            }
+            Ok(Err(error)) => warn!(%error, "Emphasis persistence worker failed"),
+            Err(_) => warn!("Emphasis persistence exceeded 5 seconds; task execution continues"),
         }
     }
 
+    #[allow(dead_code)]
     pub(super) async fn load_emphasis_from_l0(&self, task_iri: &str) -> Vec<String> {
         let mut result = Vec::new();
 

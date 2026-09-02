@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::ops::BitOr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -246,14 +247,52 @@ impl FromStr for EventType {
     }
 }
 
-/// Type mask for O(1) bitmap routing
-///
-/// Each @type gets assigned a unique bit position.
-/// Event matching is done via bitwise AND operation.
+/// Dynamically sized event-type bitset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventTypeMask(Vec<u64>);
+
+impl EventTypeMask {
+    fn singleton(index: usize) -> Self {
+        let mut words = vec![0; index / 64 + 1];
+        words[index / 64] = 1u64 << (index % 64);
+        Self(words)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|word| *word == 0)
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .any(|(left, right)| left & right != 0)
+    }
+
+    fn union_assign(&mut self, other: &Self) {
+        if self.0.len() < other.0.len() {
+            self.0.resize(other.0.len(), 0);
+        }
+        for (index, word) in other.0.iter().enumerate() {
+            self.0[index] |= word;
+        }
+    }
+}
+
+impl BitOr for EventTypeMask {
+    type Output = Self;
+
+    fn bitor(mut self, rhs: Self) -> Self::Output {
+        self.union_assign(&rhs);
+        self
+    }
+}
+
+/// Registry assigning each event type a position in a dynamic bitset.
 #[derive(Debug, Clone)]
 pub struct TypeMask {
-    masks: HashMap<String, u64>,
-    next_bit: u32,
+    masks: HashMap<String, usize>,
+    next_bit: usize,
 }
 
 impl TypeMask {
@@ -264,30 +303,32 @@ impl TypeMask {
         }
     }
 
-    pub fn get_or_create_mask(&mut self, type_name: &str) -> u64 {
-        if let Some(&mask) = self.masks.get(type_name) {
-            return mask;
+    pub fn get_or_create_mask(&mut self, type_name: &str) -> EventTypeMask {
+        if let Some(&index) = self.masks.get(type_name) {
+            return EventTypeMask::singleton(index);
         }
 
-        if self.next_bit >= 64 {
-            panic!("TypeMask overflow: more than 64 types registered");
-        }
-
-        let mask = 1u64 << self.next_bit;
+        let index = self.next_bit;
         self.next_bit += 1;
-        self.masks.insert(type_name.to_string(), mask);
-        mask
+        self.masks.insert(type_name.to_string(), index);
+        EventTypeMask::singleton(index)
     }
 
-    pub fn combine_masks(&self, types: &[String]) -> u64 {
-        types
+    pub fn combine_masks(&self, types: &[String]) -> EventTypeMask {
+        let mut combined = EventTypeMask::default();
+        for index in types
             .iter()
-            .filter_map(|t| self.masks.get(t))
-            .fold(0u64, |acc, &mask| acc | mask)
+            .filter_map(|event_type| self.masks.get(event_type))
+        {
+            combined.union_assign(&EventTypeMask::singleton(*index));
+        }
+        combined
     }
 
-    pub fn get_mask(&self, type_name: &str) -> Option<u64> {
-        self.masks.get(type_name).copied()
+    pub fn get_mask(&self, type_name: &str) -> Option<EventTypeMask> {
+        self.masks
+            .get(type_name)
+            .map(|index| EventTypeMask::singleton(*index))
     }
 
     pub fn type_count(&self) -> usize {
@@ -307,7 +348,7 @@ pub struct InternalEvent {
     pub event_id: u64,
     pub change_type: String,
     pub affected_iri: Arc<str>,
-    pub affected_types_mask: u64,
+    pub affected_types_mask: EventTypeMask,
     pub scope_iri: Arc<str>,
     pub timestamp: i64,
     pub payload: String,
@@ -338,7 +379,7 @@ pub struct Event {
     pub payload_json_ld: String,
     pub timestamp: DateTime<Utc>,
     pub sequence: u64,
-    pub type_mask: u64,
+    pub type_mask: EventTypeMask,
     pub priority: EventPriority,
 }
 
@@ -346,7 +387,7 @@ pub struct Event {
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub subscriber_id: String,
-    pub type_mask: u64,
+    pub type_mask: EventTypeMask,
     pub scope_iri: Option<String>,
     pub event_types: Vec<String>,
 }
@@ -355,13 +396,13 @@ impl Subscription {
     pub fn new(subscriber_id: String) -> Self {
         Self {
             subscriber_id,
-            type_mask: 0,
+            type_mask: EventTypeMask::default(),
             scope_iri: None,
             event_types: Vec::new(),
         }
     }
 
-    pub fn with_type_mask(mut self, mask: u64) -> Self {
+    pub fn with_type_mask(mut self, mask: EventTypeMask) -> Self {
         self.type_mask = mask;
         self
     }
@@ -378,7 +419,7 @@ impl Subscription {
 
     /// O(1) check if event matches subscription
     pub fn matches(&self, event: &Event) -> bool {
-        if self.type_mask != 0 && (event.type_mask & self.type_mask) == 0 {
+        if !self.type_mask.is_empty() && !event.type_mask.intersects(&self.type_mask) {
             return false;
         }
 
@@ -422,9 +463,6 @@ pub struct EventBus {
 
     /// Event counter
     event_count: AtomicU64,
-
-    /// Subscriber count
-    subscriber_count: AtomicU64,
 
     /// Type mask registry
     type_mask: std::sync::Mutex<TypeMask>,
@@ -471,7 +509,6 @@ impl EventBus {
         Self {
             sender,
             event_count: AtomicU64::new(0),
-            subscriber_count: AtomicU64::new(0),
             type_mask: std::sync::Mutex::new(TypeMask::new()),
             history: std::sync::Mutex::new(VecDeque::with_capacity(config.max_history)),
             max_history: config.max_history,
@@ -529,7 +566,7 @@ impl EventBus {
             event_id = %event_id,
             event_type = %event_type,
             task_iri = %task_iri,
-            type_mask = %type_mask,
+            type_mask = ?event.type_mask,
             "Event emitted"
         );
 
@@ -548,14 +585,12 @@ impl EventBus {
 
     /// Subscribe to events
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         self.sender.subscribe()
     }
 
     /// Subscribe with a specific subscription filter. Events that do not
     /// match are consumed from this receiver and never exposed to its caller.
     pub fn subscribe_with_filter(&self, subscription: Subscription) -> FilteredEventReceiver {
-        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
         FilteredEventReceiver {
             receiver: self.sender.subscribe(),
             subscription,
@@ -563,13 +598,13 @@ impl EventBus {
     }
 
     /// Register a type for bitmap routing
-    pub fn register_type(&self, type_name: &str) -> u64 {
+    pub fn register_type(&self, type_name: &str) -> EventTypeMask {
         let mut mask = self.type_mask.lock().expect("type_mask Mutex poisoned");
         mask.get_or_create_mask(type_name)
     }
 
     /// Get combined mask for multiple types
-    pub fn get_combined_mask(&self, types: &[String]) -> u64 {
+    pub fn get_combined_mask(&self, types: &[String]) -> EventTypeMask {
         let mask = self.type_mask.lock().expect("type_mask Mutex poisoned");
         mask.combine_masks(types)
     }
@@ -581,7 +616,7 @@ impl EventBus {
 
     /// Get subscriber count
     pub fn subscriber_count(&self) -> u64 {
-        self.subscriber_count.load(Ordering::Relaxed)
+        self.sender.receiver_count() as u64
     }
 
     /// Get registered type count
@@ -661,13 +696,13 @@ pub struct EventFilter {
     pub source_agent: Option<String>,
 
     /// Type mask for O(1) routing
-    pub type_mask: u64,
+    pub type_mask: EventTypeMask,
 }
 
 impl EventFilter {
     /// Check if an event matches the filter
     pub fn matches(&self, event: &Event) -> bool {
-        if self.type_mask != 0 && (event.type_mask & self.type_mask) == 0 {
+        if !self.type_mask.is_empty() && !event.type_mask.intersects(&self.type_mask) {
             return false;
         }
 
@@ -691,7 +726,7 @@ impl EventFilter {
     }
 
     /// Create filter with type mask for O(1) matching
-    pub fn with_type_mask(mut self, mask: u64) -> Self {
+    pub fn with_type_mask(mut self, mask: EventTypeMask) -> Self {
         self.type_mask = mask;
         self
     }
@@ -787,11 +822,40 @@ mod tests {
         assert_ne!(mask2, mask3);
 
         let combined = mask.combine_masks(&["PLAN_NODE".to_string(), "CODE_ARTIFACT".to_string()]);
-        assert_eq!(combined, mask1 | mask2);
+        assert_eq!(combined, mask1.clone() | mask2.clone());
 
-        assert!((combined & mask1) != 0);
-        assert!((combined & mask2) != 0);
-        assert!((combined & mask3) == 0);
+        assert!(combined.intersects(&mask1));
+        assert!(combined.intersects(&mask2));
+        assert!(!combined.intersects(&mask3));
+    }
+
+    #[tokio::test]
+    async fn dynamic_type_mask_supports_more_than_sixty_four_event_types() {
+        let bus = EventBus::new(8);
+        let mut last = EventTypeMask::default();
+        for index in 0..130 {
+            last = bus.register_type(&format!("CUSTOM_{index}"));
+        }
+        assert_eq!(bus.type_count(), 130);
+        assert!(!last.is_empty());
+
+        let mut receiver = bus.subscribe_with_filter(
+            Subscription::new("late-type".to_string())
+                .with_type_mask(last)
+                .with_event_types(vec!["CUSTOM_129".to_string()]),
+        );
+        bus.emit("task", "CUSTOM_129", "agent", "{}").await;
+        assert_eq!(receiver.recv().await.unwrap().event_type, "CUSTOM_129");
+    }
+
+    #[test]
+    fn subscriber_count_tracks_receiver_lifetime() {
+        let bus = EventBus::new(8);
+        assert_eq!(bus.subscriber_count(), 0);
+        let receiver = bus.subscribe();
+        assert_eq!(bus.subscriber_count(), 1);
+        drop(receiver);
+        assert_eq!(bus.subscriber_count(), 0);
     }
 
     #[test]
@@ -800,8 +864,8 @@ mod tests {
         let plan_mask = type_mask.get_or_create_mask("PLAN_NODE");
         let code_mask = type_mask.get_or_create_mask("CODE_ARTIFACT");
 
-        let subscription =
-            Subscription::new("sub_1".to_string()).with_type_mask(plan_mask | code_mask);
+        let subscription = Subscription::new("sub_1".to_string())
+            .with_type_mask(plan_mask.clone() | code_mask.clone());
 
         let plan_event = Event {
             event_id: "evt_1".to_string(),

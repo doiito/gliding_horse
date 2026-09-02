@@ -28,6 +28,24 @@ fn direct_response_delivery_contract_rejects_invented_artifact_requirements() {
 }
 
 #[test]
+fn workspace_artifact_contract_requires_a_specific_verified_file() {
+    let constraints = HashMap::from([
+        (
+            DELIVERY_MODE_CONSTRAINT.to_string(),
+            DELIVERY_MODE_WORKSPACE_ARTIFACT.to_string(),
+        ),
+        (
+            DELIVERY_TARGET_PATH_CONSTRAINT.to_string(),
+            "AI_Agent_Research_Report.md".to_string(),
+        ),
+    ]);
+    let contract = workspace_artifact_delivery_contract(&constraints).unwrap();
+    assert!(contract.contains("file_write"));
+    assert!(contract.contains("CA must read"));
+    assert!(contract.contains("AI_Agent_Research_Report.md"));
+}
+
+#[test]
 fn web_research_capability_requires_live_evidence_and_disclosure() {
     let constraints = std::collections::HashMap::from([(
         REQUIRED_CAPABILITY_CONSTRAINT.to_string(),
@@ -1193,9 +1211,8 @@ fn shell_effect_confirmation_rejects_noop_and_accepts_content_change() {
                 "command": format!("sed -i 's/missing/replacement/' '{}'", path.display())
             });
             let before = capture_workspace_effect_snapshot(&executor).unwrap();
-            let noop_result = executor
-                .read()
-                .clone()
+            let executor_snapshot = executor.read().clone();
+            let noop_result = executor_snapshot
                 .execute("bash", noop_args.clone())
                 .await
                 .unwrap();
@@ -1214,9 +1231,8 @@ fn shell_effect_confirmation_rejects_noop_and_accepts_content_change() {
                 "command": format!("sed -i 's/old/new/' '{}'", path.display())
             });
             let before = capture_workspace_effect_snapshot(&executor).unwrap();
-            let change_result = executor
-                .read()
-                .clone()
+            let executor_snapshot = executor.read().clone();
+            let change_result = executor_snapshot
                 .execute("bash", change_args.clone())
                 .await
                 .unwrap();

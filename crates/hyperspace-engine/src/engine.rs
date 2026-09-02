@@ -31,12 +31,12 @@ use tracing::{info, warn};
 use crate::error::EngineError;
 use crate::filter::{evaluate_filters, FilterEvaluation, JsonLdFilter};
 use crate::hnsw::{HnswConfig, IncrementalHNSW};
-use crate::hyper_vector::EmbeddingVector;
+use crate::hyper_vector::{EmbeddingVector, MetricKind};
 use crate::jsonld_meta::JsonLdMetadataIndex;
+use crate::lexical::LexicalIndex;
 use crate::metric::{metric_from_kind, Metric};
 use crate::snapshot::{self, EngineSnapshot};
 use crate::storage::VectorStore;
-use crate::tangent::{is_poincare, TangentCache};
 use crate::wal::{EngineWal, WalOp, WalSyncMode};
 
 // ── SearchHit ────────────────────────────────────────────────────────────────
@@ -48,6 +48,25 @@ pub struct SearchHit {
     pub iri: String,
     pub score: f32,
     pub payload: Option<Value>,
+}
+
+/// A single exact-vs-ANN comparison over one immutable active-store snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnProbeResult {
+    pub ann_ids: Vec<u32>,
+    pub exact_ids: Vec<u32>,
+    pub ann_elapsed_us: u64,
+    pub exact_elapsed_us: u64,
+}
+
+/// Capacity facts required to decide whether checkpoint, metadata cleanup, or
+/// a full index rebuild should be considered by an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnIndexStats {
+    pub active_vectors: u32,
+    pub allocated_slots: u32,
+    pub tombstone_slots: u32,
+    pub active_wal_bytes: u64,
 }
 
 // ── IriRegistry ──────────────────────────────────────────────────────────────
@@ -180,6 +199,9 @@ impl Searcher {
         top_k: usize,
         filters: &[JsonLdFilter],
     ) -> Vec<SearchHit> {
+        if query.metric != self.index.metric().kind() || query.validate().is_err() {
+            return Vec::new();
+        }
         let results = match evaluate_filters(&self.metadata, filters) {
             FilterEvaluation::Unrestricted => self.index.search(query, top_k),
             FilterEvaluation::Matched(allowed) => {
@@ -188,40 +210,18 @@ impl Searcher {
                 if ann_results.len() >= expected {
                     ann_results
                 } else {
-                    // P6#8: tangent-space pruning for Poincaré — build a tangent
-                    // cache over the allowed set, prune candidates, then exact
-                    // re-rank within the pruned candidate set.
-                    let mut exact = if is_poincare(&self.index.metric().kind())
-                        && allowed.len() as usize > top_k
-                    {
-                        let mut id_vecs: Vec<(u32, EmbeddingVector)> = allowed
-                            .iter()
-                            .filter_map(|id| self.vectors.get(&id).map(|v| (id, v.clone())))
-                            .collect();
-                        id_vecs.sort_by_key(|(id, _)| *id);
-                        let ids: Vec<u32> = id_vecs.iter().map(|(id, _)| *id).collect();
-                        let vectors: Vec<EmbeddingVector> =
-                            id_vecs.into_iter().map(|(_, v)| v).collect();
-                        let cache = TangentCache::build(&vectors, 1.0);
-                        cache
-                            .search_with_pruning(query, &ids, top_k, 2)
-                            .into_iter()
-                            .filter_map(|id| {
-                                self.vectors
-                                    .get(&id)
-                                    .map(|vector| (id, self.index.metric().distance(query, vector)))
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        allowed
-                            .iter()
-                            .filter_map(|id| {
-                                self.vectors
-                                    .get(&id)
-                                    .map(|vector| (id, self.index.metric().distance(query, vector)))
-                            })
-                            .collect::<Vec<_>>()
-                    };
+                    // Selective filters fall back to the complete, exact
+                    // candidate set. Tangent pruning remains an opt-in
+                    // experiment until a fixed corpus proves its recall and
+                    // latency trade-off.
+                    let mut exact = allowed
+                        .iter()
+                        .filter_map(|id| {
+                            self.vectors
+                                .get(&id)
+                                .map(|vector| (id, self.index.metric().distance(query, vector)))
+                        })
+                        .collect::<Vec<_>>();
                     exact.sort_by(|left, right| {
                         left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal)
                     });
@@ -326,11 +326,91 @@ pub struct HyperspaceEngineImpl {
     /// mutations take the write lock.
     inner: RwLock<EngineInner>,
     metadata: JsonLdMetadataIndex,
+    lexical: RwLock<LexicalIndex>,
     iri_registry: Mutex<IriRegistry>,
     wal: EngineWal,
     data_dir: PathBuf,
     config: HnswConfig,
     dim: usize,
+}
+
+fn validate_snapshot_compatibility(
+    snapshot: &EngineSnapshot,
+    envelope_metric: MetricKind,
+    expected_dimension: usize,
+    expected_metric: MetricKind,
+) -> Result<(), EngineError> {
+    if snapshot.dimension != expected_dimension {
+        return Err(EngineError::StorageError {
+            message: format!(
+                "Snapshot dimension {} is incompatible with engine dimension {}",
+                snapshot.dimension, expected_dimension
+            ),
+        });
+    }
+    if envelope_metric != expected_metric {
+        return Err(EngineError::StorageError {
+            message: format!(
+                "Snapshot metric {:?} is incompatible with engine metric {:?}",
+                envelope_metric, expected_metric
+            ),
+        });
+    }
+
+    for (id, node) in snapshot.nodes.iter().enumerate() {
+        let Some(node) = node else {
+            continue;
+        };
+        if node.coords.len() != expected_dimension {
+            return Err(EngineError::StorageError {
+                message: format!(
+                    "Snapshot node {id} has dimension {}, expected {}",
+                    node.coords.len(),
+                    expected_dimension
+                ),
+            });
+        }
+        let node_metric = match node.metric_tag {
+            0 => MetricKind::Cosine,
+            1 => MetricKind::Poincare,
+            2 => MetricKind::Lorentz,
+            3 => MetricKind::Euclidean,
+            tag => {
+                return Err(EngineError::StorageError {
+                    message: format!("Snapshot node {id} has unknown metric tag {tag}"),
+                })
+            }
+        };
+        if node_metric != expected_metric {
+            return Err(EngineError::StorageError {
+                message: format!(
+                    "Snapshot node {id} uses metric {:?}, expected {:?}",
+                    node_metric, expected_metric
+                ),
+            });
+        }
+        node.to_embedding(expected_metric)
+            .map_err(|error| EngineError::StorageError {
+                message: format!("Snapshot node {id} is invalid: {error}"),
+            })?;
+        for neighbor in node
+            .neighbors0
+            .iter()
+            .chain(node.neighbors_upper.iter().flatten())
+        {
+            let valid_neighbor = snapshot
+                .nodes
+                .get(*neighbor as usize)
+                .and_then(Option::as_ref)
+                .is_some();
+            if !valid_neighbor {
+                return Err(EngineError::StorageError {
+                    message: format!("Snapshot node {id} references missing neighbor {neighbor}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl HyperspaceEngineImpl {
@@ -342,6 +422,11 @@ impl HyperspaceEngineImpl {
         metric: Box<dyn Metric>,
         config: HnswConfig,
     ) -> Result<Self, EngineError> {
+        if dim == 0 {
+            return Err(EngineError::InvalidVector(
+                "HyperspaceEngine dimension must be greater than zero".into(),
+            ));
+        }
         let wal = EngineWal::open(dir, sync_mode)?;
         let element_size = EmbeddingVector::element_size(dim);
         let store = VectorStore::new(dir, element_size);
@@ -357,6 +442,7 @@ impl HyperspaceEngineImpl {
                 clock: 0,
             }),
             metadata,
+            lexical: RwLock::new(LexicalIndex::default()),
             iri_registry: Mutex::new(iri_registry),
             wal,
             data_dir: dir.to_owned(),
@@ -364,51 +450,77 @@ impl HyperspaceEngineImpl {
             dim,
         };
 
-        // Load the newest snapshot first, then replay records newer than its
-        // clock from both frozen segments and the active WAL.
+        // Load the newest valid snapshot first, deleting corrupt or
+        // incompatible generations. WAL replay below fills any gap left by a
+        // discarded generation.
         let snapshot_path = dir.join("index.snapshot");
-        if snapshot_path.exists() {
-            match snapshot::load_snapshot(&snapshot_path) {
-                Ok(snap) => {
-                    info!(
-                        "Loading snapshot: {} nodes, clock={}",
-                        snap.nodes.len(),
-                        snap.clock
+        let previous_snapshot_path = snapshot::snapshot_previous_path(&snapshot_path);
+        let expected_metric = engine.inner.read().unwrap().index.metric().kind();
+        for candidate_path in [&snapshot_path, &previous_snapshot_path] {
+            if !candidate_path.exists() {
+                continue;
+            }
+
+            let loaded = match snapshot::load_snapshot_with_metadata(candidate_path) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    warn!(
+                        path = %candidate_path.display(),
+                        %error,
+                        "Deleting unreadable snapshot generation"
                     );
-                    let mut inner = engine.inner.write().unwrap();
-                    let metric_kind = inner.index.metric().kind();
-                    inner.index.import_nodes(snap.nodes.clone());
-                    inner.clock = snap.clock;
-                    // Populate VectorStore from HNSW node data
-                    for (node_id, node_opt) in snap.nodes.iter().enumerate() {
-                        if let Some(node) = node_opt {
-                            let vec =
-                                EmbeddingVector::new_unchecked(node.coords.clone(), metric_kind);
-                            let bytes = vec.as_bytes();
-                            let _ = inner.store.set(node_id as u32, &bytes);
-                        }
-                    }
-                    if let Ok(mut reg) = engine.iri_registry.lock() {
-                        reg.import(snap.iri_registry);
-                    }
-                    // Restore forward metadata (JSON strings → Values)
-                    for (id, payload_str) in snap.forward_meta {
-                        if let Ok(payload) = serde_json::from_str(&payload_str) {
-                            engine.metadata.index(id, &payload);
-                        }
-                    }
-                    // Restore deleted IDs
-                    for id in snap.deleted_ids {
-                        engine.metadata.remove(id);
-                    }
-                    drop(inner);
+                    snapshot::delete_snapshot(candidate_path)?;
+                    continue;
                 }
-                Err(e) => {
-                    warn!("Failed to load snapshot, falling back to WAL replay: {e}");
+            };
+            let snap = loaded.snapshot;
+            if let Err(error) =
+                validate_snapshot_compatibility(&snap, loaded.metric_kind, dim, expected_metric)
+            {
+                warn!(
+                    path = %candidate_path.display(),
+                    %error,
+                    "Deleting incompatible snapshot generation"
+                );
+                snapshot::delete_snapshot(candidate_path)?;
+                continue;
+            }
+
+            info!(
+                "Loading snapshot: {} nodes, clock={}, source={}, format={}",
+                snap.nodes.len(),
+                snap.clock,
+                loaded.source_path.display(),
+                loaded.format_version,
+            );
+            let mut inner = engine.inner.write().unwrap();
+            inner.index.import_nodes(snap.nodes.clone())?;
+            inner.clock = snap.clock;
+            // Populate VectorStore from HNSW node data.
+            for (node_id, node_opt) in snap.nodes.iter().enumerate() {
+                if let Some(node) = node_opt {
+                    let vector = node.to_embedding(expected_metric)?;
+                    let bytes = vector.as_bytes();
+                    let _ = inner.store.set(node_id as u32, &bytes);
                 }
             }
+            if let Ok(mut reg) = engine.iri_registry.lock() {
+                reg.import(snap.iri_registry);
+            }
+            // Restore forward metadata (JSON strings → Values).
+            for (id, payload_str) in snap.forward_meta {
+                if let Ok(payload) = serde_json::from_str(&payload_str) {
+                    engine.metadata.index(id, &payload);
+                }
+            }
+            // Restore deleted IDs.
+            for id in snap.deleted_ids {
+                engine.metadata.remove(id);
+            }
+            break;
         }
         engine.recover()?;
+        engine.rebuild_lexical_index();
 
         Ok(engine)
     }
@@ -512,6 +624,116 @@ impl HyperspaceEngineImpl {
         let iri_registry = self.iri_registry.lock().unwrap().clone();
         Searcher::new(new_index, self.metadata.clone(), iri_registry, vectors)
     }
+
+    fn rebuild_lexical_index(&self) {
+        let payloads = self
+            .metadata
+            .forward
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        let mut lexical = self
+            .lexical
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        lexical.rebuild(payloads.iter().map(|(id, payload)| (*id, payload)));
+    }
+
+    /// Search the explicitly whitelisted lexical corpus while applying the
+    /// same JSON-LD filter semantics as semantic retrieval.
+    pub fn lexical_search(
+        &self,
+        query: &str,
+        top_k: usize,
+        filters: &[JsonLdFilter],
+    ) -> Result<Vec<SearchHit>, EngineError> {
+        let allowed = evaluate_filters(&self.metadata, filters);
+        let allowed = match &allowed {
+            FilterEvaluation::Unrestricted => None,
+            FilterEvaluation::Matched(bitmap) => Some(bitmap),
+            FilterEvaluation::Empty => return Ok(Vec::new()),
+        };
+        let lexical = self
+            .lexical
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let results = lexical.search(query, top_k, allowed);
+        drop(lexical);
+        let registry = self.iri_registry.lock().unwrap();
+        Ok(results
+            .into_iter()
+            .map(|(id, score)| SearchHit {
+                id,
+                iri: registry.lookup(id).unwrap_or_default(),
+                score,
+                payload: self.metadata.get_payload(id),
+            })
+            .collect())
+    }
+
+    /// Compare raw HNSW output with exact ranking over the same active vector
+    /// snapshot. This method never applies the normal filtered-search exact
+    /// fallback, because that would hide ANN candidate shortfall.
+    pub fn probe_ann(
+        &self,
+        query: &EmbeddingVector,
+        top_k: usize,
+        filters: &[JsonLdFilter],
+    ) -> Result<AnnProbeResult, EngineError> {
+        let started = std::time::Instant::now();
+        let inner = self.inner.read().unwrap();
+        query.validate_for_engine(self.dim, inner.index.metric().kind())?;
+        let allowed = evaluate_filters(&self.metadata, filters);
+        let ann = match &allowed {
+            FilterEvaluation::Unrestricted => inner.index.search(query, top_k),
+            FilterEvaluation::Matched(bitmap) => {
+                inner.index.search_with_filter(query, top_k, Some(bitmap))
+            }
+            FilterEvaluation::Empty => Vec::new(),
+        };
+        let ann_elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let exact_started = std::time::Instant::now();
+        let mut exact = inner
+            .store
+            .iter_active()
+            .filter(|(id, _)| match &allowed {
+                FilterEvaluation::Unrestricted => true,
+                FilterEvaluation::Matched(bitmap) => bitmap.contains(*id),
+                FilterEvaluation::Empty => false,
+            })
+            .map(|(id, bytes)| {
+                let vector = EmbeddingVector::from_bytes(bytes, self.dim)?;
+                Ok((id, inner.index.metric().distance(query, &vector)))
+            })
+            .collect::<Result<Vec<(u32, f64)>, EngineError>>()?;
+        exact.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
+        exact.truncate(top_k);
+        let exact_elapsed_us = exact_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        Ok(AnnProbeResult {
+            ann_ids: ann.into_iter().map(|(id, _)| id).collect(),
+            exact_ids: exact.into_iter().map(|(id, _)| id).collect(),
+            ann_elapsed_us,
+            exact_elapsed_us,
+        })
+    }
+
+    pub fn ann_index_stats(&self) -> AnnIndexStats {
+        let inner = self.inner.read().unwrap();
+        let active_vectors = inner.store.active_count();
+        let allocated_slots = inner.store.capacity();
+        let active_wal_bytes = std::fs::metadata(self.wal.active_path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        AnnIndexStats {
+            active_vectors,
+            allocated_slots,
+            tombstone_slots: allocated_slots.saturating_sub(active_vectors),
+            active_wal_bytes,
+        }
+    }
 }
 
 #[async_trait]
@@ -524,6 +746,8 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         vector: EmbeddingVector,
         jsonld: Value,
     ) -> Result<u32, EngineError> {
+        let expected_metric = self.inner.read().unwrap().index.metric().kind();
+        vector.validate_for_engine(self.dim, expected_metric)?;
         let _write_guard = self.write_barrier.lock().unwrap();
         let id = {
             let mut reg = self.iri_registry.lock().unwrap();
@@ -553,6 +777,10 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
+        self.lexical
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .upsert_payload(id, &jsonld);
         // Clear deleted flag in case this is a re-insert of the same IRI
         self.metadata.undelete(id);
 
@@ -567,6 +795,8 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         vector: EmbeddingVector,
         jsonld: Value,
     ) -> Result<u32, EngineError> {
+        let expected_metric = self.inner.read().unwrap().index.metric().kind();
+        vector.validate_for_engine(self.dim, expected_metric)?;
         let _write_guard = self.write_barrier.lock().unwrap();
         let id = {
             let mut reg = self.iri_registry.lock().unwrap();
@@ -596,6 +826,10 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         inner.store.set(id, &bytes)?;
         inner.index.insert(id, vector);
         self.metadata.index(id, &jsonld);
+        self.lexical
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .upsert_payload(id, &jsonld);
         self.metadata.undelete(id);
 
         Ok(id)
@@ -629,6 +863,10 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         inner.store.remove(id);
         inner.index.remove(id);
         self.metadata.remove(id);
+        self.lexical
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id);
 
         Ok(())
     }
@@ -642,6 +880,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
         let inner = self.inner.read().unwrap();
+        query.validate_for_engine(self.dim, inner.index.metric().kind())?;
         let results = match evaluate_filters(&self.metadata, filters) {
             FilterEvaluation::Unrestricted => inner.index.search(query, top_k),
             FilterEvaluation::Matched(allowed) => {
@@ -702,9 +941,21 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         alpha: f32,
         filters: &[JsonLdFilter],
     ) -> Result<Vec<SearchHit>, EngineError> {
+        if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+            return Err(EngineError::InvalidVector(
+                "hybrid search alpha must be finite and within [0, 1]".into(),
+            ));
+        }
         let allowed = evaluate_filters(&self.metadata, filters);
 
         let inner = self.inner.read().unwrap();
+        let expected_metric = inner.index.metric().kind();
+        if let Some(query) = text_query {
+            query.validate_for_engine(self.dim, expected_metric)?;
+        }
+        if let Some(query) = struct_query {
+            query.validate_for_engine(self.dim, expected_metric)?;
+        }
 
         // For hybrid search, text and struct use the same index.
         // In production, use separate indexes: one Cosine, one Poincaré.
@@ -843,6 +1094,12 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
 
     async fn checkpoint(&self) -> Result<(), EngineError> {
         let snapshot_path = self.data_dir.join("index.snapshot");
+        // Keep the WAL needed to replay from the previous snapshot generation.
+        // If the freshly written current generation is later corrupted, that
+        // retained segment advances the previous snapshot without data loss.
+        let previous_snapshot_clock = snapshot::load_snapshot(&snapshot_path)
+            .map(|snapshot| snapshot.clock)
+            .unwrap_or(0);
 
         // Keep the WAL and in-memory state at one common clock while the
         // snapshot is made.  The snapshot is committed before rotation: a
@@ -853,7 +1110,7 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
         self.wal.sync()?;
 
         // Phase 1: Build and persist a snapshot of the common clock.
-        let (nodes, clock, iri_entries, forward_entries, deleted_ids) = {
+        let (nodes, clock, iri_entries, forward_entries, deleted_ids, metric_kind) = {
             let inner = self.inner.read().unwrap();
             let reg = self.iri_registry.lock().unwrap();
 
@@ -879,7 +1136,14 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
                 .iter()
                 .collect();
 
-            (nodes, clock, iri_entries, forward_entries, deleted_ids)
+            (
+                nodes,
+                clock,
+                iri_entries,
+                forward_entries,
+                deleted_ids,
+                inner.index.metric().kind(),
+            )
         };
 
         let snap = EngineSnapshot {
@@ -892,13 +1156,13 @@ impl HyperspaceEngine for HyperspaceEngineImpl {
             dimension: self.dim,
             config: self.config.clone(),
         };
-        snapshot::save_snapshot(&snapshot_path, &snap)?;
+        snapshot::save_snapshot_generational(&snapshot_path, &snap, metric_kind)?;
 
         // Phase 2: move all records covered by the snapshot to a frozen
         // segment, then delete frozen segments only after the snapshot is
         // durable. New mutations are blocked until this completes.
         self.wal.rotate()?;
-        self.wal.cleanup_frozen()?;
+        self.wal.cleanup_frozen_through(previous_snapshot_clock)?;
 
         info!("Checkpoint complete: snapshot saved, frozen WALs cleaned");
         Ok(())
@@ -971,6 +1235,33 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 1);
         assert_eq!(results[0].iri, "vec:1");
+    }
+
+    #[tokio::test]
+    async fn engine_rejects_wrong_dimension_and_invalid_metric_vectors_before_wal_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = setup_async_engine(dir.path());
+        let wrong_dimension = EmbeddingVector::new(vec![1.0, 0.0], MetricKind::Cosine).unwrap();
+        assert!(engine
+            .insert("bad:dimension", wrong_dimension, json!({}))
+            .await
+            .is_err());
+        assert_eq!(engine.count().await.unwrap(), 0);
+
+        let poincare_engine = HyperspaceEngineImpl::open(
+            dir.path().join("poincare").as_path(),
+            WalSyncMode::Strict,
+            2,
+            Box::new(crate::metric::PoincareMetric),
+            HnswConfig::default(),
+        )
+        .unwrap();
+        let outside_ball = EmbeddingVector::new_unchecked(vec![1.0, 0.0], MetricKind::Poincare);
+        assert!(poincare_engine
+            .insert("bad:poincare", outside_ball, json!({}))
+            .await
+            .is_err());
+        assert_eq!(poincare_engine.count().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1104,6 +1395,150 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].iri, "p");
+    }
+
+    #[tokio::test]
+    async fn corrupted_current_snapshot_recovers_from_previous_generation_and_retained_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let eng = setup_async_engine(dir.path());
+            eng.insert(
+                "generation:base",
+                v(vec![1.0, 0.0, 0.0, 0.0]),
+                json!({"label": "base"}),
+            )
+            .await
+            .unwrap();
+            eng.checkpoint().await.unwrap();
+            eng.insert(
+                "generation:tail",
+                v(vec![0.0, 1.0, 0.0, 0.0]),
+                json!({"label": "tail"}),
+            )
+            .await
+            .unwrap();
+            eng.checkpoint().await.unwrap();
+        }
+        std::fs::write(
+            dir.path().join("index.snapshot"),
+            b"corrupt current snapshot",
+        )
+        .unwrap();
+
+        let reopened = setup_async_engine(dir.path());
+        assert!(!dir.path().join("index.snapshot").exists());
+        assert!(snapshot::snapshot_previous_path(&dir.path().join("index.snapshot")).exists());
+        assert_eq!(reopened.count().await.unwrap(), 2);
+        assert!(reopened
+            .get_payload("generation:base")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .get_payload("generation:tail")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn incompatible_snapshot_metric_is_deleted_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = setup_engine(dir.path());
+            let snapshot = EngineSnapshot {
+                nodes: vec![],
+                entry_point: u32::MAX,
+                clock: 0,
+                iri_registry: vec![],
+                forward_meta: vec![],
+                deleted_ids: vec![],
+                dimension: 4,
+                config: HnswConfig::default(),
+            };
+            crate::snapshot::save_snapshot_with_metric(
+                &dir.path().join("index.snapshot"),
+                &snapshot,
+                MetricKind::Cosine,
+            )
+            .unwrap();
+            drop(engine);
+        }
+        let reopened = HyperspaceEngineImpl::open(
+            dir.path(),
+            WalSyncMode::Strict,
+            4,
+            Box::new(crate::metric::EuclideanMetric),
+            HnswConfig::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join("index.snapshot").exists());
+        assert_eq!(reopened.inner.read().unwrap().clock, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_snapshot_vector_is_deleted_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = EngineSnapshot {
+            nodes: vec![Some(crate::hnsw::SerializableNode {
+                coords: vec![0.1, 0.2],
+                metric_tag: MetricKind::Poincare.tag(),
+                // A cached value is persisted, but must agree with the
+                // coordinates rather than being trusted during recovery.
+                alpha: 0.0,
+                neighbors0: vec![],
+                neighbors_upper: vec![],
+                level: 0,
+            })],
+            entry_point: 0,
+            clock: 3,
+            iri_registry: vec![(0, "bad:snapshot".into())],
+            forward_meta: vec![],
+            deleted_ids: vec![],
+            dimension: 2,
+            config: HnswConfig::default(),
+        };
+        crate::snapshot::save_snapshot_with_metric(
+            &dir.path().join("index.snapshot"),
+            &snapshot,
+            MetricKind::Poincare,
+        )
+        .unwrap();
+
+        let reopened = HyperspaceEngineImpl::open(
+            dir.path(),
+            WalSyncMode::Strict,
+            2,
+            Box::new(crate::metric::PoincareMetric),
+            HnswConfig::default(),
+        )
+        .unwrap();
+        assert!(!dir.path().join("index.snapshot").exists());
+        assert_eq!(reopened.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn legacy_snapshot_is_deleted_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_snapshot = EngineSnapshot {
+            nodes: vec![],
+            entry_point: u32::MAX,
+            clock: 0,
+            iri_registry: vec![],
+            forward_meta: vec![],
+            deleted_ids: vec![],
+            dimension: 4,
+            config: HnswConfig::default(),
+        };
+        std::fs::write(
+            dir.path().join("index.snapshot"),
+            bincode::serialize(&legacy_snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let reopened = setup_engine(dir.path());
+        assert!(!dir.path().join("index.snapshot").exists());
+        assert_eq!(reopened.inner.read().unwrap().clock, 0);
     }
 
     #[tokio::test]

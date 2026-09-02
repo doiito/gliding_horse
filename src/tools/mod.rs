@@ -2,6 +2,7 @@ pub mod builtin;
 pub mod hooks;
 pub mod mcp;
 pub mod mcp_client;
+pub(crate) mod process_env;
 pub mod sharing;
 pub mod sharing_audit;
 pub mod skill_registry;

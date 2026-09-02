@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -48,6 +48,11 @@ struct CachedContent {
 
 /// Version store table: key = "version:{path}:v{version}", value = serialized content.
 const VERSION_STORE: TableDefinition<&str, &[u8]> = TableDefinition::new("version_store");
+/// Content-addressed blobs referenced by workspace snapshot manifests.  This
+/// deliberately has a separate key space from the path/version cache: a
+/// snapshot must restore the bytes it named, never silently fall back to the
+/// current version of a path.
+const SNAPSHOT_BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot_blobs");
 
 /// Content cache with LRU eviction, SHA-256 change detection, and redb version store.
 pub struct ContentStore {
@@ -57,6 +62,9 @@ pub struct ContentStore {
     version_index: RwLock<HashMap<String, u64>>,
     /// redb database for storing historical versions (path → versioned content).
     version_store: Option<Database>,
+    /// Small process-local cache for content-addressed snapshot blobs.  The
+    /// durable redb table remains the source of truth when configured.
+    snapshot_blobs: Mutex<HashMap<String, Vec<u8>>>,
     /// Maximum cache size in bytes (approximate).
     #[allow(dead_code)]
     max_cache_bytes: usize,
@@ -75,6 +83,7 @@ impl ContentStore {
             )),
             version_index: RwLock::new(HashMap::new()),
             version_store: db,
+            snapshot_blobs: Mutex::new(HashMap::new()),
             max_cache_bytes,
         }
     }
@@ -320,11 +329,70 @@ impl ContentStore {
         Some(String::from_utf8_lossy(guard.value()).to_string())
     }
 
+    /// Materialize a file as a content-addressed snapshot blob and return its
+    /// stable SHA-256 identity plus exact byte length.  This intentionally
+    /// reads bytes rather than UTF-8 text so a workspace manifest can also
+    /// restore non-text files that are tracked by the monitor.
+    pub fn capture_snapshot_file(&self, path: &str) -> Result<(String, u64), String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("Failed to read snapshot file {path}: {error}"))?;
+        let hash = hash_bytes(&bytes);
+        self.store_snapshot_blob(&hash, &bytes)?;
+        Ok((hash, bytes.len() as u64))
+    }
+
+    /// Load the exact bytes captured for a snapshot hash.  No path/version
+    /// fallback is permitted: returning `None` makes a rollback fail before it
+    /// mutates the workspace, instead of restoring unrelated current content.
+    pub fn get_snapshot_blob(&self, hash: &str) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.snapshot_blobs.lock().get(hash).cloned() {
+            return Some(bytes);
+        }
+        let db = self.version_store.as_ref()?;
+        let read_txn = db.begin_read().ok()?;
+        let table = read_txn.open_table(SNAPSHOT_BLOBS).ok()?;
+        let bytes = table.get(hash).ok()??.value().to_vec();
+        self.snapshot_blobs
+            .lock()
+            .insert(hash.to_string(), bytes.clone());
+        Some(bytes)
+    }
+
     // ── Private helpers ──
 
     fn invalidate_cache(&self, path: &str) {
         let mut cache = self.lines_cache.lock();
         cache.pop(path);
+    }
+
+    fn store_snapshot_blob(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
+        if let Some(db) = &self.version_store {
+            let write_txn = db
+                .begin_write()
+                .map_err(|error| format!("Failed to open snapshot blob transaction: {error}"))?;
+            {
+                let mut table = write_txn
+                    .open_table(SNAPSHOT_BLOBS)
+                    .map_err(|error| format!("Failed to open snapshot blob table: {error}"))?;
+                if table
+                    .get(hash)
+                    .map_err(|error| format!("Failed to read snapshot blob: {error}"))?
+                    .is_none()
+                {
+                    table
+                        .insert(hash, bytes)
+                        .map_err(|error| format!("Failed to store snapshot blob: {error}"))?;
+                }
+            }
+            write_txn
+                .commit()
+                .map_err(|error| format!("Failed to commit snapshot blob: {error}"))?;
+        }
+        self.snapshot_blobs
+            .lock()
+            .entry(hash.to_string())
+            .or_insert_with(|| bytes.to_vec());
+        Ok(())
     }
 
     fn store_version(&self, path: &str, content: &str, version: u64) {
@@ -353,8 +421,12 @@ impl ContentStore {
 
 /// Compute SHA-256 hash of content.
 fn hash_content(content: &str) -> String {
+    hash_bytes(content.as_bytes())
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(bytes);
     let result = hasher.finalize();
     format!("sha256:{}", hex::encode(result))
 }

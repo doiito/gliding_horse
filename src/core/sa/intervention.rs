@@ -1,3 +1,5 @@
+use std::path::{Component, Path};
+
 use tracing::{info, warn};
 
 use crate::core::agent_instance::AgentRole;
@@ -8,6 +10,93 @@ use crate::CoreError;
 use super::actions::get_action_handler;
 use super::agent::SupervisorAgent;
 use super::types::*;
+
+/// Deterministic delivery updates are intentionally handled outside the LLM
+/// classifier. A user asking to persist the final output is an execution
+/// contract, not a probabilistic piece of context that may be misclassified
+/// or delayed behind another model request.
+pub(super) const DEFAULT_WORKSPACE_DELIVERY_PATH: &str = "AI_Agent_Research_Report.md";
+
+#[derive(Debug, Default)]
+pub(super) struct SupplementaryProcessingOutcome {
+    pub workspace_delivery_target: Option<String>,
+}
+
+fn workspace_relative_markdown_path(text: &str) -> Option<String> {
+    text.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '，' | '。'
+                    | '；'
+                    | '：'
+                    | '、'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+            )
+    })
+    .map(|token| {
+        token.trim_matches(|ch: char| {
+            ch.is_ascii_punctuation() && ch != '.' && ch != '_' && ch != '-'
+        })
+    })
+    .find_map(|token| {
+        let lower = token.to_ascii_lowercase();
+        if !lower.ends_with(".md") {
+            return None;
+        }
+        let path = Path::new(token);
+        (!path.is_absolute()
+            && !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))))
+        .then(|| token.to_string())
+    })
+}
+
+pub(super) fn workspace_delivery_target_from_supplement(text: &str) -> Option<String> {
+    let normalized = text.to_lowercase();
+    let mentions_workspace = [
+        "当前工作区",
+        "工作区",
+        "current workspace",
+        "working directory",
+        "workspace",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let requests_output = [
+        "输出到",
+        "写入",
+        "保存到",
+        "生成到",
+        "写到",
+        "output to",
+        "write to",
+        "save to",
+        "create in",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    (mentions_workspace && requests_output).then(|| {
+        workspace_relative_markdown_path(text)
+            .unwrap_or_else(|| DEFAULT_WORKSPACE_DELIVERY_PATH.to_string())
+    })
+}
 
 impl SupervisorAgent {
     /// Stream an SA-only, tool-free LLM request while retaining the same
@@ -665,7 +754,8 @@ Notes:
         task_iri: &str,
         step_role: &AgentRole,
         step_objective: &str,
-    ) -> Result<(), CoreError> {
+    ) -> Result<SupplementaryProcessingOutcome, CoreError> {
+        let mut outcome = SupplementaryProcessingOutcome::default();
         let mut supp_payloads = Vec::new();
         let mut pending_interventions: Vec<crate::perception::proactive_engine::InterventionPlan> =
             Vec::new();
@@ -737,11 +827,32 @@ Notes:
         };
 
         if pending.is_empty() {
-            return Ok(());
+            return Ok(outcome);
         }
 
         // 3. Process supplementary inputs one by one
         for supplement in &pending {
+            if let Some(target_path) = workspace_delivery_target_from_supplement(supplement) {
+                let contract = format!(
+                    "Mandatory delivery update: write the complete final deliverable to the current workspace at `{target_path}`. This replaces any direct-response-only delivery mode. DA must use file_write and CA must read and verify that exact file before completion."
+                );
+                self.supplement_store.store(task_iri, &contract, None, 1.0);
+                outcome.workspace_delivery_target = Some(target_path.clone());
+                self.event_bus
+                    .emit(
+                        task_iri,
+                        "DELIVERY_CONTRACT_UPDATED",
+                        "SA",
+                        &serde_json::json!({
+                            "target_path": target_path,
+                            "status": "accepted",
+                            "source": "supplementary_input",
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                continue;
+            }
             let context = format!("Current step: {:?} - {}", step_role, step_objective);
             match self
                 .classify_supplementary_input_with_llm(task_iri, supplement, &context)
@@ -754,6 +865,7 @@ Notes:
                 }
                 Err(e) => {
                     warn!(error = %e, supplement = %supplement, "Supplementary input classification failed, defaulting to context injection");
+                    self.supplement_store.store(task_iri, supplement, None, 1.0);
                     self.inject_to_current_agent(task_iri, supplement).await;
                 }
             }
@@ -766,7 +878,7 @@ Notes:
             }
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// LLM classification: map user supplementary input to predefined action
@@ -927,6 +1039,11 @@ Notes:
             }
             SupplementaryInputAction::ProvideConstraint => {
                 info!("Supplementary input: provide constraint");
+                // Constraints must reach the next AgentRunner turn as well as
+                // be visible on the event bus. Previously this branch emitted
+                // an event only, which made a late user constraint disappear.
+                self.supplement_store.store(task_iri, supplement, None, 1.0);
+                self.inject_to_current_agent(task_iri, supplement).await;
                 self.event_bus
                     .emit(
                         task_iri,

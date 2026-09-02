@@ -546,7 +546,7 @@ mod tests {
             payload_json_ld: "src/lib.rs changed".to_string(),
             timestamp: chrono::Utc::now(),
             sequence: 1,
-            type_mask: 1,
+            type_mask: crate::core::event_bus::EventTypeMask::default(),
             priority: EventPriority::Normal,
         };
 

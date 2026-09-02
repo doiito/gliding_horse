@@ -21,11 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&settings.output.directory)?;
     std::fs::create_dir_all(&settings.memory.l0.path)?;
 
-    let addr = settings
-        .api
-        .grpc_addr
-        .parse()
-        .unwrap_or_else(|_| "[::1]:50051".parse().expect("default addr parse"));
+    let addr: std::net::SocketAddr = settings.api.grpc_addr.parse()?;
+    let http_addr: std::net::SocketAddr = settings.api.http_addr.parse()?;
+    let auth_token = settings.api.auth_token.clone();
     let agent_os_service =
         AgentOSService::new(settings).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
@@ -34,11 +32,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // mount existing axum HTTP/SSE routes (build_router) alongside gRPC, sharing runtime state
     let http_router = agent_os_service.build_http_router();
-    let http_port: u16 = std::env::var("AGENT_OS_HTTP_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8080);
-    let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
@@ -53,10 +46,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Agent OS gRPC server starting on {}", addr);
 
-    tonic::transport::Server::builder()
-        .add_service(SeKernelServiceServer::new(agent_os_service))
-        .serve(addr)
-        .await?;
+    if let Some(expected_token) = auth_token.filter(|token| !token.trim().is_empty()) {
+        let interceptor = move |request: tonic::Request<()>| {
+            let header = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok());
+            if glidinghorse::api::auth::valid_bearer_header(header, &expected_token) {
+                Ok(request)
+            } else {
+                Err(tonic::Status::unauthenticated(
+                    "missing or invalid bearer token",
+                ))
+            }
+        };
+        tonic::transport::Server::builder()
+            .add_service(SeKernelServiceServer::with_interceptor(
+                agent_os_service,
+                interceptor,
+            ))
+            .serve(addr)
+            .await?;
+    } else {
+        tonic::transport::Server::builder()
+            .add_service(SeKernelServiceServer::new(agent_os_service))
+            .serve(addr)
+            .await?;
+    }
 
     Ok(())
 }

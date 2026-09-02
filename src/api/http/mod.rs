@@ -3,11 +3,12 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -90,11 +91,14 @@ pub struct StreamEventResponse {
     pub data: Value,
 }
 
-pub fn build_router(core: Arc<SemanticCore>, kg_store: Arc<oxigraph::store::Store>) -> Router {
+pub fn build_router(
+    core: Arc<SemanticCore>,
+    kg_store: Arc<oxigraph::store::Store>,
+    auth_token: Option<String>,
+) -> Router {
     let state = Arc::new(AppState { core, kg_store });
 
-    Router::new()
-        .route("/health", get(health_handler))
+    let protected = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/api/v1/tasks", post(create_task_handler))
         .route("/api/v1/tasks/:task_iri", get(get_task_handler))
@@ -116,8 +120,36 @@ pub fn build_router(core: Arc<SemanticCore>, kg_store: Arc<oxigraph::store::Stor
         .route("/api/v1/guard/audit", get(guard_audit_handler))
         .route("/api/v1/guard/stats", get(guard_stats_handler))
         .route("/api/v1/kg/import", post(kg_import_handler))
-        .route("/api/v1/kg/query", post(kg_query_handler))
+        .route("/api/v1/kg/query", post(kg_query_handler));
+    let protected = if let Some(token) = auth_token.filter(|token| !token.trim().is_empty()) {
+        protected.layer(middleware::from_fn_with_state(
+            Arc::new(token),
+            require_bearer,
+        ))
+    } else {
+        protected
+    };
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn require_bearer(
+    State(expected_token): State<Arc<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let header = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if crate::api::auth::valid_bearer_header(header, expected_token.as_str()) {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -205,50 +237,15 @@ async fn get_task_handler(
 }
 
 async fn stream_task_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<StreamTaskRequest>,
+    State(_state): State<Arc<AppState>>,
+    Json(_req): Json<StreamTaskRequest>,
 ) -> impl IntoResponse {
-    let task_iri = req
-        .task_iri
-        .unwrap_or_else(|| format!("iri://stream/{}", uuid::Uuid::new_v4().hyphenated()));
-
-    let event_bus = state.core.events.clone();
-    let task_iri_clone = task_iri.clone();
-    let mut rx = event_bus.subscribe();
-
-    let stream = async_stream::stream! {
-        yield Ok::<axum::response::sse::Event, std::convert::Infallible>(Event::default().event("task_started").data(json!({
-            "task_iri": task_iri_clone,
-            "status": "started"
-        }).to_string()));
-
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if event.task_iri != task_iri_clone {
-                        continue;
-                    }
-
-                    if let Some(sse_event) = convert_event_to_sse(&event) {
-                        yield Ok(sse_event);
-                    }
-
-                    if event.event_type == "TASK_COMPLETED" || event.event_type == "TASK_FAILED" {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    continue;
-                }
-            }
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "HTTP task execution is not wired; use the gRPC ExecuteTaskStream API"
+        })),
+    )
         .into_response()
 }
 
@@ -256,45 +253,26 @@ async fn get_realtime_status_handler(
     State(_state): State<Arc<AppState>>,
     axum::extract::Path(task_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    Json(json!({
-        "task_iri": task_iri,
-        "status": "running",
-        "current_phase": "do",
-        "current_agent": {
-            "id": "da_001",
-            "role": "DA",
-            "status": "running",
-            "turn": 1
-        },
-        "progress": {
-            "completed_steps": 1,
-            "total_steps": 4,
-            "percentage": 25
-        }
-    }))
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "task_iri": task_iri,
+            "error": "HTTP execution state is not wired; use the gRPC GetRealtimeStatus API"
+        })),
+    )
 }
 
 async fn get_execution_details_handler(
     State(_state): State<Arc<AppState>>,
     axum::extract::Path(task_iri): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    Json(json!({
-        "task_iri": task_iri,
-        "status": "running",
-        "current_phase": "do",
-        "plan": {
-            "plan_id": "plan_001",
-            "description": "Execute task",
-            "steps": []
-        },
-        "steps": [],
-        "agent_sessions": [],
-        "stats": {
-            "total_turns": 0,
-            "total_tool_calls": 0,
-            "total_tokens": 0
-        }
-    }))
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "task_iri": task_iri,
+            "error": "HTTP execution details are not wired; use the gRPC GetExecutionDetails API"
+        })),
+    )
 }
 
 async fn write_node_handler(
@@ -516,114 +494,4 @@ async fn kg_query_handler(
         ),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))),
     }
-}
-
-fn convert_event_to_sse(event: &crate::core::event_bus::Event) -> Option<Event> {
-    use crate::core::event_bus::EventType;
-
-    let event_type = EventType::from_str(&event.event_type);
-    let (event_name, data) = match event_type {
-        EventType::PlanStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "idle",
-                "to_phase": "plan",
-                "agent_role": "PA"
-            }),
-        ),
-        EventType::PlanCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "plan",
-                "to_phase": "do",
-                "agent_role": "PA"
-            }),
-        ),
-        EventType::DoStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "plan",
-                "to_phase": "do",
-                "agent_role": "DA"
-            }),
-        ),
-        EventType::DoCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "do",
-                "to_phase": "check",
-                "agent_role": "DA"
-            }),
-        ),
-        EventType::CheckStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "do",
-                "to_phase": "check",
-                "agent_role": "CA"
-            }),
-        ),
-        EventType::CheckCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "check",
-                "to_phase": "act",
-                "agent_role": "CA"
-            }),
-        ),
-        EventType::ActStarted => (
-            "phase_change",
-            json!({
-                "from_phase": "check",
-                "to_phase": "act",
-                "agent_role": "AA"
-            }),
-        ),
-        EventType::ActCompleted => (
-            "phase_change",
-            json!({
-                "from_phase": "act",
-                "to_phase": "completed",
-                "agent_role": "AA"
-            }),
-        ),
-        EventType::AgentStarted => (
-            "agent_status",
-            json!({
-                "agent_id": event.source_agent_iri,
-                "status": "running"
-            }),
-        ),
-        EventType::AgentCompleted => (
-            "agent_status",
-            json!({
-                "agent_id": event.source_agent_iri,
-                "status": "completed"
-            }),
-        ),
-        EventType::AgentError => (
-            "error",
-            json!({
-                "agent_id": event.source_agent_iri,
-                "message": event.payload
-            }),
-        ),
-        EventType::TaskCompleted => (
-            "completion",
-            json!({
-                "status": "success",
-                "summary": event.payload
-            }),
-        ),
-        EventType::TaskFailed => (
-            "completion",
-            json!({
-                "status": "failed",
-                "summary": event.payload
-            }),
-        ),
-        _ => return None,
-    };
-
-    Some(Event::default().event(event_name).data(data.to_string()))
 }

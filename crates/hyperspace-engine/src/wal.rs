@@ -555,6 +555,30 @@ impl EngineWal {
         }
         Ok(())
     }
+
+    /// Remove only frozen segments fully covered by a retained snapshot.  The
+    /// most recent segment is intentionally kept when it contains records
+    /// newer than the previous snapshot generation, allowing recovery to
+    /// replay it if the current snapshot later fails integrity validation.
+    pub fn cleanup_frozen_through(&self, covered_clock: u64) -> Result<(), EngineError> {
+        for path in self.frozen_paths()? {
+            let mut max_clock = 0u64;
+            EngineWal::replay(&path, |record| {
+                max_clock = max_clock.max(record.clock);
+                Ok(())
+            })?;
+            if max_clock > 0 && max_clock <= covered_clock {
+                tracing::info!(
+                    path = %path.display(),
+                    max_clock,
+                    covered_clock,
+                    "Cleaning frozen WAL segment covered by previous snapshot generation"
+                );
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -187,6 +187,12 @@ const RECORD_KIND_INDEX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("record_kind_index");
 const BLOB_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("content_blobs");
 const BLOB_REFCOUNT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_refcounts");
+const TASK_EVIDENCE_FRAME_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("task_evidence_frames");
+const TASK_EVIDENCE_HEAD_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("task_evidence_heads");
+const TASK_EVIDENCE_SEAL_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("task_evidence_seals");
 
 const META_SCHEMA_VERSION: &str = "_gh_schema_version";
 const META_RECORD_KIND: &str = "_gh_record_kind";
@@ -203,6 +209,57 @@ const ENTRY_ENVELOPE_VERSION: u8 = 1;
 const CODEC_RAW: u8 = 0;
 const CODEC_GZIP: u8 = 1;
 const ENVELOPE_HEADER_LEN: usize = 4 + 1 + 1 + 8 + 32;
+
+/// A task-local, hash-linked evidence frame. It is stored in L0's own redb
+/// transaction domain so multiple journal instances cannot allocate the same
+/// sequence or append after a terminal seal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvidenceFrameRecord {
+    pub schema_version: u32,
+    pub task_key: String,
+    pub task_iri: String,
+    pub sequence: u64,
+    pub event_iri: String,
+    pub event_hash: String,
+    /// Serialized journal event. Normal production events contain only hashes,
+    /// sizes and identifiers; payload capture remains an explicit caller opt-in.
+    pub event_json: String,
+    pub previous_frame_hash: Option<String>,
+    pub frame_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvidenceHead {
+    pub next_sequence: u64,
+    pub last_frame_hash: Option<String>,
+    pub sealed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvidenceSealRecord {
+    pub schema_version: u32,
+    pub task_key: String,
+    pub task_iri: String,
+    pub frame_count: u64,
+    pub root_hash: Option<String>,
+    pub terminal_status: String,
+    pub sealed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEvidenceAppendOutcome {
+    Appended,
+    Conflict,
+    Sealed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEvidenceSealOutcome {
+    Sealed,
+    Conflict,
+    AlreadySealed,
+}
 
 /// L0 Store
 pub struct L0Store {
@@ -580,6 +637,9 @@ impl L0Store {
             let _ = write_txn.open_table(RECORD_KIND_INDEX_TABLE);
             let _ = write_txn.open_table(BLOB_TABLE);
             let _ = write_txn.open_table(BLOB_REFCOUNT_TABLE);
+            let _ = write_txn.open_table(TASK_EVIDENCE_FRAME_TABLE);
+            let _ = write_txn.open_table(TASK_EVIDENCE_HEAD_TABLE);
+            let _ = write_txn.open_table(TASK_EVIDENCE_SEAL_TABLE);
             write_txn.commit().map_err(|e| CoreError::StorageError {
                 message: format!("Failed to commit transaction: {}", e),
             })?;
@@ -617,6 +677,248 @@ impl L0Store {
             })?;
         transaction.set_quick_repair(self.config.quick_repair);
         Ok(transaction)
+    }
+
+    fn evidence_head_from_table<T>(table: &T, task_key: &str) -> Result<TaskEvidenceHead, CoreError>
+    where
+        T: ReadableTable<&'static str, &'static [u8]>,
+    {
+        let value = table
+            .get(task_key)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to read task evidence head: {error}"),
+            })?;
+        match value {
+            Some(value) => {
+                serde_json::from_slice(value.value()).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to decode task evidence head: {error}"),
+                })
+            }
+            None => Ok(TaskEvidenceHead {
+                next_sequence: 0,
+                last_frame_hash: None,
+                sealed: false,
+            }),
+        }
+    }
+
+    /// Read a task evidence head without mutating access metadata.
+    pub fn task_evidence_head(&self, task_key: &str) -> Result<TaskEvidenceHead, CoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to begin task evidence read: {error}"),
+            })?;
+        let table = read_txn
+            .open_table(TASK_EVIDENCE_HEAD_TABLE)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to open task evidence head table: {error}"),
+            })?;
+        Self::evidence_head_from_table(&table, task_key)
+    }
+
+    /// Atomically append a hash-linked frame if its observed head is still
+    /// current. Callers retry a `Conflict` after reading the new head; a
+    /// terminal seal is a permanent append barrier.
+    pub fn try_append_task_evidence(
+        &self,
+        frame: &TaskEvidenceFrameRecord,
+    ) -> Result<TaskEvidenceAppendOutcome, CoreError> {
+        let write_txn = self.begin_write("Failed to begin task evidence append")?;
+        {
+            let mut heads = write_txn
+                .open_table(TASK_EVIDENCE_HEAD_TABLE)
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to open task evidence head table: {error}"),
+                })?;
+            let head = Self::evidence_head_from_table(&heads, &frame.task_key)?;
+            if head.sealed {
+                return Ok(TaskEvidenceAppendOutcome::Sealed);
+            }
+            if head.next_sequence != frame.sequence
+                || head.last_frame_hash != frame.previous_frame_hash
+            {
+                return Ok(TaskEvidenceAppendOutcome::Conflict);
+            }
+            let frame_key = format!("{}/seq_{:020}", frame.task_key, frame.sequence);
+            let mut frames = write_txn
+                .open_table(TASK_EVIDENCE_FRAME_TABLE)
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to open task evidence frame table: {error}"),
+                })?;
+            if frames
+                .get(frame_key.as_str())
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to read task evidence frame: {error}"),
+                })?
+                .is_some()
+            {
+                return Ok(TaskEvidenceAppendOutcome::Conflict);
+            }
+            let encoded = serde_json::to_vec(frame).map_err(|error| CoreError::StorageError {
+                message: format!("Failed to encode task evidence frame: {error}"),
+            })?;
+            frames
+                .insert(frame_key.as_str(), encoded.as_slice())
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to append task evidence frame: {error}"),
+                })?;
+            let next_head = TaskEvidenceHead {
+                next_sequence: frame.sequence.saturating_add(1),
+                last_frame_hash: Some(frame.frame_hash.clone()),
+                sealed: false,
+            };
+            let encoded_head =
+                serde_json::to_vec(&next_head).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to encode task evidence head: {error}"),
+                })?;
+            heads
+                .insert(frame.task_key.as_str(), encoded_head.as_slice())
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to update task evidence head: {error}"),
+                })?;
+        }
+        write_txn
+            .commit()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to commit task evidence append: {error}"),
+            })?;
+        Ok(TaskEvidenceAppendOutcome::Appended)
+    }
+
+    /// Atomically seal a task's evidence chain. The caller must provide the
+    /// currently observed count/root; a concurrent append causes `Conflict`.
+    pub fn try_seal_task_evidence(
+        &self,
+        seal: &TaskEvidenceSealRecord,
+    ) -> Result<TaskEvidenceSealOutcome, CoreError> {
+        let write_txn = self.begin_write("Failed to begin task evidence seal")?;
+        {
+            let mut heads = write_txn
+                .open_table(TASK_EVIDENCE_HEAD_TABLE)
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to open task evidence head table: {error}"),
+                })?;
+            let head = Self::evidence_head_from_table(&heads, &seal.task_key)?;
+            if head.sealed {
+                return Ok(TaskEvidenceSealOutcome::AlreadySealed);
+            }
+            if head.next_sequence != seal.frame_count || head.last_frame_hash != seal.root_hash {
+                return Ok(TaskEvidenceSealOutcome::Conflict);
+            }
+            let mut seals = write_txn
+                .open_table(TASK_EVIDENCE_SEAL_TABLE)
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to open task evidence seal table: {error}"),
+                })?;
+            if seals
+                .get(seal.task_key.as_str())
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to read task evidence seal: {error}"),
+                })?
+                .is_some()
+            {
+                return Ok(TaskEvidenceSealOutcome::AlreadySealed);
+            }
+            let encoded = serde_json::to_vec(seal).map_err(|error| CoreError::StorageError {
+                message: format!("Failed to encode task evidence seal: {error}"),
+            })?;
+            seals
+                .insert(seal.task_key.as_str(), encoded.as_slice())
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to write task evidence seal: {error}"),
+                })?;
+            let sealed_head = TaskEvidenceHead {
+                sealed: true,
+                ..head
+            };
+            let encoded_head =
+                serde_json::to_vec(&sealed_head).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to encode sealed evidence head: {error}"),
+                })?;
+            heads
+                .insert(seal.task_key.as_str(), encoded_head.as_slice())
+                .map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to seal task evidence head: {error}"),
+                })?;
+        }
+        write_txn
+            .commit()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to commit task evidence seal: {error}"),
+            })?;
+        Ok(TaskEvidenceSealOutcome::Sealed)
+    }
+
+    pub fn task_evidence_frames(
+        &self,
+        task_key: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskEvidenceFrameRecord>, CoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to begin task evidence frame read: {error}"),
+            })?;
+        let table = read_txn
+            .open_table(TASK_EVIDENCE_FRAME_TABLE)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to open task evidence frame table: {error}"),
+            })?;
+        let prefix = format!("{task_key}/");
+        let mut frames = Vec::new();
+        for result in table
+            .range(prefix.as_str()..)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to iterate task evidence frames: {error}"),
+            })?
+        {
+            let (key, value) = result.map_err(|error| CoreError::StorageError {
+                message: format!("Failed to read task evidence frame: {error}"),
+            })?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            let frame =
+                serde_json::from_slice(value.value()).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to decode task evidence frame: {error}"),
+                })?;
+            frames.push(frame);
+            if frames.len() >= limit.max(1) {
+                break;
+            }
+        }
+        Ok(frames)
+    }
+
+    pub fn task_evidence_seal(
+        &self,
+        task_key: &str,
+    ) -> Result<Option<TaskEvidenceSealRecord>, CoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to begin task evidence seal read: {error}"),
+            })?;
+        let table = read_txn
+            .open_table(TASK_EVIDENCE_SEAL_TABLE)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to open task evidence seal table: {error}"),
+            })?;
+        table
+            .get(task_key)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to read task evidence seal: {error}"),
+            })?
+            .map(|value| {
+                serde_json::from_slice(value.value()).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to decode task evidence seal: {error}"),
+                })
+            })
+            .transpose()
     }
 
     pub fn store(&self, iri: &str, content: &str) -> Result<(), CoreError> {

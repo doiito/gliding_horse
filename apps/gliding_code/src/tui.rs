@@ -30,6 +30,27 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::CliConfig;
 use crate::log_buffer::LogBuffer;
 
+mod markdown;
+#[cfg(test)]
+use markdown::convert_markdown_style;
+use markdown::markdown_to_owned_lines;
+
+// `Runtime::new()` gives Tokio worker threads a small default stack.  The
+// interactive path intentionally keeps the complete SA/PDCA future, stream
+// accumulator, persistence hand-off and event forwarding on those workers;
+// real planning requests can therefore exceed the default before an `await`
+// unwinds the stack.  Keep this explicit and local to the TUI so a large
+// terminal task cannot abort the entire process with a worker stack overflow.
+const TUI_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn build_tui_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("glidingcode-tui")
+        .thread_stack_size(TUI_WORKER_STACK_BYTES)
+        .build()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum MessageRole {
     User,
@@ -76,6 +97,9 @@ pub struct App {
     current_task_iri: Option<String>,
     /// 从 checkpoint 恢复的历史消息（用于 resume 模式）
     resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
+    /// Canonical checkpoint state.  This is present only for an explicit
+    /// startup resume, never for ordinary multi-turn conversation carryover.
+    resumed_state: Option<glidinghorse::core::checkpoint::TaskResumeState>,
     /// 标记当前会话是否为 resume 模式（防止事件重置计数）
     is_resume_session: bool,
     session_turn_count: u32,
@@ -122,7 +146,8 @@ pub struct App {
     completion_tokens: Arc<std::sync::atomic::AtomicU64>,
     last_prompt_tokens: Arc<std::sync::atomic::AtomicU64>,
     last_completion_tokens: Arc<std::sync::atomic::AtomicU64>,
-    status_rx: Option<mpsc::UnboundedReceiver<StatusEvent>>,
+    status_rx: Option<mpsc::Receiver<StatusEvent>>,
+    event_listener: Option<tokio::task::JoinHandle<()>>,
     result_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<(String, TaskResult)>>>,
     /// Last user input string (for topic shift detection)
     last_user_input: String,
@@ -229,59 +254,6 @@ fn strip_mermaid_fences(content: &str) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Replace bare ``` fences (no language) with ```txt so syntect
-/// can resolve it to "Plain Text" syntax instead of logging a warning.
-fn default_code_lang(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut in_fence = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !in_fence && trimmed.starts_with("```") {
-            let rest = trimmed[3..].trim();
-            if rest.is_empty() {
-                out.push_str("```txt\n");
-            } else {
-                out.push_str(line);
-                out.push('\n');
-            }
-            in_fence = !trimmed.ends_with("```") || rest.is_empty();
-        } else if in_fence && trimmed == "```" {
-            out.push_str(line);
-            out.push('\n');
-            in_fence = false;
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-fn markdown_to_owned_lines(content: &str) -> Vec<Line<'static>> {
-    let prepared = default_code_lang(content);
-    let text = tui_markdown::from_str(&prepared);
-    text.lines
-        .into_iter()
-        .map(|line| {
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .map(|span| {
-                    // tui-markdown uses ratatui_core::Style (separate crate) which is
-                    // layout-compatible with ratatui::Style when underline-color is
-                    // disabled (our build: default-features=false). Transmute is safe
-                    // because both structs have {fg, bg, add_modifier, sub_modifier}
-                    // with identical Color/Modifier representations.
-                    let style = span.style;
-                    let style: ratatui::style::Style = unsafe { std::mem::transmute(style) };
-                    Span::styled(span.content.into_owned(), style)
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect()
 }
 
 fn mermaid_block_lines(mb: &MermaidBlock) -> Vec<Line<'static>> {
@@ -766,7 +738,7 @@ impl App {
         let startup_reporter = startup_screen.as_ref().map(StartupScreen::reporter);
         let max_l2_mb = config.max_l2_mb;
         let max_l3_mb = config.max_l3_mb;
-        let rt = tokio::runtime::Runtime::new()?;
+        let rt = build_tui_runtime()?;
         let engine = {
             // Construct the engine inside the runtime context so subsystems
             // that capture a tokio Handle at init (e.g. WatchEngine) work.
@@ -816,6 +788,7 @@ impl App {
             current_phase: "Idle".into(),
             current_task_iri: None,
             resumed_messages: None,
+            resumed_state: None,
             is_resume_session: false,
             session_turn_count: 0,
             session_tool_call_count: 0,
@@ -853,6 +826,7 @@ impl App {
             last_prompt_tokens,
             last_completion_tokens,
             status_rx: None,
+            event_listener: None,
             result_rx: None,
             last_user_input: String::new(),
             workspace_monitor,
@@ -884,41 +858,35 @@ impl App {
         // Resume mode: load checkpoint from L0 and restore conversation
         if let Some(ref task_iri) = resume_task_iri {
             let cm = glidinghorse::core::checkpoint::CheckpointManager::with_persistence(l0);
-            if let Ok(Some(cp)) = cm.restore_latest(task_iri) {
+            if let Ok(Some(restored)) = cm.restore_task(task_iri) {
+                let cp = restored.checkpoint;
                 // Restore current_task_iri so new input continues the same task
                 app.current_task_iri = Some(task_iri.clone());
 
-                // Parse session_messages_json into TUI Messages
-                if let Ok(msgs) =
-                    serde_json::from_str::<Vec<ChatMessage>>(&cp.session_messages_json)
-                {
-                    // 保存恢复的历史消息用于传递给 AgentRunner
-                    app.resumed_messages = Some(msgs.clone());
-                    app.is_resume_session = true;
+                let msgs = restored.messages;
+                // 保存恢复的历史消息和结构化状态用于传递给 AgentRunner
+                app.resumed_messages = Some(compact_chat_history(msgs.clone()));
+                app.resumed_state = Some(restored.state.clone());
+                app.is_resume_session = true;
 
-                    // 恢复 turn/tool 计数
-                    app.session_turn_count =
-                        msgs.iter().filter(|m| m.role == "assistant").count() as u32;
-                    app.session_tool_call_count = msgs
-                        .iter()
-                        .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
-                        .count() as u32;
+                // Restore counters from the same validated state used by SA.
+                app.session_turn_count = restored.state.turn;
+                app.session_tool_call_count = restored.state.tool_call_count;
 
-                    for msg in &msgs {
-                        let role = match msg.role.as_str() {
-                            "user" => MessageRole::User,
-                            "assistant" => MessageRole::Assistant,
-                            _ => continue,
-                        };
-                        app.messages.push(Message {
-                            role,
-                            content: msg.content.clone(),
-                            full_raw: msg.reasoning_content.clone(),
-                            can_expand: msg.reasoning_content.is_some(),
-                            timestamp: timestamp(),
-                            mermaid_blocks: extract_mermaid_blocks(&msg.content),
-                        });
-                    }
+                for msg in &msgs {
+                    let role = match msg.role.as_str() {
+                        "user" => MessageRole::User,
+                        "assistant" => MessageRole::Assistant,
+                        _ => continue,
+                    };
+                    app.messages.push(Message {
+                        role,
+                        content: msg.content.clone(),
+                        full_raw: msg.reasoning_content.clone(),
+                        can_expand: msg.reasoning_content.is_some(),
+                        timestamp: timestamp(),
+                        mermaid_blocks: extract_mermaid_blocks(&msg.content),
+                    });
                 }
 
                 // 恢复 token 计数（从 agent_state_json）
@@ -1088,13 +1056,14 @@ impl App {
                     Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                         // Sender dropped — the background task panicked or was cancelled
                         self.result_rx = None;
-                        self.status_rx = None; // drop mpsc receiver → kills zombie event listener
+                        self.stop_event_listener();
                         self.is_processing = false;
                         self.current_phase = "Idle".into();
                     }
                     Err(_) => {}
                 }
             }
+            self.enforce_message_budget();
 
             // 不要用 ? — draw 错误后继续循环，让 cleanup 有机会执行
             if self.auto_scroll {
@@ -1197,6 +1166,11 @@ impl App {
             LeaveAlternateScreen,
             crossterm::event::DisableMouseCapture
         )?;
+        self.stop_event_listener();
+        self.rt.block_on(async {
+            let mut engine = self.engine.lock().await;
+            engine.shutdown().await;
+        });
         Ok(())
     }
 
@@ -1284,6 +1258,14 @@ impl App {
                             .await;
                     });
                 }
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content: "↳ 补充指令已接收，等待当前步骤结束后合并".to_string(),
+                    full_raw: None,
+                    can_expand: false,
+                    timestamp: timestamp(),
+                    mermaid_blocks: Vec::new(),
+                });
                 return;
             }
             if code == KeyCode::Enter {
@@ -1424,7 +1406,8 @@ impl App {
         self.current_task_iri = Some(task_iri.clone());
         self.last_user_input = input.clone();
 
-        let (status_tx, status_rx) = mpsc::unbounded_channel::<StatusEvent>();
+        self.stop_event_listener();
+        let (status_tx, status_rx) = mpsc::channel::<StatusEvent>(256);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         let engine = self.engine.clone();
@@ -1433,38 +1416,48 @@ impl App {
         // 仅在同任务延续时传递 resumed_messages，主题切换时丢弃
         let resumed = if is_topic_shift {
             self.resumed_messages = None; // 新任务：丢弃之前对话历史
+            self.resumed_state = None;
             None
         } else {
             self.resumed_messages.take() // 同任务：传递历史用于上下文延续
         };
+        let resumed_state = if is_topic_shift {
+            None
+        } else {
+            self.resumed_state.take()
+        };
+
+        let mut receiver = self.event_bus.subscribe();
+        self.event_listener = Some(self.rt.spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(ev) => {
+                        if status_tx
+                            .send(StatusEvent {
+                                event_type: ev.event_type,
+                                payload: ev.payload,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        }));
 
         self.rt.spawn(async move {
             let mut guard = engine.lock().await;
-            let mut receiver = guard.subscribe();
-
-            let stx = status_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    match receiver.recv().await {
-                        Ok(ev) => {
-                            if stx
-                                .send(StatusEvent {
-                                    event_type: ev.event_type,
-                                    payload: ev.payload,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    }
-                }
-            });
-
             let result = guard
-                .process_task_with_iri_and_messages(&input2, &task_iri_bg, resumed)
+                .process_task_with_iri_and_resume_state(
+                    &input2,
+                    &task_iri_bg,
+                    resumed,
+                    resumed_state,
+                )
                 .await;
             let _ = result_tx.send(result.map(|tr| (task_iri_bg, tr)));
         });
@@ -1548,7 +1541,7 @@ impl App {
                     tool_call_id: None,
                     reasoning_content: None,
                 });
-                self.resumed_messages = Some(conversation);
+                self.resumed_messages = Some(compact_chat_history(conversation));
             }
             Err(e) => {
                 self.messages.push(Message {
@@ -1561,7 +1554,7 @@ impl App {
                 });
             }
         }
-        self.status_rx = None; // drop mpsc receiver → kills zombie event listener
+        self.stop_event_listener();
         self.is_processing = false;
         self.current_phase = "Idle".into();
         self.scroll_offset = 0;
@@ -1571,7 +1564,10 @@ impl App {
         // Collect events into local vec to avoid borrow conflicts
         let batch: Vec<StatusEvent> = if let Some(rx) = &mut self.status_rx {
             let mut v = Vec::new();
-            while let Ok(ev) = rx.try_recv() {
+            while v.len() < 128 {
+                let Ok(ev) = rx.try_recv() else {
+                    break;
+                };
                 v.push(ev);
             }
             v
@@ -1653,6 +1649,51 @@ impl App {
                     mermaid_blocks: Vec::new(),
                 });
             }
+        }
+    }
+
+    fn stop_event_listener(&mut self) {
+        self.status_rx = None;
+        if let Some(listener) = self.event_listener.take() {
+            listener.abort();
+            self.rt.spawn(async move {
+                let _ = listener.await;
+            });
+        }
+    }
+
+    fn enforce_message_budget(&mut self) {
+        const MAX_MESSAGES: usize = 500;
+        const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+        let mut bytes: usize = self
+            .messages
+            .iter()
+            .map(|message| {
+                message.content.len()
+                    + message
+                        .full_raw
+                        .as_ref()
+                        .map_or(0, std::string::String::len)
+            })
+            .sum();
+        let mut removed = 0;
+        while self.messages.len().saturating_sub(removed) > MAX_MESSAGES
+            || (bytes > MAX_MESSAGE_BYTES && self.messages.len().saturating_sub(removed) > 1)
+        {
+            let message = &self.messages[removed];
+            bytes = bytes.saturating_sub(
+                message.content.len()
+                    + message
+                        .full_raw
+                        .as_ref()
+                        .map_or(0, std::string::String::len),
+            );
+            removed += 1;
+        }
+        if removed > 0 {
+            self.messages.drain(..removed);
+            self.expanded.clear();
+            self.line_map_cache.borrow_mut().clear();
         }
     }
 
@@ -1876,6 +1917,110 @@ impl App {
             }
             s if s == "Act_STARTED" => return Some((MessageRole::System, "🔄 AA".into(), None)),
             s if s == "Act_COMPLETED" => return Some((MessageRole::System, "✅ AA".into(), None)),
+            "DELIVERY_CONTRACT_UPDATED" => {
+                let target = serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("target_path")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "deliverable.md".to_string());
+                return Some((
+                    MessageRole::System,
+                    format!("📄 交付已切换为工作区文件：`{target}`"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "DELIVERY_RECONCILIATION_STARTED" => {
+                let target = serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("target_path")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "工作区文件".to_string());
+                return Some((
+                    MessageRole::System,
+                    format!("📄 正在补做并验证工作区交付：`{target}`"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "DELIVERY_RECONCILIATION_COMPLETED" => {
+                let target = serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("target_path")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "工作区文件".to_string());
+                return Some((
+                    MessageRole::System,
+                    format!("✅ 工作区交付已补做并进入校验：`{target}`"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "DELIVERY_RECONCILIATION_FAILED" => {
+                let detail = Self::runtime_event_detail(payload, "工作区交付补做失败");
+                return Some((
+                    MessageRole::Error,
+                    format!("❌ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "LLM_REQUEST_STARTED" => {
+                let detail = Self::runtime_event_detail(payload, "请求模型中");
+                return Some((
+                    MessageRole::System,
+                    format!("⏳ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "LLM_REQUEST_COMPLETED" => {
+                let detail = Self::runtime_event_detail(payload, "模型响应已收到");
+                return Some((
+                    MessageRole::System,
+                    format!("✓ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "LLM_REQUEST_FAILED" => {
+                let detail = Self::runtime_event_detail(payload, "模型请求失败");
+                return Some((
+                    MessageRole::System,
+                    format!("❌ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "TURN_PERSISTENCE_STARTED" => {
+                let detail = Self::runtime_event_detail(payload, "正在保存执行状态");
+                return Some((
+                    MessageRole::System,
+                    format!("⏳ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "TURN_PERSISTENCE_COMPLETED" => {
+                let detail = Self::runtime_event_detail(payload, "执行状态已保存");
+                return Some((
+                    MessageRole::System,
+                    format!("✓ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
+            "TURN_PERSISTENCE_FAILED" => {
+                let detail = Self::runtime_event_detail(payload, "保存执行状态失败（任务继续）");
+                return Some((
+                    MessageRole::System,
+                    format!("⚠ {detail}"),
+                    Some(payload.to_string()),
+                ));
+            }
             "COMPLETE" => return Some((MessageRole::System, format!("✅ SA {}", payload), None)),
             _ => {}
         }
@@ -1898,7 +2043,7 @@ impl App {
         match &ee.event {
             ExecutionEventKind::Thought(th) => {
                 let preview = width_truncate(&th.thought, max_cols);
-                let content = format!("◆ AGENT:{}:THOUGHT {}", short_role, preview);
+                let content = format!("◆ AGENT:{}:THOUGHT [{}] {}", short_role, th.action, preview);
                 Some((MessageRole::System, content, Some(th.thought.clone())))
             }
             ExecutionEventKind::ToolCall(tc) => {
@@ -1949,6 +2094,22 @@ impl App {
                 Some((MessageRole::Error, content, None))
             }
             _ => None,
+        }
+    }
+
+    fn runtime_event_detail(payload: &str, fallback: &str) -> String {
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return fallback.to_string();
+        };
+        let role = value.get("role").and_then(Value::as_str);
+        let operation = value
+            .get("operation")
+            .or_else(|| value.get("stage"))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback);
+        match role {
+            Some(role) => format!("{role}: {operation}"),
+            None => operation.to_string(),
         }
     }
 
@@ -2707,6 +2868,58 @@ impl App {
     }
 }
 
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str("\n[history truncated]");
+}
+
+fn compact_chat_history(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    const MAX_HISTORY_MESSAGES: usize = 200;
+    const MAX_HISTORY_BYTES: usize = 1024 * 1024;
+    for message in &mut messages {
+        truncate_utf8(&mut message.content, 256 * 1024);
+        if let Some(reasoning) = &mut message.reasoning_content {
+            truncate_utf8(reasoning, 128 * 1024);
+        }
+        if let Some(tool_calls) = &mut message.tool_calls {
+            for call in tool_calls {
+                truncate_utf8(&mut call.function.arguments, 128 * 1024);
+            }
+        }
+    }
+
+    let leading_system = messages
+        .first()
+        .filter(|message| message.role == "system")
+        .cloned();
+    let mut kept = Vec::new();
+    let mut bytes = 0;
+    for message in messages.into_iter().rev() {
+        let size = serde_json::to_vec(&message).map_or(message.content.len(), |value| value.len());
+        if kept.len() >= MAX_HISTORY_MESSAGES
+            || (!kept.is_empty() && bytes + size > MAX_HISTORY_BYTES)
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        kept.push(message);
+    }
+    kept.reverse();
+    if let Some(system) = leading_system {
+        if kept.first().is_none_or(|message| message.role != "system") {
+            kept.insert(0, system);
+        }
+    }
+    kept
+}
+
 fn strip_ansi_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut s = s;
@@ -2920,4 +3133,69 @@ fn try_parse_json_in_text(raw: &str) -> Option<serde_json::Value> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui_core::style::{Color as MarkdownColor, Modifier as MarkdownModifier};
+
+    #[test]
+    fn markdown_style_conversion_preserves_colors_and_modifiers() {
+        let source = ratatui_core::style::Style {
+            fg: Some(MarkdownColor::Rgb(12, 34, 56)),
+            bg: Some(MarkdownColor::Indexed(123)),
+            add_modifier: MarkdownModifier::BOLD | MarkdownModifier::ITALIC,
+            sub_modifier: MarkdownModifier::DIM | MarkdownModifier::UNDERLINED,
+        };
+
+        let converted = convert_markdown_style(source);
+
+        assert_eq!(converted.fg, Some(Color::Rgb(12, 34, 56)));
+        assert_eq!(converted.bg, Some(Color::Indexed(123)));
+        assert_eq!(converted.add_modifier, Modifier::BOLD | Modifier::ITALIC);
+        assert_eq!(converted.sub_modifier, Modifier::DIM | Modifier::UNDERLINED);
+    }
+
+    #[test]
+    fn markdown_rendering_keeps_inline_emphasis() {
+        let lines = markdown_to_owned_lines("# Heading\n\nplain **bold** and *italic*");
+        let spans: Vec<&Span<'static>> = lines.iter().flat_map(|line| line.spans.iter()).collect();
+
+        assert!(spans.iter().any(|span| {
+            span.content.contains("bold") && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content.contains("italic") && span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+    }
+
+    #[test]
+    fn resumed_history_is_bounded_and_preserves_latest_unicode_message() {
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: String::new(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        for index in 0..300 {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!("{index}:{}", "滑翔马".repeat(2000)),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
+
+        let compacted = compact_chat_history(messages);
+        assert!(compacted.len() <= 201);
+        assert_eq!(compacted.first().unwrap().role, "system");
+        assert!(compacted.last().unwrap().content.starts_with("299:"));
+        let bytes = serde_json::to_vec(&compacted).unwrap().len();
+        assert!(bytes <= 1024 * 1024 + 1024);
+    }
 }

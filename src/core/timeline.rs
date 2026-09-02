@@ -279,6 +279,7 @@ mod tests {
             importance: None,
             jsonld_types: vec![],
             stored_at: Some(Utc::now().timestamp() as f64),
+            decay_exempt: false,
         }];
         apply_time_decay(&mut entries, 0.0);
         assert!((entries[0].score - 0.9).abs() < 0.01);
@@ -296,6 +297,7 @@ mod tests {
                 importance: None,
                 jsonld_types: vec![],
                 stored_at: Some(two_hours_ago),
+                decay_exempt: false,
             },
             ScoredEntry {
                 iri: "new".into(),
@@ -305,6 +307,7 @@ mod tests {
                 importance: None,
                 jsonld_types: vec![],
                 stored_at: Some(Utc::now().timestamp() as f64),
+                decay_exempt: false,
             },
         ];
         apply_time_decay(&mut entries, 0.5);

@@ -25,7 +25,7 @@ pub mod watch_engine;
 pub use content_store::{ContentStore, ReadMode, ReadResult};
 pub use diff_engine::DiffEngine;
 pub use inventory::{FileEntry, FileInventory, FileState};
-pub use snapshot::{RollbackResult, SnapshotManager, WorkspaceSnapshot};
+pub use snapshot::{RollbackPlan, RollbackResult, SnapshotManager, WorkspaceSnapshot};
 pub use watch_engine::{WatchConfig, WatchEngine};
 
 /// Configuration for the workspace monitor subsystem.
@@ -229,16 +229,15 @@ impl WorkspaceMonitor {
             config.exclude_patterns.clone(),
         )));
 
-        // SnapshotManager (in-memory redb)
-        let snap_db = Arc::new(
-            redb::Builder::new()
-                .create_with_backend(redb::backends::InMemoryBackend::new())
-                .map_err(|e| format!("Failed to open snapshot redb: {}", e))?,
-        );
+        // Workspace manifests must survive a process restart.  Content blobs
+        // live in ContentStore's database; this independent manifest database
+        // retains their task/reason/path mapping.
+        let snap_db = Self::open_snapshot_database(&config)?;
         let snapshot_manager = Arc::new(SnapshotManager::new(
             snap_db,
             content_store.clone(),
             inventory.clone(),
+            config.workspace_root.clone(),
         ));
 
         let event_bus_for_struct = event_bus.clone();
@@ -1076,6 +1075,26 @@ impl WorkspaceMonitor {
                 Ok((Some(meta_db), Some(content_db)))
             }
             None => Ok((None, None)),
+        }
+    }
+
+    fn open_snapshot_database(
+        config: &WorkspaceMonitorConfig,
+    ) -> Result<Arc<redb::Database>, String> {
+        match &config.db_path {
+            Some(path) => {
+                std::fs::create_dir_all(path).map_err(|error| {
+                    format!("Failed to create snapshot database directory: {error}")
+                })?;
+                let snapshot_path = path.join("snapshots");
+                redb::Database::create(snapshot_path)
+                    .map(Arc::new)
+                    .map_err(|error| format!("Failed to open snapshot redb: {error}"))
+            }
+            None => redb::Builder::new()
+                .create_with_backend(redb::backends::InMemoryBackend::new())
+                .map(Arc::new)
+                .map_err(|error| format!("Failed to open snapshot redb: {error}")),
         }
     }
 }

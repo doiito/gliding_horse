@@ -329,8 +329,8 @@ pub trait OntologyEmbedStore: Send + Sync {
 pub struct HyperspaceEmbedStore {
     text_engine: Arc<dyn HyperspaceEngine>,
     struct_engine: Arc<dyn HyperspaceEngine>,
-    /// Dimensions are optional for backwards-compatible direct construction.
-    /// `OntologyBridgeManager` always supplies them from the embedding services.
+    /// Dimensions are optional for direct construction. `OntologyBridgeManager`
+    /// always supplies them from the embedding services.
     text_dimension: Option<usize>,
     struct_dimension: Option<usize>,
     projection: Option<Arc<dyn CrossSpaceProjection>>,
@@ -352,9 +352,10 @@ impl HyperspaceEmbedStore {
 
     /// Build a store whose embedding-space dimensions are known.
     ///
-    /// Cross-space lookup is only valid without a projection model when both
-    /// spaces use vectors of the same dimensionality.  The manager has this
-    /// information from its two embedding services and uses this constructor.
+    /// Cross-space lookup always needs an explicit projection because text
+    /// cosine vectors and structural Poincaré vectors use different geometry.
+    /// The manager has dimensions from both embedding services and uses this
+    /// constructor to validate that projection at the boundary.
     pub fn new_with_dimensions(
         text_engine: Arc<dyn HyperspaceEngine>,
         struct_engine: Arc<dyn HyperspaceEngine>,
@@ -379,12 +380,23 @@ impl HyperspaceEmbedStore {
     }
 
     fn ensure_cross_space_dimensions_compatible(&self) -> Result<(), EngineError> {
+        if self.projection.is_none() {
+            return Err(EngineError::InvalidVector(
+                "cross-space retrieval requires an explicit projection between text and structural metrics".into(),
+            ));
+        }
         if let (Some(text_dimension), Some(struct_dimension)) =
             (self.text_dimension, self.struct_dimension)
         {
-            if text_dimension != struct_dimension && self.projection.is_none() {
+            let projection = self.projection.as_ref().expect("checked above");
+            if projection.text_dimension() != text_dimension
+                || projection.struct_dimension() != struct_dimension
+            {
                 return Err(EngineError::InvalidVector(format!(
-                    "cross-space retrieval requires an explicit projection when text and structural dimensions differ ({text_dimension} != {struct_dimension})"
+                    "projection {} dimensions do not match store (text {}, struct {})",
+                    projection.version(),
+                    text_dimension,
+                    struct_dimension
                 )));
             }
         }
@@ -542,31 +554,25 @@ impl OntologyEmbedStore for HyperspaceEmbedStore {
         source_iri: &str,
         top_k: usize,
     ) -> Result<Vec<SearchHit>, EngineError> {
-        // A structural vector cannot be queried against a text index with a
-        // different dimension.  No projection model is configured here, so
-        // fail explicitly instead of delegating an invalid vector to the
-        // engine (or silently returning misleading results).
+        // A structural vector cannot be queried against a text index directly:
+        // equal dimensions do not make Poincaré and cosine coordinates
+        // semantically interchangeable.  Projection is therefore mandatory.
         self.ensure_cross_space_dimensions_compatible()?;
+        let projection = self
+            .projection_for_dimensions()?
+            .expect("cross-space projection checked above");
         // Primary: get struct vector → search text space
         if let Some(vec) = self.struct_engine.get_vector(source_iri).await? {
-            let projected = match self.projection_for_dimensions()? {
-                Some(projection) => EmbeddingVector::new(
-                    projection.struct_to_text(&vec.coords)?,
-                    MetricKind::Cosine,
-                )?,
-                None => vec,
-            };
+            let projected =
+                EmbeddingVector::new(projection.struct_to_text(&vec.coords)?, MetricKind::Cosine)?;
             return self.text_engine.search(&projected, top_k, &[]).await;
         }
         // Fallback: get text vector → search struct space
         if let Some(vec) = self.text_engine.get_vector(source_iri).await? {
-            let projected = match self.projection_for_dimensions()? {
-                Some(projection) => EmbeddingVector::new(
-                    projection.text_to_struct(&vec.coords)?,
-                    MetricKind::Poincare,
-                )?,
-                None => vec,
-            };
+            let projected = EmbeddingVector::new(
+                projection.text_to_struct(&vec.coords)?,
+                MetricKind::Poincare,
+            )?;
             return self.struct_engine.search(&projected, top_k, &[]).await;
         }
         Ok(Vec::new())
@@ -850,6 +856,27 @@ mod tests {
         EmbeddingVector::new_unchecked(coords, MetricKind::Poincare)
     }
 
+    fn identity_projection() -> Arc<dyn CrossSpaceProjection> {
+        Arc::new(
+            LinearCrossSpaceProjection::new(
+                "test-identity-v1",
+                vec![
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0, 0.0],
+                    vec![0.0, 0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 0.0, 1.0],
+                ],
+                vec![
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0, 0.0],
+                    vec![0.0, 0.0, 1.0, 0.0],
+                    vec![0.0, 0.0, 0.0, 1.0],
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn linear_projection_enforces_bidirectional_dimensions() {
         let projection = LinearCrossSpaceProjection::new(
@@ -901,7 +928,8 @@ mod tests {
         let store = HyperspaceEmbedStore::new(
             Arc::new(text_engine(dir.path())),
             Arc::new(struct_engine(dir.path())),
-        );
+        )
+        .with_cross_space_projection(identity_projection());
 
         let payload = json!({"@type": ["OntologyClass"], "label": "Person"});
         store
@@ -1064,7 +1092,8 @@ mod tests {
         let store = HyperspaceEmbedStore::new(
             Arc::new(text_engine(dir.path())),
             Arc::new(struct_engine(dir.path())),
-        );
+        )
+        .with_cross_space_projection(identity_projection());
 
         // Insert with BOTH text and struct vectors
         store
@@ -1077,9 +1106,9 @@ mod tests {
             .await
             .unwrap();
 
-        // cross_search should find entries in the STRUCTURAL space similar to
-        // the TEXT vector — but since both spaces have the same entries,
-        // this is primarily testing the routing works (non-panicking, returns results)
+        // cross_search maps the structural vector into the text metric before
+        // querying. The identity matrix is a test projection only; production
+        // must supply a trained, versioned projection.
         let results = store.cross_search("onto:Dual", 5).await.unwrap();
         assert_eq!(
             results.len(),
@@ -1087,6 +1116,28 @@ mod tests {
             "cross_search should return at least the source entry"
         );
         assert_eq!(results[0].iri, "onto:Dual");
+    }
+
+    #[tokio::test]
+    async fn cross_search_refuses_metric_mixing_without_a_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HyperspaceEmbedStore::new(
+            Arc::new(text_engine(dir.path())),
+            Arc::new(struct_engine(dir.path())),
+        );
+        store
+            .store_embedding(
+                "onto:NoProjection",
+                Some(&v_cos(vec![1.0, 0.0, 0.0, 0.0])),
+                Some(&v_poin(vec![0.2, 0.1, 0.0, 0.0])),
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.cross_search("onto:NoProjection", 5).await,
+            Err(EngineError::InvalidVector(message)) if message.contains("explicit projection")
+        ));
     }
 
     #[tokio::test]

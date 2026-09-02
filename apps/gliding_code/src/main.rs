@@ -1,7 +1,11 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "gliding", about = "Agent OS Console - AI Coding Assistant")]
+#[command(
+    name = "glidingcode",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Agent OS Console - AI Coding Assistant"
+)]
 struct Cli {
     #[arg(help = "Single prompt (omit for interactive mode)")]
     prompt: Option<String>,
@@ -25,14 +29,14 @@ struct Cli {
     #[arg(
         long = "max-iterations",
         default_value = "50",
-        help = "Maximum iterations"
+        help = "Maximum ReAct turns per agent invocation (the PDCA task total can be higher)"
     )]
     max_iterations: u32,
 
     #[arg(
         long = "max-pdca-cycles",
         default_value = "7",
-        help = "Maximum PDCA cycle re-entry count for recursive tasks"
+        help = "Maximum SA-level PDCA cycles (verify-first plans require a verification and fallback cycle)"
     )]
     max_pdca_cycles: u32,
 
@@ -97,6 +101,72 @@ struct Cli {
     summarize_learning_evaluations: bool,
 
     #[arg(
+        long = "list-offline-retrieval-evaluations",
+        help = "List durable independent-label retrieval verdicts as JSON"
+    )]
+    list_offline_retrieval_evaluations: bool,
+
+    #[arg(
+        long = "verify-task-evidence",
+        value_name = "TASK_IRI",
+        help = "Verify one task's hash-linked execution evidence and terminal seal as JSON"
+    )]
+    verify_task_evidence: Option<String>,
+
+    #[arg(
+        long = "inspect-ann-health",
+        help = "Run a read-only exact-vs-ANN health probe and persist aggregate audit evidence"
+    )]
+    inspect_ann_health: bool,
+
+    #[arg(
+        long = "list-learning-health",
+        help = "List family-scoped learning health reports as JSON"
+    )]
+    list_learning_health: bool,
+
+    #[arg(
+        long = "list-learning-deltas",
+        help = "List auditable retrieval-policy delta lifecycles as JSON"
+    )]
+    list_learning_deltas: bool,
+
+    #[arg(
+        long = "rollback-learning-delta",
+        value_name = "ID",
+        help = "Record an approved rollback for a frozen learning delta (requires --delta-approver)"
+    )]
+    rollback_learning_delta: Option<String>,
+
+    #[arg(
+        long = "delta-approver",
+        value_name = "IDENTITY",
+        help = "Audit identity for --rollback-learning-delta; not authentication"
+    )]
+    delta_approver: Option<String>,
+
+    #[arg(
+        long = "delta-comment",
+        value_name = "TEXT",
+        help = "Optional audit comment for --rollback-learning-delta"
+    )]
+    delta_comment: Option<String>,
+
+    #[arg(
+        long = "evaluate-candidate-graph-rerank",
+        value_name = "FILE",
+        help = "Run an offline candidate-graph rerank experiment from JSON; stores only IRI-based verdicts"
+    )]
+    evaluate_candidate_graph_rerank: Option<String>,
+
+    #[arg(
+        long = "propose-candidate-graph-rerank",
+        value_name = "FILE",
+        help = "Create a proposed reranker Delta from an admitted graph-vs-exact evaluation JSON"
+    )]
+    propose_candidate_graph_rerank: Option<String>,
+
+    #[arg(
         long = "list-evolution-proposals",
         help = "List durable skill-evolution proposals for this workspace"
     )]
@@ -151,7 +221,7 @@ struct Cli {
 
     #[arg(
         long = "daemon",
-        help = "Run in daemon mode (Agent OS Worker — processes tasks from a Unix socket queue)"
+        help = "Run in daemon mode (Agent OS Worker — processes tasks from a durable filesystem queue)"
     )]
     daemon: bool,
 
@@ -170,8 +240,36 @@ struct Cli {
     mcp_server_stdio: Vec<String>,
 }
 
+impl Cli {
+    /// Commands in this set operate only on local durable state. They must
+    /// remain available when an API key is intentionally absent, for example
+    /// during incident evidence collection or offline audit.
+    fn is_local_management_command(&self) -> bool {
+        self.list_checkpoints
+            || self.list_learning_evaluations
+            || self.summarize_learning_evaluations
+            || self.list_offline_retrieval_evaluations
+            || self.verify_task_evidence.is_some()
+            || self.inspect_ann_health
+            || self.list_learning_health
+            || self.list_learning_deltas
+            || self.rollback_learning_delta.is_some()
+            || self.evaluate_candidate_graph_rerank.is_some()
+            || self.propose_candidate_graph_rerank.is_some()
+            || self.list_evolution_proposals
+            || self.approve_evolution_proposal.is_some()
+            || self.validate_evolution_proposal.is_some()
+            || self.commit_evolution_proposal.is_some()
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.daemon {
+        return run_daemon();
+    }
+    let local_management_command = cli.is_local_management_command();
 
     let log_level = if cli.debug {
         "debug"
@@ -180,19 +278,6 @@ fn main() -> anyhow::Result<()> {
     } else {
         "warn"
     };
-
-    // ── Terminal crash recovery ──
-    // If the previous glidingcode instance was killed by SIGKILL (OOM killer),
-    // the terminal may still be in raw mode + alternate screen.
-    // Clean up here BEFORE any mode-specific code runs, so --help, one-shot,
-    // and interactive mode all recover from a prior crash.
-    let _ = crossterm::terminal::disable_raw_mode();
-    let mut crash_recovery_stdout = std::io::stdout();
-    let _ = crossterm::execute!(
-        crash_recovery_stdout,
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
-    );
 
     // Capture all tracing output into a shared buffer so the TUI can display it
     // in the log panel instead of sending it to stderr where it corrupts the display.
@@ -223,29 +308,6 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    if let Some(key) = cli.api_key {
-        std::env::set_var("DEEPSEEK_API_KEY", key);
-    }
-    if let Some(url) = cli.api_url {
-        std::env::set_var("DEEPSEEK_API_URL", url);
-    }
-
-    // Parse --mcp-server args into MCP_SERVER__{NAME} env vars
-    for entry in &cli.mcp_server {
-        if let Some((name, url)) = entry.split_once('=') {
-            let env_key = format!("MCP_SERVER__{}", name);
-            std::env::set_var(env_key, url);
-        }
-    }
-
-    // Parse --mcp-server-stdio args into MCP_STDIO__{NAME} env vars
-    for entry in &cli.mcp_server_stdio {
-        if let Some((name, json_val)) = entry.split_once('=') {
-            let env_key = format!("MCP_STDIO__{}", name);
-            std::env::set_var(env_key, json_val);
-        }
-    }
-
     let learning_mode = cli
         .learning_mode
         .or_else(|| std::env::var("GLIDING_LEARNING_MODE").ok())
@@ -253,7 +315,14 @@ fn main() -> anyhow::Result<()> {
         .parse::<glidinghorse::core::policy_learning::LearningMode>()
         .map_err(anyhow::Error::msg)?;
 
-    let mut config = code_cli::config::CliConfig::from_env_and_args(
+    let config_builder = if local_management_command {
+        code_cli::config::CliConfig::from_env_and_args_without_required_api_key
+    } else {
+        code_cli::config::CliConfig::from_env_and_args
+    };
+    let mut config = config_builder(
+        cli.api_key.clone(),
+        cli.api_url.clone(),
         cli.model,
         cli.workspace.clone(),
         cli.max_iterations,
@@ -262,15 +331,46 @@ fn main() -> anyhow::Result<()> {
         cli.workflow,
         cli.skill_dir,
     );
+    for entry in &cli.mcp_server {
+        if let Some((name, url)) = entry.split_once('=') {
+            let name = name.to_lowercase();
+            if let Some(existing) = config
+                .mcp_servers
+                .iter_mut()
+                .find(|server| server.name == name)
+            {
+                existing.url = url.to_string();
+            } else {
+                config.mcp_servers.push(code_cli::config::McpServerEntry {
+                    name,
+                    url: url.to_string(),
+                });
+            }
+        }
+    }
+    for entry in &cli.mcp_server_stdio {
+        if let Some((name, json_value)) = entry.split_once('=') {
+            let parsed: code_cli::config::McpStdioServerEntry = serde_json::from_str(json_value)
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid stdio MCP config '{}': {}", name, error)
+                })?;
+            let name = name.to_lowercase();
+            if let Some(existing) = config
+                .mcp_stdio_servers
+                .iter_mut()
+                .find(|(server_name, _)| server_name == &name)
+            {
+                existing.1 = parsed;
+            } else {
+                config.mcp_stdio_servers.push((name, parsed));
+            }
+        }
+    }
     if cli.learning_pair_id.is_some() {
         config.learning_pair_id = cli.learning_pair_id.clone();
     }
     if cli.learning_seed.is_some() {
         config.learning_seed = cli.learning_seed.clone();
-    }
-
-    if cli.daemon {
-        return run_daemon();
     }
 
     if cli.list_checkpoints {
@@ -285,6 +385,49 @@ fn main() -> anyhow::Result<()> {
 
     if cli.summarize_learning_evaluations {
         summarize_learning_evaluations(&config)?;
+        return Ok(());
+    }
+
+    if cli.list_offline_retrieval_evaluations {
+        list_offline_retrieval_evaluations(&config)?;
+        return Ok(());
+    }
+
+    if let Some(ref task_iri) = cli.verify_task_evidence {
+        verify_task_evidence(&config, task_iri)?;
+        return Ok(());
+    }
+
+    if cli.inspect_ann_health {
+        inspect_ann_health(config)?;
+        return Ok(());
+    }
+
+    if cli.list_learning_health {
+        list_learning_health(&config)?;
+        return Ok(());
+    }
+
+    if cli.list_learning_deltas {
+        list_learning_deltas(&config)?;
+        return Ok(());
+    }
+
+    if let Some(ref delta_id) = cli.rollback_learning_delta {
+        let approver = cli.delta_approver.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--rollback-learning-delta requires --delta-approver")
+        })?;
+        rollback_learning_delta(&config, delta_id, approver, cli.delta_comment.as_deref())?;
+        return Ok(());
+    }
+
+    if let Some(ref input_path) = cli.evaluate_candidate_graph_rerank {
+        evaluate_candidate_graph_rerank(&config, input_path)?;
+        return Ok(());
+    }
+
+    if let Some(ref input_path) = cli.propose_candidate_graph_rerank {
+        propose_candidate_graph_rerank(&config, input_path)?;
         return Ok(());
     }
 
@@ -323,13 +466,14 @@ fn main() -> anyhow::Result<()> {
             run_single(config, &prompt)?;
         }
     } else {
+        recover_terminal_for_interactive_session();
         code_cli::tui::App::new(config, log_buffer, None)?.run()?;
     }
 
     return Ok(());
 
     // Run in daemon mode: spawn an Agent OS Worker that processes tasks
-    // from a Unix socket queue.
+    // from a durable filesystem queue.
     fn run_daemon() -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         let config = glidinghorse::worker::WorkerConfig::from_env();
@@ -337,11 +481,22 @@ fn main() -> anyhow::Result<()> {
             "Agent OS Worker starting (queue={}, concurrency={})...",
             config.queue_base_path, config.concurrency
         );
-        if let Err(e) = rt.block_on(glidinghorse::worker::run_worker(config)) {
-            eprintln!("Agent OS Worker terminated with error: {}", e);
-        }
-        Ok(())
+        rt.block_on(glidinghorse::worker::run_worker(config))
+            .map_err(|error| anyhow::anyhow!("Agent OS Worker terminated with error: {error}"))
     }
+}
+
+/// Best-effort recovery for a terminal left in TUI mode by an interrupted
+/// interactive session.  This deliberately runs only when starting a new TUI:
+/// audit and one-shot commands must keep stdout machine-readable.
+fn recover_terminal_for_interactive_session() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+    );
 }
 
 fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Result<()> {
@@ -363,7 +518,7 @@ fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Resu
 
     let result = rt.block_on(engine.process_task(prompt));
 
-    match result {
+    let exit_status = match result {
         Ok((_, tr)) => {
             let icon = match tr.status.as_str() {
                 "success" => "✅",
@@ -379,13 +534,14 @@ fn run_single(config: code_cli::config::CliConfig, prompt: &str) -> anyhow::Resu
             println!("📁 Output: {}", engine.workspace());
             println!();
             println!("{}", tr.summary);
+            task_exit_status(&tr)
         }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-        }
-    }
+        Err(error) => Err(error),
+    };
 
-    Ok(())
+    rt.block_on(engine.shutdown());
+
+    exit_status
 }
 
 /// Run a single task and dump all captured logs before exiting.
@@ -430,7 +586,7 @@ fn run_single_with_logs(
         eprintln!("--- END LOG DUMP ---");
     }
 
-    match result {
+    let exit_status = match result {
         Ok((_, tr)) => {
             let icon = match tr.status.as_str() {
                 "success" => "✅",
@@ -446,13 +602,30 @@ fn run_single_with_logs(
             println!("📁 Output: {}", engine.workspace());
             println!();
             println!("{}", tr.summary);
+            task_exit_status(&tr)
         }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-        }
-    }
+        Err(error) => Err(error),
+    };
 
-    Ok(())
+    rt.block_on(engine.shutdown());
+
+    exit_status
+}
+
+/// A one-shot command is successful only when the supervisory quality gate
+/// explicitly returns `success`.  Printing a failed result while returning
+/// exit code zero made shell scripts and CI treat failed tasks as completed.
+fn task_exit_status(result: &glidinghorse::core::agent_runner::TaskResult) -> anyhow::Result<()> {
+    if result.status == "success" {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "Task finished with status '{}' after {} turn(s) and {} tool call(s)",
+            result.status,
+            result.turn_count,
+            result.tool_call_count
+        ))
+    }
 }
 
 fn list_checkpoints(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
@@ -515,6 +688,101 @@ fn summarize_learning_evaluations(config: &code_cli::config::CliConfig) -> anyho
     Ok(())
 }
 
+fn list_offline_retrieval_evaluations(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let evaluations =
+        code_cli::engine::CodeCliEngine::list_offline_retrieval_evaluations_from_config(config)?;
+    println!("{}", serde_json::to_string_pretty(&evaluations)?);
+    Ok(())
+}
+
+fn verify_task_evidence(
+    config: &code_cli::config::CliConfig,
+    task_iri: &str,
+) -> anyhow::Result<()> {
+    let verification =
+        code_cli::engine::CodeCliEngine::verify_task_evidence_from_config(config, task_iri)?;
+    println!("{}", serde_json::to_string_pretty(&verification)?);
+    if verification.valid && verification.sealed {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "task evidence is not a valid sealed chain: {}",
+            verification.failures.join("; ")
+        ))
+    }
+}
+
+fn inspect_ann_health(config: code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let engine = {
+        let _guard = runtime.enter();
+        code_cli::engine::CodeCliEngine::new(config)?
+    };
+    if engine.embedding_provider() == "fallback" {
+        return Err(anyhow::anyhow!(
+            "ANN health probe is unavailable because semantic embeddings are not configured \
+             (provider=fallback). Configure embedding.provider as 'ollama' or 'oneapi' before \
+             interpreting ANN recall metrics."
+        ));
+    }
+    let evidence = runtime.block_on(engine.inspect_ann_health())?;
+    println!("{}", serde_json::to_string_pretty(&evidence)?);
+    Ok(())
+}
+
+fn list_learning_health(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let reports = code_cli::engine::CodeCliEngine::list_learning_health_from_config(config)?;
+    println!("{}", serde_json::to_string_pretty(&reports)?);
+    Ok(())
+}
+
+fn list_learning_deltas(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let deltas = code_cli::engine::CodeCliEngine::list_learning_deltas_from_config(config)?;
+    println!("{}", serde_json::to_string_pretty(&deltas)?);
+    Ok(())
+}
+
+fn rollback_learning_delta(
+    config: &code_cli::config::CliConfig,
+    delta_id: &str,
+    approver: &str,
+    comment: Option<&str>,
+) -> anyhow::Result<()> {
+    let delta = code_cli::engine::CodeCliEngine::rollback_learning_delta_from_config(
+        config, delta_id, approver, comment,
+    )?;
+    println!(
+        "Rolled back learning delta {} ({:?}); its policy family remains frozen at baseline.",
+        delta.delta_id, delta.state
+    );
+    Ok(())
+}
+
+fn evaluate_candidate_graph_rerank(
+    config: &code_cli::config::CliConfig,
+    input_path: &str,
+) -> anyhow::Result<()> {
+    let admission = code_cli::engine::CodeCliEngine::evaluate_candidate_graph_rerank_from_config(
+        config, input_path,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&admission)?);
+    Ok(())
+}
+
+fn propose_candidate_graph_rerank(
+    config: &code_cli::config::CliConfig,
+    input_path: &str,
+) -> anyhow::Result<()> {
+    let delta = code_cli::engine::CodeCliEngine::propose_candidate_graph_rerank_from_config(
+        config, input_path,
+    )?;
+    println!(
+        "Proposed candidate graph reranker delta {} ({:?}); it is not connected to runtime retrieval.",
+        delta.delta_id, delta.state
+    );
+    Ok(())
+}
+
 fn approve_evolution_proposal(
     config: &code_cli::config::CliConfig,
     proposal_id: &str,
@@ -560,6 +828,24 @@ fn commit_evolution_proposal(
 mod tests {
     use super::Cli;
     use clap::Parser;
+
+    fn task_result(status: &str) -> glidinghorse::core::agent_runner::TaskResult {
+        glidinghorse::core::agent_runner::TaskResult {
+            task_iri: "iri://task/test".to_string(),
+            status: status.to_string(),
+            verdict: None,
+            summary: String::new(),
+            output: None,
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: Vec::new(),
+            turn_count: 2,
+            tool_call_count: 1,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: None,
+        }
+    }
 
     #[test]
     fn parses_durable_evolution_governance_commands() {
@@ -613,6 +899,94 @@ mod tests {
     }
 
     #[test]
+    fn parses_learning_health_and_human_rollback_commands() {
+        let list = Cli::try_parse_from(["glidingcode", "--list-learning-health"])
+            .expect("learning health command should be registered");
+        assert!(list.list_learning_health);
+
+        let rollback = Cli::try_parse_from([
+            "glidingcode",
+            "--rollback-learning-delta",
+            "delta_42",
+            "--delta-approver",
+            "operator@example.test",
+            "--delta-comment",
+            "reviewed regression",
+        ])
+        .expect("learning delta rollback command should be registered");
+        assert_eq!(
+            rollback.rollback_learning_delta.as_deref(),
+            Some("delta_42")
+        );
+        assert_eq!(
+            rollback.delta_approver.as_deref(),
+            Some("operator@example.test")
+        );
+    }
+
+    #[test]
+    fn parses_offline_candidate_graph_rerank_commands() {
+        let list = Cli::try_parse_from(["glidingcode", "--list-offline-retrieval-evaluations"])
+            .expect("offline retrieval evaluation list command should be registered");
+        assert!(list.list_offline_retrieval_evaluations);
+
+        let evaluate = Cli::try_parse_from([
+            "glidingcode",
+            "--evaluate-candidate-graph-rerank",
+            "experiment.json",
+        ])
+        .expect("offline graph rerank evaluation command should be registered");
+        assert_eq!(
+            evaluate.evaluate_candidate_graph_rerank.as_deref(),
+            Some("experiment.json")
+        );
+
+        let propose = Cli::try_parse_from([
+            "glidingcode",
+            "--propose-candidate-graph-rerank",
+            "proposal.json",
+        ])
+        .expect("offline graph rerank proposal command should be registered");
+        assert_eq!(
+            propose.propose_candidate_graph_rerank.as_deref(),
+            Some("proposal.json")
+        );
+    }
+
+    #[test]
+    fn parses_task_evidence_and_ann_health_commands() {
+        let verify = Cli::try_parse_from([
+            "glidingcode",
+            "--verify-task-evidence",
+            "iri://task/example",
+        ])
+        .expect("task evidence verification command should be registered");
+        assert_eq!(
+            verify.verify_task_evidence.as_deref(),
+            Some("iri://task/example")
+        );
+
+        let inspect = Cli::try_parse_from(["glidingcode", "--inspect-ann-health"])
+            .expect("ANN health inspection command should be registered");
+        assert!(inspect.inspect_ann_health);
+    }
+
+    #[test]
+    fn local_management_commands_do_not_require_an_llm_credential() {
+        let verify = Cli::try_parse_from([
+            "glidingcode",
+            "--verify-task-evidence",
+            "iri://task/example",
+        ])
+        .expect("task evidence command should parse");
+        assert!(verify.is_local_management_command());
+
+        let prompt = Cli::try_parse_from(["glidingcode", "answer the task"])
+            .expect("one-shot prompt should parse");
+        assert!(!prompt.is_local_management_command());
+    }
+
+    #[test]
     fn parses_paired_learning_summary_command() {
         let cli = Cli::try_parse_from([
             "glidingcode",
@@ -626,6 +1000,14 @@ mod tests {
         assert!(cli.summarize_learning_evaluations);
         assert_eq!(cli.learning_pair_id.as_deref(), Some("pair-17"));
         assert_eq!(cli.learning_seed.as_deref(), Some("fixed-42"));
+    }
+
+    #[test]
+    fn one_shot_exit_status_requires_full_success() {
+        assert!(super::task_exit_status(&task_result("success")).is_ok());
+        let error = super::task_exit_status(&task_result("partial_success"))
+            .expect_err("partial success must return a non-zero CLI result");
+        assert!(error.to_string().contains("partial_success"));
     }
 }
 

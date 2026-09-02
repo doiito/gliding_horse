@@ -6,8 +6,42 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use crate::gateway::unified_gateway::ChatMessage;
 use crate::memory::l0_store::L0Store;
 use crate::CoreError;
+
+/// Current durable schema for task resumption.  The older checkpoint fields
+/// remain for backwards compatibility, but new readers use this single
+/// validated object instead of independently re-parsing loosely related JSON
+/// fields at each application entry point.
+pub const TASK_RESUME_STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskResumeState {
+    pub schema_version: u32,
+    pub checkpoint_name: String,
+    pub turn: u32,
+    pub tool_call_count: u32,
+    pub current_role: Option<String>,
+    pub prev_summary: Option<String>,
+    pub five_w2h_json: Option<String>,
+    pub cycle_state_json: Option<String>,
+    pub completed_nodes_json: Option<String>,
+    pub pending_approvals_json: Option<String>,
+    pub supplement_json: Option<String>,
+    pub tool_error_json: Option<String>,
+    pub action_tracker_json: Option<String>,
+    pub perception_anomaly_json: Option<String>,
+}
+
+/// The sole supported checkpoint restoration input for callers.  Parsing and
+/// schema validation happen before an application begins a resumed task.
+#[derive(Debug, Clone)]
+pub struct RestoredTask {
+    pub checkpoint: CheckpointData,
+    pub messages: Vec<ChatMessage>,
+    pub state: TaskResumeState,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointData {
@@ -52,6 +86,11 @@ pub struct CheckpointData {
 
     /// Perception engine anomaly history (used for dedup)
     pub perception_anomaly_json: Option<String>,
+
+    /// Versioned runtime state used by all new resume paths.  Missing values
+    /// are migrated from legacy fields at read time.
+    #[serde(default)]
+    pub resume_state: Option<TaskResumeState>,
 }
 
 pub struct CheckpointManager {
@@ -126,6 +165,20 @@ impl CheckpointManager {
             tool_error_json: None,
             action_tracker_json: None,
             perception_anomaly_json: None,
+            resume_state: Some(TaskResumeState::from_fields(
+                name,
+                agent_state_json,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )),
         };
 
         let content = serde_json::to_string(&checkpoint).map_err(|e| CoreError::Internal {
@@ -226,6 +279,20 @@ impl CheckpointManager {
             tool_error_json: tool_error_json.map(|s| s.to_string()),
             action_tracker_json: action_tracker_json.map(|s| s.to_string()),
             perception_anomaly_json: perception_anomaly_json.map(|s| s.to_string()),
+            resume_state: Some(TaskResumeState::from_fields(
+                name,
+                agent_state_json,
+                current_role,
+                five_w2h_json,
+                prev_summary,
+                cycle_state_json,
+                completed_nodes_json,
+                pending_approvals_json,
+                supplement_json,
+                tool_error_json,
+                action_tracker_json,
+                perception_anomaly_json,
+            )),
         };
 
         let content = serde_json::to_string(&checkpoint).map_err(|e| CoreError::Internal {
@@ -255,9 +322,7 @@ impl CheckpointManager {
     pub fn restore(&self, checkpoint_iri: &str) -> Result<CheckpointData, CoreError> {
         if let Some(ref l0) = self.l0 {
             if let Ok(Some(entry)) = l0.retrieve(checkpoint_iri) {
-                return serde_json::from_str(&entry.content).map_err(|e| CoreError::Internal {
-                    message: format!("Invalid checkpoint data: {}", e),
-                });
+                return Self::deserialize_checkpoint(&entry.content);
             }
         }
         Err(CoreError::Internal {
@@ -268,6 +333,23 @@ impl CheckpointManager {
     pub fn restore_latest(&self, task_iri: &str) -> Result<Option<CheckpointData>, CoreError> {
         let list = self.list(task_iri, 1);
         Ok(list.into_iter().next())
+    }
+
+    /// Restore the latest fully valid checkpoint and its parsed, versioned
+    /// runtime state.  Invalid/corrupt newest records are skipped in favour of
+    /// an older usable checkpoint rather than making recovery all-or-nothing.
+    pub fn restore_task(&self, task_iri: &str) -> Result<Option<RestoredTask>, CoreError> {
+        for checkpoint in self.list(task_iri, MAX_CHECKPOINTS_PER_TASK as i32) {
+            match checkpoint.to_restored_task() {
+                Ok(restored) => return Ok(Some(restored)),
+                Err(error) => tracing::warn!(
+                    checkpoint_iri = %checkpoint.checkpoint_iri,
+                    %error,
+                    "Skipping invalid checkpoint during task restore"
+                ),
+            }
+        }
+        Ok(None)
     }
 
     /// Restore the latest checkpoint for a given task, parsing its phase label.
@@ -292,10 +374,13 @@ impl CheckpointManager {
         &self,
         task_iri: &str,
     ) -> Result<Option<(CheckpointData, Vec<String>)>, CoreError> {
-        let cp = self.restore_latest(task_iri)?;
-        Ok(cp.map(|c| {
-            let skip_roles = compute_skip_roles_from_phase(&c.name, c.current_role.as_deref());
-            (c, skip_roles)
+        let restored = self.restore_task(task_iri)?;
+        Ok(restored.map(|restored| {
+            let skip_roles = compute_skip_roles_from_phase(
+                &restored.state.checkpoint_name,
+                restored.state.current_role.as_deref(),
+            );
+            (restored.checkpoint, skip_roles)
         }))
     }
 
@@ -312,7 +397,7 @@ impl CheckpointManager {
                             l0.retrieve(iri)
                                 .ok()
                                 .flatten()
-                                .and_then(|e| serde_json::from_str(&e.content).ok())
+                                .and_then(|e| Self::deserialize_checkpoint(&e.content).ok())
                         } else {
                             None
                         }
@@ -329,7 +414,7 @@ impl CheckpointManager {
             if let Ok(entries) = l0.scan_iri_prefix(&prefix, 100_000) {
                 let mut results: Vec<CheckpointData> = entries
                     .iter()
-                    .filter_map(|e| serde_json::from_str(&e.content).ok())
+                    .filter_map(|e| Self::deserialize_checkpoint(&e.content).ok())
                     .collect();
                 results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 results.truncate(limit as usize);
@@ -406,6 +491,139 @@ impl CheckpointManager {
                 iris.retain(|candidate| candidate != &iri);
             }
         }
+    }
+}
+
+impl TaskResumeState {
+    #[allow(clippy::too_many_arguments)]
+    fn from_fields(
+        checkpoint_name: &str,
+        agent_state_json: &str,
+        current_role: Option<&str>,
+        five_w2h_json: Option<&str>,
+        prev_summary: Option<&str>,
+        cycle_state_json: Option<&str>,
+        completed_nodes_json: Option<&str>,
+        pending_approvals_json: Option<&str>,
+        supplement_json: Option<&str>,
+        tool_error_json: Option<&str>,
+        action_tracker_json: Option<&str>,
+        perception_anomaly_json: Option<&str>,
+    ) -> Self {
+        let state = serde_json::from_str::<serde_json::Value>(agent_state_json).ok();
+        let turn = state
+            .as_ref()
+            .and_then(|value| value.get("turn"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        let tool_call_count = state
+            .as_ref()
+            .and_then(|value| value.get("tc"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        Self {
+            schema_version: TASK_RESUME_STATE_SCHEMA_VERSION,
+            checkpoint_name: checkpoint_name.to_string(),
+            turn,
+            tool_call_count,
+            current_role: current_role.map(str::to_string),
+            prev_summary: prev_summary.map(str::to_string),
+            five_w2h_json: five_w2h_json.map(str::to_string),
+            cycle_state_json: cycle_state_json.map(str::to_string),
+            completed_nodes_json: completed_nodes_json.map(str::to_string),
+            pending_approvals_json: pending_approvals_json.map(str::to_string),
+            supplement_json: supplement_json.map(str::to_string),
+            tool_error_json: tool_error_json.map(str::to_string),
+            action_tracker_json: action_tracker_json.map(str::to_string),
+            perception_anomaly_json: perception_anomaly_json.map(str::to_string),
+        }
+    }
+
+    fn validate(&self) -> Result<(), CoreError> {
+        if self.schema_version != TASK_RESUME_STATE_SCHEMA_VERSION {
+            return Err(CoreError::Internal {
+                message: format!(
+                    "Unsupported task resume schema version {}",
+                    self.schema_version
+                ),
+            });
+        }
+        if self.checkpoint_name.is_empty() {
+            return Err(CoreError::Internal {
+                message: "Task resume state has no checkpoint name".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl CheckpointData {
+    fn legacy_resume_state(&self) -> TaskResumeState {
+        TaskResumeState::from_fields(
+            &self.name,
+            &self.agent_state_json,
+            self.current_role.as_deref(),
+            self.five_w2h_json.as_deref(),
+            self.prev_summary.as_deref(),
+            self.cycle_state_json.as_deref(),
+            self.completed_nodes_json.as_deref(),
+            self.pending_approvals_json.as_deref(),
+            self.supplement_json.as_deref(),
+            self.tool_error_json.as_deref(),
+            self.action_tracker_json.as_deref(),
+            self.perception_anomaly_json.as_deref(),
+        )
+    }
+
+    pub fn to_restored_task(&self) -> Result<RestoredTask, CoreError> {
+        if self.task_iri.is_empty() || self.checkpoint_iri.is_empty() {
+            return Err(CoreError::Internal {
+                message: "Checkpoint is missing task or checkpoint IRI".to_string(),
+            });
+        }
+        let messages = serde_json::from_str::<Vec<ChatMessage>>(&self.session_messages_json)
+            .map_err(|error| CoreError::Internal {
+                message: format!("Invalid checkpoint session messages: {error}"),
+            })?;
+        let state = self
+            .resume_state
+            .clone()
+            .unwrap_or_else(|| self.legacy_resume_state());
+        state.validate()?;
+        if state.checkpoint_name != self.name {
+            return Err(CoreError::Internal {
+                message: "Checkpoint resume state does not match checkpoint name".to_string(),
+            });
+        }
+        Ok(RestoredTask {
+            checkpoint: self.clone(),
+            messages,
+            state,
+        })
+    }
+}
+
+impl CheckpointManager {
+    fn deserialize_checkpoint(content: &str) -> Result<CheckpointData, CoreError> {
+        let checkpoint = serde_json::from_str::<CheckpointData>(content).map_err(|error| {
+            CoreError::Internal {
+                message: format!("Invalid checkpoint data: {error}"),
+            }
+        })?;
+        // Validate the structural invariant here while accepting legacy state
+        // migration.  Session message validation happens in restore_task so a
+        // caller can still inspect older metadata-only checkpoint records.
+        if checkpoint.task_iri.is_empty() || checkpoint.checkpoint_iri.is_empty() {
+            return Err(CoreError::Internal {
+                message: "Checkpoint is missing task or checkpoint IRI".to_string(),
+            });
+        }
+        if let Some(state) = &checkpoint.resume_state {
+            state.validate()?;
+        }
+        Ok(checkpoint)
     }
 }
 
@@ -566,6 +784,63 @@ mod tests {
         let list = mgr2.list("iri://task/abc-123", 10);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "finish_DA");
+    }
+
+    #[test]
+    fn restore_task_uses_versioned_state_and_skips_a_corrupt_newer_checkpoint() {
+        use crate::memory::l0_store::L0Store;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let l0 = Arc::new(L0Store::new(dir.path().to_str().unwrap()).unwrap());
+        let manager = CheckpointManager::with_persistence(l0.clone());
+        let checkpoint = manager
+            .create_ext(
+                "iri://task/resume-fallback",
+                "turn_Do_7",
+                "[]",
+                r#"[{"role":"system","content":"s"},{"role":"assistant","content":"done"}]"#,
+                r#"{"turn":7,"tc":3}"#,
+                &["Do".to_string()],
+                Some("Do"),
+                None,
+                Some("plan summary"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut corrupt = checkpoint.clone();
+        corrupt.checkpoint_iri = "iri://checkpoint/task/resume-fallback/corrupt".to_string();
+        corrupt.created_at += chrono::Duration::seconds(1);
+        corrupt.session_messages_json = "{not valid json".to_string();
+        l0.store(
+            &corrupt.checkpoint_iri,
+            &serde_json::to_string(&corrupt).unwrap(),
+        )
+        .unwrap();
+
+        let restored = CheckpointManager::with_persistence(l0)
+            .restore_task("iri://task/resume-fallback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.checkpoint.checkpoint_iri,
+            checkpoint.checkpoint_iri
+        );
+        assert_eq!(
+            restored.state.schema_version,
+            TASK_RESUME_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(restored.state.turn, 7);
+        assert_eq!(restored.state.tool_call_count, 3);
+        assert_eq!(restored.state.current_role.as_deref(), Some("Do"));
+        assert_eq!(restored.state.prev_summary.as_deref(), Some("plan summary"));
     }
 
     #[test]

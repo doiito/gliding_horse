@@ -8,12 +8,7 @@ apps/gliding_code/target/
 
 # PR resources: ignore imported/reference material, but keep the maintained
 # audit report available for a normal commit.
-PR-res/*
-!PR-res/PROJECT_AUDIT_REPORT_2026-08-31.md
-!PR-res/SNAPSHOT_AND_LLM_TRACE_AUDIT_2026-08-31.md
-!PR-res/RUVECTOR_GLIDING_HORSE_INTEGRATION_REPORT_2026-09-01.md
-!PR-res/RUVECTOR_SECONDARY_IMPLEMENTATION_RESEARCH_2026-09-01.md
-!PR-res/P1_P2_RETRIEVAL_EVIDENCE_ANN_IMPLEMENTATION_REPORT_2026-09-01.md
+PR-res/
 
 # application data
 data/

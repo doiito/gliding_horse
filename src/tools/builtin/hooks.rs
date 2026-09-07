@@ -6,7 +6,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -82,6 +82,7 @@ pub struct HookRunResult {
     denied: bool,
     failed: bool,
     cancelled: bool,
+    timed_out: bool,
     messages: Vec<String>,
     permission_override: Option<PermissionOverride>,
     permission_reason: Option<String>,
@@ -95,6 +96,7 @@ impl HookRunResult {
             denied: false,
             failed: false,
             cancelled: false,
+            timed_out: false,
             messages,
             permission_override: None,
             permission_reason: None,
@@ -115,6 +117,11 @@ impl HookRunResult {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    #[must_use]
+    pub fn is_timed_out(&self) -> bool {
+        self.timed_out
     }
 
     #[must_use]
@@ -148,15 +155,29 @@ impl HookRunResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookRunner {
     config: RuntimeHookConfig,
+    command_timeout: Duration,
 }
 
 impl HookRunner {
+    const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[must_use]
     pub fn new(config: RuntimeHookConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            command_timeout: Self::DEFAULT_COMMAND_TIMEOUT,
+        }
+    }
+
+    /// Set a hard wall-clock budget for each external hook command.  A zero
+    /// duration is clamped to one millisecond rather than disabling the guard.
+    #[must_use]
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     #[must_use]
@@ -186,6 +207,7 @@ impl HookRunner {
             false,
             abort_signal,
             reporter,
+            self.command_timeout,
         )
     }
 
@@ -236,6 +258,7 @@ impl HookRunner {
             is_error,
             abort_signal,
             reporter,
+            self.command_timeout,
         )
     }
 
@@ -286,6 +309,7 @@ impl HookRunner {
             true,
             abort_signal,
             reporter,
+            self.command_timeout,
         )
     }
 
@@ -316,6 +340,7 @@ impl HookRunner {
         is_error: bool,
         abort_signal: Option<&HookAbortSignal>,
         mut reporter: Option<&mut dyn HookProgressReporter>,
+        command_timeout: Duration,
     ) -> HookRunResult {
         if commands.is_empty() {
             return HookRunResult::allow(Vec::new());
@@ -326,6 +351,7 @@ impl HookRunner {
                 denied: false,
                 failed: false,
                 cancelled: true,
+                timed_out: false,
                 messages: vec![format!(
                     "{} hook cancelled before execution",
                     event.as_str()
@@ -357,6 +383,7 @@ impl HookRunner {
                 is_error,
                 &payload,
                 abort_signal,
+                command_timeout,
             ) {
                 HookCommandOutcome::Allow { parsed } => {
                     if let Some(reporter) = reporter.as_deref_mut() {
@@ -404,6 +431,19 @@ impl HookRunner {
                     result.messages.push(message);
                     return result;
                 }
+                HookCommandOutcome::TimedOut { message } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Cancelled {
+                            event,
+                            tool_name: tool_name.to_string(),
+                            command: command.clone(),
+                        });
+                    }
+                    result.failed = true;
+                    result.timed_out = true;
+                    result.messages.push(message);
+                    return result;
+                }
             }
         }
 
@@ -420,6 +460,7 @@ impl HookRunner {
         is_error: bool,
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
+        command_timeout: Duration,
     ) -> HookCommandOutcome {
         let mut child = shell_command(command);
         child.stdin(Stdio::piped());
@@ -433,7 +474,7 @@ impl HookRunner {
             child.env("HOOK_TOOL_OUTPUT", tool_output);
         }
 
-        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+        match child.output_with_stdin(payload.as_bytes(), abort_signal, command_timeout) {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -476,6 +517,13 @@ impl HookRunner {
                     event.as_str()
                 ),
             },
+            Ok(CommandExecution::TimedOut) => HookCommandOutcome::TimedOut {
+                message: format!(
+                    "{} hook `{command}` timed out after {} ms while handling `{tool_name}`",
+                    event.as_str(),
+                    command_timeout.as_millis()
+                ),
+            },
             Err(error) => HookCommandOutcome::Failed {
                 parsed: ParsedHookOutput {
                     messages: vec![format!(
@@ -495,6 +543,7 @@ enum HookCommandOutcome {
     Deny { parsed: ParsedHookOutput },
     Failed { parsed: ParsedHookOutput },
     Cancelled { message: String },
+    TimedOut { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -686,17 +735,24 @@ impl CommandWithStdin {
         &mut self,
         stdin: &[u8],
         abort_signal: Option<&HookAbortSignal>,
+        timeout: Duration,
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
             child_stdin.write_all(stdin)?;
         }
 
+        let started = Instant::now();
         loop {
             if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
                 let _ = child.kill();
                 let _ = child.wait_with_output();
                 return Ok(CommandExecution::Cancelled);
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                return Ok(CommandExecution::TimedOut);
             }
 
             match child.try_wait()? {
@@ -710,6 +766,13 @@ impl CommandWithStdin {
 enum CommandExecution {
     Finished(std::process::Output),
     Cancelled,
+    TimedOut,
+}
+
+impl Default for HookRunner {
+    fn default() -> Self {
+        Self::new(RuntimeHookConfig::default())
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1036,27 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn external_hook_command_is_killed_after_its_budget() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("sleep 2")],
+            Vec::new(),
+            Vec::new(),
+        ))
+        .with_command_timeout(Duration::from_millis(40));
+
+        let started = std::time::Instant::now();
+        let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
+
+        assert!(result.is_failed());
+        assert!(result.is_timed_out());
+        assert!(result
+            .messages()
+            .iter()
+            .any(|message| message.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(windows)]

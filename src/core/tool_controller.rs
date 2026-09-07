@@ -243,7 +243,11 @@ mod tests {
         assert!(!tc.should_force_finish(&calls2, &AgentRole::Plan));
         let agent_output = vec![("read_agent_output".to_string(), Value::Null)];
         assert!(!tc.should_force_finish(&agent_output, &AgentRole::Plan));
-        let micro_tool = vec![("read_full_result_call_session_a".to_string(), Value::Null)];
+        let micro_tool = vec![(
+            crate::tools::result_router::ResultRoutingIdentity::new("l1-tool-controller", "call_0")
+                .reader_name,
+            Value::Null,
+        )];
         assert!(!tc.should_force_finish(&micro_tool, &AgentRole::Plan));
         let unknown = vec![("unregistered_dynamic_tool".to_string(), Value::Null)];
         assert!(tc.should_force_finish(&unknown, &AgentRole::Plan));

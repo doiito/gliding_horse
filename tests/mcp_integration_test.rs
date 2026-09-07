@@ -305,8 +305,10 @@ async fn test_register_tools_to_tool_executor() {
             .register_tools_to_tool_executor(&mut executor, handle.clone());
     }
 
+    let registered_name =
+        glidinghorse::tools::builtin::mcp::mcp_tool_name("chrome", "browser_navigate");
     let result = executor
-        .execute("browser_navigate", json!({"url": "https://example.com"}))
+        .execute(&registered_name, json!({"url": "https://example.com"}))
         .await;
     assert!(result.is_ok());
     let output = result.unwrap();

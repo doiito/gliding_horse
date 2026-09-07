@@ -85,7 +85,8 @@ impl PerceptionEntry {
 /// # Lifecycle
 /// 1. System components call `store(task_iri, entry)` to write perception data
 /// 2. AgentRunner calls `take_perception_text()` during exec() initial assembly
-/// 3. Text is injected as a `role: "system"` message after messages[0]
+/// 3. AgentRunner admits it as task-scoped `UnverifiedRetrieval`; the
+///    per-dispatch compiler renders it without granting system authority
 /// 4. `cleanup(task_iri)` is called when the task completes
 pub struct PerceptionStore {
     /// task_iri → perception entry list

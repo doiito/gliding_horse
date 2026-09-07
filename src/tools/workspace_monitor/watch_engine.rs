@@ -48,6 +48,9 @@ impl WatchConfig {
     /// Check if a path should be excluded from file events.
     /// Matches patterns against whole path components only (not substrings within a filename).
     pub fn is_excluded(&self, path: &str) -> bool {
+        if crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(Path::new(path)) {
+            return true;
+        }
         let normalized = path.replace('\\', "/");
         for pattern in &self.exclude_patterns {
             let pat = pattern.replace('\\', "/");
@@ -253,7 +256,13 @@ impl WatchEngine {
                                 .max_depth(1)
                                 .into_iter()
                                 .filter_map(|e| e.ok())
-                                .filter(|e| e.file_type().is_dir())
+                                .filter(|e| {
+                                    e.file_type().is_dir()
+                                        && !Self::is_path_excluded(
+                                            &e.path().to_string_lossy(),
+                                            &exclude,
+                                        )
+                                })
                             {
                                 let _ = debouncer
                                     .watcher()
@@ -332,8 +341,7 @@ impl WatchEngine {
             .min_depth(1)
             .into_iter()
             .filter_entry(|entry| {
-                entry.depth() == 1
-                    || !Self::is_path_excluded(&entry.path().to_string_lossy(), &watch_exclude)
+                !Self::is_path_excluded(&entry.path().to_string_lossy(), &watch_exclude)
             })
             .filter_map(|e| e.ok())
         {
@@ -363,6 +371,9 @@ impl WatchEngine {
     }
 
     fn is_path_excluded(path: &str, exclude_patterns: &[String]) -> bool {
+        if crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(Path::new(path)) {
+            return true;
+        }
         let normalized = path.replace('\\', "/");
         for pattern in exclude_patterns {
             let pat = pattern.replace('\\', "/");
@@ -420,6 +431,9 @@ impl WatchEngine {
                 let now = std::time::Instant::now();
                 for entry in walkdir::WalkDir::new(&root)
                     .into_iter()
+                    .filter_entry(|entry| {
+                        !WatchEngine::is_path_excluded(&entry.path().to_string_lossy(), &exclude)
+                    })
                     .filter_map(|e| e.ok())
                 {
                     if !entry.file_type().is_file() {
@@ -532,6 +546,21 @@ mod tests {
         assert!(config.is_excluded("/project/target/debug/app"));
         assert!(config.is_excluded("/project/build/output.o"));
         assert!(!config.is_excluded("/project/src/targeting.rs"));
+    }
+
+    #[test]
+    fn workspace_runtime_tree_is_excluded_even_without_config_pattern() {
+        let config = WatchConfig {
+            exclude_patterns: vec!["target/".into()],
+            ..Default::default()
+        };
+        assert!(config.is_excluded("/project/.gliding_horse/ws_monitor/content"));
+        assert!(config.is_excluded("/project/generated/.gliding_horse/ws_monitor/metadata"));
+        assert!(WatchEngine::is_path_excluded(
+            "/project/.gliding_horse/ws_monitor/snapshots",
+            &[]
+        ));
+        assert!(!config.is_excluded("/project/.gliding_horse_notes/report.md"));
     }
 
     #[test]

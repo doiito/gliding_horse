@@ -1604,6 +1604,7 @@ dependencies = [
  "json-ld",
  "json-syntax 0.12.5",
  "jsonschema",
+ "libc",
  "lru 0.12.5",
  "md5",
  "mockall",

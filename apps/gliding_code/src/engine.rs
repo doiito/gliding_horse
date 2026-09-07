@@ -6,7 +6,7 @@ use std::time::Instant;
 use glidinghorse::causal::engine::CausalEngine;
 use glidinghorse::causal::fused::FusedRootCauseEngine;
 use glidinghorse::causal::store::CausalModelStore;
-use glidinghorse::config::{McpServerConfig, McpStdioServerConfig};
+use glidinghorse::config::{AgentSettings, McpServerConfig, McpStdioServerConfig, Settings};
 use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::{Event, EventBus};
 use glidinghorse::core::sa::SupervisorAgent;
@@ -57,6 +57,18 @@ fn report_startup(reporter: &Option<StartupReporter>, stage: &str, progress: Opt
     if let Some(reporter) = reporter {
         reporter(stage, progress);
     }
+}
+
+fn resolve_agent_settings(
+    configured: &AgentSettings,
+    react_reasoning_effort_override: Option<glidinghorse::config::settings::ReasoningEffort>,
+) -> AgentSettings {
+    let mut agent_settings = configured.clone();
+    if let Some(effort) = react_reasoning_effort_override {
+        agent_settings.execution_budget.react_reasoning_effort =
+            glidinghorse::config::settings::RoleReasoningEffortSettings::uniform(effort);
+    }
+    agent_settings
 }
 
 #[cfg(target_os = "linux")]
@@ -133,6 +145,9 @@ pub struct CodeCliEngine {
     /// Stable code-scan exclusions compiled from built-ins, workspace settings,
     /// and the supported subset of the workspace `.gitignore`.
     code_scan_exclude_patterns: Vec<String>,
+    /// Runtime-owned files excluded by exact normalized workspace-relative
+    /// path; unlike glob patterns these never hide a same-named project file.
+    code_scan_exact_exclude_paths: Vec<std::path::PathBuf>,
     learning_snapshot_max_files: usize,
     learning_snapshot_max_bytes: u64,
 }
@@ -257,11 +272,56 @@ fn load_code_scan_exclusions(root: &std::path::Path, configured: &[String]) -> V
     patterns
 }
 
+fn normalized_relative_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => normalized.push(value),
+            _ => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+fn canonical_executable_relative_to_workspace(
+    workspace_root: &std::path::Path,
+    executable: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
+    let canonical_executable = std::fs::canonicalize(executable).ok()?;
+    if !canonical_root.is_dir() || !canonical_executable.is_file() {
+        return None;
+    }
+    normalized_relative_path(canonical_executable.strip_prefix(canonical_root).ok()?)
+}
+
+fn current_executable_workspace_exclusion(
+    workspace_root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    canonical_executable_relative_to_workspace(workspace_root, &executable)
+}
+
+fn exact_relative_path_is_excluded(
+    relative_path: &std::path::Path,
+    exact_exclude_paths: &[std::path::PathBuf],
+) -> bool {
+    normalized_relative_path(relative_path)
+        .is_some_and(|path| exact_exclude_paths.iter().any(|excluded| excluded == &path))
+}
+
 fn code_path_is_excluded(
     relative_path: &std::path::Path,
     is_directory: bool,
     patterns: &[String],
+    exact_exclude_paths: &[std::path::PathBuf],
 ) -> bool {
+    if !is_directory && exact_relative_path_is_excluded(relative_path, exact_exclude_paths) {
+        return true;
+    }
     let mut path = relative_path.to_string_lossy().replace('\\', "/");
     if is_directory && !path.ends_with('/') {
         path.push('/');
@@ -274,6 +334,7 @@ fn code_path_is_excluded(
 fn collect_workspace_code_files(
     root: &std::path::Path,
     exclusion_patterns: &[String],
+    exact_exclude_paths: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<std::path::PathBuf>> {
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -326,7 +387,12 @@ fn collect_workspace_code_files(
             }
             let relative_path = path.strip_prefix(root).unwrap_or(path.as_path());
             if file_type.is_dir() {
-                if !code_path_is_excluded(relative_path, true, exclusion_patterns) {
+                if !code_path_is_excluded(
+                    relative_path,
+                    true,
+                    exclusion_patterns,
+                    exact_exclude_paths,
+                ) {
                     pending.push(path);
                 }
             } else if file_type.is_file()
@@ -334,7 +400,12 @@ fn collect_workspace_code_files(
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .is_some_and(supported)
-                && !code_path_is_excluded(relative_path, false, exclusion_patterns)
+                && !code_path_is_excluded(
+                    relative_path,
+                    false,
+                    exclusion_patterns,
+                    exact_exclude_paths,
+                )
             {
                 files.push(path);
             }
@@ -350,6 +421,7 @@ fn collect_workspace_code_files(
 fn workspace_state_fingerprint(
     root: &std::path::Path,
     exclusion_patterns: &[String],
+    exact_exclude_paths: &[std::path::PathBuf],
     max_files: usize,
     max_bytes: u64,
 ) -> anyhow::Result<String> {
@@ -368,11 +440,11 @@ fn workspace_state_fingerprint(
             }
             let relative = path.strip_prefix(root).unwrap_or(path.as_path());
             if file_type.is_dir() {
-                if !code_path_is_excluded(relative, true, exclusion_patterns) {
+                if !code_path_is_excluded(relative, true, exclusion_patterns, exact_exclude_paths) {
                     pending.push(path);
                 }
             } else if file_type.is_file()
-                && !code_path_is_excluded(relative, false, exclusion_patterns)
+                && !code_path_is_excluded(relative, false, exclusion_patterns, exact_exclude_paths)
             {
                 files.push(path);
                 if files.len() > max_files {
@@ -423,6 +495,11 @@ impl CodeCliEngine {
     ) -> anyhow::Result<Self> {
         let startup_started = Instant::now();
         report_startup(&startup_reporter, "Resolving workspace", None);
+        // Resolve process policy before entering the task workspace. A project
+        // named `config.yaml` is task data and must not silently control model
+        // reasoning, hooks, or execution budgets for the host application.
+        let loaded_settings = Settings::load().ok();
+        let settings = loaded_settings.clone().unwrap_or_default();
         // Set the process working directory to the configured workspace so that
         // agent_os tool handlers (execute_file_read/write/edit, execute_bash, …)
         // resolve relative paths against the correct root. Without this they
@@ -430,6 +507,16 @@ impl CodeCliEngine {
         let workspace_abs = std::path::Path::new(&config.workspace)
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(&config.workspace));
+        let runtime_executable_exclude_paths =
+            current_executable_workspace_exclusion(&workspace_abs)
+                .into_iter()
+                .collect::<Vec<_>>();
+        if let Some(path) = runtime_executable_exclude_paths.first() {
+            info!(
+                path = %path.display(),
+                "Excluding the running executable from workspace attribution scans"
+            );
+        }
         // Store canonicalized path so engine.workspace() returns the real absolute path
         config.workspace = workspace_abs.to_string_lossy().to_string();
         std::env::set_current_dir(&workspace_abs).map_err(|e| {
@@ -438,10 +525,6 @@ impl CodeCliEngine {
 
         let gateway = Arc::new(UnifiedGateway::new(&config.gateway)?);
         let dir = tempfile::TempDir::new()?;
-        // Load agent-os config before constructing memory layers so their
-        // storage and capacity settings are effective from the first write.
-        let loaded_settings = glidinghorse::config::Settings::load().ok();
-        let settings = loaded_settings.clone().unwrap_or_default();
 
         // A configured data directory is a shared root, not a workspace
         // identity. Keep state from separate repositories isolated below a
@@ -581,7 +664,10 @@ impl CodeCliEngine {
         let ontology_bridge = Arc::new(ontology_bridge);
         info!("OntologyBridge initialised (text + structural engines)");
 
-        let agent_settings = settings.agents.clone();
+        let agent_settings = resolve_agent_settings(
+            &config.agent_settings,
+            config.react_reasoning_effort_override,
+        );
 
         let proj = Arc::new(ProjectionEngine::with_vector_store(
             l2.clone(),
@@ -659,6 +745,7 @@ impl CodeCliEngine {
         let workspace_root = std::path::PathBuf::from(&config.workspace);
         let code_scan_exclude_patterns =
             load_code_scan_exclusions(&workspace_root, &settings.workspace.exclude_patterns);
+        let code_scan_exact_exclude_paths = runtime_executable_exclude_paths.clone();
 
         // ── TimelineStore (temporal event recording for graph mutations) ──
         // Created before SkillGraphStore so the store can attach it and record
@@ -889,7 +976,15 @@ impl CodeCliEngine {
                 .with_causal_engine(causal_engine.clone()),
         ));
 
-        let event_bus = Arc::new(EventBus::new(100));
+        let event_bus_capacity = agent_settings.event_bus_capacity.max(1);
+        if event_bus_capacity != agent_settings.event_bus_capacity {
+            warn!(
+                configured = agent_settings.event_bus_capacity,
+                effective = event_bus_capacity,
+                "agents.event_bus_capacity must be positive; using the minimum safe capacity"
+            );
+        }
+        let event_bus = Arc::new(EventBus::new(event_bus_capacity));
         // The mature Runner emits tool-call/result events through this bus.
         runner.set_event_bus(event_bus.clone());
 
@@ -942,6 +1037,7 @@ impl CodeCliEngine {
                 effect_snapshot_max_files: settings.workspace.effect_snapshot_max_files,
                 effect_snapshot_max_bytes: settings.workspace.effect_snapshot_max_bytes,
                 exclude_patterns: settings.workspace.exclude_patterns.clone(),
+                exact_exclude_paths: runtime_executable_exclude_paths,
                 db_path: Some(ws_db_path),
                 ..Default::default()
             };
@@ -1097,6 +1193,7 @@ impl CodeCliEngine {
             core_config,
             oxi_store: unified.store(),
             code_scan_exclude_patterns,
+            code_scan_exact_exclude_paths,
             learning_snapshot_max_files: settings.workspace.learning_snapshot_max_files,
             learning_snapshot_max_bytes: settings.workspace.learning_snapshot_max_bytes,
         })
@@ -1218,7 +1315,11 @@ impl CodeCliEngine {
             KnowledgeGraphStore::with_shared_store(self.oxi_store.clone()).map_err(|error| {
                 anyhow::anyhow!("Failed to create KG store for code analysis: {error}")
             })?;
-        let files = collect_workspace_code_files(root, &self.code_scan_exclude_patterns)?;
+        let files = collect_workspace_code_files(
+            root,
+            &self.code_scan_exclude_patterns,
+            &self.code_scan_exact_exclude_paths,
+        )?;
         let mut analyzed = 0u32;
         let mut errors = 0u32;
         for path in files {
@@ -1342,8 +1443,8 @@ impl CodeCliEngine {
             self.event_bus.clone(),
             self.l0.clone(),
         )
-        .finalize(&task_iri, &result)
-        .await;
+        .finalize_checked(&task_iri, &result)
+        .await?;
 
         // Record post-task metrics for skill evolution + causal analysis
         if let (true, Ok(mut ee)) = (
@@ -1484,20 +1585,9 @@ impl CodeCliEngine {
                                 warn!(task_iri = %task_iri, %error, "Failed to persist causal knowledge proposal");
                             }
                         }
-                        let causal_summary = suggestions
-                            .iter()
-                            .map(|s| {
-                                format!(
-                                    "{} (conf={:.2}): {}",
-                                    s.skill_iri, s.confidence, s.description
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ");
                         info!(
                             task_iri = %task_iri,
                             suggestion_count = suggestions.len(),
-                            causal_summary = %causal_summary,
                             "故障因果分析完成，生成了演化建议"
                         );
 
@@ -1935,6 +2025,28 @@ impl CodeCliEngine {
             anyhow::anyhow!("no local task evidence store exists for this workspace")
         })?;
         Ok(glidinghorse::core::TaskExecutionJournal::open(l0, task_iri)?.verify()?)
+    }
+
+    /// Discover terminal task identities from durable typed evidence seals.
+    ///
+    /// Unlike the TUI session panel, this operator-facing JSON source is not
+    /// constrained by terminal width. It is suitable for automation that
+    /// starts with a fresh data directory and subsequently needs the exact IRI
+    /// to pass to `verify_task_evidence_from_config`.
+    pub fn list_task_evidence_from_config(
+        config: &CliConfig,
+    ) -> anyhow::Result<Vec<glidinghorse::memory::TaskEvidenceSealRecord>> {
+        let Some(l0) = Self::open_workspace_l0_from_config(config)? else {
+            return Ok(Vec::new());
+        };
+        let mut seals = l0.task_evidence_seals(10_000)?;
+        seals.sort_by(|left, right| {
+            right
+                .sealed_at
+                .cmp(&left.sealed_at)
+                .then_with(|| left.task_iri.cmp(&right.task_iri))
+        });
+        Ok(seals)
     }
 
     /// Operator-triggered, read-only ANN probe. It persists aggregate audit
@@ -2382,11 +2494,7 @@ impl CodeCliEngine {
         let restored = cm
             .restore_task(task_iri)?
             .ok_or_else(|| anyhow::anyhow!("没有找到 task_iri={} 的 checkpoint", task_iri))?;
-
-        let resume_input = format!(
-            "继续执行之前中断的任务。上次进度: {}\n\n请从上次中断处继续。",
-            restored.state.checkpoint_name
-        );
+        let resume_input = restored.state.contract.original_user_task.clone();
         self.process_task_with_iri_and_resume_state(
             &resume_input,
             task_iri,
@@ -2400,13 +2508,13 @@ impl CodeCliEngine {
     pub async fn resume_task_with_messages(
         &mut self,
         task_iri: &str,
-        resumed_messages: Vec<glidinghorse::gateway::unified_gateway::ChatMessage>,
+        _resumed_messages: Vec<glidinghorse::gateway::unified_gateway::ChatMessage>,
     ) -> anyhow::Result<TaskResult> {
-        let resume_input = "继续执行之前中断的任务。请从上次中断处继续。".to_string();
         let restored =
             glidinghorse::core::checkpoint::CheckpointManager::with_persistence(self.l0.clone())
                 .restore_task(task_iri)?;
         if let Some(restored) = restored {
+            let resume_input = restored.state.contract.original_user_task.clone();
             self.process_task_with_iri_and_resume_state(
                 &resume_input,
                 task_iri,
@@ -2415,8 +2523,10 @@ impl CodeCliEngine {
             )
             .await
         } else {
-            self.process_task_with_iri_and_messages(&resume_input, task_iri, Some(resumed_messages))
-                .await
+            Err(anyhow::anyhow!(
+                "拒绝恢复 task_iri={}: 缺少带结构化状态的受支持 checkpoint",
+                task_iri
+            ))
         }
     }
 
@@ -2431,7 +2541,8 @@ impl CodeCliEngine {
             .await
     }
 
-    /// Process a task with optional resumed messages (for checkpoint resume)
+    /// Process a task with optional ordinary conversation history. Durable
+    /// checkpoint replay must use `process_task_with_iri_and_resume_state`.
     pub async fn process_task_with_iri_and_messages(
         &mut self,
         user_input: &str,
@@ -2452,6 +2563,18 @@ impl CodeCliEngine {
         resumed_messages: Option<Vec<glidinghorse::gateway::unified_gateway::ChatMessage>>,
         resumed_state: Option<glidinghorse::core::checkpoint::TaskResumeState>,
     ) -> anyhow::Result<TaskResult> {
+        if resumed_state.is_some() && resumed_messages.is_none() {
+            return Err(anyhow::anyhow!(
+                "拒绝恢复 task_iri={}: 结构化 checkpoint 状态缺少配对消息",
+                task_iri
+            ));
+        }
+        let canonical_user_input = resumed_state
+            .as_ref()
+            .map(|state| state.contract.original_user_task.as_str())
+            .unwrap_or(user_input)
+            .to_string();
+        let user_input = canonical_user_input.as_str();
         self.ensure_embedding_healthy().await;
         self.ensure_skill_vectors_indexed().await;
         // Match the normal task path: TUI/resume must populate the inventory
@@ -2507,35 +2630,39 @@ impl CodeCliEngine {
 
         let ctx = TaskContext::new(task_iri, user_input, self.config.max_iterations)
             .with_original_task(user_input);
-        let ctx = with_learning_experiment_constraints(
-            with_glidingcode_task_constraints(ctx, user_input),
-            &self.config,
-            self.learning_snapshot_max_files,
-            self.learning_snapshot_max_bytes,
-        );
+        let ctx = if let Some(state) = resumed_state.as_ref() {
+            state.validate().map_err(|error| anyhow::anyhow!(error))?;
+            ctx.with_constraints(state.contract.constraints_hash_map())
+                .with_effect_policy(state.contract.effect_policy.clone())
+        } else {
+            with_learning_experiment_constraints(
+                with_glidingcode_task_constraints(ctx, user_input),
+                &self.config,
+                self.learning_snapshot_max_files,
+                self.learning_snapshot_max_bytes,
+            )
+        };
         let ctx = if let Some(ref summary) = ws_summary {
             ctx.with_workspace_summary(summary)
         } else {
             ctx
         };
-        let ctx = if let Some(ref wf_path) = self.config.workflow_path {
-            let wf_jsonld = std::fs::read_to_string(wf_path)
-                .map_err(|e| anyhow::anyhow!("读取工作流文件 '{}' 失败: {}", wf_path, e))?;
-            ctx.with_workflow(&wf_jsonld)
+        let ctx = if resumed_state.is_none() {
+            if let Some(ref wf_path) = self.config.workflow_path {
+                let wf_jsonld = std::fs::read_to_string(wf_path)
+                    .map_err(|e| anyhow::anyhow!("读取工作流文件 '{}' 失败: {}", wf_path, e))?;
+                ctx.with_workflow(&wf_jsonld)
+            } else {
+                ctx
+            }
         } else {
             ctx
         };
         let ctx = match (resumed_messages, resumed_state) {
             (Some(messages), Some(state)) => ctx.with_resumed_checkpoint(messages, state),
-            (Some(messages), None) => {
-                let turn_count = messages.iter().filter(|m| m.role == "assistant").count() as u32;
-                let tool_count = messages
-                    .iter()
-                    .filter(|m| m.role == "tool" || m.tool_call_id.is_some())
-                    .count() as u32;
-                ctx.with_resumed_messages(messages, turn_count, tool_count)
-            }
-            (None, _) => ctx,
+            (Some(messages), None) => ctx.with_conversation_history(messages),
+            (None, None) => ctx,
+            (None, Some(_)) => unreachable!("resume pair was validated before initialization"),
         };
 
         let result = self
@@ -2559,8 +2686,8 @@ impl CodeCliEngine {
             self.event_bus.clone(),
             self.l0.clone(),
         )
-        .finalize(task_iri, &result)
-        .await;
+        .finalize_checked(task_iri, &result)
+        .await?;
         let post_task_started = Instant::now();
         self.record_tui_task_evolution(task_iri, user_input, &result)
             .await;
@@ -2847,6 +2974,7 @@ fn glidingcode_prompt_profile() -> ApplicationPromptProfile {
 - AA application extension: decide from the structured CA evidence. Do not modify code or explore files unless the runtime explicitly enables correction or challenge mode.
 - Test failures, build failures, incomplete code analysis, or unavailable external services are evidence to report; do not hide them or claim success without a valid fallback.
 - Code AST/knowledge-graph information is auxiliary evidence. Its absence or partial failure does not fail an ordinary file-editing task unless graph analysis is an explicit requirement.
+- The machine-readable `completion` JSON belongs only in the agent response. Never create `.completion.json` or another completion-protocol sidecar unless the original user request explicitly asks for that file.
 - Do not modify repository metadata, internal runtime state, backup copies, or diagnostic-output files unless explicitly requested."#,
     )
     .with_optimized_contract(
@@ -2874,7 +3002,8 @@ Engineering boundaries
 - Do not invent coverage, performance, or security requirements. Do not modify repository metadata, runtime state, backup copies, or diagnostic-output files unless explicitly requested.
 - If tests/builds/external services fail, report the exact failure and distinguish it from a code defect.
 
-Required handoff shape
+Required PA/DA execution handoff shape
+- The following `completion` object is for PA/DA execution handoff only. CA and AA must use their kernel-owned role terminal contracts (`ca_audit/v1` for CA and the AA disposition prefixes); this application contract must not replace those formats.
 - `completion_state`: `complete`, `incomplete`, or `blocked`
 - `criteria`: each declared criterion and status (`pass`, `fail`, `blocked`, or `unverified`)
 - `evidence`: file paths, relevant excerpts, commands, and exit results
@@ -2883,8 +3012,37 @@ Required handoff shape
 - `pending_effects`: unresolved executable work as objects with `objective`, optional `target`, `reason`, and `effect_policy`
 - `blockers`: exact external or capability blockers
 - Put these fields in a machine-readable JSON object named `completion`; use an empty `pending_effects` array only when execution is complete.
+- The `completion` object is response-only protocol metadata. Never write `.completion.json` or another completion-protocol sidecar into the workspace unless the original user request explicitly asks for that file.
 - Final status must be supported by the evidence; never claim success from an absent check."#,
     )
+}
+
+/// Recognize an explicit user acceptance condition that a project must live in
+/// a newly created directory.  The application owns this language classifier;
+/// the generic kernel receives only the typed layout constraint below.
+fn glidingcode_task_requires_new_child_directory(user_input: &str) -> bool {
+    let normalized = user_input.to_lowercase();
+    [
+        "必须新创建一个目录",
+        "必须新建一个目录",
+        "必须创建一个新目录",
+        "新创建一个目录把",
+        "新建一个目录把",
+        "新建目录并将",
+        "新建目录，并将",
+        "在新创建的目录",
+        "在新建的目录",
+        "must create a new directory",
+        "must create a new folder",
+        "create a new directory for",
+        "create a new folder for",
+        "inside a new directory",
+        "inside a new folder",
+        "in a newly created directory",
+        "in a newly created folder",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 /// Declare when the software application expects DA to leave concrete
@@ -2976,6 +3134,14 @@ fn with_glidingcode_task_constraints(
         ctx.with_constraint(
             glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT,
             glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH,
+        )
+    } else {
+        ctx
+    };
+    let ctx = if uses_workspace && glidingcode_task_requires_new_child_directory(user_input) {
+        ctx.with_constraint(
+            glidinghorse::core::agent_runner::WORKSPACE_LAYOUT_CONSTRAINT,
+            glidinghorse::core::agent_runner::WORKSPACE_LAYOUT_NEW_CHILD_DIRECTORY,
         )
     } else {
         ctx
@@ -3178,11 +3344,20 @@ fn with_learning_experiment_constraints(
     let workspace_fingerprint = if config.learning_pair_id.is_some() {
         let root = std::path::Path::new(&config.workspace);
         let exclusions = load_code_scan_exclusions(root, &[]);
-        workspace_state_fingerprint(root, &exclusions, snapshot_max_files, snapshot_max_bytes)
-            .unwrap_or_else(|error| {
-                let error_digest = Sha256::digest(error.to_string().as_bytes());
-                format!("unavailable:sha256:{}", hex::encode(&error_digest[..12]))
-            })
+        let exact_exclusions = current_executable_workspace_exclusion(root)
+            .into_iter()
+            .collect::<Vec<_>>();
+        workspace_state_fingerprint(
+            root,
+            &exclusions,
+            &exact_exclusions,
+            snapshot_max_files,
+            snapshot_max_bytes,
+        )
+        .unwrap_or_else(|error| {
+            let error_digest = Sha256::digest(error.to_string().as_bytes());
+            format!("unavailable:sha256:{}", hex::encode(&error_digest[..12]))
+        })
     } else {
         workspace_identity_fingerprint
     };
@@ -3207,9 +3382,13 @@ fn with_learning_experiment_constraints(
         .as_deref()
         .map(std::path::Path::new)
         .map(|root| {
+            let exact_exclusions = current_executable_workspace_exclusion(root)
+                .into_iter()
+                .collect::<Vec<_>>();
             workspace_state_fingerprint(
                 root,
                 &load_code_scan_exclusions(root, &[]),
+                &exact_exclusions,
                 snapshot_max_files,
                 snapshot_max_bytes,
             )
@@ -3262,9 +3441,11 @@ fn with_learning_experiment_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_workspace_code_files, glidingcode_learning_skill_node, glidingcode_prompt_profile,
-        glidingcode_task_uses_workspace, is_legacy_glidingcode_auto_link,
-        load_code_scan_exclusions, shared_bootstrap_skill_types, with_glidingcode_task_constraints,
+        canonical_executable_relative_to_workspace, collect_workspace_code_files,
+        current_executable_workspace_exclusion, glidingcode_learning_skill_node,
+        glidingcode_prompt_profile, glidingcode_task_uses_workspace,
+        is_legacy_glidingcode_auto_link, load_code_scan_exclusions, resolve_agent_settings,
+        shared_bootstrap_skill_types, with_glidingcode_task_constraints,
         workspace_state_fingerprint, CodeCliEngine, GLIDINGCODE_WORKFLOW_SKILL_IRI,
     };
     use crate::config::CliConfig;
@@ -3285,8 +3466,36 @@ mod tests {
         assert!(prompt.contains("criteria"));
         assert!(prompt.contains("existing public interfaces"));
         assert!(prompt.contains("non-zero build/test exit"));
+        assert!(prompt.contains("response-only protocol metadata"));
+        assert!(prompt.contains("Never write `.completion.json`"));
         assert!(!prompt.contains("Constitution"));
         assert!(!prompt.contains("PDCA"));
+    }
+
+    #[test]
+    fn react_reasoning_cli_override_is_explicit_and_uniform() {
+        use glidinghorse::config::settings::{ReasoningEffort, RoleReasoningEffortSettings};
+
+        let mut settings = glidinghorse::config::Settings::default();
+        settings.agents.execution_budget.react_reasoning_effort = RoleReasoningEffortSettings {
+            plan: ReasoningEffort::High,
+            do_agent: ReasoningEffort::Low,
+            check: ReasoningEffort::Max,
+            act: ReasoningEffort::None,
+        };
+
+        let configured = resolve_agent_settings(&settings.agents, None);
+        assert_eq!(
+            configured.execution_budget.react_reasoning_effort,
+            settings.agents.execution_budget.react_reasoning_effort,
+            "an absent CLI flag must preserve role-specific process config"
+        );
+
+        let overridden = resolve_agent_settings(&settings.agents, Some(ReasoningEffort::None));
+        assert_eq!(
+            overridden.execution_budget.react_reasoning_effort,
+            RoleReasoningEffortSettings::uniform(ReasoningEffort::None)
+        );
     }
 
     #[test]
@@ -3295,7 +3504,7 @@ mod tests {
         let change = with_glidingcode_task_constraints(change, "实现一个可运行的功能并测试");
         assert_eq!(
             change
-                .constraints
+                .constraints()
                 .get("required_effect")
                 .map(String::as_str),
             Some("workspace_mutation")
@@ -3307,7 +3516,7 @@ mod tests {
 
         let review = glidinghorse::core::agent_runner::TaskContext::new("t", "x", 10);
         let review = with_glidingcode_task_constraints(review, "只读分析当前实现，不修改任何文件");
-        assert!(!review.constraints.contains_key("required_effect"));
+        assert!(!review.constraints().contains_key("required_effect"));
         assert_eq!(
             review.effective_effect_policy(),
             glidinghorse::core::effect::EffectPolicy::EvidenceOnly
@@ -3323,6 +3532,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_chinese_calculator_task_requires_a_new_workspace_child_directory() {
+        let request = "使用python语言开发计算器程序，需要先进行设计，使用markdown语言，涉及图形使用mermaid格式输出，然后进行测试和文档编写，完成整个工程。注意：必须新创建一个目录把项目相关内容都创建到该目录下。";
+        assert!(glidingcode_task_uses_workspace(request));
+
+        let ctx = glidinghorse::core::agent_runner::TaskContext::new("t", request, 10);
+        let ctx = with_glidingcode_task_constraints(ctx, request);
+        assert_eq!(
+            ctx.constraints()
+                .get(glidinghorse::core::agent_runner::WORKSPACE_LAYOUT_CONSTRAINT)
+                .map(String::as_str),
+            Some(glidinghorse::core::agent_runner::WORKSPACE_LAYOUT_NEW_CHILD_DIRECTORY)
+        );
+        assert_eq!(
+            ctx.effective_effect_policy(),
+            glidinghorse::core::effect::EffectPolicy::required_workspace_mutation()
+        );
+
+        let ordinary = glidinghorse::core::agent_runner::TaskContext::new("t2", "实现计算器", 10);
+        let ordinary = with_glidingcode_task_constraints(ordinary, "实现计算器");
+        assert!(!ordinary
+            .constraints()
+            .contains_key(glidinghorse::core::agent_runner::WORKSPACE_LAYOUT_CONSTRAINT));
+    }
+
+    #[test]
     fn research_task_is_not_misclassified_as_workspace_code_work() {
         let research = "做一个AI Agent最新进展以及发展趋势的调研报告，需要搜索最新的趋势和场景，使用markdown格式输出，涉及图形使用mermaid格式，给出完整报告";
         assert!(!glidingcode_task_uses_workspace(research));
@@ -3335,13 +3569,13 @@ mod tests {
             glidinghorse::core::effect::EffectPolicy::EvidenceOnly
         );
         assert_eq!(
-            ctx.constraints
+            ctx.constraints()
                 .get(glidinghorse::core::agent_runner::DELIVERY_MODE_CONSTRAINT)
                 .map(String::as_str),
             Some(glidinghorse::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE)
         );
         assert_eq!(
-            ctx.constraints
+            ctx.constraints()
                 .get(glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT)
                 .map(String::as_str),
             Some(glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH)
@@ -3490,8 +3724,8 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         std::fs::write(workspace.path().join("main.py"), "print('one')\n").unwrap();
         let exclusions = load_code_scan_exclusions(workspace.path(), &[]);
-        let first =
-            workspace_state_fingerprint(workspace.path(), &exclusions, 100, 1_000_000).unwrap();
+        let first = workspace_state_fingerprint(workspace.path(), &exclusions, &[], 100, 1_000_000)
+            .unwrap();
 
         std::fs::create_dir_all(workspace.path().join(".gliding_horse")).unwrap();
         std::fs::write(
@@ -3500,12 +3734,14 @@ mod tests {
         )
         .unwrap();
         let runtime_changed =
-            workspace_state_fingerprint(workspace.path(), &exclusions, 100, 1_000_000).unwrap();
+            workspace_state_fingerprint(workspace.path(), &exclusions, &[], 100, 1_000_000)
+                .unwrap();
         assert_eq!(first, runtime_changed);
 
         std::fs::write(workspace.path().join("main.py"), "print('two')\n").unwrap();
         let source_changed =
-            workspace_state_fingerprint(workspace.path(), &exclusions, 100, 1_000_000).unwrap();
+            workspace_state_fingerprint(workspace.path(), &exclusions, &[], 100, 1_000_000)
+                .unwrap();
         assert_ne!(first, source_changed);
     }
 
@@ -3545,6 +3781,62 @@ mod tests {
     }
 
     #[test]
+    fn executable_exclusion_requires_canonical_workspace_containment() {
+        let parent = tempfile::tempdir().expect("temporary parent");
+        let workspace = parent.path().join("workspace");
+        let prefix_sibling = parent.path().join("workspace-copy");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&prefix_sibling).unwrap();
+        let inside = workspace.join("glidingcode");
+        let outside = prefix_sibling.join("glidingcode");
+        std::fs::write(&inside, "inside").unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+
+        assert_eq!(
+            canonical_executable_relative_to_workspace(&workspace, &inside),
+            Some(std::path::PathBuf::from("glidingcode"))
+        );
+        assert_eq!(
+            canonical_executable_relative_to_workspace(&workspace, &outside),
+            None,
+            "a lexical workspace-prefix sibling is outside the canonical root"
+        );
+    }
+
+    #[test]
+    fn external_current_executable_does_not_create_a_workspace_exclusion() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        assert!(current_executable_workspace_exclusion(workspace.path()).is_none());
+    }
+
+    #[test]
+    fn exact_executable_code_exclusion_keeps_same_named_nested_source() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(workspace.path().join("tools")).unwrap();
+        std::fs::write(workspace.path().join("glidingcode.rs"), "fn runtime() {}").unwrap();
+        std::fs::write(
+            workspace.path().join("tools/glidingcode.rs"),
+            "fn project_source() {}",
+        )
+        .unwrap();
+
+        let files = collect_workspace_code_files(
+            workspace.path(),
+            &[],
+            &[std::path::PathBuf::from("glidingcode.rs")],
+        )
+        .expect("workspace scan should succeed");
+        let relative = files
+            .iter()
+            .map(|path| path.strip_prefix(workspace.path()).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relative,
+            vec![std::path::PathBuf::from("tools/glidingcode.rs")]
+        );
+    }
+
+    #[test]
     fn code_scan_honors_configured_and_gitignore_exclusions_recursively() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         std::fs::create_dir_all(workspace.path().join("src/nested")).unwrap();
@@ -3562,7 +3854,7 @@ mod tests {
 
         let exclusions =
             load_code_scan_exclusions(workspace.path(), &["configured_skip/".to_string()]);
-        let files = collect_workspace_code_files(workspace.path(), &exclusions)
+        let files = collect_workspace_code_files(workspace.path(), &exclusions, &[])
             .expect("workspace scan should succeed");
         let relative = files
             .iter()
@@ -3575,6 +3867,60 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(relative, vec!["src/nested/kept.rs"]);
+    }
+
+    #[test]
+    fn task_evidence_listing_uses_complete_durable_seal_identities() {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut config = CliConfig::from_env_and_args(
+            None,
+            None,
+            "offline-test-model".into(),
+            workspace.path().to_string_lossy().to_string(),
+            1,
+            1,
+            LearningMode::Baseline,
+            None,
+            None,
+        );
+        config.data_dir = Some(data.path().to_string_lossy().to_string());
+        let l0_path = CodeCliEngine::workspace_l0_path_from_config(&config)
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir_all(&l0_path).unwrap();
+
+        let old_iri = "iri://task/11111111-2222-3333-4444-555555555555";
+        let new_iri = "iri://task/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        {
+            let l0 = glidinghorse::memory::L0Store::new(&l0_path.to_string_lossy()).unwrap();
+            for (key, iri, age_seconds) in
+                [("old-key", old_iri, 5_i64), ("new-key", new_iri, 0_i64)]
+            {
+                assert_eq!(
+                    l0.try_seal_task_evidence(&glidinghorse::memory::TaskEvidenceSealRecord {
+                        schema_version: 1,
+                        task_key: key.into(),
+                        task_iri: iri.into(),
+                        frame_count: 0,
+                        root_hash: None,
+                        terminal_status: "success".into(),
+                        sealed_at: chrono::Utc::now() - chrono::Duration::seconds(age_seconds),
+                    },)
+                        .unwrap(),
+                    glidinghorse::memory::TaskEvidenceSealOutcome::Sealed
+                );
+            }
+        }
+
+        let seals = CodeCliEngine::list_task_evidence_from_config(&config).unwrap();
+        assert_eq!(
+            seals
+                .iter()
+                .map(|seal| seal.task_iri.as_str())
+                .collect::<Vec<_>>(),
+            vec![new_iri, old_iri]
+        );
     }
 
     #[test]

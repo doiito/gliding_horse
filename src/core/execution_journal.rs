@@ -18,7 +18,7 @@ use crate::memory::l0_store::{
 };
 use crate::CoreError;
 
-pub const TASK_EXECUTION_JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const TASK_EXECUTION_JOURNAL_SCHEMA_VERSION: u32 = 4;
 pub const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const MAX_APPEND_RETRIES: usize = 16;
 const MAX_EVIDENCE_FRAMES: usize = 100_000;
@@ -31,6 +31,57 @@ pub struct PayloadReference {
     /// payload capture enabled.  The production default is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured: Option<String>,
+}
+
+/// Durable identity of one provider-issued tool call.
+///
+/// Provider call IDs are correlation tokens within one model request, not
+/// globally unique operation IDs.  In particular, different isolated agent
+/// sessions routinely reuse values such as `call_0`.  The execution journal
+/// is task-wide, so every component that establishes the model/agent/session
+/// boundary is part of the durable identity used for replay safety.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ToolCallIdentity {
+    pub agent_id: String,
+    pub l1_session_id: String,
+    pub llm_request_id: String,
+    /// Raw provider correlation ID. This remains unchanged for protocol
+    /// pairing and observability, but must never be used as a task-global key.
+    pub provider_call_id: String,
+}
+
+impl ToolCallIdentity {
+    pub fn new(
+        agent_id: impl Into<String>,
+        l1_session_id: impl Into<String>,
+        llm_request_id: impl Into<String>,
+        provider_call_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            l1_session_id: l1_session_id.into(),
+            llm_request_id: llm_request_id.into(),
+            provider_call_id: provider_call_id.into(),
+        }
+    }
+}
+
+/// A tool operation as assessed at a resume boundary. Keeping the tool name
+/// bound to the full identity prevents a mismatched finish record from
+/// cancelling a different operation even if a provider reused its call ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JournalToolCall {
+    pub identity: ToolCallIdentity,
+    pub tool_name: String,
+}
+
+impl JournalToolCall {
+    pub fn new(identity: ToolCallIdentity, tool_name: impl Into<String>) -> Self {
+        Self {
+            identity,
+            tool_name: tool_name.into(),
+        }
+    }
 }
 
 impl PayloadReference {
@@ -53,6 +104,9 @@ pub enum TaskExecutionJournalKind {
         model: String,
         message_count: usize,
         advertised_tool_names: Vec<String>,
+        /// Hash of the metadata-only typed role-context manifest.
+        #[serde(default)]
+        context_manifest_hash: Option<String>,
         request: PayloadReference,
     },
     LlmResponseReceived {
@@ -71,15 +125,21 @@ pub enum TaskExecutionJournalKind {
         request_id: String,
         latency_ms: u64,
         error_class: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_status: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retryable: Option<bool>,
     },
     ToolExecutionStarted {
-        call_id: String,
+        call_identity: ToolCallIdentity,
         tool_name: String,
         turn: u32,
+        /// Conservative execution-time classification.
+        side_effect_risk: bool,
         arguments: PayloadReference,
     },
     ToolExecutionFinished {
-        call_id: String,
+        call_identity: ToolCallIdentity,
         tool_name: String,
         success: bool,
         duration_ms: u64,
@@ -90,7 +150,7 @@ pub enum TaskExecutionJournalKind {
         checkpoint_name: String,
     },
     WorkspaceMutationCommitted {
-        call_id: String,
+        call_identity: ToolCallIdentity,
         tool_name: String,
     },
 }
@@ -103,6 +163,36 @@ pub struct TaskExecutionJournalEvent {
     pub task_iri: String,
     pub timestamp: DateTime<Utc>,
     pub event: TaskExecutionJournalKind,
+}
+
+/// Metadata-only decision used before resuming a ReAct transcript. A risky
+/// call after the selected checkpoint may have partially or fully committed
+/// even when its response was never checkpointed, so automatic replay must
+/// stop for operator review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeSafetyAssessment {
+    pub safe_to_resume: bool,
+    pub checkpoint_found: bool,
+    /// Exact task-journal identities for all effectful calls after the
+    /// selected checkpoint. Any entry makes automatic replay unsafe.
+    pub risky_calls: Vec<JournalToolCall>,
+    /// Exact identities for read-only starts without a matching finish. These
+    /// may be retried because they cannot mutate the workspace.
+    pub readonly_unfinished_calls: Vec<JournalToolCall>,
+}
+
+impl ResumeSafetyAssessment {
+    pub fn risky_tool_names(&self) -> Vec<String> {
+        let mut names = self
+            .risky_calls
+            .iter()
+            .map(|call| call.tool_name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
 }
 
 /// Append-only durable task trace.  Sequence allocation resumes from persisted
@@ -123,6 +213,8 @@ pub struct TaskEvidenceVerification {
     pub task_iri: String,
     pub frame_count: u64,
     pub sealed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_status: Option<String>,
     pub root_hash: Option<String>,
     pub valid: bool,
     pub failures: Vec<String>,
@@ -234,13 +326,121 @@ impl TaskExecutionJournal {
             .task_evidence_frames(&self.task_key, limit.max(1))?
             .into_iter()
             .map(|frame| {
-                serde_json::from_str::<TaskExecutionJournalEvent>(&frame.event_json).map_err(
-                    |error| CoreError::StorageError {
+                let event = serde_json::from_str::<TaskExecutionJournalEvent>(&frame.event_json)
+                    .map_err(|error| CoreError::StorageError {
                         message: format!("Failed to decode task journal evidence event: {error}"),
-                    },
-                )
+                    })?;
+                if event.schema_version != TASK_EXECUTION_JOURNAL_SCHEMA_VERSION {
+                    return Err(CoreError::StorageError {
+                        message: format!(
+                            "Task journal schema {} is incompatible with required schema {}",
+                            event.schema_version, TASK_EXECUTION_JOURNAL_SCHEMA_VERSION
+                        ),
+                    });
+                }
+                Ok(event)
             })
             .collect()
+    }
+
+    /// Determine whether replay from the exact `checkpoint_iri` is
+    /// side-effect safe. Human-readable names repeat across roles and PDCA
+    /// cycles and therefore cannot identify a replay boundary.
+    /// Only unfinished read-only operations may be retried automatically.
+    /// Tool payloads are neither required nor returned by this audit.
+    pub fn assess_resume_safety(
+        &self,
+        checkpoint_iri: Option<&str>,
+    ) -> Result<ResumeSafetyAssessment, CoreError> {
+        use std::collections::HashSet;
+
+        let events = self.events(MAX_EVIDENCE_FRAMES)?;
+        let checkpoint_index = checkpoint_iri
+            .and_then(|expected| {
+                events.iter().rposition(|event| {
+                    matches!(
+                        &event.event,
+                        TaskExecutionJournalKind::CheckpointCommitted {
+                            checkpoint_iri,
+                            ..
+                        } if checkpoint_iri == expected
+                    )
+                })
+            })
+            .or_else(|| {
+                checkpoint_iri.is_none().then(|| {
+                    events.iter().rposition(|event| {
+                        matches!(
+                            event.event,
+                            TaskExecutionJournalKind::CheckpointCommitted { .. }
+                        )
+                    })
+                })?
+            });
+        let checkpoint_found = checkpoint_index.is_some();
+        let tail = checkpoint_index
+            .map(|index| &events[index.saturating_add(1)..])
+            .unwrap_or(events.as_slice());
+
+        let mut risky_calls = HashSet::<JournalToolCall>::new();
+        let mut readonly_started = HashSet::<JournalToolCall>::new();
+        let mut finished = HashSet::<JournalToolCall>::new();
+        for event in tail {
+            match &event.event {
+                TaskExecutionJournalKind::ToolExecutionStarted {
+                    call_identity,
+                    tool_name,
+                    side_effect_risk,
+                    ..
+                } => {
+                    let call = JournalToolCall::new(call_identity.clone(), tool_name.clone());
+                    if *side_effect_risk {
+                        risky_calls.insert(call);
+                    } else {
+                        readonly_started.insert(call);
+                    }
+                }
+                TaskExecutionJournalKind::ToolExecutionFinished {
+                    call_identity,
+                    tool_name,
+                    ..
+                } => {
+                    finished.insert(JournalToolCall::new(
+                        call_identity.clone(),
+                        tool_name.clone(),
+                    ));
+                }
+                TaskExecutionJournalKind::WorkspaceMutationCommitted {
+                    call_identity,
+                    tool_name,
+                } => {
+                    risky_calls.insert(JournalToolCall::new(
+                        call_identity.clone(),
+                        tool_name.clone(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let mut risky_calls = risky_calls.into_iter().collect::<Vec<_>>();
+        let mut readonly_unfinished_calls = readonly_started
+            .difference(&finished)
+            .cloned()
+            .collect::<Vec<_>>();
+        risky_calls.sort();
+        readonly_unfinished_calls.sort();
+
+        // Any missing checkpoint receipt means we cannot establish the replay
+        // boundary. Old snapshots without a matching v4 execution journal are
+        // intentionally incompatible and must not be auto-resumed.
+        let unknown_boundary = !checkpoint_found;
+        Ok(ResumeSafetyAssessment {
+            safe_to_resume: !unknown_boundary && risky_calls.is_empty(),
+            checkpoint_found,
+            risky_calls,
+            readonly_unfinished_calls,
+        })
     }
 
     /// Seal the task only after its terminal result is known. A seal is
@@ -345,6 +545,7 @@ impl TaskExecutionJournal {
             task_iri: self.task_iri.clone(),
             frame_count: frames.len() as u64,
             sealed,
+            terminal_status: seal.as_ref().map(|seal| seal.terminal_status.clone()),
             root_hash: previous_hash,
             valid: failures.is_empty(),
             failures,
@@ -446,6 +647,7 @@ mod tests {
                 model: "model-a".into(),
                 message_count: 2,
                 advertised_tool_names: vec!["file_write".into()],
+                context_manifest_hash: Some("sha256:context".into()),
                 request: reference,
             })
             .unwrap();
@@ -478,10 +680,12 @@ mod tests {
         let verification = reopened.verify().unwrap();
         assert!(verification.valid, "{:?}", verification.failures);
         assert!(!verification.sealed);
+        assert_eq!(verification.terminal_status, None);
         reopened.seal("success").unwrap();
         let verification = reopened.verify().unwrap();
         assert!(verification.valid, "{:?}", verification.failures);
         assert!(verification.sealed);
+        assert_eq!(verification.terminal_status.as_deref(), Some("success"));
         assert!(reopened
             .append(TaskExecutionJournalKind::CheckpointCommitted {
                 checkpoint_iri: "iri://checkpoint/task/after-seal".into(),
@@ -502,6 +706,210 @@ mod tests {
                 .captured
                 .as_deref(),
             Some("debug payload")
+        );
+    }
+
+    fn append_checkpoint(journal: &TaskExecutionJournal, name: &str) {
+        journal
+            .append(TaskExecutionJournalKind::CheckpointCommitted {
+                checkpoint_iri: format!("iri://checkpoint/{name}"),
+                checkpoint_name: name.to_string(),
+            })
+            .unwrap();
+    }
+
+    fn append_tool_start(
+        journal: &TaskExecutionJournal,
+        call_identity: ToolCallIdentity,
+        tool_name: &str,
+        side_effect_risk: bool,
+    ) {
+        journal
+            .append(TaskExecutionJournalKind::ToolExecutionStarted {
+                call_identity,
+                tool_name: tool_name.to_string(),
+                turn: 1,
+                side_effect_risk,
+                arguments: PayloadReference::metadata_only("{}"),
+            })
+            .unwrap();
+    }
+
+    fn call_identity(
+        agent_id: &str,
+        l1_session_id: &str,
+        llm_request_id: &str,
+        provider_call_id: &str,
+    ) -> ToolCallIdentity {
+        ToolCallIdentity::new(agent_id, l1_session_id, llm_request_id, provider_call_id)
+    }
+
+    #[test]
+    fn resume_safety_allows_only_readonly_tail_and_uses_named_boundary() {
+        let (_dir, _l0, journal) = journal();
+        let legacy_without_receipt = journal
+            .assess_resume_safety(Some("iri://checkpoint/legacy-checkpoint"))
+            .unwrap();
+        assert!(!legacy_without_receipt.safe_to_resume);
+        assert!(!legacy_without_receipt.checkpoint_found);
+
+        append_checkpoint(&journal, "before-read");
+        let read = call_identity("agent-da", "l1-da", "req-da-1", "read-1");
+        append_tool_start(&journal, read.clone(), "file_read", false);
+
+        let safe = journal
+            .assess_resume_safety(Some("iri://checkpoint/before-read"))
+            .unwrap();
+        assert!(safe.safe_to_resume);
+        assert!(safe.checkpoint_found);
+        assert_eq!(
+            safe.readonly_unfinished_calls,
+            vec![JournalToolCall::new(read, "file_read")]
+        );
+
+        let unknown = journal
+            .assess_resume_safety(Some("iri://checkpoint/missing-checkpoint"))
+            .unwrap();
+        assert!(!unknown.safe_to_resume);
+        assert!(!unknown.checkpoint_found);
+    }
+
+    #[test]
+    fn resume_safety_blocks_started_or_committed_effect_until_later_checkpoint() {
+        let (_dir, _l0, journal) = journal();
+        append_checkpoint(&journal, "before-write");
+        let write = call_identity("agent-da", "l1-da", "req-da-1", "write-1");
+        append_tool_start(&journal, write.clone(), "file_write", true);
+
+        let started = journal
+            .assess_resume_safety(Some("iri://checkpoint/before-write"))
+            .unwrap();
+        assert!(!started.safe_to_resume);
+        assert_eq!(
+            started.risky_calls,
+            vec![JournalToolCall::new(write.clone(), "file_write")]
+        );
+
+        journal
+            .append(TaskExecutionJournalKind::WorkspaceMutationCommitted {
+                call_identity: write,
+                tool_name: "file_write".to_string(),
+            })
+            .unwrap();
+        let committed = journal
+            .assess_resume_safety(Some("iri://checkpoint/before-write"))
+            .unwrap();
+        assert!(!committed.safe_to_resume);
+        assert_eq!(committed.risky_tool_names(), vec!["file_write"]);
+
+        append_checkpoint(&journal, "after-write");
+        let checkpointed = journal
+            .assess_resume_safety(Some("iri://checkpoint/after-write"))
+            .unwrap();
+        assert!(checkpointed.safe_to_resume);
+    }
+
+    #[test]
+    fn resume_safety_distinguishes_repeated_checkpoint_names_by_exact_iri() {
+        let (_dir, _l0, journal) = journal();
+        journal
+            .append(TaskExecutionJournalKind::CheckpointCommitted {
+                checkpoint_iri: "iri://checkpoint/old-step".to_string(),
+                checkpoint_name: "step_complete_Do".to_string(),
+            })
+            .unwrap();
+        let write = call_identity("agent-da", "l1-da", "req-da-2", "write-between-boundaries");
+        append_tool_start(&journal, write.clone(), "file_write", true);
+        journal
+            .append(TaskExecutionJournalKind::WorkspaceMutationCommitted {
+                call_identity: write.clone(),
+                tool_name: "file_write".to_string(),
+            })
+            .unwrap();
+        journal
+            .append(TaskExecutionJournalKind::CheckpointCommitted {
+                checkpoint_iri: "iri://checkpoint/new-step".to_string(),
+                checkpoint_name: "step_complete_Do".to_string(),
+            })
+            .unwrap();
+
+        let old = journal
+            .assess_resume_safety(Some("iri://checkpoint/old-step"))
+            .unwrap();
+        assert!(!old.safe_to_resume);
+        assert_eq!(
+            old.risky_calls,
+            vec![JournalToolCall::new(write, "file_write")]
+        );
+
+        let new = journal
+            .assess_resume_safety(Some("iri://checkpoint/new-step"))
+            .unwrap();
+        assert!(new.safe_to_resume);
+    }
+
+    #[test]
+    fn finished_same_provider_call_id_in_another_session_cannot_cancel_unfinished_read() {
+        let (_dir, _l0, journal) = journal();
+        append_checkpoint(&journal, "before-parallel-reads");
+        let pa_call = call_identity("agent-pa", "l1-pa", "req-pa-1", "call_0");
+        let ca_call = call_identity("agent-ca", "l1-ca", "req-ca-1", "call_0");
+        append_tool_start(&journal, pa_call.clone(), "file_read", false);
+        append_tool_start(&journal, ca_call.clone(), "file_read", false);
+        journal
+            .append(TaskExecutionJournalKind::ToolExecutionFinished {
+                call_identity: ca_call.clone(),
+                tool_name: "file_read".to_string(),
+                success: true,
+                duration_ms: 2,
+                result: PayloadReference::metadata_only("ok"),
+            })
+            .unwrap();
+
+        let assessment = journal
+            .assess_resume_safety(Some("iri://checkpoint/before-parallel-reads"))
+            .unwrap();
+        assert!(assessment.safe_to_resume);
+        assert_eq!(
+            assessment.readonly_unfinished_calls,
+            vec![JournalToolCall::new(pa_call, "file_read")]
+        );
+        assert!(!assessment
+            .readonly_unfinished_calls
+            .iter()
+            .any(|call| call.identity == ca_call));
+    }
+
+    #[test]
+    fn risky_same_provider_call_id_is_bound_to_exact_agent_session_and_request() {
+        let (_dir, _l0, journal) = journal();
+        append_checkpoint(&journal, "before-colliding-calls");
+        let da_write = call_identity("agent-da", "l1-da", "req-da-7", "call_0");
+        let ca_read = call_identity("agent-ca", "l1-ca", "req-ca-4", "call_0");
+        append_tool_start(&journal, da_write.clone(), "file_write", true);
+        append_tool_start(&journal, ca_read.clone(), "file_read", false);
+        journal
+            .append(TaskExecutionJournalKind::ToolExecutionFinished {
+                call_identity: ca_read.clone(),
+                tool_name: "file_read".to_string(),
+                success: true,
+                duration_ms: 1,
+                result: PayloadReference::metadata_only("ok"),
+            })
+            .unwrap();
+
+        let assessment = journal
+            .assess_resume_safety(Some("iri://checkpoint/before-colliding-calls"))
+            .unwrap();
+        assert!(!assessment.safe_to_resume);
+        assert_eq!(
+            assessment.risky_calls,
+            vec![JournalToolCall::new(da_write, "file_write")]
+        );
+        assert!(assessment.readonly_unfinished_calls.is_empty());
+        assert_ne!(
+            assessment.risky_calls[0].identity.l1_session_id,
+            ca_read.l1_session_id
         );
     }
 

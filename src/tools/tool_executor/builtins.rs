@@ -1,7 +1,18 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::{CStr, CString, OsStr};
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -23,8 +34,12 @@ use crate::tools::builtin::sandbox::{
     SandboxConfig, SandboxStatus,
 };
 use crate::utils::text::safe_truncate;
+use crate::utils::CryptoUtils;
 
-use super::{GlobSearchInput, GrepSearchInput, ToolSearchInput, WebFetchInput, WebSearchInput};
+use super::{
+    GlobSearchInput, GrepSearchInput, ToolExecutionProfile, ToolSearchInput, WebFetchInput,
+    WebSearchInput,
+};
 
 // ========== Tool implementations ==========
 
@@ -33,14 +48,14 @@ pub(super) async fn execute_glob_search(input: Value) -> Result<Value, String> {
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let root = params.path.as_deref().unwrap_or(".");
 
+    validate_workspace_glob_pattern(&params.pattern)?;
+
     // check if search path is within workspace
-    if root != "." {
-        if let Err(msg) = check_path_in_workspace(root) {
-            return Err(format!(
-                "{}\nPlease focus on the current workspace, search within the working directory.",
-                msg
-            ));
-        }
+    if let Err(msg) = check_path_in_workspace(root) {
+        return Err(format!(
+            "{}\nPlease focus on the current workspace, search within the working directory.",
+            msg
+        ));
     }
 
     let mut files = Vec::new();
@@ -51,7 +66,19 @@ pub(super) async fn execute_glob_search(input: Value) -> Result<Value, String> {
     };
     match glob::glob(&glob_pattern) {
         Ok(entries) => {
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = entry.map_err(|error| format!("Glob traversal error: {error}"))?;
+                // A safe root does not make every expansion safe: a matching
+                // entry can traverse a symlink below that root. Validate every
+                // concrete result before exposing any of the collected names.
+                resolve_path_in_workspace(
+                    entry
+                        .to_str()
+                        .ok_or_else(|| "Glob result path is not valid UTF-8".to_string())?,
+                )?;
+                if crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(&entry) {
+                    continue;
+                }
                 if let Some(p) = entry.to_str() {
                     files.push(p.to_string());
                 }
@@ -64,11 +91,30 @@ pub(super) async fn execute_glob_search(input: Value) -> Result<Value, String> {
     Ok(json!({ "files": files, "count": files.len(), "pattern": params.pattern }))
 }
 
+fn validate_workspace_glob_pattern(pattern: &str) -> Result<(), String> {
+    let path = Path::new(pattern);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(format!(
+            "Glob pattern must be relative to its workspace search path and must not contain '..': {pattern}"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn execute_grep_search(input: Value) -> Result<Value, String> {
     let params: GrepSearchInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let root = params.path.as_deref().unwrap_or(".");
+    if let Err(message) = check_path_in_workspace(root) {
+        return Err(format!(
+            "{message}\nPlease focus on the current workspace, search within the working directory."
+        ));
+    }
     let mode = params
         .output_mode
         .as_deref()
@@ -280,6 +326,7 @@ fn is_build_or_vendored_dir(path: &std::path::Path) -> bool {
         ".venv",
         "__pycache__",
         ".next",
+        ".gliding_horse",
     ];
     let name = path.file_name().and_then(|n| n.to_str());
     matches!(name, Some(name) if EXCLUDED.contains(&name))
@@ -729,6 +776,15 @@ struct FileReadInput {
 struct FileWriteInput {
     path: String,
     content: String,
+    /// Kernel-issued optimistic-concurrency precondition. Model/tool JSON is
+    /// rejected if it contains any `__gh_*` field; only ToolExecutor may add
+    /// this value after the final Hook and workspace-lease checks.
+    #[serde(rename = "__gh_expected_current_sha256")]
+    expected_current_sha256: Option<String>,
+    /// Keep the low-level helper usable in focused filesystem tests while the
+    /// production ToolExecutor path fails closed for changed existing files.
+    #[serde(rename = "__gh_require_overwrite_baseline", default)]
+    require_overwrite_baseline: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,6 +810,10 @@ struct BashInput {
     filesystem_mode: Option<FilesystemIsolationMode>,
     #[serde(rename = "allowedMounts")]
     allowed_mounts: Option<Vec<String>>,
+    /// Injected by ToolExecutor after every model/Hook-visible trust boundary.
+    /// The public bash schema never advertises this reserved field.
+    #[serde(rename = "__gh_execution_profile", default)]
+    execution_profile: ToolExecutionProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -762,6 +822,31 @@ struct FileEditInput {
     old_string: String,
     new_string: String,
     replace_all: Option<bool>,
+    #[serde(rename = "__gh_expected_current_sha256")]
+    expected_current_sha256: Option<String>,
+    #[serde(rename = "__gh_require_overwrite_baseline", default)]
+    require_overwrite_baseline: bool,
+}
+
+fn enforce_kernel_overwrite_baseline(
+    existing: &ExistingWorkspaceFile,
+    expected_current_sha256: Option<&str>,
+    required: bool,
+) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    let expected = expected_current_sha256.ok_or_else(|| {
+        "overwrite_baseline_required: changing an existing file requires a successful whole-file read in the active Agent/L1 context"
+            .to_string()
+    })?;
+    let actual = CryptoUtils::sha256_hex_bytes(&existing.content);
+    if expected != actual {
+        return Err(format!(
+            "overwrite_baseline_stale: the file changed after the active Agent/L1 read it (expected {expected}, current {actual}); read the complete current file and retry"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -770,6 +855,8 @@ struct PowerShellInput {
     timeout: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
+    #[serde(rename = "__gh_execution_profile", default)]
+    execution_profile: ToolExecutionProfile,
 }
 
 pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
@@ -859,26 +946,47 @@ pub(super) async fn execute_file_read(input: Value) -> Result<Value, String> {
     Ok(json!({
         "path": params.path, "total_lines": total,
         "offset": start, "lines": selected, "returned": selected.len(),
+        "content_sha256": CryptoUtils::sha256_hex(&content),
     }))
 }
 
 pub(super) async fn execute_file_write(input: Value) -> Result<Value, String> {
     let params: FileWriteInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-    check_path_in_workspace(&params.path)?;
-    if let Some(parent) = std::path::Path::new(&params.path).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {}", e))?;
-    }
-    let existed = std::path::Path::new(&params.path).exists();
-    let changed = std::fs::read(&params.path)
-        .map(|existing| existing != params.content.as_bytes())
+    let target = SecureWorkspaceTarget::open(&params.path, true)?;
+    let existing = target.read_existing()?;
+    let existed = existing.is_some();
+    let changed = existing
+        .as_ref()
+        .map(|existing| existing.content != params.content.as_bytes())
         .unwrap_or(true);
-    if changed {
-        std::fs::write(&params.path, &params.content).map_err(|e| format!("Write error: {}", e))?;
-    }
+    let content_sha256 = if changed {
+        if let Some(existing) = existing.as_ref() {
+            enforce_kernel_overwrite_baseline(
+                existing,
+                params.expected_current_sha256.as_deref(),
+                params.require_overwrite_baseline,
+            )?;
+        }
+        target.commit(params.content.as_bytes(), existing.as_ref())?;
+        CryptoUtils::sha256_hex(&params.content)
+    } else {
+        let existing = existing
+            .as_ref()
+            .ok_or_else(|| "Workspace target disappeared before no-op verification".to_string())?;
+        let verified = target.verify_unchanged(existing, params.content.as_bytes())?;
+        let verified = std::str::from_utf8(&verified).map_err(|error| {
+            format!("Workspace target stopped being valid UTF-8 during final verification: {error}")
+        })?;
+        CryptoUtils::sha256_hex(verified)
+    };
     Ok(json!({
         "path": params.path,
         "bytes_written": if changed { params.content.len() } else { 0 },
+        // A changed write is atomically committed from this payload. A no-op
+        // hash is instead computed from bytes re-opened and revalidated at the
+        // final secure target, after the initial equality decision.
+        "content_sha256": content_sha256,
         "success": true,
         "changed": changed,
         "created": changed && !existed,
@@ -889,6 +997,10 @@ pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
     let params: FileListInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
     let dir = params.path.as_deref().unwrap_or(".");
+
+    if crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(Path::new(dir)) {
+        return Err("Workspace runtime state is not part of the project inventory".to_string());
+    }
 
     // check if within workspace
     if dir != "." {
@@ -904,6 +1016,9 @@ pub(super) async fn execute_file_list(input: Value) -> Result<Value, String> {
     let mut entries = Vec::new();
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("List error: {}", e))?;
     for entry in read_dir.flatten() {
+        if crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(&entry.path()) {
+            continue;
+        }
         let ft = entry.file_type().ok();
         let kind = if ft.map_or(false, |t| t.is_dir()) {
             "dir"
@@ -1029,6 +1144,7 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
             timeout: params.timeout,
             description: params.description,
             run_in_background: params.run_in_background,
+            execution_profile: params.execution_profile,
         })
         .map_err(|e| format!("Serialize error: {e}"))?;
         return execute_powershell(ps_input).await;
@@ -1043,9 +1159,24 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         let sandbox_status = sandbox_status_for_input(&params, &cwd);
         let sandbox_status_json = serde_json::to_value(&sandbox_status)
             .map_err(|e| format!("Sandbox status serialize error: {e}"))?;
+        if params.execution_profile.is_clean_verification()
+            && params.run_in_background.unwrap_or(false)
+        {
+            return Err(
+                "Clean verification profile requires a foreground verifier so its isolated cache lifetime can be bounded"
+                    .to_string(),
+            );
+        }
+        let verification_cache = verification_cache_isolation(params.execution_profile)?;
 
         if params.run_in_background.unwrap_or(false) {
-            let mut command = prepare_bash_spawn(&params.command, &cwd, &sandbox_status)?;
+            let mut command = prepare_bash_spawn(
+                &params.command,
+                &cwd,
+                &sandbox_status,
+                params.execution_profile,
+                verification_cache.as_ref().map(tempfile::TempDir::path),
+            )?;
             command
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -1070,6 +1201,8 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
             &guarded_command,
             &cwd,
             &sandbox_status,
+            params.execution_profile,
+            verification_cache.as_ref().map(tempfile::TempDir::path),
         )?);
         command.kill_on_drop(true);
         let mut child = command.spawn().map_err(|e| format!("Spawn error: {e}"))?;
@@ -1085,22 +1218,36 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
         let started = Instant::now();
         let wait_result =
             tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.wait()).await;
-        let (status, timed_out) = match wait_result {
-            Ok(result) => (Some(result.map_err(|e| format!("Wait error: {e}"))?), false),
+        let (status, timed_out, process_group_cleanup) = match wait_result {
+            Ok(result) => {
+                let status = result.map_err(|e| format!("Wait error: {e}"))?;
+                let cleanup = match pid {
+                    Some(pid) => settle_foreground_process_group(pid, None).await,
+                    None => Ok(ProcessGroupCleanup::default()),
+                };
+                (Some(status), false, cleanup)
+            }
             Err(_) => {
-                if let Some(pid) = pid {
-                    kill_process_group_by_id(pid).await;
+                let cleanup = match pid {
+                    Some(pid) => settle_foreground_process_group(pid, Some(&mut child)).await,
+                    None => Ok(ProcessGroupCleanup::default()),
+                };
+                // `settle_foreground_process_group` normally reaps the group
+                // leader while confirming that the PGID disappeared. Keep a
+                // direct-child fallback for platforms/errors where no usable
+                // process-group identity was available.
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill().await;
                 }
-                let _ = child.kill().await;
                 let _ = child.wait().await;
-                (None, true)
+                (None, true, cleanup)
             }
         };
         let stdout = join_output_capture(stdout_task).await;
         let stderr = join_output_capture(stderr_task).await;
         let original_size = stdout.total_bytes.saturating_add(stderr.total_bytes);
         if timed_out {
-            return Ok(json!({
+            let mut response = json!({
                 "command": params.command, "timed_out": true,
                 "stdout": stdout.text, "stderr": stderr.text,
                 "truncated": stdout.truncated || stderr.truncated,
@@ -1108,9 +1255,12 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
                 "duration_ms": started.elapsed().as_millis() as u64,
                 "error": format!("Timeout after {}ms", timeout_ms),
                 "sandbox_status": sandbox_status_json,
-            }));
+            });
+            attach_process_group_cleanup(&mut response, process_group_cleanup);
+            attach_verification_profile(&mut response, params.execution_profile);
+            return Ok(response);
         }
-        Ok(json!({
+        let mut response = json!({
             "command": params.command,
             "exit_code": status.and_then(|status| status.code()).unwrap_or(-1),
             "stdout": stdout.text, "stderr": stderr.text,
@@ -1118,7 +1268,10 @@ pub(super) async fn execute_bash(input: Value) -> Result<Value, String> {
             "truncated": stdout.truncated || stderr.truncated,
             "original_size": original_size,
             "sandbox_status": sandbox_status_json,
-        }))
+        });
+        attach_process_group_cleanup(&mut response, process_group_cleanup);
+        attach_verification_profile(&mut response, params.execution_profile);
+        Ok(response)
     }
 }
 
@@ -1149,18 +1302,26 @@ fn prepare_bash_spawn(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
+    execution_profile: ToolExecutionProfile,
+    verification_cache: Option<&Path>,
 ) -> Result<std::process::Command, String> {
     use std::process::Command;
+    let command = profiled_shell_command(command, execution_profile, verification_cache)?;
     if sandbox_status.filesystem_active {
         let _ = crate::tools::builtin::sandbox::ensure_sandbox_dirs(cwd);
     }
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
+    if let Some(launcher) = build_linux_sandbox_command(&command, cwd, sandbox_status) {
         let mut c = Command::new(launcher.program);
         c.args(launcher.args);
         c.current_dir(cwd);
         c.env_clear();
         c.envs(crate::tools::process_env::sanitized_child_environment(true));
+        // Agent shell probes should not leave interpreter cache artifacts in
+        // the user's deliverable. An explicit command-local assignment can
+        // still opt back in when bytecode-cache behavior is itself under test.
+        c.env("PYTHONDONTWRITEBYTECODE", "1");
         c.envs(launcher.env);
+        apply_clean_verification_environment(&mut c, execution_profile, verification_cache)?;
         c.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         #[cfg(unix)]
@@ -1170,13 +1331,15 @@ fn prepare_bash_spawn(
         return Ok(c);
     }
     let mut c = Command::new("sh");
-    c.arg("-lc").arg(command).current_dir(cwd);
+    c.arg("-lc").arg(&command).current_dir(cwd);
     c.env_clear();
     c.envs(crate::tools::process_env::sanitized_child_environment(true));
+    c.env("PYTHONDONTWRITEBYTECODE", "1");
     if sandbox_status.filesystem_active {
         c.env("HOME", cwd.join(".sandbox-home"));
         c.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
+    apply_clean_verification_environment(&mut c, execution_profile, verification_cache)?;
     c.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
@@ -1184,6 +1347,95 @@ fn prepare_bash_spawn(
         c.process_group(0);
     }
     Ok(c)
+}
+
+fn profiled_shell_command(
+    command: &str,
+    execution_profile: ToolExecutionProfile,
+    verification_cache: Option<&Path>,
+) -> Result<String, String> {
+    if execution_profile != ToolExecutionProfile::CleanMermaidVerification {
+        return Ok(command.to_string());
+    }
+    let cache = verification_cache.ok_or_else(|| {
+        "Clean Mermaid verification profile is missing its kernel-owned directory".to_string()
+    })?;
+    let config = cache.join("puppeteer.json");
+    let escaped_config = config.to_string_lossy().replace('\'', "'\"'\"'");
+    Ok(format!(
+        "mmdc() {{ command mmdc -p '{escaped_config}' \"$@\"; }}\n{command}"
+    ))
+}
+
+fn verification_cache_isolation(
+    execution_profile: ToolExecutionProfile,
+) -> Result<Option<tempfile::TempDir>, String> {
+    if !execution_profile.is_clean_verification() {
+        return Ok(None);
+    }
+    tempfile::Builder::new()
+        .prefix("glidinghorse-verification-")
+        .tempdir()
+        .map(Some)
+        .map_err(|error| format!("Cannot create isolated verification cache: {error}"))
+}
+
+fn apply_clean_verification_environment(
+    command: &mut std::process::Command,
+    execution_profile: ToolExecutionProfile,
+    verification_cache: Option<&Path>,
+) -> Result<(), String> {
+    if !execution_profile.is_clean_verification() {
+        return Ok(());
+    }
+    let cache = verification_cache.ok_or_else(|| {
+        "Clean verification profile is missing its kernel-owned cache directory".to_string()
+    })?;
+    match execution_profile {
+        ToolExecutionProfile::CleanPythonVerification => {
+            command.env("PYTHONPYCACHEPREFIX", cache.join("pycache"));
+        }
+        ToolExecutionProfile::CleanPytestVerification => {
+            command.env("PYTHONPYCACHEPREFIX", cache.join("pycache"));
+            command.env(
+                "PYTEST_ADDOPTS",
+                format!("-o cache_dir={}", cache.join("pytest-cache").display()),
+            );
+        }
+        ToolExecutionProfile::CleanMermaidVerification => {
+            std::fs::write(
+                cache.join("puppeteer.json"),
+                r#"{"args":["--no-sandbox","--disable-setuid-sandbox"]}
+"#,
+            )
+            .map_err(|error| {
+                format!("Cannot create kernel-owned Mermaid verifier config: {error}")
+            })?;
+        }
+        ToolExecutionProfile::Standard => {}
+    }
+    Ok(())
+}
+
+fn attach_verification_profile(response: &mut Value, execution_profile: ToolExecutionProfile) {
+    if !execution_profile.is_clean_verification() {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "execution_profile".to_string(),
+            serde_json::to_value(execution_profile)
+                .expect("ToolExecutionProfile is always JSON serializable"),
+        );
+        object.insert(
+            "isolated_environment".to_string(),
+            json!({
+                "PYTHONPYCACHEPREFIX": execution_profile.is_python_verification(),
+                "PYTEST_ADDOPTS": execution_profile == ToolExecutionProfile::CleanPytestVerification,
+                "PUPPETEER_CONFIG": execution_profile == ToolExecutionProfile::CleanMermaidVerification,
+            }),
+        );
+    }
 }
 
 const MAX_OUTPUT_BYTES: usize = 16_384;
@@ -1259,70 +1511,851 @@ killall() {{
     )
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessGroupCleanup {
+    residual_processes_detected: bool,
+    forced_kill: bool,
+}
+
+fn attach_process_group_cleanup(
+    response: &mut Value,
+    cleanup: Result<ProcessGroupCleanup, String>,
+) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    match cleanup {
+        Ok(cleanup) if cleanup.residual_processes_detected => {
+            object.insert(
+                "process_group_cleanup".to_string(),
+                json!({
+                    "residual_processes_detected": true,
+                    "forced_kill": cleanup.forced_kill,
+                    "confirmed_gone": true,
+                }),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            object.insert(
+                "process_group_cleanup".to_string(),
+                json!({
+                    "residual_processes_detected": true,
+                    "confirmed_gone": false,
+                    "error": error,
+                }),
+            );
+            object.entry("error".to_string()).or_insert_with(|| {
+                Value::String(
+                    "Foreground command finished, but its process group could not be settled"
+                        .to_string(),
+                )
+            });
+        }
+    }
+}
+
 #[cfg(unix)]
-async fn kill_process_group_by_id(process_group_id: u32) {
-    let _ = tokio::process::Command::new("kill")
-        .arg("--")
-        .arg(format!("-{process_group_id}"))
-        .status()
+fn checked_process_group_id(process_group_id: u32) -> Result<libc::pid_t, String> {
+    let process_group_id = libc::pid_t::try_from(process_group_id)
+        .map_err(|_| "spawned process-group id exceeds the platform PID range".to_string())?;
+    let current_pid = unsafe { libc::getpid() };
+    let current_group = unsafe { libc::getpgrp() };
+    if process_group_id <= 1 || process_group_id == current_pid || process_group_id == current_group
+    {
+        return Err(format!(
+            "refusing unsafe foreground process-group target {process_group_id}"
+        ));
+    }
+    Ok(process_group_id)
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group_id: libc::pid_t) -> Result<bool, String> {
+    if unsafe { libc::kill(-process_group_id, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        // The group exists even though the current process cannot signal it.
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(format!(
+            "cannot inspect foreground process group {process_group_id}: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group_id: libc::pid_t, signal: libc::c_int) -> Result<(), String> {
+    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot signal foreground process group {process_group_id} with {signal}: {error}"
+    ))
+}
+
+#[cfg(unix)]
+fn reap_group_leader_if_exited(
+    group_leader: &mut Option<&mut tokio::process::Child>,
+) -> Result<(), String> {
+    let exited = match group_leader.as_deref_mut() {
+        Some(child) => child
+            .try_wait()
+            .map_err(|error| format!("cannot reap foreground process-group leader: {error}"))?
+            .is_some(),
+        None => false,
+    };
+    if exited {
+        *group_leader = None;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(
+    process_group_id: libc::pid_t,
+    group_leader: &mut Option<&mut tokio::process::Child>,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        reap_group_leader_if_exited(group_leader)?;
+        if !process_group_exists(process_group_id)? {
+            return Ok(true);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(
+            std::time::Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
+        )
         .await;
+    }
+}
+
+/// Settle every process which remains in the foreground shell's dedicated
+/// process group. A model can spell `nohup ... &` inside a nominally
+/// foreground command without setting the structured `run_in_background`
+/// flag. Waiting only for the group leader would then let a descendant write
+/// after AgentRunner's post-execution workspace snapshot.
+///
+/// This function uses kernel signals directly, never a PATH-resolved `kill`
+/// utility. The PGID is the child PID assigned by `CommandExt::process_group`
+/// and is rejected if it could identify PID 1, this process, or the host
+/// process group. TERM offers a short graceful window; KILL and a second
+/// bounded poll make successful return an explicit no-live-group receipt.
+#[cfg(unix)]
+async fn settle_foreground_process_group(
+    process_group_id: u32,
+    group_leader: Option<&mut tokio::process::Child>,
+) -> Result<ProcessGroupCleanup, String> {
+    const TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+    const KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+
+    let process_group_id = checked_process_group_id(process_group_id)?;
+    let mut group_leader = group_leader;
+    reap_group_leader_if_exited(&mut group_leader)?;
+    if !process_group_exists(process_group_id)? {
+        return Ok(ProcessGroupCleanup::default());
+    }
+
+    signal_process_group(process_group_id, libc::SIGTERM)?;
+    if wait_for_process_group_exit(process_group_id, &mut group_leader, TERM_GRACE).await? {
+        return Ok(ProcessGroupCleanup {
+            residual_processes_detected: true,
+            forced_kill: false,
+        });
+    }
+
+    signal_process_group(process_group_id, libc::SIGKILL)?;
+    if wait_for_process_group_exit(process_group_id, &mut group_leader, KILL_GRACE).await? {
+        return Ok(ProcessGroupCleanup {
+            residual_processes_detected: true,
+            forced_kill: true,
+        });
+    }
+    Err(format!(
+        "foreground process group {process_group_id} still exists after TERM and KILL"
+    ))
 }
 
 #[cfg(not(unix))]
-async fn kill_process_group_by_id(_process_group_id: u32) {}
+async fn settle_foreground_process_group(
+    _process_group_id: u32,
+    _group_leader: Option<&mut tokio::process::Child>,
+) -> Result<ProcessGroupCleanup, String> {
+    Ok(ProcessGroupCleanup::default())
+}
 
-/// Check if a path is within the current working directory (workspace).
-/// Returns an error if the path is outside the workspace.
-/// For non-existent paths (e.g. file_write creating new files), checks the parent directory.
-fn check_path_in_workspace(path: &str) -> Result<(), String> {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-    let cwd_canonical = match cwd.canonicalize() {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-
-    let requested = std::path::Path::new(path);
-    // relative path: join with cwd then resolve; absolute path: resolve directly
-    let requested_abs = if requested.is_relative() {
-        cwd.join(requested)
+/// Resolve a path against the current workspace using the nearest existing
+/// ancestor. Unlike `Path::exists`, `symlink_metadata` treats dangling links as
+/// existing, so an unresolved link is rejected instead of being mistaken for
+/// a harmless missing directory.
+pub(super) fn resolve_path_in_workspace(path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("Cannot determine the current workspace: {error}"))?;
+    let workspace = std::fs::canonicalize(&cwd)
+        .map_err(|error| format!("Cannot resolve the current workspace: {error}"))?;
+    let requested = Path::new(path);
+    let requested = if requested.is_absolute() {
+        normalize_absolute_path(requested)?
     } else {
-        requested.to_path_buf()
+        normalize_absolute_path(&cwd.join(requested))?
     };
-    // try to canonicalize path; if file doesn't exist, check parent directory is within workspace
-    let check_path = match requested_abs.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // file doesn't exist, check parent
-            match requested_abs.parent() {
-                Some(parent) => match parent.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()), // parent also doesn't exist, don't block
-                },
-                None => return Ok(()), // no parent (e.g. root path), don't block
+
+    let mut ancestor = requested.clone();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor
+                    .file_name()
+                    .ok_or_else(|| format!("Path has no resolvable workspace ancestor: {path}"))?;
+                missing.push(name.to_os_string());
+                if !ancestor.pop() {
+                    return Err(format!("Path has no resolvable workspace ancestor: {path}"));
+                }
+            }
+            Err(error) => {
+                return Err(format!("Cannot inspect requested path ancestor: {error}"));
             }
         }
-    };
+    }
 
-    if !check_path.starts_with(&cwd_canonical) {
+    let mut resolved = std::fs::canonicalize(&ancestor)
+        .map_err(|error| format!("Cannot resolve requested path ancestor: {error}"))?;
+    if !resolved.starts_with(&workspace) {
         return Err(format!(
             "Path is not within the workspace: {}. The current task should only access files in the workspace.",
-            check_path.display(),
+            resolved.display(),
         ));
     }
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    if !resolved.starts_with(&workspace) {
+        return Err(format!(
+            "Path is not within the workspace: {}. The current task should only access files in the workspace.",
+            resolved.display(),
+        ));
+    }
+    Ok((workspace, resolved))
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Workspace path normalization requires an absolute path".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "Path escapes the filesystem root during normalization: {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    if !normalized.is_absolute() {
+        return Err(format!(
+            "Path is not absolute after normalization: {}",
+            path.display()
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Check whether a path resolves inside the workspace. Mutation handlers do
+/// not rely on this check alone: they use `SecureWorkspaceTarget`, which binds
+/// traversal and commit to directory file descriptors to close the TOCTOU
+/// window between validation and I/O.
+fn check_path_in_workspace(path: &str) -> Result<(), String> {
+    resolve_path_in_workspace(path).map(|_| ())
+}
+
+struct ExistingWorkspaceFile {
+    content: Vec<u8>,
+    #[cfg(unix)]
+    mode: libc::mode_t,
+    #[cfg(unix)]
+    device: libc::dev_t,
+    #[cfg(unix)]
+    inode: libc::ino_t,
+}
+
+#[cfg(unix)]
+struct SecureWorkspaceTarget {
+    root: OwnedFd,
+    parent: OwnedFd,
+    workspace: PathBuf,
+    parent_components: Vec<CString>,
+    file_name: CString,
+}
+
+#[cfg(unix)]
+static SECURE_WRITE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+impl SecureWorkspaceTarget {
+    fn open(path: &str, create_parents: bool) -> Result<Self, String> {
+        // Open `.` before resolving its printable path. This descriptor is the
+        // capability boundary used by every later filesystem operation.
+        let root = open_directory(CStr::from_bytes_with_nul(b".\0").expect("static C string"))
+            .map_err(|error| format!("Cannot open current workspace: {error}"))?;
+        let (workspace, resolved) = resolve_path_in_workspace(path)?;
+        verify_workspace_identity(&root, &workspace)?;
+        let relative = resolved.strip_prefix(&workspace).map_err(|_| {
+            format!(
+                "Resolved path is outside the workspace: {}",
+                resolved.display()
+            )
+        })?;
+        let mut components = relative.components().peekable();
+        let mut parent_components = Vec::new();
+        let mut file_name = None;
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(format!(
+                    "Workspace path is not normalized: {}",
+                    resolved.display()
+                ));
+            };
+            if components.peek().is_none() {
+                file_name = Some(os_str_to_cstring(name)?);
+                break;
+            }
+            parent_components.push(os_str_to_cstring(name)?);
+        }
+        let file_name =
+            file_name.ok_or_else(|| "Workspace root is not a file target".to_string())?;
+        let parent = open_parent_from_root(&root, &parent_components, create_parents)
+            .map_err(|error| format!("Cannot securely traverse workspace path: {error}"))?;
+        Ok(Self {
+            root,
+            parent,
+            workspace,
+            parent_components,
+            file_name,
+        })
+    }
+
+    fn read_existing(&self) -> Result<Option<ExistingWorkspaceFile>, String> {
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let raw = unsafe { libc::openat(self.parent.as_raw_fd(), self.file_name.as_ptr(), flags) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(format!("Cannot securely open workspace file: {error}"));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let metadata = metadata_for_fd(fd.as_raw_fd())
+            .map_err(|error| format!("Cannot inspect workspace file: {error}"))?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err("Workspace mutation target must be a regular file".to_string());
+        }
+        let mode = metadata.st_mode;
+        let device = metadata.st_dev;
+        let inode = metadata.st_ino;
+        let mut file: std::fs::File = fd.into();
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut content)
+            .map_err(|error| format!("Read error: {error}"))?;
+        Ok(Some(ExistingWorkspaceFile {
+            content,
+            mode,
+            device,
+            inode,
+        }))
+    }
+
+    /// Re-establish the full descriptor-relative path and final-name binding
+    /// before certifying a no-op write. The initial equality read is not
+    /// enough: another process could replace the parent, swap in a symlink, or
+    /// modify/replace the file before `execute_file_write` returns its digest.
+    fn verify_unchanged(
+        &self,
+        existing: &ExistingWorkspaceFile,
+        expected_content: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if existing.content != expected_content {
+            return Err(
+                "Workspace target did not match the requested no-op content initially".to_string(),
+            );
+        }
+
+        let parent = self.revalidate_parent().map_err(|error| {
+            format!("Workspace target changed during no-op verification: {error}")
+        })?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let raw = unsafe { libc::openat(parent.as_raw_fd(), self.file_name.as_ptr(), flags) };
+        if raw < 0 {
+            return Err(format!(
+                "Workspace target is no longer safe during no-op verification: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let metadata = metadata_for_fd(fd.as_raw_fd()).map_err(|error| {
+            format!("Cannot inspect workspace target during no-op verification: {error}")
+        })?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(
+                "Workspace no-op target must remain a regular file during verification".to_string(),
+            );
+        }
+        if metadata.st_dev != existing.device || metadata.st_ino != existing.inode {
+            return Err(
+                "Workspace target identity changed concurrently during no-op verification"
+                    .to_string(),
+            );
+        }
+
+        let mut file: std::fs::File = fd.into();
+        let mut observed = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut observed).map_err(|error| {
+            format!("Cannot read workspace target during no-op verification: {error}")
+        })?;
+        if observed != existing.content || observed != expected_content {
+            return Err(
+                "Workspace target bytes changed concurrently during no-op verification".to_string(),
+            );
+        }
+
+        self.ensure_same_commit_parent(&parent).map_err(|error| {
+            format!("Workspace target changed during no-op verification: {error}")
+        })?;
+        self.verify_named_target_identity(&parent, existing)?;
+
+        // Re-read after the pathname checks so the returned digest is derived
+        // from the last fully observed target bytes, not the earlier equality
+        // read. A final name/parent check then catches a replacement during
+        // this read.
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(|error| {
+            format!("Cannot rewind workspace target during no-op verification: {error}")
+        })?;
+        let mut final_content = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut final_content).map_err(|error| {
+            format!("Cannot re-read workspace target during no-op verification: {error}")
+        })?;
+        if final_content != observed || final_content != expected_content {
+            return Err(
+                "Workspace target bytes changed concurrently during final no-op verification"
+                    .to_string(),
+            );
+        }
+        self.ensure_same_commit_parent(&parent).map_err(|error| {
+            format!("Workspace target changed during final no-op verification: {error}")
+        })?;
+        self.verify_named_target_identity(&parent, existing)?;
+        Ok(final_content)
+    }
+
+    fn verify_named_target_identity(
+        &self,
+        parent: &OwnedFd,
+        existing: &ExistingWorkspaceFile,
+    ) -> Result<(), String> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                self.file_name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "Cannot inspect final workspace name during no-op verification: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(
+                "Workspace final name stopped identifying a regular file during no-op verification"
+                    .to_string(),
+            );
+        }
+        if metadata.st_dev != existing.device || metadata.st_ino != existing.inode {
+            return Err(
+                "Workspace final name identity changed concurrently during no-op verification"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn commit(
+        &self,
+        content: &[u8],
+        existing: Option<&ExistingWorkspaceFile>,
+    ) -> Result<(), String> {
+        let parent = self.revalidate_parent()?;
+        let (temp_name, raw) = self.create_temp_file(parent.as_raw_fd())?;
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let result = (|| -> Result<(), String> {
+            if let Some(existing) = existing {
+                let permissions = existing.mode & 0o7777;
+                if unsafe { libc::fchmod(file.as_raw_fd(), permissions) } != 0 {
+                    return Err(format!(
+                        "Cannot preserve workspace file permissions: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            std::io::Write::write_all(&mut file, content)
+                .map_err(|error| format!("Write error: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("Cannot sync workspace file: {error}"))?;
+            drop(file);
+            self.ensure_same_commit_parent(&parent)?;
+            self.verify_final_target(&parent, existing)?;
+            if unsafe {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    temp_name.as_ptr(),
+                    parent.as_raw_fd(),
+                    self.file_name.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "Cannot atomically commit workspace file: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), temp_name.as_ptr(), 0);
+            }
+        }
+        result
+    }
+
+    fn verify_final_target(
+        &self,
+        parent: &OwnedFd,
+        existing: Option<&ExistingWorkspaceFile>,
+    ) -> Result<(), String> {
+        let Some(existing) = existing else {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    self.file_name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                return Err("Workspace target appeared concurrently before commit".to_string());
+            }
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(format!("Cannot verify new workspace target: {error}"))
+            };
+        };
+
+        // Re-open the final name with write permission immediately before the
+        // rename. Besides preserving historical read-only-file behavior, the
+        // byte comparison prevents silently overwriting an in-place edit that
+        // happened after our initial read.
+        let flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let raw = unsafe { libc::openat(parent.as_raw_fd(), self.file_name.as_ptr(), flags) };
+        if raw < 0 {
+            return Err(format!(
+                "Workspace target is no longer safely writable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let metadata = metadata_for_fd(fd.as_raw_fd())
+            .map_err(|error| format!("Cannot inspect workspace target before commit: {error}"))?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err("Workspace mutation target must remain a regular file".to_string());
+        }
+        if metadata.st_dev != existing.device || metadata.st_ino != existing.inode {
+            return Err("Workspace target identity changed concurrently before commit".to_string());
+        }
+        let mut file: std::fs::File = fd.into();
+        let mut current = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut current)
+            .map_err(|error| format!("Cannot re-read workspace target before commit: {error}"))?;
+        if current != existing.content {
+            return Err("Workspace target changed concurrently before commit".to_string());
+        }
+        Ok(())
+    }
+
+    fn revalidate_parent(&self) -> Result<OwnedFd, String> {
+        verify_workspace_identity(&self.root, &self.workspace)?;
+        let current = open_parent_from_root(&self.root, &self.parent_components, false)
+            .map_err(|error| format!("Workspace target changed before commit: {error}"))?;
+        if !same_open_file(&self.parent, &current)? {
+            return Err("Workspace target directory identity changed before commit".to_string());
+        }
+        Ok(current)
+    }
+
+    fn ensure_same_commit_parent(&self, parent: &OwnedFd) -> Result<(), String> {
+        verify_workspace_identity(&self.root, &self.workspace)?;
+        let current = open_parent_from_root(&self.root, &self.parent_components, false)
+            .map_err(|error| format!("Workspace target changed during commit: {error}"))?;
+        if !same_open_file(parent, &current)? {
+            return Err("Workspace target directory identity changed during commit".to_string());
+        }
+        Ok(())
+    }
+
+    fn create_temp_file(&self, parent: RawFd) -> Result<(CString, RawFd), String> {
+        for _ in 0..128 {
+            let nonce = SECURE_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let name = CString::new(format!(
+                ".glidinghorse-write-{}-{nonce}.tmp",
+                std::process::id()
+            ))
+            .expect("generated temporary name contains no NUL");
+            let flags =
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            let raw = unsafe { libc::openat(parent, name.as_ptr(), flags, 0o666) };
+            if raw >= 0 {
+                return Ok((name, raw));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("Cannot create workspace temporary file: {error}"));
+            }
+        }
+        Err("Cannot allocate a unique workspace temporary file".to_string())
+    }
+}
+
+#[cfg(unix)]
+fn open_parent_from_root(
+    root: &OwnedFd,
+    components: &[CString],
+    create: bool,
+) -> std::io::Result<OwnedFd> {
+    let raw = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut parent = unsafe { OwnedFd::from_raw_fd(raw) };
+    for component in components {
+        parent = open_or_create_directory_at(parent.as_raw_fd(), component, create)?;
+    }
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn same_open_file(left: &OwnedFd, right: &OwnedFd) -> Result<bool, String> {
+    let left = metadata_for_fd(left.as_raw_fd())
+        .map_err(|error| format!("Cannot inspect original workspace directory: {error}"))?;
+    let right = metadata_for_fd(right.as_raw_fd())
+        .map_err(|error| format!("Cannot inspect current workspace directory: {error}"))?;
+    Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+}
+
+#[cfg(unix)]
+fn open_directory(path: &CStr) -> std::io::Result<OwnedFd> {
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+}
+
+#[cfg(unix)]
+fn open_or_create_directory_at(
+    parent: RawFd,
+    name: &CStr,
+    create: bool,
+) -> std::io::Result<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut raw = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if raw < 0 && create {
+        let open_error = std::io::Error::last_os_error();
+        if open_error.kind() == std::io::ErrorKind::NotFound {
+            if unsafe { libc::mkdirat(parent, name.as_ptr(), 0o777) } != 0 {
+                let mkdir_error = std::io::Error::last_os_error();
+                if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(mkdir_error);
+                }
+            }
+            raw = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+        }
+    }
+    if raw < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+}
+
+#[cfg(unix)]
+fn verify_workspace_identity(root: &OwnedFd, workspace: &Path) -> Result<(), String> {
+    let descriptor = metadata_for_fd(root.as_raw_fd())
+        .map_err(|error| format!("Cannot inspect workspace descriptor: {error}"))?;
+    let path_metadata = std::fs::metadata(workspace)
+        .map_err(|error| format!("Cannot inspect resolved workspace: {error}"))?;
+    if descriptor.st_dev != path_metadata.dev() || descriptor.st_ino != path_metadata.ino() {
+        return Err("Current workspace identity changed during path resolution".to_string());
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_for_fd(fd: RawFd) -> std::io::Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { metadata.assume_init() })
+    }
+}
+
+#[cfg(unix)]
+fn os_str_to_cstring(value: &OsStr) -> Result<CString, String> {
+    CString::new(value.as_bytes())
+        .map_err(|_| "Workspace paths must not contain NUL bytes".to_string())
+}
+
+// Unix provides the descriptor-relative primitives needed for strict
+// race-resistant traversal. Other targets retain fail-closed containment
+// checks; platform-specific handle-relative APIs can replace this fallback
+// without changing the mutation handlers.
+#[cfg(not(unix))]
+struct SecureWorkspaceTarget {
+    path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl SecureWorkspaceTarget {
+    fn open(path: &str, create_parents: bool) -> Result<Self, String> {
+        let (_, resolved) = resolve_path_in_workspace(path)?;
+        let parent = resolved
+            .parent()
+            .ok_or_else(|| "Workspace root is not a file target".to_string())?;
+        if create_parents {
+            std::fs::create_dir_all(parent).map_err(|error| format!("Mkdir error: {error}"))?;
+        }
+        let canonical_parent = std::fs::canonicalize(parent)
+            .map_err(|error| format!("Cannot resolve workspace parent: {error}"))?;
+        let workspace = std::fs::canonicalize(
+            std::env::current_dir()
+                .map_err(|error| format!("Cannot determine the current workspace: {error}"))?,
+        )
+        .map_err(|error| format!("Cannot resolve the current workspace: {error}"))?;
+        if !canonical_parent.starts_with(&workspace) {
+            return Err("Workspace parent escaped during path preparation".to_string());
+        }
+        let file_name = resolved
+            .file_name()
+            .ok_or_else(|| "Workspace root is not a file target".to_string())?;
+        Ok(Self {
+            path: canonical_parent.join(file_name),
+        })
+    }
+
+    fn read_existing(&self) -> Result<Option<ExistingWorkspaceFile>, String> {
+        match std::fs::read(&self.path) {
+            Ok(content) => Ok(Some(ExistingWorkspaceFile { content })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("Read error: {error}")),
+        }
+    }
+
+    fn verify_unchanged(
+        &self,
+        existing: &ExistingWorkspaceFile,
+        expected_content: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if existing.content != expected_content {
+            return Err(
+                "Workspace target did not match the requested no-op content initially".to_string(),
+            );
+        }
+        let metadata = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("Cannot inspect no-op workspace target: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err("Workspace no-op target must remain a regular file".to_string());
+        }
+        let canonical = std::fs::canonicalize(&self.path)
+            .map_err(|error| format!("Cannot resolve no-op workspace target: {error}"))?;
+        let workspace = std::fs::canonicalize(
+            std::env::current_dir()
+                .map_err(|error| format!("Cannot determine the current workspace: {error}"))?,
+        )
+        .map_err(|error| format!("Cannot resolve the current workspace: {error}"))?;
+        if !canonical.starts_with(&workspace) {
+            return Err("Workspace target escaped during no-op verification".to_string());
+        }
+        let observed = std::fs::read(&self.path)
+            .map_err(|error| format!("Cannot read no-op workspace target: {error}"))?;
+        if observed != existing.content || observed != expected_content {
+            return Err(
+                "Workspace target bytes changed concurrently during no-op verification".to_string(),
+            );
+        }
+        let final_metadata = std::fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("Cannot re-inspect no-op workspace target: {error}"))?;
+        let final_content = std::fs::read(&self.path)
+            .map_err(|error| format!("Cannot re-read no-op workspace target: {error}"))?;
+        if !final_metadata.file_type().is_file()
+            || final_content != observed
+            || final_content != expected_content
+        {
+            return Err("Workspace target changed during final no-op verification".to_string());
+        }
+        Ok(final_content)
+    }
+
+    fn commit(
+        &self,
+        content: &[u8],
+        _existing: Option<&ExistingWorkspaceFile>,
+    ) -> Result<(), String> {
+        std::fs::write(&self.path, content).map_err(|error| format!("Write error: {error}"))
+    }
 }
 
 pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
     let params: FileEditInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
-
-    check_path_in_workspace(&params.path)?;
-
-    let content =
-        std::fs::read_to_string(&params.path).map_err(|e| format!("Read error: {}", e))?;
+    let target = SecureWorkspaceTarget::open(&params.path, false)?;
+    let existing = target
+        .read_existing()?
+        .ok_or_else(|| format!("Read error: file not found: {}", params.path))?;
+    let content = String::from_utf8(existing.content.clone())
+        .map_err(|error| format!("Read error: workspace file is not UTF-8 text: {error}"))?;
 
     let count = content.matches(&params.old_string).count();
     if count == 0 {
@@ -1354,7 +2387,12 @@ pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
 
     let changed = new_content != content;
     if changed {
-        std::fs::write(&params.path, &new_content).map_err(|e| format!("Write error: {}", e))?;
+        enforce_kernel_overwrite_baseline(
+            &existing,
+            params.expected_current_sha256.as_deref(),
+            params.require_overwrite_baseline,
+        )?;
+        target.commit(new_content.as_bytes(), Some(&existing))?;
     }
 
     Ok(json!({
@@ -1362,6 +2400,8 @@ pub(super) async fn execute_file_edit(input: Value) -> Result<Value, String> {
         "success": true,
         "changed": changed,
         "replacements": if changed { replacements } else { 0 },
+        "content_sha256": CryptoUtils::sha256_hex(&new_content),
+        "size_bytes": new_content.len(),
         "diff": diff,
     }))
 }
@@ -1393,6 +2433,15 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
     let params: PowerShellInput =
         serde_json::from_value(input).map_err(|e| format!("Invalid input: {}", e))?;
 
+    if params.execution_profile.is_clean_verification() && params.run_in_background.unwrap_or(false)
+    {
+        return Err(
+            "Clean verification profile requires a foreground verifier so its isolated cache lifetime can be bounded"
+                .to_string(),
+        );
+    }
+    let verification_cache = verification_cache_isolation(params.execution_profile)?;
+
     let exe = if cfg!(target_os = "windows") {
         "powershell"
     } else {
@@ -1405,15 +2454,31 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
     };
 
     let timeout_ms = params.timeout.unwrap_or(60_000);
+    let profiled_command = profiled_powershell_command(
+        &params.command,
+        params.execution_profile,
+        verification_cache.as_ref().map(tempfile::TempDir::path),
+    )?;
 
     let mut command = tokio::process::Command::new(&exe_path);
     command
-        .args(["-NoProfile", "-NonInteractive", "-Command", &params.command])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &profiled_command,
+        ])
         .env_clear()
         .envs(crate::tools::process_env::sanitized_child_environment(true))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    apply_clean_verification_environment_tokio(
+        &mut command,
+        params.execution_profile,
+        verification_cache.as_ref().map(tempfile::TempDir::path),
+    )?;
     let mut child = command.spawn().map_err(|e| format!("Spawn error: {}", e))?;
 
     let stdout_task = child
@@ -1443,7 +2508,7 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
     let original_size = stdout.total_bytes.saturating_add(stderr.total_bytes);
 
     if timed_out {
-        return Ok(json!({
+        let mut response = json!({
             "command": params.command,
             "timed_out": true,
             "stdout": stdout.text,
@@ -1453,10 +2518,12 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
             "duration_ms": started.elapsed().as_millis() as u64,
             "error": format!("Timeout after {}ms", timeout_ms),
             "shell": exe,
-        }));
+        });
+        attach_verification_profile(&mut response, params.execution_profile);
+        return Ok(response);
     }
 
-    Ok(json!({
+    let mut response = json!({
         "command": params.command,
         "exit_code": status.and_then(|status| status.code()).unwrap_or(-1),
         "stdout": stdout.text,
@@ -1465,7 +2532,64 @@ pub(super) async fn execute_powershell(input: Value) -> Result<Value, String> {
         "original_size": original_size,
         "duration_ms": started.elapsed().as_millis() as u64,
         "shell": exe,
-    }))
+    });
+    attach_verification_profile(&mut response, params.execution_profile);
+    Ok(response)
+}
+
+fn apply_clean_verification_environment_tokio(
+    command: &mut tokio::process::Command,
+    execution_profile: ToolExecutionProfile,
+    verification_cache: Option<&Path>,
+) -> Result<(), String> {
+    if !execution_profile.is_clean_verification() {
+        return Ok(());
+    }
+    let cache = verification_cache.ok_or_else(|| {
+        "Clean verification profile is missing its kernel-owned cache directory".to_string()
+    })?;
+    match execution_profile {
+        ToolExecutionProfile::CleanPythonVerification => {
+            command.env("PYTHONPYCACHEPREFIX", cache.join("pycache"));
+        }
+        ToolExecutionProfile::CleanPytestVerification => {
+            command.env("PYTHONPYCACHEPREFIX", cache.join("pycache"));
+            command.env(
+                "PYTEST_ADDOPTS",
+                format!("-o cache_dir={}", cache.join("pytest-cache").display()),
+            );
+        }
+        ToolExecutionProfile::CleanMermaidVerification => {
+            std::fs::write(
+                cache.join("puppeteer.json"),
+                r#"{"args":["--no-sandbox","--disable-setuid-sandbox"]}
+"#,
+            )
+            .map_err(|error| {
+                format!("Cannot create kernel-owned Mermaid verifier config: {error}")
+            })?;
+        }
+        ToolExecutionProfile::Standard => {}
+    }
+    Ok(())
+}
+
+fn profiled_powershell_command(
+    command: &str,
+    execution_profile: ToolExecutionProfile,
+    verification_cache: Option<&Path>,
+) -> Result<String, String> {
+    if execution_profile != ToolExecutionProfile::CleanMermaidVerification {
+        return Ok(command.to_string());
+    }
+    let cache = verification_cache.ok_or_else(|| {
+        "Clean Mermaid verification profile is missing its kernel-owned directory".to_string()
+    })?;
+    let config = cache.join("puppeteer.json");
+    let escaped_config = config.to_string_lossy().replace('\'', "''");
+    Ok(format!(
+        "$ghMmdc = (Get-Command mmdc -CommandType Application).Source; function mmdc {{ & $ghMmdc -p '{escaped_config}' @args }}; {command}"
+    ))
 }
 
 fn which_powershell(exe: &str) -> Option<String> {
@@ -1820,10 +2944,12 @@ mod web_search_filter_tests {
 
 pub(super) async fn execute_create_skill(
     input: Value,
+    interactions: Option<Arc<crate::llm::LlmInteractionService>>,
     gateway: Option<Arc<crate::gateway::unified_gateway::UnifiedGateway>>,
     shared_graph: Option<Arc<SkillGraphStore>>,
     shared_registry: Option<Arc<crate::tools::SkillRegistry>>,
     vector_store: Option<Arc<crate::memory::hyperspace_store::HyperspaceStore>>,
+    interaction_scope: Option<crate::llm::LlmInteractionScope>,
 ) -> Result<Value, String> {
     let description = input["description"].as_str().unwrap_or("").to_string();
     if description.is_empty() {
@@ -1834,13 +2960,27 @@ pub(super) async fn execute_create_skill(
     let category_hint = input["category_hint"].as_str().map(String::from);
     let security_level_override = input["security_level_override"].as_str().map(String::from);
 
-    if let Some(gateway) = gateway {
+    if interactions.is_some() || gateway.is_some() {
         let graph_store =
             shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
         let registry = shared_registry
             .unwrap_or_else(|| std::sync::Arc::new(crate::tools::SkillRegistry::new()));
         let config = crate::skill_graph::SkillCreatorConfig::default();
-        let creator = crate::skill_graph::SkillCreator::new(gateway, graph_store, registry, config);
+        let creator = if let Some(interactions) = interactions {
+            crate::skill_graph::SkillCreator::new_with_interactions(
+                interactions,
+                graph_store,
+                registry,
+                config,
+            )
+        } else {
+            crate::skill_graph::SkillCreator::new(
+                gateway.expect("gateway checked above"),
+                graph_store,
+                registry,
+                config,
+            )
+        };
         let creator = match vector_store {
             Some(store) => creator.with_vector_store(store),
             None => creator,
@@ -1853,10 +2993,15 @@ pub(super) async fn execute_create_skill(
             security_level_override,
         };
 
-        let result = creator
-            .create_from_description(request)
-            .await
-            .map_err(|e| format!("Create Skill failed: {:?}", e))?;
+        let result = match interaction_scope {
+            Some(scope) => {
+                creator
+                    .create_from_description_with_scope(request, scope)
+                    .await
+            }
+            None => creator.create_from_description(request).await,
+        }
+        .map_err(|e| format!("Create Skill failed: {:?}", e))?;
 
         Ok(json!({
             "skill_iri": result.skill_iri,
@@ -1893,10 +3038,12 @@ pub(super) async fn execute_create_skill(
 
 pub(super) async fn execute_convert_skill(
     input: Value,
+    interactions: Option<Arc<crate::llm::LlmInteractionService>>,
     gateway: Option<Arc<crate::gateway::unified_gateway::UnifiedGateway>>,
     shared_graph: Option<Arc<SkillGraphStore>>,
     shared_registry: Option<Arc<crate::tools::SkillRegistry>>,
     vector_store: Option<Arc<crate::memory::hyperspace_store::HyperspaceStore>>,
+    interaction_scope: Option<crate::llm::LlmInteractionScope>,
 ) -> Result<Value, String> {
     let markdown_content = input["markdown_content"].as_str().unwrap_or("").to_string();
     if markdown_content.is_empty() {
@@ -1904,13 +3051,27 @@ pub(super) async fn execute_convert_skill(
     }
     let source_path = input["source_path"].as_str().map(String::from);
 
-    if let Some(gateway) = gateway {
+    if interactions.is_some() || gateway.is_some() {
         let graph_store =
             shared_graph.unwrap_or_else(|| Arc::new(crate::skill_graph::SkillGraphStore::new()));
         let registry = shared_registry
             .unwrap_or_else(|| std::sync::Arc::new(crate::tools::SkillRegistry::new()));
         let config = crate::skill_graph::SkillCreatorConfig::default();
-        let creator = crate::skill_graph::SkillCreator::new(gateway, graph_store, registry, config);
+        let creator = if let Some(interactions) = interactions {
+            crate::skill_graph::SkillCreator::new_with_interactions(
+                interactions,
+                graph_store,
+                registry,
+                config,
+            )
+        } else {
+            crate::skill_graph::SkillCreator::new(
+                gateway.expect("gateway checked above"),
+                graph_store,
+                registry,
+                config,
+            )
+        };
         let creator = match vector_store {
             Some(store) => creator.with_vector_store(store),
             None => creator,
@@ -1921,10 +3082,15 @@ pub(super) async fn execute_convert_skill(
             source_path,
         };
 
-        let result = creator
-            .convert_from_markdown(request)
-            .await
-            .map_err(|e| format!("Convert Skill failed: {:?}", e))?;
+        let result = match interaction_scope {
+            Some(scope) => {
+                creator
+                    .convert_from_markdown_with_scope(request, scope)
+                    .await
+            }
+            None => creator.convert_from_markdown(request).await,
+        }
+        .map_err(|e| format!("Convert Skill failed: {:?}", e))?;
 
         Ok(json!({
             "skill_iri": result.skill_iri,
@@ -2453,6 +3619,543 @@ pub(super) async fn execute_knowledge_extract_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_mermaid_profile_uses_a_kernel_owned_root_safe_browser_config() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut process = std::process::Command::new("true");
+        apply_clean_verification_environment(
+            &mut process,
+            ToolExecutionProfile::CleanMermaidVerification,
+            Some(cache.path()),
+        )
+        .unwrap();
+        let config = cache.path().join("puppeteer.json");
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            parsed,
+            json!({"args": ["--no-sandbox", "--disable-setuid-sandbox"]})
+        );
+
+        let command = profiled_shell_command(
+            "cd project && mmdc -i design.md -o /tmp/design.svg",
+            ToolExecutionProfile::CleanMermaidVerification,
+            Some(cache.path()),
+        )
+        .unwrap();
+        assert!(command.starts_with("mmdc() { command mmdc -p '"));
+        assert!(command.contains(&config.to_string_lossy().to_string()));
+        assert!(command.ends_with("cd project && mmdc -i design.md -o /tmp/design.svg"));
+
+        let powershell = profiled_powershell_command(
+            "mmdc -i design.md -o $env:TEMP/design.svg",
+            ToolExecutionProfile::CleanMermaidVerification,
+            Some(cache.path()),
+        )
+        .unwrap();
+        assert!(powershell.contains("Get-Command mmdc -CommandType Application"));
+        assert!(powershell.contains(&config.to_string_lossy().to_string()));
+        assert!(powershell.ends_with("mmdc -i design.md -o $env:TEMP/design.svg"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_mermaid_profile_renders_when_mmdc_is_installed() {
+        if std::process::Command::new("mmdc")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("diagram.mmd");
+        let output = workspace.path().join("diagram.svg");
+        std::fs::write(&source, "flowchart LR\nA --> B\n").unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_bash(json!({
+                "command": format!(
+                    "mmdc -i '{}' -o '{}' -q",
+                    source.display(),
+                    output.display(),
+                ),
+                "__gh_execution_profile": "clean_mermaid_verification",
+            })))
+            .unwrap();
+        assert_eq!(result["exit_code"], 0, "{result:?}");
+        assert_eq!(result["execution_profile"], "clean_mermaid_verification");
+        assert_eq!(result["isolated_environment"]["PUPPETEER_CONFIG"], true);
+        assert!(output.is_file() && output.metadata().unwrap().len() > 0);
+        assert!(
+            !result.to_string().contains("glidinghorse-verification-"),
+            "the ephemeral browser config path is kernel-private"
+        );
+    }
+
+    #[cfg(unix)]
+    fn workspace_tempdir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(std::env::current_dir().expect("workspace cwd"))
+            .expect("workspace temporary directory")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_read_content_receipt_is_canonical_sha256_hex() {
+        let container = workspace_tempdir(".workspace-file-read-hash-test-");
+        let path = container.path().join("receipt.txt");
+        std::fs::write(&path, "abc").unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_file_read(json!({"path": path})))
+            .unwrap();
+
+        assert_eq!(
+            result["content_sha256"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_resolution_rejects_missing_path_below_outside_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-ancestor-test-");
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), container.path().join("escape")).unwrap();
+        let requested = container.path().join("escape/missing/deep/report.md");
+
+        let error = check_path_in_workspace(requested.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("not within the workspace"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_resolution_fails_closed_for_dangling_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-dangling-test-");
+        symlink(
+            container.path().join("does-not-exist"),
+            container.path().join("dangling"),
+        )
+        .unwrap();
+        let requested = container.path().join("dangling/report.md");
+
+        let error = check_path_in_workspace(requested.to_str().unwrap()).unwrap_err();
+        assert!(
+            error.contains("Cannot resolve requested path ancestor"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_search_accepts_an_absolute_path_inside_the_workspace() {
+        let container = workspace_tempdir(".workspace-grep-inside-test-");
+        std::fs::write(container.path().join("sample.txt"), "alpha\nbeta\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = runtime
+            .block_on(execute_grep_search(json!({
+                "pattern": "alpha",
+                "path": container.path(),
+                "output_mode": "content"
+            })))
+            .unwrap();
+
+        assert_eq!(result["num_matches"], 1);
+        assert!(result["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("alpha")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_search_rejects_an_absolute_path_outside_the_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "must not be read").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let error = runtime
+            .block_on(execute_grep_search(json!({
+                "pattern": "secret",
+                "path": outside.path()
+            })))
+            .unwrap_err();
+
+        assert!(error.contains("not within the workspace"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_search_rejects_a_workspace_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-grep-symlink-test-");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "must not be read").unwrap();
+        let escape = container.path().join("escape");
+        symlink(outside.path(), &escape).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let error = runtime
+            .block_on(execute_grep_search(json!({
+                "pattern": "secret",
+                "path": escape
+            })))
+            .unwrap_err();
+
+        assert!(error.contains("not within the workspace"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_search_accepts_an_absolute_root_inside_the_workspace() {
+        let container = workspace_tempdir(".workspace-glob-inside-test-");
+        std::fs::write(container.path().join("sample.txt"), "workspace data").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = runtime
+            .block_on(execute_glob_search(json!({
+                "path": container.path(),
+                "pattern": "*.txt"
+            })))
+            .unwrap();
+
+        assert_eq!(result["count"], 1);
+        assert!(result["files"].as_array().unwrap().iter().any(|path| {
+            path.as_str()
+                .is_some_and(|path| path.ends_with("sample.txt"))
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_search_rejects_an_absolute_root_outside_the_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "must not be listed").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let error = runtime
+            .block_on(execute_glob_search(json!({
+                "path": outside.path(),
+                "pattern": "*.txt"
+            })))
+            .unwrap_err();
+
+        assert!(error.contains("not within the workspace"), "{error}");
+    }
+
+    #[test]
+    fn glob_search_rejects_absolute_and_parent_traversal_patterns() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for pattern in ["../*", "nested/../../*", "/tmp/*"] {
+            let error = runtime
+                .block_on(execute_glob_search(json!({"pattern": pattern})))
+                .unwrap_err();
+            assert!(error.contains("Glob pattern must be relative"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_search_rejects_a_matching_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-glob-symlink-test-");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "must not be listed").unwrap();
+        symlink(outside.path(), container.path().join("escape")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let error = runtime
+            .block_on(execute_glob_search(json!({
+                "path": container.path(),
+                "pattern": "escape/*"
+            })))
+            .unwrap_err();
+
+        assert!(error.contains("not within the workspace"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_tools_hide_workspace_runtime_state_before_monitor_scan() {
+        let container = workspace_tempdir(".workspace-runtime-hide-test-");
+        std::fs::write(container.path().join("visible.txt"), "project content").unwrap();
+        std::fs::create_dir_all(container.path().join(".gliding_horse/ws_monitor")).unwrap();
+        std::fs::write(
+            container.path().join(".gliding_horse/ws_monitor/content"),
+            "runtime state",
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let listed = runtime
+            .block_on(execute_file_list(json!({"path": container.path()})))
+            .unwrap();
+        let names = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"visible.txt"));
+        assert!(!names.contains(&".gliding_horse"));
+
+        let globbed = runtime
+            .block_on(execute_glob_search(json!({
+                "path": container.path(),
+                "pattern": "**/*"
+            })))
+            .unwrap();
+        let files = globbed["files"].as_array().unwrap();
+        assert!(files.iter().any(|path| {
+            path.as_str()
+                .is_some_and(|path| path.ends_with("visible.txt"))
+        }));
+        assert!(!files.iter().any(|path| {
+            path.as_str()
+                .is_some_and(|path| path.contains(".gliding_horse"))
+        }));
+
+        let error = runtime
+            .block_on(execute_file_list(json!({
+                "path": container.path().join(".gliding_horse")
+            })))
+            .unwrap_err();
+        assert!(error.contains("runtime state"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_bound_commit_cannot_follow_post_validation_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-toctou-test-");
+        let outside = tempfile::tempdir().unwrap();
+        let active = container.path().join("active");
+        let parked = container.path().join("parked");
+        std::fs::create_dir(&active).unwrap();
+        let requested = active.join("report.md");
+
+        // Prepare the capability while `active` is a real workspace directory,
+        // then replace its pathname with a link to an outside directory before
+        // committing. Revalidation from the root capability detects the
+        // changed directory identity and fails closed.
+        let target = SecureWorkspaceTarget::open(requested.to_str().unwrap(), true).unwrap();
+        std::fs::rename(&active, &parked).unwrap();
+        symlink(outside.path(), &active).unwrap();
+        let error = target.commit(b"must not be written", None).unwrap_err();
+
+        assert!(error.contains("changed before commit"), "{error}");
+        assert!(!parked.join("report.md").exists());
+        assert!(!outside.path().join("report.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_commit_rejects_concurrent_final_file_changes() {
+        let container = workspace_tempdir(".workspace-concurrent-write-test-");
+        let path = container.path().join("report.md");
+        std::fs::write(&path, "initial").unwrap();
+        let target = SecureWorkspaceTarget::open(path.to_str().unwrap(), false).unwrap();
+        let existing = target.read_existing().unwrap().unwrap();
+
+        std::fs::write(&path, "concurrent update").unwrap();
+        let error = target
+            .commit(b"stale replacement", Some(&existing))
+            .unwrap_err();
+
+        assert!(error.contains("changed concurrently"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "concurrent update");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_commit_does_not_overwrite_file_that_appeared_concurrently() {
+        let container = workspace_tempdir(".workspace-concurrent-create-test-");
+        let path = container.path().join("report.md");
+        let target = SecureWorkspaceTarget::open(path.to_str().unwrap(), false).unwrap();
+        assert!(target.read_existing().unwrap().is_none());
+
+        std::fs::write(&path, "created by another actor").unwrap();
+        let error = target.commit(b"must not overwrite", None).unwrap_err();
+
+        assert!(error.contains("appeared concurrently"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "created by another actor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_noop_revalidation_rejects_concurrent_byte_change() {
+        let container = workspace_tempdir(".workspace-noop-byte-race-test-");
+        let path = container.path().join("report.md");
+        std::fs::write(&path, "expected").unwrap();
+        let target = SecureWorkspaceTarget::open(path.to_str().unwrap(), false).unwrap();
+        let existing = target.read_existing().unwrap().unwrap();
+
+        std::fs::write(&path, "concurrent update").unwrap();
+        let error = target.verify_unchanged(&existing, b"expected").unwrap_err();
+
+        assert!(error.contains("changed concurrently"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "concurrent update");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_noop_revalidation_rejects_final_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-noop-file-swap-test-");
+        let outside = tempfile::tempdir().unwrap();
+        let path = container.path().join("report.md");
+        let parked = container.path().join("parked.md");
+        let outside_path = outside.path().join("report.md");
+        std::fs::write(&path, "same bytes").unwrap();
+        std::fs::write(&outside_path, "same bytes").unwrap();
+        let target = SecureWorkspaceTarget::open(path.to_str().unwrap(), false).unwrap();
+        let existing = target.read_existing().unwrap().unwrap();
+
+        std::fs::rename(&path, &parked).unwrap();
+        symlink(&outside_path, &path).unwrap();
+        let error = target
+            .verify_unchanged(&existing, b"same bytes")
+            .unwrap_err();
+
+        assert!(error.contains("no longer safe"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&outside_path).unwrap(),
+            "same bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_noop_revalidation_rejects_identical_regular_file_replacement() {
+        let container = workspace_tempdir(".workspace-noop-identity-swap-test-");
+        let path = container.path().join("report.md");
+        let parked = container.path().join("parked.md");
+        std::fs::write(&path, "same bytes").unwrap();
+        let target = SecureWorkspaceTarget::open(path.to_str().unwrap(), false).unwrap();
+        let existing = target.read_existing().unwrap().unwrap();
+
+        std::fs::rename(&path, &parked).unwrap();
+        std::fs::write(&path, "same bytes").unwrap();
+        let error = target
+            .verify_unchanged(&existing, b"same bytes")
+            .unwrap_err();
+
+        assert!(error.contains("identity changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "same bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_noop_revalidation_rejects_parent_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let container = workspace_tempdir(".workspace-noop-parent-swap-test-");
+        let outside = tempfile::tempdir().unwrap();
+        let active = container.path().join("active");
+        let parked = container.path().join("parked");
+        std::fs::create_dir(&active).unwrap();
+        std::fs::write(active.join("report.md"), "same bytes").unwrap();
+        std::fs::write(outside.path().join("report.md"), "same bytes").unwrap();
+        let target =
+            SecureWorkspaceTarget::open(active.join("report.md").to_str().unwrap(), false).unwrap();
+        let existing = target.read_existing().unwrap().unwrap();
+
+        std::fs::rename(&active, &parked).unwrap();
+        symlink(outside.path(), &active).unwrap();
+        let error = target
+            .verify_unchanged(&existing, b"same bytes")
+            .unwrap_err();
+
+        assert!(
+            error.contains("changed during no-op verification"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("report.md")).unwrap(),
+            "same bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_write_noop_returns_hash_of_revalidated_final_bytes() {
+        let container = workspace_tempdir(".workspace-secure-noop-test-");
+        let path = container.path().join("report.md");
+        std::fs::write(&path, "stable content").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let result = runtime
+            .block_on(execute_file_write(json!({
+                "path": path,
+                "content": "stable content"
+            })))
+            .unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["changed"], false);
+        assert_eq!(result["created"], false);
+        assert_eq!(result["bytes_written"], 0);
+        assert_eq!(
+            result["content_sha256"],
+            CryptoUtils::sha256_hex(&std::fs::read_to_string(&path).unwrap())
+        );
+        assert_eq!(before.dev(), after.dev());
+        assert_eq!(before.ino(), after.ino());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_write_and_edit_use_secure_atomic_workspace_commit() {
+        let container = workspace_tempdir(".workspace-secure-write-test-");
+        let path = container.path().join("nested/report.md");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let write = runtime
+            .block_on(execute_file_write(json!({
+                "path": path,
+                "content": "alpha beta"
+            })))
+            .unwrap();
+        assert_eq!(write["created"], true);
+        let edit = runtime
+            .block_on(execute_file_edit(json!({
+                "path": path,
+                "old_string": "beta",
+                "new_string": "gamma"
+            })))
+            .unwrap();
+        assert_eq!(edit["changed"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha gamma");
+        let leftovers = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".glidinghorse-write-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
 
     #[test]
     fn test_is_build_or_vendored_dir() {

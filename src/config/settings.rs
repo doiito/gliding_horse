@@ -2,6 +2,69 @@ use anyhow::Result;
 use config::{Config, ConfigError, Environment};
 use serde::Deserialize;
 
+/// Provider-agnostic reasoning policy requested by an execution stage.
+///
+/// Wire encodings are deliberately selected by the gateway: `none` means no
+/// provider-specific reasoning extension is sent, while non-zero values are
+/// emitted only on a transport/model family with a known compatible shape.
+/// Keeping this typed at the configuration boundary prevents arbitrary values
+/// from reaching a provider request or the interaction audit stream.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Use the provider's compatible/default behavior without a reasoning
+    /// extension.
+    #[default]
+    None,
+    /// Request disabled reasoning where the gateway has a known safe provider
+    /// encoding. Unknown provider dialects omit the extension; correctness
+    /// must never depend on hidden thought actually being disabled.
+    Disabled,
+    Low,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Disabled => "disabled",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// Value reported at the provider request boundary. `none` is not a
+    /// portable wire value, so diagnostics name the behavior actually
+    /// applied instead of claiming that provider reasoning was disabled.
+    pub const fn provider_label(self) -> &'static str {
+        match self {
+            Self::None => "provider_default",
+            Self::Disabled => "disabled",
+            _ => self.as_str(),
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "disabled" | "off" => Ok(Self::Disabled),
+            "low" => Ok(Self::Low),
+            "high" => Ok(Self::High),
+            "max" => Ok(Self::Max),
+            _ => Err(format!(
+                "unsupported reasoning effort `{value}`; expected none, disabled, low, high, or max"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub gateway: GatewaySettings,
@@ -149,8 +212,8 @@ pub struct WorkspaceSettings {
     #[serde(default = "default_learning_snapshot_max_bytes")]
     pub learning_snapshot_max_bytes: u64,
     /// Maximum file count hashed when confirming that a shell-like tool made
-    /// a semantic workspace change.  If exceeded, confirmation falls back to
-    /// the monitor's generation/delta evidence.
+    /// a semantic workspace change. Exceeding it makes exact effect
+    /// attribution incomplete.
     #[serde(default = "default_effect_snapshot_max_files")]
     pub effect_snapshot_max_files: usize,
     /// Maximum aggregate bytes hashed for one semantic effect snapshot.
@@ -200,6 +263,13 @@ impl Default for WorkspaceSettings {
                 "dist/".into(),
                 "build/".into(),
                 "__pycache__/".into(),
+                ".pytest_cache/".into(),
+                ".mypy_cache/".into(),
+                ".ruff_cache/".into(),
+                ".tox/".into(),
+                ".nox/".into(),
+                "htmlcov/".into(),
+                ".coverage".into(),
                 ".venv/".into(),
                 "venv/".into(),
                 ".next/".into(),
@@ -231,8 +301,9 @@ pub struct GatewaySettings {
     pub max_retries: u32,
     #[serde(default = "default_retry_base_ms")]
     pub retry_base_ms: u64,
-    /// Route deepseek-v4-flash requests through the Responses API (`/v1/responses`)
-    /// instead of chat completions. Other models keep using chat completions.
+    /// Route configured model requests through the Responses API
+    /// (`/v1/responses`) instead of Chat Completions. Enable this only for a
+    /// provider/model combination that implements that API.
     #[serde(default)]
     pub use_responses_api: bool,
     pub model_mapping: std::collections::HashMap<String, String>,
@@ -385,14 +456,105 @@ fn default_error_rate_threshold() -> f64 {
     0.5
 }
 
+/// Runtime Hook policy owned by one AgentRunner. Built-in observability hooks
+/// are safe defaults; behavior-changing limits and external processes require
+/// explicit opt-in below.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct AgentHookSettings {
+    pub logging: bool,
+    pub timing: bool,
+    pub metrics: bool,
+    pub llm_rate_limit: LlmRateLimitHookSettings,
+    pub external_tools: ExternalToolHookSettings,
+}
+
+impl Default for AgentHookSettings {
+    fn default() -> Self {
+        Self {
+            logging: true,
+            timing: true,
+            metrics: true,
+            llm_rate_limit: LlmRateLimitHookSettings::default(),
+            external_tools: ExternalToolHookSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct LlmRateLimitHookSettings {
+    pub enabled: bool,
+    pub max_calls: usize,
+    pub window_seconds: u64,
+}
+
+impl Default for LlmRateLimitHookSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_calls: 100,
+            window_seconds: 60,
+        }
+    }
+}
+
+/// Commands are intentionally redacted from Debug output: operators may use
+/// environment references or wrapper commands containing deployment details.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct ExternalToolHookSettings {
+    pub enabled: bool,
+    pub pre_tool_use: Vec<String>,
+    pub post_tool_use: Vec<String>,
+    pub post_tool_use_failure: Vec<String>,
+    pub timeout_ms: u64,
+    pub allow_input_rewrite: bool,
+}
+
+impl Default for ExternalToolHookSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pre_tool_use: Vec::new(),
+            post_tool_use: Vec::new(),
+            post_tool_use_failure: Vec::new(),
+            timeout_ms: 30_000,
+            allow_input_rewrite: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for ExternalToolHookSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalToolHookSettings")
+            .field("enabled", &self.enabled)
+            .field("pre_tool_use_count", &self.pre_tool_use.len())
+            .field("post_tool_use_count", &self.post_tool_use.len())
+            .field(
+                "post_tool_use_failure_count",
+                &self.post_tool_use_failure.len(),
+            )
+            .field("timeout_ms", &self.timeout_ms)
+            .field("allow_input_rewrite", &self.allow_input_rewrite)
+            .finish()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentSettings {
     pub max_iterations: u32,
     pub parallel_execution: bool,
     pub max_parallel_agents: usize,
+    /// Default wall-clock budget for one PA/DA/CA/AA BizAgent dispatch.
+    /// Workflow nodes with `timeout_secs: 0` inherit this value.
     pub timeout_seconds: u64,
     pub api_timeout_seconds: u64,
     pub event_bus_capacity: usize,
+    /// Runner-local built-in and external Hook policy.
+    #[serde(default)]
+    pub hooks: AgentHookSettings,
     pub template_path: Option<String>,
     #[serde(default = "default_max_pdca_cycles")]
     pub max_pdca_cycles: u32,
@@ -438,10 +600,47 @@ pub struct RoleTurnLimitSettings {
     pub act: Option<u32>,
 }
 
+/// Model-side reasoning policy for ordinary ReAct decision turns. This is
+/// deliberately separate from BizAgent decomposition, whose schema-only
+/// control request has its own lower-cost policy.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoleReasoningEffortSettings {
+    pub plan: ReasoningEffort,
+    pub do_agent: ReasoningEffort,
+    pub check: ReasoningEffort,
+    pub act: ReasoningEffort,
+}
+
+impl RoleReasoningEffortSettings {
+    pub const fn uniform(effort: ReasoningEffort) -> Self {
+        Self {
+            plan: effort,
+            do_agent: effort,
+            check: effort,
+            act: effort,
+        }
+    }
+}
+
+impl Default for RoleReasoningEffortSettings {
+    fn default() -> Self {
+        // Ordinary ReAct turns still need enough reasoning to select safe
+        // tools and evaluate observations. `low` bounds hidden reasoning while
+        // preserving that capability; operators can override individual roles.
+        Self::uniform(ReasoningEffort::Low)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentExecutionBudgetSettings {
     #[serde(default)]
     pub role_max_turns: RoleTurnLimitSettings,
+    /// Explicit per-role model reasoning policy for both synchronous and
+    /// streaming ReAct requests. An explicit setting avoids provider defaults
+    /// silently changing latency and token consumption.
+    #[serde(default)]
+    pub react_reasoning_effort: RoleReasoningEffortSettings,
     #[serde(default = "default_turn_early_warning_remaining")]
     pub early_warning_remaining: u32,
     #[serde(default = "default_turn_final_warning_remaining")]
@@ -462,10 +661,17 @@ pub struct AgentExecutionBudgetSettings {
     /// more work. Zero disables the evidence-convergence prompt.
     #[serde(default = "default_ca_evidence_focus_turns")]
     pub ca_evidence_focus_turns: u32,
-    /// After this many CA tool turns, remove tools and require the final
-    /// criterion-linked PASS/FAIL verdict. Zero disables the close gate.
+    /// After this many broad CA audit-tool turns, remove tools and require the
+    /// final criterion-linked PASS/FAIL verdict. If an executable verifier is
+    /// authorized but no verification receipt exists yet, one verifier-only
+    /// turn is exposed before closing. Zero disables the close gate.
     #[serde(default = "default_ca_evidence_close_turns")]
     pub ca_evidence_close_turns: u32,
+    /// Task-wide cap for fresh, isolated CA executions used only to close a
+    /// missing verification receipt. These retries remain evidence-only and
+    /// never consume or refresh the CA→DA mutation-repair budget.
+    #[serde(default = "default_max_ca_evidence_rechecks")]
+    pub max_ca_evidence_rechecks: usize,
     /// After this many PA tool turns, runtime removes inspection tools and
     /// asks PA to emit the executable plan from evidence already collected.
     /// Zero disables the convergence gate.
@@ -480,8 +686,73 @@ pub struct AgentExecutionBudgetSettings {
     /// final evidence-backed deliverable. Zero disables the close gate.
     #[serde(default = "default_da_evidence_close_turns")]
     pub da_evidence_close_turns: u32,
+    /// After a workspace-changing DA has successfully run a recognisable
+    /// verification command against the latest changed state, restrict broad
+    /// discovery at this many stable turns. A later change or failed command
+    /// resets the window. Zero disables the focus gate.
+    #[serde(default = "default_da_post_effect_verification_focus_turns")]
+    pub da_post_effect_verification_focus_turns: u32,
+    /// Request a terminal verdict after this many stable turns backed by fresh
+    /// post-effect verification. For required workspace delivery this remains
+    /// a soft acceptance review with narrowed write/check tools: a passing
+    /// unit test cannot prove that later artifacts are complete. Other effect
+    /// policies use the hard tool close. Zero disables the gate.
+    #[serde(default = "default_da_post_effect_verification_close_turns")]
+    pub da_post_effect_verification_close_turns: u32,
+    /// A workspace change without a recognisable verification receipt must
+    /// not lead to an unbounded read/inspection loop. At this many stable
+    /// post-effect turns, retain only repair and executable-check tools. Zero
+    /// disables this focus gate.
+    #[serde(default = "default_da_post_effect_inspection_focus_turns")]
+    pub da_post_effect_inspection_focus_turns: u32,
+    /// Request an honest terminal handoff after this many unverified
+    /// post-effect turns. Required workspace delivery retains narrowed
+    /// write/check tools so a time threshold cannot strand pending artifacts;
+    /// other effect policies use the hard close. This never asserts success
+    /// or replaces downstream CA. Zero disables the gate.
+    #[serde(default = "default_da_post_effect_inspection_close_turns")]
+    pub da_post_effect_inspection_close_turns: u32,
     #[serde(default = "default_biz_agent_max_sub_agents")]
     pub max_sub_agents: usize,
+    /// Enable the adaptive same-role parent/child path for every PA/DA/CA/AA
+    /// BizAgent. The LLM may still select MONO for atomic work.
+    #[serde(default = "default_biz_agent_orchestration_enabled")]
+    pub biz_agent_orchestration_enabled: bool,
+    /// Maximum effective agent.md + task context supplied to the untrusted
+    /// child-plan generator. This is a character bound, not a token budget.
+    #[serde(default = "default_biz_agent_decomposition_context_max_chars")]
+    pub biz_agent_decomposition_context_max_chars: usize,
+    /// Completion-token ceiling for the schema-constrained child-plan call.
+    /// This includes reasoning tokens on providers whose Responses endpoint
+    /// shares one output budget between reasoning and visible output.
+    #[serde(default = "default_biz_agent_decomposition_max_tokens")]
+    pub biz_agent_decomposition_max_tokens: u32,
+    /// Reasoning policy for the latency-sensitive child-plan call. The
+    /// production default is `disabled`; operators may opt into deeper reasoning
+    /// explicitly for unusually ambiguous workloads.
+    #[serde(default = "default_biz_agent_decomposition_reasoning_effort")]
+    pub biz_agent_decomposition_reasoning_effort: ReasoningEffort,
+    /// Independent wall-clock ceiling for the optional child-plan decision.
+    /// A stalled provider must not consume the complete BizAgent dispatch
+    /// budget before the safe MONO fallback can start.
+    #[serde(default = "default_biz_agent_decomposition_timeout_seconds")]
+    pub biz_agent_decomposition_timeout_seconds: u64,
+    /// Maximum normalized child-result evidence supplied to the parent
+    /// aggregator. The durable result manifest is never truncated.
+    #[serde(default = "default_biz_agent_aggregation_context_max_chars")]
+    pub biz_agent_aggregation_context_max_chars: usize,
+    /// Completion-token ceiling for the synthesized parent deliverable.
+    #[serde(default = "default_biz_agent_aggregation_max_tokens")]
+    pub biz_agent_aggregation_max_tokens: u32,
+    /// Reasoning policy for optional parent prose synthesis. Deterministic
+    /// aggregation remains authoritative, so the production default avoids
+    /// hidden reasoning latency on this best-effort presentation step.
+    #[serde(default = "default_biz_agent_aggregation_reasoning_effort")]
+    pub biz_agent_aggregation_reasoning_effort: ReasoningEffort,
+    /// Independent wall-clock ceiling for optional parent prose synthesis.
+    /// On timeout the complete deterministic child ledger is returned.
+    #[serde(default = "default_biz_agent_aggregation_timeout_seconds")]
+    pub biz_agent_aggregation_timeout_seconds: u64,
     #[serde(default = "default_ca_handoff_max_chars")]
     pub ca_handoff_max_chars: usize,
     #[serde(default = "default_recursive_handoff_max_chars")]
@@ -534,10 +805,13 @@ fn default_da_repair_effect_block_turns() -> u32 {
     4
 }
 fn default_ca_evidence_focus_turns() -> u32 {
-    5
+    4
 }
 fn default_ca_evidence_close_turns() -> u32 {
-    10
+    7
+}
+fn default_max_ca_evidence_rechecks() -> usize {
+    2
 }
 fn default_pa_planning_focus_turns() -> u32 {
     4
@@ -548,7 +822,46 @@ fn default_da_evidence_focus_turns() -> u32 {
 fn default_da_evidence_close_turns() -> u32 {
     8
 }
+fn default_da_post_effect_verification_focus_turns() -> u32 {
+    1
+}
+fn default_da_post_effect_verification_close_turns() -> u32 {
+    3
+}
+fn default_da_post_effect_inspection_focus_turns() -> u32 {
+    2
+}
+fn default_da_post_effect_inspection_close_turns() -> u32 {
+    4
+}
 fn default_biz_agent_max_sub_agents() -> usize {
+    8
+}
+fn default_biz_agent_orchestration_enabled() -> bool {
+    true
+}
+fn default_biz_agent_decomposition_context_max_chars() -> usize {
+    24_000
+}
+fn default_biz_agent_decomposition_max_tokens() -> u32 {
+    4_096
+}
+fn default_biz_agent_decomposition_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::Disabled
+}
+fn default_biz_agent_decomposition_timeout_seconds() -> u64 {
+    15
+}
+fn default_biz_agent_aggregation_context_max_chars() -> usize {
+    48_000
+}
+fn default_biz_agent_aggregation_max_tokens() -> u32 {
+    4_096
+}
+fn default_biz_agent_aggregation_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::Disabled
+}
+fn default_biz_agent_aggregation_timeout_seconds() -> u64 {
     5
 }
 fn default_ca_handoff_max_chars() -> usize {
@@ -595,6 +908,7 @@ impl Default for AgentExecutionBudgetSettings {
     fn default() -> Self {
         Self {
             role_max_turns: RoleTurnLimitSettings::default(),
+            react_reasoning_effort: RoleReasoningEffortSettings::default(),
             early_warning_remaining: default_turn_early_warning_remaining(),
             final_warning_remaining: default_turn_final_warning_remaining(),
             effect_progress_warning_turns: default_effect_progress_warning_turns(),
@@ -602,10 +916,31 @@ impl Default for AgentExecutionBudgetSettings {
             da_repair_effect_block_turns: default_da_repair_effect_block_turns(),
             ca_evidence_focus_turns: default_ca_evidence_focus_turns(),
             ca_evidence_close_turns: default_ca_evidence_close_turns(),
+            max_ca_evidence_rechecks: default_max_ca_evidence_rechecks(),
             pa_planning_focus_turns: default_pa_planning_focus_turns(),
             da_evidence_focus_turns: default_da_evidence_focus_turns(),
             da_evidence_close_turns: default_da_evidence_close_turns(),
+            da_post_effect_verification_focus_turns:
+                default_da_post_effect_verification_focus_turns(),
+            da_post_effect_verification_close_turns:
+                default_da_post_effect_verification_close_turns(),
+            da_post_effect_inspection_focus_turns: default_da_post_effect_inspection_focus_turns(),
+            da_post_effect_inspection_close_turns: default_da_post_effect_inspection_close_turns(),
             max_sub_agents: default_biz_agent_max_sub_agents(),
+            biz_agent_orchestration_enabled: default_biz_agent_orchestration_enabled(),
+            biz_agent_decomposition_context_max_chars:
+                default_biz_agent_decomposition_context_max_chars(),
+            biz_agent_decomposition_max_tokens: default_biz_agent_decomposition_max_tokens(),
+            biz_agent_decomposition_reasoning_effort:
+                default_biz_agent_decomposition_reasoning_effort(),
+            biz_agent_decomposition_timeout_seconds:
+                default_biz_agent_decomposition_timeout_seconds(),
+            biz_agent_aggregation_context_max_chars:
+                default_biz_agent_aggregation_context_max_chars(),
+            biz_agent_aggregation_max_tokens: default_biz_agent_aggregation_max_tokens(),
+            biz_agent_aggregation_reasoning_effort: default_biz_agent_aggregation_reasoning_effort(
+            ),
+            biz_agent_aggregation_timeout_seconds: default_biz_agent_aggregation_timeout_seconds(),
             ca_handoff_max_chars: default_ca_handoff_max_chars(),
             recursive_handoff_max_chars: default_recursive_handoff_max_chars(),
             sa_stream_emit_min_chars: default_sa_stream_emit_min_chars(),
@@ -659,7 +994,8 @@ impl Default for AgentSettings {
             max_parallel_agents: 10,
             timeout_seconds: 300,
             api_timeout_seconds: 120,
-            event_bus_capacity: 100,
+            event_bus_capacity: 1024,
+            hooks: AgentHookSettings::default(),
             template_path: None,
             max_pdca_cycles: 7,
             max_active: 20,
@@ -834,6 +1170,10 @@ impl Default for LoggingSettings {
                 "password".to_string(),
                 "token".to_string(),
                 "secret".to_string(),
+                "authorization".to_string(),
+                "access_token".to_string(),
+                "refresh_token".to_string(),
+                "client_secret".to_string(),
             ],
         }
     }
@@ -858,6 +1198,16 @@ pub struct ToolResultRouterSettings {
     pub micro_tool_page_size: usize,
     #[serde(default = "default_micro_tool_max_page_size")]
     pub micro_tool_max_page_size: usize,
+    /// Maximum number of source lines carried by one `file_read` result that
+    /// may be delivered inline. This applies to the current returned page,
+    /// not to the total length of the source file.
+    #[serde(default = "default_file_read_inline_max_lines")]
+    pub file_read_inline_max_lines: usize,
+    /// Maximum serialized UTF-8 byte size of a complete `file_read` envelope
+    /// delivered inline. The envelope includes JSON metadata as well as file
+    /// content, so this is intentionally larger than the former 4 KiB cap.
+    #[serde(default = "default_file_read_inline_max_bytes")]
+    pub file_read_inline_max_bytes: usize,
 }
 
 fn default_prepare_threshold() -> usize {
@@ -868,6 +1218,12 @@ fn default_micro_tool_page_size() -> usize {
 }
 fn default_micro_tool_max_page_size() -> usize {
     200
+}
+fn default_file_read_inline_max_lines() -> usize {
+    300
+}
+fn default_file_read_inline_max_bytes() -> usize {
+    8 * 1024
 }
 
 impl Default for ToolResultRouterSettings {
@@ -885,6 +1241,8 @@ impl Default for ToolResultRouterSettings {
             prepare_threshold: default_prepare_threshold(),
             micro_tool_page_size: default_micro_tool_page_size(),
             micro_tool_max_page_size: default_micro_tool_max_page_size(),
+            file_read_inline_max_lines: default_file_read_inline_max_lines(),
+            file_read_inline_max_bytes: default_file_read_inline_max_bytes(),
         }
     }
 }
@@ -1125,6 +1483,9 @@ pub struct ToolResultCompressorSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_max_full_results")]
+    /// Number of recent ReAct tool-result batches retained in full. All
+    /// sibling results emitted by one model turn are retained or aged as one
+    /// atomic observation unit.
     pub max_full_results: usize,
     #[serde(default = "default_max_summary_length")]
     pub max_summary_length: usize,
@@ -1591,6 +1952,25 @@ impl Settings {
         if self.agents.max_iterations == 0 {
             return Err("agents.max_iterations must be > 0".to_string());
         }
+        let hook_settings = &self.agents.hooks;
+        if hook_settings.llm_rate_limit.enabled {
+            if hook_settings.llm_rate_limit.max_calls == 0 {
+                return Err(
+                    "agents.hooks.llm_rate_limit.max_calls must be > 0 when enabled".to_string(),
+                );
+            }
+            if hook_settings.llm_rate_limit.window_seconds == 0 {
+                return Err(
+                    "agents.hooks.llm_rate_limit.window_seconds must be > 0 when enabled"
+                        .to_string(),
+                );
+            }
+        }
+        if hook_settings.external_tools.enabled && hook_settings.external_tools.timeout_ms == 0 {
+            return Err(
+                "agents.hooks.external_tools.timeout_ms must be > 0 when enabled".to_string(),
+            );
+        }
         let grpc_addr = self
             .api
             .grpc_addr
@@ -1670,8 +2050,81 @@ impl Settings {
                     .to_string(),
             );
         }
+        if budget.da_post_effect_verification_close_turns != 0
+            && budget.da_post_effect_verification_focus_turns != 0
+            && budget.da_post_effect_verification_close_turns
+                <= budget.da_post_effect_verification_focus_turns
+        {
+            return Err(
+                "agents.execution_budget.da_post_effect_verification_close_turns must be zero or greater than da_post_effect_verification_focus_turns"
+                    .to_string(),
+            );
+        }
+        if budget.da_post_effect_inspection_close_turns != 0
+            && budget.da_post_effect_inspection_focus_turns != 0
+            && budget.da_post_effect_inspection_close_turns
+                <= budget.da_post_effect_inspection_focus_turns
+        {
+            return Err(
+                "agents.execution_budget.da_post_effect_inspection_close_turns must be zero or greater than da_post_effect_inspection_focus_turns"
+                    .to_string(),
+            );
+        }
         if budget.max_sub_agents == 0 {
             return Err("agents.execution_budget.max_sub_agents must be > 0".to_string());
+        }
+        if budget.biz_agent_orchestration_enabled && budget.max_sub_agents < 2 {
+            return Err(
+                "agents.execution_budget.max_sub_agents must be >= 2 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
+        }
+        if budget.biz_agent_orchestration_enabled
+            && budget.biz_agent_decomposition_context_max_chars < 4_096
+        {
+            return Err(
+                "agents.execution_budget.biz_agent_decomposition_context_max_chars must be >= 4096 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
+        }
+        if budget.biz_agent_orchestration_enabled
+            && budget.biz_agent_decomposition_max_tokens < 1_024
+        {
+            return Err(
+                "agents.execution_budget.biz_agent_decomposition_max_tokens must be >= 1024 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
+        }
+        if budget.biz_agent_orchestration_enabled
+            && budget.biz_agent_decomposition_timeout_seconds == 0
+        {
+            return Err(
+                "agents.execution_budget.biz_agent_decomposition_timeout_seconds must be > 0 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
+        }
+        if budget.biz_agent_orchestration_enabled
+            && budget.biz_agent_aggregation_context_max_chars < 4_096
+        {
+            return Err(
+                "agents.execution_budget.biz_agent_aggregation_context_max_chars must be >= 4096 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
+        }
+        if budget.biz_agent_orchestration_enabled && budget.biz_agent_aggregation_max_tokens < 1_024
+        {
+            return Err(
+                "agents.execution_budget.biz_agent_aggregation_max_tokens must be >= 1024 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
+        }
+        if budget.biz_agent_orchestration_enabled
+            && budget.biz_agent_aggregation_timeout_seconds == 0
+        {
+            return Err(
+                "agents.execution_budget.biz_agent_aggregation_timeout_seconds must be > 0 when BizAgent orchestration is enabled"
+                    .to_string(),
+            );
         }
         if budget.ca_handoff_max_chars == 0 {
             return Err("agents.execution_budget.ca_handoff_max_chars must be > 0".to_string());
@@ -1694,6 +2147,7 @@ impl Settings {
                 budget.max_recursive_task_executions,
             ),
             ("max_ca_da_corrections", budget.max_ca_da_corrections),
+            ("max_ca_evidence_rechecks", budget.max_ca_evidence_rechecks),
             (
                 "ca_correction_handoff_max_chars",
                 budget.ca_correction_handoff_max_chars,
@@ -1757,6 +2211,14 @@ impl Settings {
         {
             return Err(
                 "tool_result_router micro-tool limits must be positive and max_page_size >= page_size"
+                    .to_string(),
+            );
+        }
+        if self.tool_result_router.file_read_inline_max_lines == 0
+            || self.tool_result_router.file_read_inline_max_bytes < 8 * 1024
+        {
+            return Err(
+                "tool_result_router file_read inline limits require max_lines > 0 and max_bytes >= 8192"
                     .to_string(),
             );
         }
@@ -1909,6 +2371,21 @@ mod tests {
             timeout_seconds: 300
             api_timeout_seconds: 120
             event_bus_capacity: 100
+            hooks:
+              logging: false
+              timing: true
+              metrics: false
+              llm_rate_limit:
+                enabled: true
+                max_calls: 7
+                window_seconds: 11
+              external_tools:
+                enabled: true
+                pre_tool_use: ["hook-pre"]
+                post_tool_use: ["hook-post"]
+                post_tool_use_failure: ["hook-failure"]
+                timeout_ms: 2500
+                allow_input_rewrite: true
             max_pdca_cycles: 7
             max_active: 42
             snapshot_frequency: 2000
@@ -1917,6 +2394,11 @@ mod tests {
             execution_budget:
               role_max_turns:
                 check: 24
+              react_reasoning_effort:
+                plan: high
+                do_agent: low
+                check: max
+                act: none
               early_warning_remaining: 6
               final_warning_remaining: 2
               effect_progress_warning_turns: 7
@@ -1924,10 +2406,24 @@ mod tests {
               da_repair_effect_block_turns: 4
               ca_evidence_focus_turns: 9
               ca_evidence_close_turns: 14
+              max_ca_evidence_rechecks: 3
               pa_planning_focus_turns: 6
               da_evidence_focus_turns: 7
               da_evidence_close_turns: 12
+              da_post_effect_verification_focus_turns: 2
+              da_post_effect_verification_close_turns: 5
+              da_post_effect_inspection_focus_turns: 3
+              da_post_effect_inspection_close_turns: 6
               max_sub_agents: 8
+              biz_agent_orchestration_enabled: true
+              biz_agent_decomposition_context_max_chars: 32000
+              biz_agent_decomposition_max_tokens: 6144
+              biz_agent_decomposition_reasoning_effort: high
+              biz_agent_decomposition_timeout_seconds: 11
+              biz_agent_aggregation_context_max_chars: 64000
+              biz_agent_aggregation_max_tokens: 9216
+              biz_agent_aggregation_reasoning_effort: low
+              biz_agent_aggregation_timeout_seconds: 17
               ca_handoff_max_chars: 9000
               recursive_handoff_max_chars: 5000
               sa_stream_emit_min_chars: 64
@@ -1950,15 +2446,99 @@ mod tests {
         assert_eq!(settings.snapshot_frequency, 2000);
         assert_eq!(settings.max_full_snapshots, 5);
         assert_eq!(settings.max_projection_size, 1024);
+        assert!(!settings.hooks.logging);
+        assert!(settings.hooks.timing);
+        assert!(!settings.hooks.metrics);
+        assert!(settings.hooks.llm_rate_limit.enabled);
+        assert_eq!(settings.hooks.llm_rate_limit.max_calls, 7);
+        assert_eq!(settings.hooks.llm_rate_limit.window_seconds, 11);
+        assert!(settings.hooks.external_tools.enabled);
+        assert_eq!(settings.hooks.external_tools.pre_tool_use, ["hook-pre"]);
+        assert_eq!(settings.hooks.external_tools.post_tool_use, ["hook-post"]);
+        assert_eq!(
+            settings.hooks.external_tools.post_tool_use_failure,
+            ["hook-failure"]
+        );
+        assert_eq!(settings.hooks.external_tools.timeout_ms, 2_500);
+        assert!(settings.hooks.external_tools.allow_input_rewrite);
         assert_eq!(settings.execution_budget.role_max_turns.check, Some(24));
+        assert_eq!(
+            settings.execution_budget.react_reasoning_effort,
+            RoleReasoningEffortSettings {
+                plan: ReasoningEffort::High,
+                do_agent: ReasoningEffort::Low,
+                check: ReasoningEffort::Max,
+                act: ReasoningEffort::None,
+            }
+        );
         assert_eq!(settings.execution_budget.early_warning_remaining, 6);
         assert_eq!(settings.execution_budget.ca_evidence_focus_turns, 9);
         assert_eq!(settings.execution_budget.ca_evidence_close_turns, 14);
+        assert_eq!(settings.execution_budget.max_ca_evidence_rechecks, 3);
         assert_eq!(settings.execution_budget.da_repair_effect_block_turns, 4);
         assert_eq!(settings.execution_budget.pa_planning_focus_turns, 6);
         assert_eq!(settings.execution_budget.da_evidence_focus_turns, 7);
         assert_eq!(settings.execution_budget.da_evidence_close_turns, 12);
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_verification_focus_turns,
+            2
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_verification_close_turns,
+            5
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_inspection_focus_turns,
+            3
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_inspection_close_turns,
+            6
+        );
         assert_eq!(settings.execution_budget.max_sub_agents, 8);
+        assert!(settings.execution_budget.biz_agent_orchestration_enabled);
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_decomposition_context_max_chars,
+            32_000
+        );
+        assert_eq!(
+            settings.execution_budget.biz_agent_decomposition_max_tokens,
+            6_144
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_decomposition_reasoning_effort,
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_decomposition_timeout_seconds,
+            11
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_aggregation_reasoning_effort,
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_aggregation_timeout_seconds,
+            17
+        );
         assert_eq!(settings.execution_budget.ca_handoff_max_chars, 9_000);
         assert_eq!(settings.execution_budget.max_plan_steps, 18);
         assert_eq!(settings.execution_budget.max_recursive_sub_tasks, 7);
@@ -1986,13 +2566,78 @@ mod tests {
         assert_eq!(settings.snapshot_frequency, 1000);
         assert_eq!(settings.max_full_snapshots, 10);
         assert_eq!(settings.max_projection_size, 500);
+        assert!(settings.hooks.logging);
+        assert!(settings.hooks.timing);
+        assert!(settings.hooks.metrics);
+        assert!(!settings.hooks.llm_rate_limit.enabled);
+        assert_eq!(settings.hooks.llm_rate_limit.max_calls, 100);
+        assert_eq!(settings.hooks.llm_rate_limit.window_seconds, 60);
+        assert!(!settings.hooks.external_tools.enabled);
+        assert_eq!(settings.hooks.external_tools.timeout_ms, 30_000);
+        assert!(!settings.hooks.external_tools.allow_input_rewrite);
         assert_eq!(settings.execution_budget.role_max_turns.check, None);
+        assert_eq!(
+            settings.execution_budget.react_reasoning_effort,
+            RoleReasoningEffortSettings::uniform(ReasoningEffort::Low)
+        );
         assert_eq!(settings.execution_budget.early_warning_remaining, 8);
         assert_eq!(settings.execution_budget.final_warning_remaining, 3);
+        assert_eq!(
+            settings.execution_budget.biz_agent_decomposition_max_tokens,
+            4_096
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_decomposition_reasoning_effort,
+            ReasoningEffort::Disabled
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_decomposition_timeout_seconds,
+            15
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_aggregation_reasoning_effort,
+            ReasoningEffort::Disabled
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .biz_agent_aggregation_timeout_seconds,
+            5
+        );
         assert_eq!(settings.execution_budget.max_plan_steps, 12);
         assert_eq!(settings.execution_budget.max_recursive_sub_tasks, 5);
         assert_eq!(settings.execution_budget.max_recursive_task_executions, 8);
         assert_eq!(settings.execution_budget.max_recursive_total_turns, 60);
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_verification_focus_turns,
+            1
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_verification_close_turns,
+            3
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_inspection_focus_turns,
+            2
+        );
+        assert_eq!(
+            settings
+                .execution_budget
+                .da_post_effect_inspection_close_turns,
+            4
+        );
     }
 
     #[test]
@@ -2004,6 +2649,10 @@ mod tests {
             .unwrap();
         let settings: Settings = config.try_deserialize().unwrap();
         assert_eq!(settings.agents.execution_budget.role_max_turns.check, None);
+        assert_eq!(
+            settings.agents.execution_budget.react_reasoning_effort,
+            RoleReasoningEffortSettings::uniform(ReasoningEffort::Low)
+        );
         assert_eq!(settings.agents.execution_budget.max_plan_steps, 12);
         assert_eq!(settings.agents.execution_budget.max_recursive_sub_tasks, 5);
         assert_eq!(
@@ -2018,9 +2667,303 @@ mod tests {
             60
         );
         assert_eq!(settings.tool_result_router.micro_tool_page_size, 100);
+        assert_eq!(settings.tool_result_router.file_read_inline_max_lines, 300);
+        assert_eq!(
+            settings.tool_result_router.file_read_inline_max_bytes,
+            8_192
+        );
         assert_eq!(settings.memory.l1.reload_preview_chars, 400);
         assert_eq!(settings.workspace.effect_snapshot_max_files, 10_000);
         assert_eq!(settings.workspace.effect_snapshot_max_bytes, 67_108_864);
+        assert!(settings.agents.hooks.logging);
+        assert!(settings.agents.hooks.timing);
+        assert!(settings.agents.hooks.metrics);
+        assert!(!settings.agents.hooks.llm_rate_limit.enabled);
+        assert!(!settings.agents.hooks.external_tools.enabled);
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .biz_agent_decomposition_max_tokens,
+            4_096
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .biz_agent_decomposition_reasoning_effort,
+            ReasoningEffort::Disabled
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .biz_agent_decomposition_timeout_seconds,
+            15
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .biz_agent_aggregation_reasoning_effort,
+            ReasoningEffort::Disabled
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .biz_agent_aggregation_timeout_seconds,
+            5
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .da_post_effect_verification_focus_turns,
+            1
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .da_post_effect_verification_close_turns,
+            3
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .da_post_effect_inspection_focus_turns,
+            2
+        );
+        assert_eq!(
+            settings
+                .agents
+                .execution_budget
+                .da_post_effect_inspection_close_turns,
+            4
+        );
         settings.validate().unwrap();
+    }
+
+    #[test]
+    fn biz_agent_decomposition_reasoning_effort_rejects_unknown_value() {
+        let yaml = r#"
+            max_iterations: 10
+            parallel_execution: true
+            max_parallel_agents: 10
+            timeout_seconds: 300
+            api_timeout_seconds: 120
+            event_bus_capacity: 100
+            execution_budget:
+              biz_agent_decomposition_reasoning_effort: arbitrary
+        "#;
+        let cfg = Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap();
+        assert!(cfg.try_deserialize::<AgentSettings>().is_err());
+    }
+
+    #[test]
+    fn biz_agent_aggregation_reasoning_effort_rejects_unknown_value() {
+        let yaml = r#"
+            max_iterations: 10
+            parallel_execution: true
+            max_parallel_agents: 10
+            timeout_seconds: 300
+            api_timeout_seconds: 120
+            event_bus_capacity: 100
+            execution_budget:
+              biz_agent_aggregation_reasoning_effort: arbitrary
+        "#;
+        let cfg = Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap();
+        assert!(cfg.try_deserialize::<AgentSettings>().is_err());
+    }
+
+    #[test]
+    fn react_reasoning_effort_is_typed_and_partial_role_maps_keep_low_defaults() {
+        let yaml = r#"
+            max_iterations: 10
+            parallel_execution: true
+            max_parallel_agents: 10
+            timeout_seconds: 300
+            api_timeout_seconds: 120
+            event_bus_capacity: 100
+            execution_budget:
+              react_reasoning_effort:
+                plan: high
+        "#;
+        let cfg = Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap();
+        let settings: AgentSettings = cfg.try_deserialize().unwrap();
+        assert_eq!(
+            settings.execution_budget.react_reasoning_effort,
+            RoleReasoningEffortSettings {
+                plan: ReasoningEffort::High,
+                do_agent: ReasoningEffort::Low,
+                check: ReasoningEffort::Low,
+                act: ReasoningEffort::Low,
+            }
+        );
+
+        assert!("none".parse::<ReasoningEffort>().is_ok());
+        assert!("LOW".parse::<ReasoningEffort>().is_ok());
+        assert!("medium".parse::<ReasoningEffort>().is_err());
+    }
+
+    #[test]
+    fn enabled_biz_agent_orchestration_requires_bounded_decomposition_output() {
+        let mut settings = valid_settings();
+        settings
+            .agents
+            .execution_budget
+            .biz_agent_decomposition_max_tokens = 1_023;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("biz_agent_decomposition_max_tokens"));
+
+        settings
+            .agents
+            .execution_budget
+            .biz_agent_decomposition_max_tokens = 1_024;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_biz_agent_orchestration_requires_positive_aggregation_timeout() {
+        let mut settings = valid_settings();
+        settings
+            .agents
+            .execution_budget
+            .biz_agent_aggregation_timeout_seconds = 0;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("biz_agent_aggregation_timeout_seconds"));
+
+        settings
+            .agents
+            .execution_budget
+            .biz_agent_aggregation_timeout_seconds = 1;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_biz_agent_orchestration_requires_positive_decomposition_timeout() {
+        let mut settings = valid_settings();
+        settings
+            .agents
+            .execution_budget
+            .biz_agent_decomposition_timeout_seconds = 0;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("biz_agent_decomposition_timeout_seconds"));
+
+        settings
+            .agents
+            .execution_budget
+            .biz_agent_decomposition_timeout_seconds = 1;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn da_post_effect_verification_close_must_follow_focus() {
+        let mut settings = valid_settings();
+        settings
+            .agents
+            .execution_budget
+            .da_post_effect_verification_focus_turns = 3;
+        settings
+            .agents
+            .execution_budget
+            .da_post_effect_verification_close_turns = 3;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("da_post_effect_verification_close_turns"));
+
+        settings
+            .agents
+            .execution_budget
+            .da_post_effect_verification_close_turns = 4;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn da_post_effect_inspection_close_must_follow_focus() {
+        let mut settings = valid_settings();
+        settings
+            .agents
+            .execution_budget
+            .da_post_effect_inspection_focus_turns = 4;
+        settings
+            .agents
+            .execution_budget
+            .da_post_effect_inspection_close_turns = 4;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("da_post_effect_inspection_close_turns"));
+
+        settings
+            .agents
+            .execution_budget
+            .da_post_effect_inspection_close_turns = 5;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_llm_rate_limit_requires_positive_values() {
+        let mut settings = valid_settings();
+        settings.agents.hooks.llm_rate_limit.enabled = true;
+        settings.agents.hooks.llm_rate_limit.max_calls = 0;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("llm_rate_limit.max_calls"));
+
+        settings.agents.hooks.llm_rate_limit.max_calls = 1;
+        settings.agents.hooks.llm_rate_limit.window_seconds = 0;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("llm_rate_limit.window_seconds"));
+
+        settings.agents.hooks.llm_rate_limit.window_seconds = 1;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_external_tool_hooks_require_positive_timeout() {
+        let mut settings = valid_settings();
+        settings.agents.hooks.external_tools.enabled = true;
+        settings.agents.hooks.external_tools.timeout_ms = 0;
+        assert!(settings
+            .validate()
+            .unwrap_err()
+            .contains("external_tools.timeout_ms"));
+
+        settings.agents.hooks.external_tools.timeout_ms = 1;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn external_hook_commands_are_redacted_from_debug() {
+        let settings = ExternalToolHookSettings {
+            enabled: true,
+            pre_tool_use: vec!["command-containing-secret".to_string()],
+            ..ExternalToolHookSettings::default()
+        };
+        let rendered = format!("{settings:?}");
+        assert!(!rendered.contains("command-containing-secret"));
+        assert!(rendered.contains("pre_tool_use_count"));
     }
 }

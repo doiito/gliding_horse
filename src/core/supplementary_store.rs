@@ -56,7 +56,7 @@ impl SupplementaryInputStore {
         map.entry(task_iri.to_string()).or_default().push(entry);
         tracing::info!(
             task_iri = %task_iri,
-            content = %content.chars().take(80).collect::<String>(),
+            content_chars = content.chars().count(),
             score = relevance_score,
             "Supplementary input stored in SupplementaryInputStore"
         );
@@ -64,23 +64,25 @@ impl SupplementaryInputStore {
 
     /// Called by AgentRunner: fetch all unconsumed supplementary inputs for the current task
     ///
-    /// Atomic operation: fetched entries are marked consumed but kept in the list for auditing.
+    /// Atomic operation: fetched entries are marked consumed and removed from
+    /// the in-memory queue. Durable audit belongs to the execution journal;
+    /// retaining user text and embeddings here after delivery would leak both
+    /// memory and sensitive context for the lifetime of the process.
     /// Returns Vec instead of iterator to minimize lock hold time.
     pub fn take_pending(&self, task_iri: &str) -> Vec<SupplementEntry> {
         let mut map = self
             .pending
             .lock()
             .expect("SupplementaryInputStore lock poisoned");
-        let entries = map.entry(task_iri.to_string()).or_default();
-        let pending: Vec<_> = entries
-            .iter_mut()
-            .filter(|e| !e.consumed)
-            .map(|e| {
-                e.consumed = true;
-                e.clone()
+        map.remove(task_iri)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.consumed)
+            .map(|mut entry| {
+                entry.consumed = true;
+                entry
             })
-            .collect();
-        pending
+            .collect()
     }
 
     /// Return an audit snapshot of inputs that have not yet been injected
@@ -187,6 +189,14 @@ mod tests {
             0,
             "consumed entries should not be returned again"
         );
+        assert!(store.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn taking_an_unknown_task_does_not_allocate_a_retained_queue() {
+        let store = SupplementaryInputStore::new();
+        assert!(store.take_pending("iri://task/missing").is_empty());
+        assert!(store.pending.lock().unwrap().is_empty());
     }
 
     #[test]

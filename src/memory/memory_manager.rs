@@ -18,8 +18,8 @@ use crate::{CoreConfig, CoreError};
 /// Coordinates all four memory layers (L0/L1/L2/L3)
 ///
 /// Memory lifecycle:
-/// L1 Session → (compress) → L2 Blackboard → (archive) → L0 persistence
-///                                                      → L3 projection (on demand)
+/// L1 Session → (compress) → L0 persistence → L2 Blackboard
+///                                      └────────────→ L3 projection (on demand)
 pub struct MemoryManager {
     l0: Arc<L0Store>,
     l2: Arc<Blackboard>,
@@ -27,14 +27,86 @@ pub struct MemoryManager {
     config: CoreConfig,
     sessions: HashMap<String, L1Session>,
     scheduler: Option<Arc<MemoryScheduler>>,
-    l1_active_count: AtomicU64,
-    active_session_ids: std::collections::HashSet<String>,
+    active_l1: Arc<ActiveL1Registry>,
     /// HyperspaceEngine-backed vector store for semantic search.
     /// Available to all memory layers for embedding-based retrieval.
     vector_store: Option<Arc<HyperspaceStore>>,
     /// OntologyBridge dual-space embedding store (text Cosine + struct Poincaré).
     #[cfg(feature = "ontology")]
     ontology_bridge: Option<Arc<OntologyBridgeManager>>,
+}
+
+/// Synchronous lifecycle registry shared with cancellation guards.
+///
+/// `MemoryManager` is protected by an async mutex, so a future's `Drop`
+/// implementation cannot lock it safely. Keeping only opaque session IDs in a
+/// separately shared synchronous registry lets cancellation release accounting
+/// immediately without archiving a partial transcript or spawning detached
+/// cleanup work.
+#[derive(Default)]
+struct ActiveL1Registry {
+    session_ids: parking_lot::Mutex<std::collections::HashSet<String>>,
+    count: AtomicU64,
+}
+
+impl ActiveL1Registry {
+    fn register(&self, session_id: &str) {
+        let mut session_ids = self.session_ids.lock();
+        if session_ids.insert(session_id.to_string()) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn unregister(&self, session_id: &str) -> bool {
+        let mut session_ids = self.session_ids.lock();
+        if session_ids.remove(session_id) {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+/// Cancellation-safe lease for an externally owned L1 session.
+///
+/// Normal finalization unregisters the session before this lease is dropped,
+/// making `Drop` a no-op. If the owning future is cancelled at an await point,
+/// `Drop` synchronously abandons only the active-session accounting entry. The
+/// incomplete transcript is intentionally not archived.
+#[must_use = "dropping the ActiveL1Lease is what makes cancellation release L1 accounting"]
+pub(crate) struct ActiveL1Lease {
+    registry: std::sync::Weak<ActiveL1Registry>,
+    session_id: String,
+}
+
+impl ActiveL1Lease {
+    fn new(registry: &Arc<ActiveL1Registry>, session_id: &str) -> Self {
+        Self {
+            registry: Arc::downgrade(registry),
+            session_id: session_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ActiveL1Lease {
+    fn drop(&mut self) {
+        if self
+            .registry
+            .upgrade()
+            .is_some_and(|registry| registry.unregister(&self.session_id))
+        {
+            debug!(
+                session_id = %self.session_id,
+                archived = false,
+                "Cancelled L1 session abandoned without archiving its incomplete transcript"
+            );
+        }
+    }
 }
 
 impl MemoryManager {
@@ -63,8 +135,7 @@ impl MemoryManager {
             config,
             sessions: HashMap::new(),
             scheduler: None,
-            l1_active_count: AtomicU64::new(0),
-            active_session_ids: std::collections::HashSet::new(),
+            active_l1: Arc::new(ActiveL1Registry::default()),
             vector_store,
             #[cfg(feature = "ontology")]
             ontology_bridge: None,
@@ -101,8 +172,7 @@ impl MemoryManager {
             config,
             sessions: HashMap::new(),
             scheduler: Some(scheduler),
-            l1_active_count: AtomicU64::new(0),
-            active_session_ids: std::collections::HashSet::new(),
+            active_l1: Arc::new(ActiveL1Registry::default()),
             vector_store,
             #[cfg(feature = "ontology")]
             ontology_bridge: None,
@@ -163,18 +233,27 @@ impl MemoryManager {
         }
         let session =
             L1Session::with_config(agent_id, agent_role, task_iri, budget, eviction_config);
-        if self
-            .active_session_ids
-            .insert(session.session_id().to_string())
-        {
-            self.l1_active_count.fetch_add(1, Ordering::Relaxed);
-        }
+        self.active_l1.register(session.session_id());
         debug!(
             session_id = %session.session_id(),
             agent_id = %agent_id,
             "L1 session created"
         );
         session
+    }
+
+    /// Create an externally owned L1 session together with its cancellation
+    /// lease. Agent execution entry points must keep the lease alive for the
+    /// complete session lifetime.
+    pub(crate) fn create_scoped_session(
+        &mut self,
+        agent_id: &str,
+        agent_role: &str,
+        task_iri: &str,
+    ) -> (L1Session, ActiveL1Lease) {
+        let session = self.create_session(agent_id, agent_role, task_iri);
+        let lease = ActiveL1Lease::new(&self.active_l1, session.session_id());
+        (session, lease)
     }
 
     /// Register session with manager, returns session_id
@@ -187,9 +266,7 @@ impl MemoryManager {
         } else {
             self.sessions.insert(id.clone(), session);
         }
-        if self.active_session_ids.insert(id.clone()) {
-            self.l1_active_count.fetch_add(1, Ordering::Relaxed);
-        }
+        self.active_l1.register(&id);
         id
     }
 
@@ -234,8 +311,8 @@ impl MemoryManager {
             );
             Ok(summary)
         };
-        if result.is_ok() && self.active_session_ids.remove(session_id) {
-            self.l1_active_count.fetch_sub(1, Ordering::Relaxed);
+        if result.is_ok() {
+            self.active_l1.unregister(session_id);
         }
         result
     }
@@ -251,7 +328,7 @@ impl MemoryManager {
 
     /// Lock-free active session count (maintained via atomic counter)
     pub fn l1_session_count(&self) -> u64 {
-        self.l1_active_count.load(Ordering::Relaxed)
+        self.active_l1.count()
     }
 
     // ========== L2/L0 Archival ==========
@@ -281,11 +358,17 @@ impl MemoryManager {
         task_iri: &str,
         actions: &[TrackedAction],
         summary: &str,
+        status: &str,
+        verdict: Option<&str>,
     ) -> Result<(), CoreError> {
         if actions.is_empty() {
             return Ok(());
         }
-        let task_id = format!("iri://task/{}", task_iri);
+        let task_id = if task_iri.starts_with("iri://task/") {
+            task_iri.to_string()
+        } else {
+            format!("iri://task/{}", task_iri)
+        };
         let mut produces = vec![];
         for a in actions {
             for fc in &a.files_created {
@@ -296,16 +379,19 @@ impl MemoryManager {
                 }));
             }
         }
-        let json_ld = serde_json::json!({
+        let mut task_node = serde_json::json!({
             "@context": {"aos": "https://agent-os.org/ontology/core/"},
             "@id": task_id,
             "@type": "aos:Task",
-            "aos:hasStatus": "completed",
+            "aos:hasStatus": status,
             "aos:produces": produces,
             "aos:summary": summary,
             "aos:actionCount": actions.len(),
-        })
-        .to_string();
+        });
+        if let Some(verdict) = verdict {
+            task_node["aos:verdict"] = serde_json::Value::String(verdict.to_string());
+        }
+        let json_ld = task_node.to_string();
         self.l2.write_node(&task_id, &json_ld, &self.config)
     }
 
@@ -485,7 +571,7 @@ impl MemoryManager {
     /// Finalize and archive an externally held L1Session (skips track_session/close_session flow)
     ///
     /// Suitable for callers like AgentRunner that directly own the session.
-    /// Automates: track → close → archive_to_l2 → archive_to_l0
+    /// Automates: track → close → archive_to_l0 → archive_to_l2
     pub fn finalize_session(
         &mut self,
         session: L1Session,
@@ -576,7 +662,9 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tracked_action::ActionTracker;
     use crate::memory::EvictionConfig;
+    use serde_json::json;
 
     fn manager_with_config(config: CoreConfig) -> (MemoryManager, Arc<L0Store>, Arc<Blackboard>) {
         let dir = tempfile::tempdir().unwrap();
@@ -639,5 +727,103 @@ mod tests {
         assert_eq!(manager.session_count(), 0);
         assert_eq!(l0.count().unwrap(), 1);
         assert_eq!(l2.get_task_nodes("iri://task/finalize-count").len(), 1);
+    }
+
+    #[test]
+    fn dropping_scoped_session_lease_releases_count_without_archiving() {
+        let (mut manager, l0, l2) = manager_with_config(CoreConfig::default());
+        let task_iri = "iri://task/cancelled-scoped-l1";
+        let (mut session, lease) = manager.create_scoped_session("da-cancelled", "DA", task_iri);
+        session.add_summary("DA", "incomplete transcript", None);
+        assert_eq!(manager.l1_session_count(), 1);
+
+        // This is the ownership order produced when an execution future is
+        // cancelled: its external session and then its lifecycle lease drop.
+        drop(session);
+        drop(lease);
+
+        assert_eq!(manager.l1_session_count(), 0);
+        assert_eq!(manager.session_count(), 0);
+        assert_eq!(l0.count().unwrap(), 0);
+        assert!(l2.get_task_nodes(task_iri).is_empty());
+    }
+
+    #[test]
+    fn finalized_scoped_session_then_dropped_lease_is_idempotent() {
+        let (mut manager, l0, l2) = manager_with_config(CoreConfig::default());
+        let task_iri = "iri://task/finalized-scoped-l1";
+        let (mut session, lease) = manager.create_scoped_session("da-finalized", "DA", task_iri);
+        session.add_summary("DA", "complete transcript", None);
+        assert_eq!(manager.l1_session_count(), 1);
+
+        manager.finalize_session(session, task_iri).unwrap();
+        assert_eq!(manager.l1_session_count(), 0);
+        drop(lease);
+
+        assert_eq!(manager.l1_session_count(), 0);
+        assert_eq!(manager.session_count(), 0);
+        assert_eq!(l0.count().unwrap(), 1);
+        assert_eq!(l2.get_task_nodes(task_iri).len(), 1);
+    }
+
+    #[test]
+    fn archive_session_actions_preserves_full_task_iri_and_outcome() {
+        let (manager, _, l2) = manager_with_config(CoreConfig::default());
+        let task_iri = "iri://task/archive-outcome";
+        let mut tracker = ActionTracker::new(task_iri, "DA");
+        tracker.record(
+            "bash",
+            &json!({"command": "run checks"}),
+            &json!({"exit_code": 1, "stderr": "failed"}),
+            0.01,
+        );
+
+        manager
+            .archive_session_actions(
+                task_iri,
+                &tracker.actions,
+                "verification did not pass",
+                "failed",
+                Some("blocked"),
+            )
+            .unwrap();
+
+        let node = l2.read_node(task_iri).unwrap().unwrap();
+        let archived: serde_json::Value = serde_json::from_str(&node.json_ld).unwrap();
+        assert_eq!(archived["@id"], task_iri);
+        assert_eq!(archived["aos:hasStatus"], "failed");
+        assert_eq!(archived["aos:verdict"], "blocked");
+        assert!(l2
+            .read_node("iri://task/iri://task/archive-outcome")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn archive_session_actions_still_normalizes_legacy_bare_task_ids() {
+        let (manager, _, l2) = manager_with_config(CoreConfig::default());
+        let mut tracker = ActionTracker::new("legacy-id", "DA");
+        tracker.record(
+            "bash",
+            &json!({"command": "run checks"}),
+            &json!({"exit_code": 0}),
+            0.01,
+        );
+
+        manager
+            .archive_session_actions(
+                "legacy-id",
+                &tracker.actions,
+                "checks passed",
+                "success",
+                Some("success"),
+            )
+            .unwrap();
+
+        let node = l2.read_node("iri://task/legacy-id").unwrap().unwrap();
+        let archived: serde_json::Value = serde_json::from_str(&node.json_ld).unwrap();
+        assert_eq!(archived["@id"], "iri://task/legacy-id");
+        assert_eq!(archived["aos:hasStatus"], "success");
+        assert_eq!(archived["aos:verdict"], "success");
     }
 }

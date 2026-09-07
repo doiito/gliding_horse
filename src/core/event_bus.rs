@@ -8,7 +8,7 @@
 //! - Zero-copy event broadcasting using Arc
 //! - SSE streaming support for real-time clients
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::BitOr;
 use std::str::FromStr;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Event types in the PDCA system
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -445,6 +445,11 @@ pub struct EventBusConfig {
 
     /// Maximum events to keep in history
     pub max_history: usize,
+
+    /// Maximum user control commands retained independently from the lossy
+    /// broadcast channel. Telemetry bursts must not evict supplementary user
+    /// instructions before the task owner can consume them.
+    pub reliable_command_capacity: usize,
 }
 
 impl Default for EventBusConfig {
@@ -452,6 +457,7 @@ impl Default for EventBusConfig {
         Self {
             buffer_size: 1000,
             max_history: 10000,
+            reliable_command_capacity: 4096,
         }
     }
 }
@@ -471,6 +477,33 @@ pub struct EventBus {
     /// from broadcast delivery and is not a durable event log.
     history: std::sync::Mutex<VecDeque<Event>>,
     max_history: usize,
+
+    /// Task-scoped reliable inbox for commands that change an active task's
+    /// contract. Broadcast remains the fan-out transport for observers.
+    reliable_commands: std::sync::Mutex<ReliableCommandInbox>,
+    reliable_command_capacity: usize,
+}
+
+#[derive(Default)]
+struct ReliableCommandInbox {
+    commands: VecDeque<Event>,
+    closed_tasks: HashSet<String>,
+    closed_task_order: VecDeque<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupplementaryCommandRejection {
+    TaskClosed,
+    CapacityExceeded,
+}
+
+impl std::fmt::Display for SupplementaryCommandRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TaskClosed => formatter.write_str("task command channel is closed"),
+            Self::CapacityExceeded => formatter.write_str("task command inbox capacity exceeded"),
+        }
+    }
 }
 
 /// A broadcast receiver that applies a `Subscription` before exposing an
@@ -512,6 +545,12 @@ impl EventBus {
             type_mask: std::sync::Mutex::new(TypeMask::new()),
             history: std::sync::Mutex::new(VecDeque::with_capacity(config.max_history)),
             max_history: config.max_history,
+            reliable_commands: std::sync::Mutex::new(ReliableCommandInbox {
+                commands: VecDeque::with_capacity(config.reliable_command_capacity),
+                closed_tasks: HashSet::new(),
+                closed_task_order: VecDeque::with_capacity(config.reliable_command_capacity),
+            }),
+            reliable_command_capacity: config.reliable_command_capacity,
         }
     }
 
@@ -541,21 +580,79 @@ impl EventBus {
         payload: &str,
         priority: EventPriority,
     ) -> String {
+        self.emit_immediate_with_priority(task_iri, event_type, source_agent_iri, payload, priority)
+            .0
+    }
+
+    /// Submit a contract-changing user command synchronously. The caller gets
+    /// an explicit rejection instead of displaying an optimistic acknowledgement
+    /// before a spawned async emitter has actually run.
+    pub fn submit_supplementary_command(
+        &self,
+        task_iri: &str,
+        source_agent_iri: &str,
+        payload: &str,
+    ) -> Result<String, SupplementaryCommandRejection> {
+        let (event_id, rejection) = self.emit_immediate_with_priority(
+            task_iri,
+            "USER_SUPPLEMENTARY_INPUT",
+            source_agent_iri,
+            payload,
+            EventPriority::High,
+        );
+        rejection.map_or(Ok(event_id), Err)
+    }
+
+    fn emit_immediate_with_priority(
+        &self,
+        task_iri: &str,
+        event_type: &str,
+        source_agent_iri: &str,
+        payload: &str,
+        priority: EventPriority,
+    ) -> (String, Option<SupplementaryCommandRejection>) {
         let sequence = self.event_count.fetch_add(1, Ordering::Relaxed);
         let event_id = format!("evt_{}", uuid::Uuid::new_v4().hyphenated());
 
+        // Hold the inbox lock across closed/capacity validation and enqueue so
+        // terminal close-and-drain is atomic with respect to user submission.
+        let mut command_inbox = (event_type == "USER_SUPPLEMENTARY_INPUT").then(|| {
+            self.reliable_commands
+                .lock()
+                .expect("reliable_commands Mutex poisoned")
+        });
+        let rejection = command_inbox.as_ref().and_then(|inbox| {
+            if inbox.closed_tasks.contains(task_iri) {
+                Some(SupplementaryCommandRejection::TaskClosed)
+            } else if self.reliable_command_capacity == 0
+                || inbox.commands.len() >= self.reliable_command_capacity
+            {
+                Some(SupplementaryCommandRejection::CapacityExceeded)
+            } else {
+                None
+            }
+        });
+        let effective_event_type = if rejection.is_some() {
+            "USER_SUPPLEMENTARY_INPUT_REJECTED"
+        } else {
+            event_type
+        };
+        let effective_payload = rejection
+            .map(|reason| serde_json::json!({"reason": reason.to_string()}).to_string())
+            .unwrap_or_else(|| payload.to_string());
+
         let type_mask = {
             let mut mask = self.type_mask.lock().expect("type_mask Mutex poisoned");
-            mask.get_or_create_mask(event_type)
+            mask.get_or_create_mask(effective_event_type)
         };
 
         let event = Event {
             event_id: event_id.clone(),
             task_iri: task_iri.to_string(),
-            event_type: event_type.to_string(),
+            event_type: effective_event_type.to_string(),
             source_agent_iri: source_agent_iri.to_string(),
-            payload: payload.to_string(),
-            payload_json_ld: payload.to_string(),
+            payload: effective_payload.clone(),
+            payload_json_ld: effective_payload,
             timestamp: Utc::now(),
             sequence,
             type_mask,
@@ -564,7 +661,7 @@ impl EventBus {
 
         debug!(
             event_id = %event_id,
-            event_type = %event_type,
+            event_type = %effective_event_type,
             task_iri = %task_iri,
             type_mask = ?event.type_mask,
             "Event emitted"
@@ -578,9 +675,21 @@ impl EventBus {
             history.push_back(event.clone());
         }
 
+        // Tokio broadcast is intentionally lossy for lagging observers. The
+        // accepted command copy remains in this task-keyed inbox until SA
+        // claims it. Rejected events contain only bounded reason metadata.
+        if rejection.is_none() {
+            if let Some(inbox) = command_inbox.as_mut() {
+                inbox.commands.push_back(event.clone());
+            }
+        } else if let Some(reason) = rejection {
+            warn!(task_iri = %task_iri, %reason, "Supplementary command rejected");
+        }
+        drop(command_inbox);
+
         let _ = self.sender.send(event);
 
-        event_id
+        (event_id, rejection)
     }
 
     /// Subscribe to events
@@ -644,6 +753,65 @@ impl EventBus {
             .collect();
         result.reverse();
         result
+    }
+
+    /// Atomically claim supplementary commands for one task. Commands for
+    /// other tasks stay queued and are never copied into an unrelated SA.
+    pub fn take_supplementary_commands(&self, task_iri: &str) -> Vec<Event> {
+        let mut inbox = self
+            .reliable_commands
+            .lock()
+            .expect("reliable_commands Mutex poisoned");
+        let mut claimed = Vec::new();
+        inbox.commands.retain(|event| {
+            if event.task_iri == task_iri && event.event_type == "USER_SUPPLEMENTARY_INPUT" {
+                claimed.push(event.clone());
+                false
+            } else {
+                true
+            }
+        });
+        claimed.sort_by_key(|event| event.sequence);
+        claimed
+    }
+
+    /// Open the task command session before execution/retry.
+    pub fn open_supplementary_commands(&self, task_iri: &str) {
+        let mut inbox = self
+            .reliable_commands
+            .lock()
+            .expect("reliable_commands Mutex poisoned");
+        inbox.closed_tasks.remove(task_iri);
+        inbox.closed_task_order.retain(|task| task != task_iri);
+    }
+
+    /// Atomically close command submission and claim everything accepted up
+    /// to that boundary. A TUI/API command racing with terminal completion is
+    /// therefore either included here or receives `TaskClosed`.
+    pub fn close_and_take_supplementary_commands(&self, task_iri: &str) -> Vec<Event> {
+        let mut inbox = self
+            .reliable_commands
+            .lock()
+            .expect("reliable_commands Mutex poisoned");
+        if inbox.closed_tasks.insert(task_iri.to_string()) {
+            inbox.closed_task_order.push_back(task_iri.to_string());
+        }
+        while inbox.closed_task_order.len() > self.reliable_command_capacity.max(1) {
+            if let Some(expired) = inbox.closed_task_order.pop_front() {
+                inbox.closed_tasks.remove(&expired);
+            }
+        }
+        let mut claimed = Vec::new();
+        inbox.commands.retain(|event| {
+            if event.task_iri == task_iri && event.event_type == "USER_SUPPLEMENTARY_INPUT" {
+                claimed.push(event.clone());
+                false
+            } else {
+                true
+            }
+        });
+        claimed.sort_by_key(|event| event.sequence);
+        claimed
     }
 
     pub fn history_len(&self) -> usize {
@@ -761,6 +929,7 @@ mod tests {
         let bus = EventBus::with_config(EventBusConfig {
             buffer_size: 8,
             max_history: 2,
+            reliable_command_capacity: 8,
         });
         bus.emit("task:a", "FIRST", "agent:a", "{}").await;
         bus.emit("task:b", "SECOND", "agent:b", "{}").await;
@@ -846,6 +1015,82 @@ mod tests {
         );
         bus.emit("task", "CUSTOM_129", "agent", "{}").await;
         assert_eq!(receiver.recv().await.unwrap().event_type, "CUSTOM_129");
+    }
+
+    #[tokio::test]
+    async fn supplementary_command_survives_broadcast_lag_and_is_claimed_once() {
+        let bus = EventBus::with_config(EventBusConfig {
+            buffer_size: 2,
+            max_history: 2,
+            reliable_command_capacity: 8,
+        });
+        let mut receiver = bus.subscribe();
+        bus.emit(
+            "task:a",
+            "USER_SUPPLEMENTARY_INPUT",
+            "ui",
+            "文件输出到当前工作区",
+        )
+        .await;
+        for index in 0..8 {
+            bus.emit("task:a", "TELEMETRY", "agent", &index.to_string())
+                .await;
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+
+        let claimed = bus.take_supplementary_commands("task:a");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].payload, "文件输出到当前工作区");
+        assert!(bus.take_supplementary_commands("task:a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn supplementary_commands_are_claimed_by_exact_task() {
+        let bus = EventBus::new(2);
+        bus.emit("task:a", "USER_SUPPLEMENTARY_INPUT", "ui", "A")
+            .await;
+        bus.emit("task:b", "USER_SUPPLEMENTARY_INPUT", "ui", "B")
+            .await;
+
+        let a = bus.take_supplementary_commands("task:a");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].payload, "A");
+        let b = bus.take_supplementary_commands("task:b");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].payload, "B");
+    }
+
+    #[test]
+    fn supplementary_terminal_boundary_accepts_or_rejects_atomically() {
+        let bus = EventBus::with_config(EventBusConfig {
+            buffer_size: 2,
+            max_history: 8,
+            reliable_command_capacity: 1,
+        });
+        bus.open_supplementary_commands("task:a");
+        assert!(bus
+            .submit_supplementary_command("task:a", "ui", "first")
+            .is_ok());
+        assert_eq!(
+            bus.submit_supplementary_command("task:a", "ui", "overflow"),
+            Err(SupplementaryCommandRejection::CapacityExceeded)
+        );
+
+        let terminal = bus.close_and_take_supplementary_commands("task:a");
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload, "first");
+        assert_eq!(
+            bus.submit_supplementary_command("task:a", "ui", "late"),
+            Err(SupplementaryCommandRejection::TaskClosed)
+        );
+
+        bus.open_supplementary_commands("task:a");
+        assert!(bus
+            .submit_supplementary_command("task:a", "ui", "retry-cycle")
+            .is_ok());
     }
 
     #[test]

@@ -93,7 +93,7 @@ pub const OUTPUT_MANAGEMENT: &str = r#"📋 Output Management — ALL tools (esp
 3. **Acknowledge on demand**: When only confirming result existence, use | grep -c or | wc -l instead of viewing full content
    4. **Truncation awareness**: Output exceeding 16KB will be silently truncated; results exceeding 2KB will be summarized with an IRI archive reference
    - If you see an 'output truncated' marker or '[archived]' tag → output was too large, narrow scope and search again
-- To view full results, use read_full_result_* tools to read on demand"#;
+- A routed result may name one exact session reader such as `read_full_result_<call-id>`. Call it only if that exact name appears in the current turn's tool schemas. Never invent, derive, or reuse a reader name from an earlier agent/session/phase; otherwise narrow the original query or use an advertised stable reader."#;
 
 /// Generic kernel-only optimization. It describes evidence and handoff
 /// semantics without assuming software engineering, PDCA, or any domain.

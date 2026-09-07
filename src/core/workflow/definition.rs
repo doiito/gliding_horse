@@ -71,7 +71,8 @@ pub struct WorkflowNodeDef {
     /// Retry delay in seconds
     #[serde(default)]
     pub retry_delay_secs: u64,
-    /// Node timeout in seconds (0 = unlimited)
+    /// Node timeout in seconds. Zero inherits the Supervisor's configured
+    /// per-agent default; a positive value overrides it for this node.
     #[serde(default)]
     pub timeout_secs: u64,
     /// Whether this is a final node

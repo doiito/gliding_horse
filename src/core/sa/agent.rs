@@ -58,6 +58,11 @@ pub struct SupervisorAgent {
     pub(super) relevance_tracker: RelevanceTracker,
     /// Timeout for intervention/LLM execution (seconds)
     pub(super) execution_timeout_secs: u64,
+    /// Default wall-clock limit for one PA/DA/CA/AA BizAgent dispatch.
+    /// A workflow node may supply its own positive timeout; zero inherits
+    /// this value. Keeping this separate from `execution_timeout_secs` avoids
+    /// coupling a long business phase to a short SA intervention call.
+    pub(super) agent_dispatch_timeout_secs: u64,
     /// Human approval wait window (seconds) before falling back to the default
     pub(super) approval_wait_secs: u64,
     /// Skill discovery engine for semantic skill search during planning
@@ -105,6 +110,7 @@ impl SupervisorAgent {
         max_iterations: u32,
         max_pdca_cycles: u32,
     ) -> Self {
+        let agent_dispatch_timeout_secs = runner.agent_settings.timeout_seconds;
         // Wire up event bus on runner so it can emit detailed execution events
         // (TOOL_CALL, TOOL_RESULT, THOUGHT) during the ReAct loop.
         if let Some(r) = Arc::get_mut(&mut runner) {
@@ -138,6 +144,7 @@ impl SupervisorAgent {
             embedder: None,
             relevance_tracker: RelevanceTracker::new(0.6),
             execution_timeout_secs: 30,
+            agent_dispatch_timeout_secs,
             approval_wait_secs: 5,
             discovery_engine: None,
             policy_learning: ConstrainedPolicy::default().with_persistence(runner.l0_store.clone()),
@@ -150,6 +157,13 @@ impl SupervisorAgent {
 
     pub fn with_execution_timeout(mut self, secs: u64) -> Self {
         self.execution_timeout_secs = secs;
+        self
+    }
+
+    /// Override the per-BizAgent dispatch timeout. Zero deliberately disables
+    /// the default only for embedders that opt into unbounded execution.
+    pub fn with_agent_dispatch_timeout(mut self, secs: u64) -> Self {
+        self.agent_dispatch_timeout_secs = secs;
         self
     }
 

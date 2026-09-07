@@ -6,8 +6,8 @@ target*/
 # Generated protobuf files
 apps/gliding_code/target/
 
-# PR resources: ignore imported/reference material, but keep the maintained
-# audit report available for a normal commit.
+# Local-only review resources and generated audit reports. This directory is
+# intentionally never published to GitHub; production source/docs live elsewhere.
 PR-res/
 
 # application data
@@ -16,6 +16,7 @@ data/
 # logs
 logs/
 *.log
+/log
 
 # trae data
 .trae*/
@@ -30,6 +31,7 @@ logs/
 /.codegraph/
 /.sandbox-home/
 /.sandbox-tmp/
+/.semantic-effect-test-*/
 
 # omo data
 .omo*/
@@ -88,6 +90,7 @@ yarn-error.log*
 *.db-wal
 *.sqlite
 *.sqlite3
+*.redb
 
 # Go test/build artifacts
 *.test

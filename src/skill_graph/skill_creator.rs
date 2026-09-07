@@ -6,6 +6,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::gateway::unified_gateway::{ChatMessage, UnifiedGateway};
+use crate::llm::{LlmInteractionScope, LlmInteractionService};
 use crate::memory::hyperspace_store::HyperspaceStore;
 use crate::skill_graph::discovery::SkillDiscoveryEngine;
 use crate::skill_graph::graph_store::SkillGraphStore;
@@ -154,7 +155,8 @@ impl Default for SkillCreatorConfig {
 }
 
 pub struct SkillCreator {
-    gateway: Arc<UnifiedGateway>,
+    interactions: Arc<LlmInteractionService>,
+    model: String,
     graph_store: Arc<SkillGraphStore>,
     skill_registry: Arc<SkillRegistry>,
     vector_store: Option<Arc<HyperspaceStore>>,
@@ -168,8 +170,29 @@ impl SkillCreator {
         skill_registry: Arc<SkillRegistry>,
         config: SkillCreatorConfig,
     ) -> Self {
+        Self::new_with_interactions(
+            LlmInteractionService::shared(gateway),
+            graph_store,
+            skill_registry,
+            config,
+        )
+    }
+
+    /// Construct a creator on an application-owned interaction plane.
+    ///
+    /// AgentRunner uses this entry point so nested skill-generation requests
+    /// share its HookManager, EventBus and token ledger. `new` remains the
+    /// standalone convenience API and resolves the gateway-scoped service.
+    pub fn new_with_interactions(
+        interactions: Arc<LlmInteractionService>,
+        graph_store: Arc<SkillGraphStore>,
+        skill_registry: Arc<SkillRegistry>,
+        config: SkillCreatorConfig,
+    ) -> Self {
+        let model = interactions.gateway().default_model();
         Self {
-            gateway,
+            interactions,
+            model,
             graph_store,
             skill_registry,
             vector_store: None,
@@ -239,7 +262,24 @@ impl SkillCreator {
         &self,
         request: CreateSkillRequest,
     ) -> Result<CreatedSkill, CoreError> {
-        info!(description = %request.description, "Starting Skill creation from natural language description");
+        self.create_from_description_with_scope(request, LlmInteractionScope::new("skill_creation"))
+            .await
+    }
+
+    /// Create a skill while preserving the trusted task/agent/parent scope of
+    /// the tool call that requested it. The operation owns the stage name;
+    /// callers may provide correlation fields but cannot relabel the event.
+    pub async fn create_from_description_with_scope(
+        &self,
+        request: CreateSkillRequest,
+        mut scope: LlmInteractionScope,
+    ) -> Result<CreatedSkill, CoreError> {
+        scope.stage = "skill_creation".to_string();
+        info!(
+            description_chars = request.description.chars().count(),
+            has_name_hint = request.skill_name_hint.is_some(),
+            "Starting Skill creation from natural language description"
+        );
 
         let user_message = if let Some(hint) = &request.skill_name_hint {
             format!(
@@ -272,8 +312,8 @@ impl SkillCreator {
         ];
 
         let response = self
-            .gateway
-            .chat(messages)
+            .interactions
+            .chat(scope, &self.model, messages)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("LLM call failed: {}", e),
@@ -301,7 +341,26 @@ impl SkillCreator {
         &self,
         request: ConvertMarkdownRequest,
     ) -> Result<CreatedSkill, CoreError> {
-        info!(source = ?request.source_path, "Starting Skill conversion from Markdown");
+        self.convert_from_markdown_with_scope(
+            request,
+            LlmInteractionScope::new("skill_markdown_conversion"),
+        )
+        .await
+    }
+
+    /// Convert a Markdown skill on the caller's interaction plane and trusted
+    /// task scope. See `create_from_description_with_scope`.
+    pub async fn convert_from_markdown_with_scope(
+        &self,
+        request: ConvertMarkdownRequest,
+        mut scope: LlmInteractionScope,
+    ) -> Result<CreatedSkill, CoreError> {
+        scope.stage = "skill_markdown_conversion".to_string();
+        info!(
+            markdown_chars = request.markdown_content.chars().count(),
+            has_source_path = request.source_path.is_some(),
+            "Starting Skill conversion from Markdown"
+        );
 
         let user_message = format!(
             "Please convert the following Markdown-format Skill description to a JSON-LD Skill definition:\n\n```markdown\n{}\n```",
@@ -328,8 +387,8 @@ impl SkillCreator {
         ];
 
         let response = self
-            .gateway
-            .chat(messages)
+            .interactions
+            .chat(scope, &self.model, messages)
             .await
             .map_err(|e| CoreError::Internal {
                 message: format!("LLM call failed: {}", e),

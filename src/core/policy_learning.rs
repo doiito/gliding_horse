@@ -1674,6 +1674,19 @@ mod tests {
         assert!(!evidence.reusable_success());
         evidence.successful_checks.push("verify output".into());
         assert!(evidence.reusable_success());
+        evidence
+            .failed_checks
+            .push("earlier diagnostic probe failed before the final audit".into());
+        assert!(
+            evidence.reusable_success(),
+            "historical failed actions remain visible evidence but do not override a final independent CA pass"
+        );
+        evidence.ca_verdict = "conditional".into();
+        assert!(
+            !evidence.reusable_success(),
+            "the canonical CA verdict, not a raw failed-action count, owns the learning gate"
+        );
+        evidence.ca_verdict = "pass".into();
         store
             .store(
                 &evidence.storage_iri(),

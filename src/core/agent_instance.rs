@@ -8,6 +8,21 @@ pub enum AgentRole {
     Act,
 }
 
+impl AgentRole {
+    /// Semantic task-type key used by [`UnifiedGateway`](crate::gateway::unified_gateway::UnifiedGateway)
+    /// model routing.
+    ///
+    /// Keep this separate from `Display`: PA/DA/CA/AA are human-facing role
+    /// labels, while gateway configuration uses stable capability keys.
+    pub const fn model_routing_key(self) -> &'static str {
+        match self {
+            Self::Plan => "planning",
+            Self::Do => "execution",
+            Self::Check | Self::Act => "analysis",
+        }
+    }
+}
+
 impl std::fmt::Display for AgentRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -62,5 +77,18 @@ impl AgentInstance {
             role,
             status: AgentStatus::Idle,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentRole;
+
+    #[test]
+    fn every_agent_role_has_the_expected_gateway_model_routing_key() {
+        assert_eq!(AgentRole::Plan.model_routing_key(), "planning");
+        assert_eq!(AgentRole::Do.model_routing_key(), "execution");
+        assert_eq!(AgentRole::Check.model_routing_key(), "analysis");
+        assert_eq!(AgentRole::Act.model_routing_key(), "analysis");
     }
 }

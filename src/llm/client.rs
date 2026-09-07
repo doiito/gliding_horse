@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::gateway::unified_gateway::{ChatCompletionResponse, ChatMessage, UnifiedGateway};
 use crate::llm::message::Message;
 use crate::llm::response_parser::{self, LLMResponse, ToolCall};
+use crate::llm::{LlmInteractionScope, LlmInteractionService};
 use crate::CoreError;
 
 /// High-level LLM client
@@ -13,6 +14,7 @@ use crate::CoreError;
 /// and standard prompt template injection.
 pub struct LLMClient {
     gateway: Arc<UnifiedGateway>,
+    interactions: Arc<LlmInteractionService>,
     default_model: String,
 }
 
@@ -20,6 +22,7 @@ impl LLMClient {
     pub fn new(gateway: Arc<UnifiedGateway>) -> Self {
         let model = gateway.default_model().to_string();
         Self {
+            interactions: LlmInteractionService::shared(gateway.clone()),
             gateway,
             default_model: model,
         }
@@ -27,6 +30,7 @@ impl LLMClient {
 
     pub fn with_model(gateway: Arc<UnifiedGateway>, model: &str) -> Self {
         Self {
+            interactions: LlmInteractionService::shared(gateway.clone()),
             gateway,
             default_model: model.to_string(),
         }
@@ -59,7 +63,14 @@ impl LLMClient {
             })
             .collect();
 
-        let response = self.gateway.chat_with_model(model, chat_messages).await?;
+        let response = self
+            .interactions
+            .chat(
+                LlmInteractionScope::new("llm_client_chat"),
+                model,
+                chat_messages,
+            )
+            .await?;
 
         Self::parse_completion_response(&response)
     }
@@ -86,8 +97,9 @@ impl LLMClient {
             .collect();
 
         let response = self
-            .gateway
+            .interactions
             .chat_with_params(
+                LlmInteractionScope::new("llm_client_tools"),
                 model,
                 chat_messages,
                 temperature,
@@ -173,8 +185,9 @@ impl LLMClient {
             .collect();
 
         let response = self
-            .gateway
+            .interactions
             .chat_with_params(
+                LlmInteractionScope::new("llm_client_json"),
                 model,
                 chat_messages,
                 temperature,

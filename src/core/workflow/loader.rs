@@ -364,6 +364,15 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
 
     // Phase 1: Add all nodes
     for node_def in &def.nodes {
+        if node_def.id.trim().is_empty() {
+            return Err("Workflow node id must not be empty".to_string());
+        }
+        if node_index.contains_key(&node_def.id) {
+            return Err(format!(
+                "Workflow definition repeats node id '{}'",
+                node_def.id
+            ));
+        }
         let idx = graph.add_node(GraphNode {
             def: node_def.clone(),
         });
@@ -387,7 +396,10 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
                     },
                 );
             } else {
-                warn!("Node {} next '{}' does not exist", node_def.id, next_id);
+                return Err(format!(
+                    "Node {} next '{}' does not exist",
+                    node_def.id, next_id
+                ));
             }
         }
 
@@ -402,10 +414,10 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
                     },
                 );
             } else {
-                warn!(
+                return Err(format!(
                     "Node {} next_node '{}' does not exist",
                     node_def.id, next_id
-                );
+                ));
             }
         }
 
@@ -419,6 +431,11 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
                         relation: "dependency".to_string(),
                     },
                 );
+            } else {
+                return Err(format!(
+                    "Node {} dependency '{}' does not exist",
+                    node_def.id, dep_id
+                ));
             }
         }
 
@@ -433,6 +450,11 @@ pub fn build_dag(def: &WorkflowDefinition) -> Result<WorkflowDag, String> {
                             relation: "branch".to_string(),
                         },
                     );
+                } else {
+                    return Err(format!(
+                        "Node {} branch target '{}' does not exist",
+                        node_def.id, branch.target
+                    ));
                 }
             }
         }
@@ -589,6 +611,48 @@ mod tests {
         let def = load_workflow_jsonld(json).unwrap();
         let dag = build_dag(&def).unwrap();
         assert!(has_cycle(&dag));
+    }
+
+    #[test]
+    fn build_dag_rejects_unknown_dependency_instead_of_dropping_it() {
+        let json = r#"{
+            "@id": "wf:unknown-dependency",
+            "name": "Unknown dependency",
+            "description": "must fail closed",
+            "version": "1.0",
+            "entry_node": "a",
+            "nodes": [
+                {"@id": "a", "@type": "AgentNode", "agent_role": "Do", "objective": "A",
+                 "dependencies": ["missing"]}
+            ]
+        }"#;
+        let def = load_workflow_jsonld(json).unwrap();
+        let error = match build_dag(&def) {
+            Ok(_) => panic!("unknown dependency must not be ignored"),
+            Err(error) => error,
+        };
+        assert!(error.contains("dependency 'missing' does not exist"));
+    }
+
+    #[test]
+    fn build_dag_rejects_duplicate_node_identity() {
+        let json = r#"{
+            "@id": "wf:duplicate-node",
+            "name": "Duplicate node",
+            "description": "must fail closed",
+            "version": "1.0",
+            "entry_node": "a",
+            "nodes": [
+                {"@id": "a", "@type": "AgentNode", "agent_role": "Do", "objective": "first"},
+                {"@id": "a", "@type": "AgentNode", "agent_role": "Check", "objective": "second"}
+            ]
+        }"#;
+        let def = load_workflow_jsonld(json).unwrap();
+        let error = match build_dag(&def) {
+            Ok(_) => panic!("duplicate node ids must not overwrite the runtime index"),
+            Err(error) => error,
+        };
+        assert!(error.contains("repeats node id 'a'"));
     }
 
     #[test]

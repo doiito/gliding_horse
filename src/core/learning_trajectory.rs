@@ -14,10 +14,11 @@ use sha2::{Digest, Sha256};
 use crate::core::policy_learning::LearningMode;
 use crate::core::retrieval_policy::RetrievalPolicyArm;
 use crate::core::tracked_action::{ActionStatus, TrackedAction};
+use crate::llm::interaction::LlmContextQualitySnapshot;
 use crate::memory::l0_store::L0Store;
 use crate::CoreError;
 
-pub const LEARNING_TRAJECTORY_SCHEMA_VERSION: u32 = 1;
+pub const LEARNING_TRAJECTORY_SCHEMA_VERSION: u32 = 2;
 pub const LEARNING_TRAJECTORY_PREFIX: &str = "iri://learning/trajectory/";
 const MAX_TRAJECTORY_STEPS: usize = 128;
 const MAX_EVIDENCE_REFERENCES: usize = 32;
@@ -71,8 +72,20 @@ pub struct LearningTrajectory {
     pub policy_candidates: Vec<String>,
     pub policy_model_version: u64,
     pub policy_explored: bool,
-    pub selected_skill_iris: Vec<String>,
-    pub selected_knowledge_fragment_iris: Vec<String>,
+    /// Retrieval candidates inspected by the policy before arm selection.
+    #[serde(default)]
+    pub observed_skill_iris: Vec<String>,
+    #[serde(default)]
+    pub observed_knowledge_fragment_iris: Vec<String>,
+    /// Candidates that survived arm ordering, deduplication and prompt
+    /// budgets and therefore were actually injected into agent context.
+    #[serde(default)]
+    pub injected_skill_iris: Vec<String>,
+    #[serde(default)]
+    pub injected_knowledge_fragment_iris: Vec<String>,
+    /// Metadata-only aggregate for real provider dispatches in this task.
+    #[serde(default)]
+    pub context_quality: LlmContextQualitySnapshot,
     pub evidence_iris: Vec<String>,
     pub tool_steps: Vec<TrajectoryToolStep>,
     pub outcome: LearningTrajectoryOutcome,
@@ -149,10 +162,26 @@ impl LearningTrajectory {
         {
             return Err("trajectory evidence must use stable IRI references".into());
         }
-        if !valid_reference_collection(&self.selected_skill_iris)
-            || !valid_reference_collection(&self.selected_knowledge_fragment_iris)
+        if !valid_reference_collection(&self.observed_skill_iris)
+            || !valid_reference_collection(&self.observed_knowledge_fragment_iris)
+            || !valid_reference_collection(&self.injected_skill_iris)
+            || !valid_reference_collection(&self.injected_knowledge_fragment_iris)
         {
-            return Err("trajectory selected references must be unique stable IRIs".into());
+            return Err("trajectory context references must be unique stable IRIs".into());
+        }
+        if self
+            .injected_skill_iris
+            .iter()
+            .any(|iri| !self.observed_skill_iris.contains(iri))
+            || self
+                .injected_knowledge_fragment_iris
+                .iter()
+                .any(|iri| !self.observed_knowledge_fragment_iris.contains(iri))
+        {
+            return Err("trajectory injected context must be a subset of observed context".into());
+        }
+        if !self.context_quality.is_consistent() {
+            return Err("trajectory context-quality counters are inconsistent".into());
         }
         if self.tool_steps.iter().any(|step| {
             step.tool_name.trim().is_empty()
@@ -291,8 +320,29 @@ mod tests {
             policy_candidates: vec!["baseline".into(), "knowledge_first".into()],
             policy_model_version: 4,
             policy_explored: false,
-            selected_skill_iris: vec!["iri://skills/report".into()],
-            selected_knowledge_fragment_iris: vec!["iri://knowledge/report".into()],
+            observed_skill_iris: vec!["iri://skills/report".into()],
+            observed_knowledge_fragment_iris: vec!["iri://knowledge/report".into()],
+            injected_skill_iris: vec!["iri://skills/report".into()],
+            injected_knowledge_fragment_iris: vec!["iri://knowledge/report".into()],
+            context_quality: LlmContextQualitySnapshot {
+                dispatch_count: 1,
+                request_messages: 1,
+                request_chars: 12,
+                by_kind: crate::llm::interaction::LlmContextKindReceipt {
+                    user_input: crate::llm::interaction::LlmContextClassReceipt {
+                        messages: 1,
+                        chars: 12,
+                    },
+                    ..Default::default()
+                },
+                manifest_fragments: 2,
+                dispositions: crate::llm::interaction::LlmContextDispositionReceipt {
+                    included: 1,
+                    dropped_budget: 1,
+                    ..Default::default()
+                },
+                required_budget_overflow_dispatches: 1,
+            },
             evidence_iris: vec!["iri://learning/ca-audit/example".into()],
             tool_steps: vec![TrajectoryToolStep {
                 tool_name: "file_read".into(),
@@ -331,6 +381,8 @@ mod tests {
         ));
         let loaded = store.load("iri://task/trajectory-1").unwrap().unwrap();
         assert!(loaded.reusable_candidate());
+        assert_eq!(loaded.context_quality.dispatch_count, 1);
+        assert_eq!(loaded.context_quality.dispositions.dropped_budget, 1);
         let raw = serde_json::to_string(&loaded).unwrap();
         assert!(!raw.contains("tool_args"));
         assert!(!raw.contains("prompt_response"));
@@ -350,10 +402,41 @@ mod tests {
     #[test]
     fn trajectory_rejects_unbounded_or_non_identifier_metadata() {
         let mut record = trajectory("iri://task/trajectory-bounds");
-        record.selected_skill_iris = vec!["sensitive/path".into()];
+        record.injected_skill_iris = vec!["sensitive/path".into()];
         assert!(record.validate().is_err());
-        record.selected_skill_iris = vec!["iri://skills/valid".into()];
+        record.injected_skill_iris = vec!["iri://skills/valid".into()];
         record.tool_steps[0].tool_name = "x".repeat(129);
         assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn trajectory_rejects_unobserved_injection_and_inconsistent_context_counters() {
+        let mut record = trajectory("iri://task/trajectory-context");
+        record.injected_skill_iris = vec!["iri://skills/not-observed".into()];
+        assert!(record.validate().is_err());
+
+        record.injected_skill_iris = vec!["iri://skills/report".into()];
+        record.context_quality.request_messages = 2;
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn new_metadata_fields_deserialize_with_safe_defaults() {
+        let mut record = trajectory("iri://task/trajectory-defaults");
+        record.observed_skill_iris.clear();
+        record.observed_knowledge_fragment_iris.clear();
+        record.injected_skill_iris.clear();
+        record.injected_knowledge_fragment_iris.clear();
+        record.context_quality = LlmContextQualitySnapshot::default();
+        let mut value = serde_json::to_value(record).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("observed_skill_iris");
+        object.remove("observed_knowledge_fragment_iris");
+        object.remove("injected_skill_iris");
+        object.remove("injected_knowledge_fragment_iris");
+        object.remove("context_quality");
+        let restored: LearningTrajectory = serde_json::from_value(value).unwrap();
+        assert!(restored.context_quality.is_consistent());
+        assert!(restored.validate().is_ok());
     }
 }

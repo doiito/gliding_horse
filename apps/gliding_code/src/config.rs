@@ -1,4 +1,4 @@
-use glidinghorse::config::{GatewaySettings, McpStdioServerConfig};
+use glidinghorse::config::{AgentSettings, GatewaySettings, McpStdioServerConfig, Settings};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -33,6 +33,13 @@ impl From<McpStdioServerEntry> for McpStdioServerConfig {
 pub struct CliConfig {
     pub gateway: GatewaySettings,
     pub model: String,
+    /// Optional operator override for every PA/DA/CA/AA ReAct request. `None`
+    /// preserves role-specific values loaded from the trusted core config.
+    pub react_reasoning_effort_override: Option<glidinghorse::config::settings::ReasoningEffort>,
+    /// Agent policy captured before the engine enters a task-controlled
+    /// workspace. Reinitializing the TUI must not reload policy from that
+    /// workspace merely because the process working directory changed.
+    pub agent_settings: AgentSettings,
     pub workspace: String,
     /// ReAct turn ceiling for each individual agent invocation. A task can
     /// invoke several agents across PDCA cycles, so this is not a global task
@@ -186,10 +193,15 @@ impl CliConfig {
         let mcp_stdio_servers = Self::load_mcp_stdio_servers();
         let learning_pair_id = std::env::var("GLIDING_LEARNING_PAIR_ID").ok();
         let learning_seed = std::env::var("GLIDING_LEARNING_SEED").ok();
+        let agent_settings = Settings::load()
+            .map(|settings| settings.agents)
+            .unwrap_or_default();
 
         Self {
             gateway,
             model,
+            react_reasoning_effort_override: None,
+            agent_settings,
             workspace,
             max_iterations,
             max_pdca_cycles,
@@ -298,6 +310,8 @@ impl CliConfig {
         Self {
             gateway,
             model,
+            react_reasoning_effort_override: self.react_reasoning_effort_override,
+            agent_settings: self.agent_settings.clone(),
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
             max_pdca_cycles: self.max_pdca_cycles,
@@ -321,6 +335,8 @@ impl CliConfig {
         Self {
             gateway,
             model: self.model.clone(),
+            react_reasoning_effort_override: self.react_reasoning_effort_override,
+            agent_settings: self.agent_settings.clone(),
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
             max_pdca_cycles: self.max_pdca_cycles,
@@ -344,6 +360,8 @@ impl CliConfig {
         Self {
             gateway,
             model: self.model.clone(),
+            react_reasoning_effort_override: self.react_reasoning_effort_override,
+            agent_settings: self.agent_settings.clone(),
             workspace: self.workspace.clone(),
             max_iterations: self.max_iterations,
             max_pdca_cycles: self.max_pdca_cycles,

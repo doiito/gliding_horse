@@ -206,6 +206,41 @@ impl Default for LearningHealthMonitorConfig {
                     target_min: None,
                     target_max: None,
                 },
+                HealthMetricSpec {
+                    name: "context_drop_rate".into(),
+                    direction: HealthMetricDirection::LowerIsBetter,
+                    degradation_threshold: 0.10,
+                    target_min: None,
+                    target_max: None,
+                },
+                HealthMetricSpec {
+                    name: "context_truncate_rate".into(),
+                    direction: HealthMetricDirection::LowerIsBetter,
+                    degradation_threshold: 0.10,
+                    target_min: None,
+                    target_max: None,
+                },
+                HealthMetricSpec {
+                    name: "context_expired_rate".into(),
+                    direction: HealthMetricDirection::LowerIsBetter,
+                    degradation_threshold: 0.05,
+                    target_min: None,
+                    target_max: None,
+                },
+                HealthMetricSpec {
+                    name: "context_required_budget_overflow_rate".into(),
+                    direction: HealthMetricDirection::LowerIsBetter,
+                    degradation_threshold: 0.05,
+                    target_min: None,
+                    target_max: None,
+                },
+                HealthMetricSpec {
+                    name: "context_chars_per_dispatch".into(),
+                    direction: HealthMetricDirection::LowerIsBetter,
+                    degradation_threshold: 0.25,
+                    target_min: None,
+                    target_max: None,
+                },
             ],
         }
     }

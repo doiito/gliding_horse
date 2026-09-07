@@ -921,6 +921,57 @@ impl L0Store {
             .transpose()
     }
 
+    /// Enumerate terminal task-evidence seals from the dedicated typed table.
+    ///
+    /// This is the authoritative discovery path for local audit tooling. In
+    /// particular, callers must not scrape a width-limited TUI transcript or
+    /// scan arbitrary L0 payload strings to recover a task identity. The
+    /// returned records contain the complete task IRI stored atomically with
+    /// the terminal seal. Ordering is deliberately left to the caller because
+    /// the table key is a task-IRI hash rather than a timestamp.
+    pub fn task_evidence_seals(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TaskEvidenceSealRecord>, CoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to begin task evidence seal listing: {error}"),
+            })?;
+        let table = read_txn
+            .open_table(TASK_EVIDENCE_SEAL_TABLE)
+            .map_err(|error| CoreError::StorageError {
+                message: format!("Failed to open task evidence seal table: {error}"),
+            })?;
+        let mut seals = Vec::new();
+        for result in table.iter().map_err(|error| CoreError::StorageError {
+            message: format!("Failed to iterate task evidence seals: {error}"),
+        })? {
+            let (key, value) = result.map_err(|error| CoreError::StorageError {
+                message: format!("Failed to read task evidence seal: {error}"),
+            })?;
+            let seal: TaskEvidenceSealRecord =
+                serde_json::from_slice(value.value()).map_err(|error| CoreError::StorageError {
+                    message: format!("Failed to decode task evidence seal: {error}"),
+                })?;
+            if seal.task_key != key.value() {
+                return Err(CoreError::StorageError {
+                    message: format!(
+                        "Task evidence seal key mismatch: table={} record={}",
+                        key.value(),
+                        seal.task_key
+                    ),
+                });
+            }
+            seals.push(seal);
+            if seals.len() >= limit.max(1) {
+                break;
+            }
+        }
+        Ok(seals)
+    }
+
     pub fn store(&self, iri: &str, content: &str) -> Result<(), CoreError> {
         let content_hash = compute_content_hash(content);
         self.write_entry_atomic(
@@ -2633,6 +2684,63 @@ mod tests {
         let entry = retrieved.unwrap();
         assert_eq!(entry.mesi_state, MesiState::Shared);
         assert!(!entry.content_hash.is_empty());
+    }
+
+    #[test]
+    fn task_evidence_seals_expose_complete_typed_task_identities() {
+        let dir = tempdir().unwrap();
+        let store = L0Store::new(dir.path().to_string_lossy().as_ref()).unwrap();
+        let first_iri = "iri://task/12345678-1234-1234-1234-1234567890ab";
+        let second_iri = "iri://task/fedcba98-7654-3210-fedc-ba9876543210";
+        for (task_key, task_iri, status) in [
+            ("key-a", first_iri, "success"),
+            ("key-b", second_iri, "failed"),
+        ] {
+            assert_eq!(
+                store
+                    .try_seal_task_evidence(&TaskEvidenceSealRecord {
+                        schema_version: 1,
+                        task_key: task_key.to_string(),
+                        task_iri: task_iri.to_string(),
+                        frame_count: 0,
+                        root_hash: None,
+                        terminal_status: status.to_string(),
+                        sealed_at: Utc::now(),
+                    })
+                    .unwrap(),
+                TaskEvidenceSealOutcome::Sealed
+            );
+        }
+
+        let seals = store.task_evidence_seals(10).unwrap();
+        assert_eq!(seals.len(), 2);
+        let task_iris = seals
+            .iter()
+            .map(|seal| seal.task_iri.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            task_iris,
+            std::collections::HashSet::from([first_iri, second_iri])
+        );
+        assert_eq!(store.task_evidence_seals(1).unwrap().len(), 1);
+
+        let mismatched = TaskEvidenceSealRecord {
+            schema_version: 1,
+            task_key: "record-key".into(),
+            task_iri: "iri://task/00000000-0000-0000-0000-000000000000".into(),
+            frame_count: 0,
+            root_hash: None,
+            terminal_status: "failed".into(),
+            sealed_at: Utc::now(),
+        };
+        let encoded = serde_json::to_vec(&mismatched).unwrap();
+        let transaction = store.db.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(TASK_EVIDENCE_SEAL_TABLE).unwrap();
+            table.insert("table-key", encoded.as_slice()).unwrap();
+        }
+        transaction.commit().unwrap();
+        assert!(store.task_evidence_seals(10).is_err());
     }
 
     #[test]

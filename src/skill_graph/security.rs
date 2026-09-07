@@ -10,6 +10,17 @@ use crate::skill_graph::graph_store::SkillGraphStore;
 use crate::skill_graph::types::*;
 use crate::CoreError;
 
+/// Ordered overwrite-baseline state derived by AgentRunner from confirmed
+/// tool-result disclosures in the active L1. `path=None` invalidates every
+/// prior baseline; `content_sha256=None` invalidates one exact path. The model
+/// cannot construct this type or attach it to SecurityContext.
+#[derive(Debug, Clone)]
+pub(crate) struct FileOverwriteBaselineEvent {
+    pub path: Option<String>,
+    pub content_sha256: Option<String>,
+    pub source_call_identity: Option<crate::core::execution_journal::ToolCallIdentity>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureInfo {
     pub algorithm: String,
@@ -191,8 +202,46 @@ pub struct SecurityContext {
     pub agent_id: String,
     pub agent_role: String,
     pub task_iri: Option<String>,
+    /// Kernel-issued correlation for an LLM call nested inside this tool
+    /// invocation. These values are deliberately not deserialized from tool
+    /// arguments: only AgentRunner can attach them, so a model cannot forge a
+    /// task accounting scope or parent interaction by adding JSON fields.
+    pub(crate) llm_invocation: Option<TrustedLlmInvocation>,
     pub requested_permissions: Vec<SkillPermission>,
+    /// Optional exact-path lease issued by a BizAgent parent. Absence means
+    /// normal serialized execution; presence narrows file_write/file_edit and
+    /// can never widen the existing workspace or permission boundary.
+    pub workspace_resource_lease: Option<crate::core::effect::WorkspaceResourceLease>,
+    /// Kernel-issued capability for the stable AgentTurn reader. The model
+    /// never supplies this scope: AgentRunner derives it from the active L1
+    /// session and TaskContext's typed handoff fields.
+    agent_turn_read_scope: Option<AgentTurnReadScope>,
+    /// Kernel-derived, disclosure-confirmed file revisions visible to this
+    /// exact Agent/L1. Kept ordered so later workspace effects invalidate an
+    /// earlier read without relying on process-global mutable state.
+    file_overwrite_baseline_events: Vec<FileOverwriteBaselineEvent>,
     pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentTurnReadScope {
+    own_turn_iri_prefix: String,
+    granted_source_refs: HashSet<String>,
+}
+
+fn is_stable_agent_turn_iri(iri: &str) -> bool {
+    let Some(path) = iri.strip_prefix("iri://task/") else {
+        return false;
+    };
+    let Some((owner, turn)) = path.rsplit_once("/turn_") else {
+        return false;
+    };
+    !owner.is_empty()
+        && !owner
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'?' | b'#' | b'\\'))
+        && !turn.is_empty()
+        && turn.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 impl SecurityContext {
@@ -201,7 +250,11 @@ impl SecurityContext {
             agent_id: agent_id.to_string(),
             agent_role: agent_role.to_string(),
             task_iri: None,
+            llm_invocation: None,
             requested_permissions: Vec::new(),
+            workspace_resource_lease: None,
+            agent_turn_read_scope: None,
+            file_overwrite_baseline_events: Vec::new(),
             timestamp: Utc::now(),
         }
     }
@@ -211,10 +264,137 @@ impl SecurityContext {
         self
     }
 
+    /// Attach causal/accounting metadata supplied by the execution kernel.
+    ///
+    /// This builder is crate-private on purpose. Tool JSON is untrusted model
+    /// output and must never be able to choose these values.
+    pub(crate) fn with_llm_invocation(
+        mut self,
+        usage_scope_iri: &str,
+        parent_interaction_id: &str,
+        cycle_id: &str,
+    ) -> Self {
+        self.llm_invocation = Some(TrustedLlmInvocation {
+            usage_scope_iri: usage_scope_iri.to_string(),
+            parent_interaction_id: parent_interaction_id.to_string(),
+            cycle_id: cycle_id.to_string(),
+        });
+        self
+    }
+
     pub fn with_permission(mut self, permission: SkillPermission) -> Self {
         self.requested_permissions.push(permission);
         self
     }
+
+    pub fn with_workspace_resource_lease(
+        mut self,
+        lease: crate::core::effect::WorkspaceResourceLease,
+    ) -> Self {
+        self.workspace_resource_lease = Some(lease);
+        self
+    }
+
+    /// Attach the stable AgentTurn capabilities derived by AgentRunner.
+    ///
+    /// This remains crate-private so external callers and model-generated tool
+    /// JSON cannot grant themselves another task or Agent's archived output.
+    pub(crate) fn with_agent_turn_read_scope(
+        mut self,
+        own_turn_iri_prefix: impl Into<String>,
+        granted_source_refs: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.agent_turn_read_scope = Some(AgentTurnReadScope {
+            own_turn_iri_prefix: own_turn_iri_prefix.into(),
+            granted_source_refs: granted_source_refs
+                .into_iter()
+                .filter(|source_ref| is_stable_agent_turn_iri(source_ref))
+                .collect(),
+        });
+        self
+    }
+
+    pub(crate) fn with_file_overwrite_baseline_events(
+        mut self,
+        events: impl IntoIterator<Item = FileOverwriteBaselineEvent>,
+    ) -> Self {
+        self.file_overwrite_baseline_events = events
+            .into_iter()
+            .filter(|event| {
+                let identity_owned = event.source_call_identity.as_ref().is_some_and(|identity| {
+                    identity.agent_id == self.agent_id
+                        && self.agent_turn_read_scope.as_ref().is_some_and(|scope| {
+                            scope
+                                .own_turn_iri_prefix
+                                .ends_with(&format!("/session/{}/turn_", identity.l1_session_id))
+                        })
+                });
+                let path_valid = event.path.as_ref().is_none_or(|path| {
+                    !path.trim().is_empty() && !path.chars().any(char::is_control)
+                });
+                let hash_valid = event.content_sha256.as_ref().is_none_or(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                identity_owned
+                    && path_valid
+                    && hash_valid
+                    && (event.path.is_some() || event.content_sha256.is_none())
+            })
+            .collect();
+        self
+    }
+
+    pub(crate) fn file_overwrite_baseline_events(&self) -> &[FileOverwriteBaselineEvent] {
+        &self.file_overwrite_baseline_events
+    }
+
+    /// Return whether this runtime context owns or was explicitly handed the
+    /// exact stable AgentTurn IRI. Prefix ownership is limited to the active
+    /// L1 session; handoff grants are exact-string capabilities.
+    pub(crate) fn permits_agent_turn_read(&self, node_iri: &str) -> bool {
+        if !is_stable_agent_turn_iri(node_iri) {
+            return false;
+        }
+        self.agent_turn_read_scope.as_ref().is_some_and(|scope| {
+            scope.granted_source_refs.contains(node_iri)
+                || node_iri
+                    .strip_prefix(&scope.own_turn_iri_prefix)
+                    .is_some_and(|turn| {
+                        !turn.is_empty() && turn.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
+    }
+
+    /// Return the kernel-owned identity of the active model transcript for
+    /// context-sensitive read deduplication.
+    ///
+    /// File bytes may be cached process-wide, but the fact that those bytes
+    /// have been shown to a model is scoped to one AgentInstance/L1
+    /// transcript.  AgentRunner installs `agent_turn_read_scope` from the
+    /// active L1 session, so including its own-turn prefix prevents a later L1
+    /// owned by the same logical agent from inheriting an "already visible"
+    /// decision. Standalone callers that do not own an L1 retain an
+    /// agent/task-local fallback rather than sharing a global visibility bit.
+    pub(crate) fn file_read_visibility_scope(&self) -> String {
+        let task = self.task_iri.as_deref().unwrap_or("no-task");
+        let l1_scope = self
+            .agent_turn_read_scope
+            .as_ref()
+            .map(|scope| scope.own_turn_iri_prefix.as_str())
+            .unwrap_or("no-l1");
+        format!("{task}|{}|{}|{l1_scope}", self.agent_id, self.agent_role)
+    }
+}
+
+/// Trusted metadata for model work performed by a tool implementation.
+/// Keeping this separate from `SecurityContext`'s public task identity makes
+/// the provenance boundary explicit and avoids process-global/task-local
+/// state that could leak between concurrently executing BizAgent children.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustedLlmInvocation {
+    pub usage_scope_iri: String,
+    pub parent_interaction_id: String,
+    pub cycle_id: String,
 }
 
 pub struct SecurityEngine {

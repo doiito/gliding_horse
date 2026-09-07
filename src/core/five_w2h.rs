@@ -407,21 +407,29 @@ pub fn audit_dimensions(
     {
         let detail = if let Some(ref hm) = five_w2h.how_much {
             let mut warnings = Vec::new();
-            if let Some(ref budget) = hm.token_budget {
-                let usage = result.tool_call_count as u64 * 1000; // rough estimate
-                if usage > *budget {
-                    warnings.push(format!(
-                        "Token budget exceeded: budget={}, estimated={}",
-                        budget, usage
-                    ));
+            // LLM turns are not PDCA cycles and tool calls are not tokens.
+            // Inferring either cost from those unrelated counters made a
+            // successful multi-agent run conditionally fail its learning
+            // gate (for example 36 LLM turns against a 7-cycle ceiling).
+            // Compare budgets only with the typed counters populated by the
+            // owning runtime. The SA loop enforces max_pdca_cycles directly;
+            // an absent ActualCost must never be replaced with a heuristic.
+            if let Some(actual) = hm.actual_cost.as_ref() {
+                if let Some(budget) = hm.token_budget {
+                    if actual.tokens_used > budget {
+                        warnings.push(format!(
+                            "Token budget exceeded: budget={}, actual={}",
+                            budget, actual.tokens_used
+                        ));
+                    }
                 }
-            }
-            if let Some(ref max_cycles) = hm.max_pdca_cycles {
-                if result.turn_count > *max_cycles {
-                    warnings.push(format!(
-                        "Turn count exceeded: max={}, actual={}",
-                        max_cycles, result.turn_count
-                    ));
+                if let Some(max_cycles) = hm.max_pdca_cycles {
+                    if actual.cycles_used > max_cycles {
+                        warnings.push(format!(
+                            "PDCA cycle budget exceeded: max={}, actual={}",
+                            max_cycles, actual.cycles_used
+                        ));
+                    }
                 }
             }
             if warnings.is_empty() {
@@ -436,10 +444,13 @@ pub fn audit_dimensions(
             dimension: "how_much".to_string(),
             status: detail,
             evidence: format!(
-                "turns={}, tool_calls={}, errors={}",
-                result.turn_count,
-                result.tool_call_count,
-                result.errors.len()
+                "token_budget={:?}, max_pdca_cycles={:?}, actual_cost={:?}",
+                five_w2h.how_much.as_ref().and_then(|hm| hm.token_budget),
+                five_w2h.how_much.as_ref().and_then(|hm| hm.max_pdca_cycles),
+                five_w2h
+                    .how_much
+                    .as_ref()
+                    .and_then(|hm| hm.actual_cost.as_ref())
             ),
             details: vec![],
         });
@@ -1796,6 +1807,60 @@ mod tests {
         assert!(w2h.how_much.is_some());
         assert_eq!(w2h.how.as_ref().unwrap().forbidden_tools, vec!["bash"]);
         assert_eq!(w2h.how_much.as_ref().unwrap().token_budget, Some(50000));
+    }
+
+    #[test]
+    fn how_much_never_treats_llm_turns_as_pdca_cycles_or_tools_as_tokens() {
+        let w2h = Task5W2H::new("Verify project", "Accept a verified delivery").with_how_much(
+            HowMuchDetail {
+                token_budget: Some(1),
+                max_sub_agents: Some(2),
+                max_pdca_cycles: Some(2),
+                expected_quality: None,
+                actual_cost: None,
+            },
+        );
+        let mut result = ca_result("PASS: independently verified");
+        result.turn_count = 36;
+        result.tool_call_count = 49;
+
+        let audits = audit_dimensions(&w2h, &result, &result.task_iri, None);
+        let how_much = audits
+            .iter()
+            .find(|audit| audit.dimension == "how_much")
+            .unwrap();
+        assert_eq!(how_much.status, AuditStatus::Pass);
+        assert!(!how_much.evidence.contains("turns="));
+        assert!(!how_much.evidence.contains("tool_calls="));
+    }
+
+    #[test]
+    fn how_much_compares_only_typed_actual_cost_with_matching_budgets() {
+        let w2h = Task5W2H::new("Verify project", "Accept a verified delivery").with_how_much(
+            HowMuchDetail {
+                token_budget: Some(100),
+                max_sub_agents: None,
+                max_pdca_cycles: Some(2),
+                expected_quality: None,
+                actual_cost: Some(ActualCost {
+                    tokens_used: 101,
+                    cycles_used: 3,
+                    duration_secs: 1.0,
+                }),
+            },
+        );
+
+        let result = ca_result("PASS: independently verified");
+        let audits = audit_dimensions(&w2h, &result, &result.task_iri, None);
+        let how_much = audits
+            .iter()
+            .find(|audit| audit.dimension == "how_much")
+            .unwrap();
+        let AuditStatus::Warning(message) = &how_much.status else {
+            panic!("typed over-budget actual cost must be reported")
+        };
+        assert!(message.contains("Token budget exceeded: budget=100, actual=101"));
+        assert!(message.contains("PDCA cycle budget exceeded: max=2, actual=3"));
     }
 
     #[test]

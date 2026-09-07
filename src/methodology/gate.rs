@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -62,8 +62,25 @@ pub struct AntiPatternGateResult {
     pub gate_action: String,
     /// Whether this should block execution
     pub should_block: bool,
+    /// True only when structured runtime evidence demonstrates the
+    /// anti-pattern. `gate_before` alone describes where to check and is not
+    /// evidence that a violation occurred.
+    pub violation_confirmed: bool,
     /// Formatted warning message for injection
     pub message: String,
+}
+
+/// Model-visible feedback for a methodology gate that declined one tool call
+/// without terminating the enclosing Agent.  Security and authorization
+/// denials deliberately never use this channel.
+pub const METHODOLOGY_RECOVERY_FEEDBACK_KEY: &str = "methodology_recovery_feedback";
+
+fn is_fatal_methodology_violation(result: &AntiPatternGateResult) -> bool {
+    result.gate_action.trim_start().starts_with("ABORT")
+        || matches!(
+            result.methodology_id.as_str(),
+            "methodology:least-privilege" | "methodology:boundary-enforcement"
+        )
 }
 
 /// A constitution→methodology binding registered for dynamic triggering
@@ -104,8 +121,10 @@ pub struct MethodologyGate {
     max_active: usize,
     /// Settled usage windows (activation → outcome)
     usage_history: Vec<MethodologyUsageRecord>,
-    /// IDs activated at the most recent SkillBefore, awaiting SkillAfter settlement
-    pending_skill_activation: Vec<String>,
+    /// Tool-call-correlated activation windows awaiting SkillAfter/TaskError
+    /// settlement. A single global vector lets concurrent BizAgents settle or
+    /// overwrite one another's methodology usage.
+    pending_skill_activation: HashMap<String, Vec<String>>,
     /// Methodologies excluded from activation (cold-archived)
     archived: HashSet<String>,
 }
@@ -121,7 +140,7 @@ impl MethodologyGate {
             bindings: Vec::new(),
             max_active,
             usage_history: Vec::new(),
-            pending_skill_activation: Vec::new(),
+            pending_skill_activation: HashMap::new(),
             archived: HashSet::new(),
         }
     }
@@ -327,6 +346,50 @@ impl MethodologyGate {
     /// Clear all active methodologies.
     pub fn reset(&mut self) {
         self.active.clear();
+        self.pending_skill_activation.clear();
+    }
+
+    fn skill_usage_window_key(ctx: &HookContext) -> String {
+        let tool_call_id = ctx
+            .data
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        format!(
+            "{}|{}|{}|{}",
+            ctx.agent_id,
+            ctx.task_iri.as_deref().unwrap_or_default(),
+            ctx.trace_id,
+            tool_call_id
+        )
+    }
+
+    /// Open an independent methodology usage window for one concrete tool
+    /// call. Already-active matches are included so two concurrent callers of
+    /// the same tool do not lose the second usage record.
+    fn open_skill_usage_window(&mut self, ctx: &HookContext) -> Vec<ActivatedMethodology> {
+        let newly_active = self.on_hook_trigger(HookPoint::SkillBefore, ctx);
+        let matching_ids = self
+            .active
+            .iter()
+            .filter(|active| {
+                self.registry
+                    .all()
+                    .get(active.registry_index)
+                    .is_some_and(|definition| {
+                        self.evaluate_activation(
+                            &definition.activation,
+                            HookPoint::SkillBefore,
+                            ctx,
+                        )
+                        .is_some()
+                    })
+            })
+            .map(|active| active.methodology_id.clone())
+            .collect::<Vec<_>>();
+        self.pending_skill_activation
+            .insert(Self::skill_usage_window_key(ctx), matching_ids);
+        newly_active
     }
 
     /// Settle the pending SkillBefore activation window with an outcome.
@@ -345,9 +408,39 @@ impl MethodologyGate {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let window_key = Self::skill_usage_window_key(ctx);
+        let mut methodology_ids = self
+            .pending_skill_activation
+            .remove(&window_key)
+            .unwrap_or_default();
+        if methodology_ids.is_empty() && ctx.hook_point == HookPoint::TaskError {
+            // Agent-level failure hooks are emitted after the ReAct loop and
+            // therefore have a fresh trace/span. Settle only this isolated
+            // agent/task's abandoned tool windows, never another child.
+            let agent_prefix = format!(
+                "{}|{}|",
+                ctx.agent_id,
+                ctx.task_iri.as_deref().unwrap_or_default()
+            );
+            let matching_keys = self
+                .pending_skill_activation
+                .keys()
+                .filter(|key| key.starts_with(&agent_prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in matching_keys {
+                if let Some(ids) = self.pending_skill_activation.remove(&key) {
+                    for id in ids {
+                        if !methodology_ids.contains(&id) {
+                            methodology_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
         let mut settled = Vec::new();
         self.active.retain(|a| {
-            if self.pending_skill_activation.contains(&a.methodology_id) {
+            if methodology_ids.contains(&a.methodology_id) {
                 settled.push(MethodologyUsageRecord {
                     methodology_id: a.methodology_id.clone(),
                     task_iri: ctx.task_iri.clone().unwrap_or_default(),
@@ -356,12 +449,13 @@ impl MethodologyGate {
                     duration_seconds: now.saturating_sub(a.activated_at),
                     error_message: error_message.map(str::to_string),
                 });
-                false
+                self.pending_skill_activation
+                    .values()
+                    .any(|pending| pending.contains(&a.methodology_id))
             } else {
                 true
             }
         });
-        self.pending_skill_activation.clear();
         self.usage_history.extend(settled.clone());
         settled
     }
@@ -541,6 +635,14 @@ impl MethodologyGate {
     /// Returns a list of gate results. Any result with `should_block: true` should
     /// block the tool call until the check is addressed.
     pub fn check_anti_patterns_for_tool(&self, tool_name: &str) -> Vec<AntiPatternGateResult> {
+        self.check_anti_patterns_for_tool_with_context(tool_name, None)
+    }
+
+    pub fn check_anti_patterns_for_tool_with_context(
+        &self,
+        tool_name: &str,
+        context: Option<&HookContext>,
+    ) -> Vec<AntiPatternGateResult> {
         let mut results = Vec::new();
 
         for activated in &self.active {
@@ -560,8 +662,22 @@ impl MethodologyGate {
                     continue;
                 }
 
-                let should_block =
-                    ap.gate_action.starts_with("STOP") || ap.gate_action.starts_with("ABORT");
+                let violation_confirmed = context.is_some_and(|context| {
+                    anti_pattern_violation_confirmed(def.id, ap.name, tool_name, context)
+                });
+                let should_block = violation_confirmed
+                    && (ap.gate_action.starts_with("STOP") || ap.gate_action.starts_with("ABORT"));
+                let message = if violation_confirmed {
+                    format!(
+                        "⚠️ Confirmed anti-pattern [{}]: {} — {}\nAsk yourself: {}\nAction: {}",
+                        def.name, ap.name, ap.description, ap.gate_ask, ap.gate_action
+                    )
+                } else {
+                    format!(
+                        "Methodology check [{}]: {} may apply before `{}`. No structured violation evidence was observed. Check: {}",
+                        def.name, ap.name, tool_name, ap.gate_ask
+                    )
+                };
 
                 results.push(AntiPatternGateResult {
                     methodology_id: def.id.to_string(),
@@ -570,10 +686,8 @@ impl MethodologyGate {
                     gate_ask: ap.gate_ask.to_string(),
                     gate_action: ap.gate_action.to_string(),
                     should_block,
-                    message: format!(
-                        "⚠️ Anti-pattern [{}]: {} — {}\nAsk yourself: {}\nAction: {}",
-                        def.name, ap.name, ap.description, ap.gate_ask, ap.gate_action
-                    ),
+                    violation_confirmed,
+                    message,
                 });
             }
         }
@@ -831,9 +945,7 @@ impl MethodologyGateHandle {
                 // Evaluate activation before the anti-pattern gate so newly activated
                 // methodologies can contribute their anti-patterns this turn.
                 let context_clone = ctx.clone();
-                let activated = g.on_hook_trigger(HookPoint::SkillBefore, &context_clone);
-                g.pending_skill_activation =
-                    activated.iter().map(|a| a.methodology_id.clone()).collect();
+                let activated = g.open_skill_usage_window(&context_clone);
                 if let Some(ref evo) = evo_tool {
                     let inner = evo.inner();
                     let mut e = inner.write();
@@ -842,7 +954,8 @@ impl MethodologyGateHandle {
                     }
                 }
 
-                let anti_patterns = g.check_anti_patterns_for_tool(tool_name);
+                let anti_patterns =
+                    g.check_anti_patterns_for_tool_with_context(tool_name, Some(ctx));
                 let role = &ctx.agent_role;
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -852,7 +965,7 @@ impl MethodologyGateHandle {
                 if let Some(ref evo) = evo_tool {
                     let inner = evo.inner();
                     let mut e = inner.write();
-                    for ap in &anti_patterns {
+                    for ap in anti_patterns.iter().filter(|ap| ap.violation_confirmed) {
                         let record =
                             ViolationReporter::from_anti_pattern(ap, role, None, timestamp);
                         e.record_violation(record);
@@ -862,24 +975,73 @@ impl MethodologyGateHandle {
                 let blocking: Vec<_> = anti_patterns.iter().filter(|r| r.should_block).collect();
 
                 if !blocking.is_empty() {
-                    let messages: Vec<String> =
-                        blocking.iter().map(|r| r.message.clone()).collect();
+                    let fatal = blocking
+                        .iter()
+                        .copied()
+                        .filter(|result| is_fatal_methodology_violation(result))
+                        .collect::<Vec<_>>();
+                    let recoverable = blocking
+                        .iter()
+                        .copied()
+                        .filter(|result| !is_fatal_methodology_violation(result))
+                        .collect::<Vec<_>>();
+                    let messages: Vec<String> = blocking
+                        .iter()
+                        .map(|result| result.message.clone())
+                        .collect();
                     ctx.metadata.insert(
                         "methodology_anti_patterns".to_string(),
                         Value::Array(messages.into_iter().map(Value::String).collect()),
                     );
 
-                    let first = &blocking[0];
-                    ctx.error = Some(format!(
-                        "MethodologyGate anti-pattern block [{}]: {}",
+                    if let Some(first) = fatal.first() {
+                        // Fatal safety/authorization denials stay on the
+                        // opaque terminal channel.  Do not attach the
+                        // model-visible recovery payload used for ordinary
+                        // efficiency and workflow coaching.
+                        ctx.error = Some(
+                            "Tool call rejected by a safety or authorization policy".to_string(),
+                        );
+                        warn!(
+                            methodology = %first.methodology_id,
+                            anti_pattern = %first.anti_pattern_name,
+                            "MethodologyGate: safety/authorization policy rejected tool call"
+                        );
+                        return HookResult::Abort;
+                    }
+
+                    let feedback = recoverable
+                        .iter()
+                        .map(|result| {
+                            serde_json::json!({
+                                "methodology_id": result.methodology_id,
+                                "anti_pattern": result.anti_pattern_name,
+                                "description": result.description,
+                                "question": result.gate_ask,
+                                "required_next_action": result.gate_action,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    ctx.metadata.insert(
+                        METHODOLOGY_RECOVERY_FEEDBACK_KEY.to_string(),
+                        Value::Array(feedback),
+                    );
+
+                    let first = recoverable[0];
+                    let settlement_error = format!(
+                        "Recoverable methodology constraint [{}]: {}",
                         first.anti_pattern_name, first.description
-                    ));
+                    );
+                    // A skipped operation has no SkillAfter hook. Close this
+                    // exact usage window here so it cannot leak into a later
+                    // tool call or another parallel child.
+                    g.settle_pending_skill_usage(false, Some(&settlement_error), &context_clone);
                     debug!(
                         methodology = %first.methodology_id,
                         anti_pattern = %first.anti_pattern_name,
-                        "MethodologyGate: Anti-pattern blocked tool call"
+                        "MethodologyGate: recoverable anti-pattern skipped tool call"
                     );
-                    return HookResult::Abort;
+                    return HookResult::Skip;
                 }
 
                 let warnings: Vec<String> = anti_patterns
@@ -920,9 +1082,86 @@ impl MethodologyGateHandle {
 // Helper Functions
 // ════════════════════════════════════════════════════════════════════════
 
+fn anti_pattern_violation_confirmed(
+    methodology_id: &str,
+    anti_pattern_name: &str,
+    tool_name: &str,
+    context: &HookContext,
+) -> bool {
+    // Trusted policy/security hooks can attach an explicit structured verdict.
+    // Tool arguments live in a different metadata slot and cannot implicitly
+    // assert that their own call is safe or unsafe.
+    let explicit = context
+        .metadata
+        .get("confirmed_methodology_violations")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().filter_map(Value::as_str).any(|item| {
+                item == anti_pattern_name
+                    || item == methodology_id
+                    || item == format!("{methodology_id}:{anti_pattern_name}")
+            })
+        });
+    if explicit {
+        return true;
+    }
+
+    let arguments = context.data.get("arguments").unwrap_or(&Value::Null);
+    match anti_pattern_name.to_ascii_lowercase().as_str() {
+        // A targeted file_read is never a directory/full scan. Only command
+        // forms that visibly request an unbounded recursive traversal qualify.
+        "blind full scan" if tool_name.eq_ignore_ascii_case("bash") => {
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let recursive = ["ls -r", "find .", "find /", "grep -r ", "grep --recursive"]
+                .iter()
+                .any(|pattern| command.contains(pattern));
+            let bounded = [
+                "| head",
+                "| tail",
+                "-maxdepth",
+                "--max-depth",
+                "-name ",
+                "--include",
+                "--exclude",
+            ]
+            .iter()
+            .any(|pattern| command.contains(pattern));
+            recursive && !bounded
+        }
+        "full traversal" if tool_name.eq_ignore_ascii_case("glob") => {
+            let pattern = arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            matches!(pattern, "*" | "**" | "**/*")
+        }
+        // Methodology prose is not an authorization oracle.  Absolute paths
+        // are routinely emitted by the model for files *inside* the configured
+        // workspace, while `..` can also normalize to an in-workspace target.
+        // The file/tool executors perform the authoritative canonical boundary
+        // check.  A trusted policy hook can still make this gate fatal by
+        // attaching `confirmed_methodology_violations` above.
+        "privilege escalation" | "boundary overstep" => false,
+        _ => false,
+    }
+}
+
 fn tool_name_matches_gate(tool_name: &str, gate_before: &str) -> bool {
     let tl = tool_name.to_lowercase();
     let gb = gate_before.to_lowercase();
+
+    // Cross-cutting authorization gates intentionally cover every concrete
+    // tool. They still require structured violation evidence below; this only
+    // fixes applicability so a real boundary violation cannot bypass the
+    // fatal classifier because its prose does not name `bash`/`file_read`.
+    if gb.contains("any tool") || gb.contains("potentially overstepping operations") {
+        return true;
+    }
 
     if gb.contains(&tl) {
         return true;
@@ -1378,6 +1617,202 @@ mod tests {
             !bash_results.is_empty(),
             "bash should trigger cost-awareness anti-pattern"
         );
+        assert!(
+            bash_results.iter().all(|result| !result.should_block),
+            "gate applicability without runtime evidence is advisory"
+        );
+    }
+
+    #[test]
+    fn targeted_file_read_is_not_misclassified_as_blind_full_scan() {
+        let mut gate = test_gate();
+        gate.activate("methodology:cost-awareness", TriggerSource::Manual);
+        let mut context = test_context(HookPoint::SkillBefore, "CA", Some("file_read"));
+        context.data.insert(
+            "arguments".to_string(),
+            serde_json::json!({"path": "AI_Agent_Research_Report.md", "offset": 0, "limit": 100}),
+        );
+
+        let results = gate.check_anti_patterns_for_tool_with_context("file_read", Some(&context));
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|result| !result.violation_confirmed));
+        assert!(results.iter().all(|result| !result.should_block));
+    }
+
+    #[test]
+    fn structured_evidence_is_required_before_methodology_abort() {
+        let mut gate = test_gate();
+        gate.activate("methodology:cost-awareness", TriggerSource::Manual);
+        let mut context = test_context(HookPoint::SkillBefore, "DA", Some("bash"));
+        context.data.insert(
+            "arguments".to_string(),
+            serde_json::json!({"command": "find . -type f"}),
+        );
+        let results = gate.check_anti_patterns_for_tool_with_context("bash", Some(&context));
+        let blind_scan = results
+            .iter()
+            .find(|result| result.anti_pattern_name == "blind full scan")
+            .expect("cost-awareness check");
+        assert!(blind_scan.violation_confirmed);
+        assert!(blind_scan.should_block);
+    }
+
+    #[tokio::test]
+    async fn registered_efficiency_violation_is_recoverable_structured_feedback() {
+        let mut gate = test_gate();
+        gate.activate("methodology:cost-awareness", TriggerSource::Manual);
+        let handle = MethodologyGateHandle::new(gate);
+        let inner = handle.inner();
+        let manager = HookManager::new();
+        handle.register_hooks(&manager);
+        let mut context = test_context(HookPoint::SkillBefore, "DA", Some("bash"));
+        context.trace_id = "interaction-recoverable".to_string();
+        context.data.insert(
+            "tool_call_id".to_string(),
+            Value::String("call-find-all".to_string()),
+        );
+        let arguments = serde_json::json!({"command": "find . -type f"});
+        context
+            .data
+            .insert("arguments".to_string(), arguments.clone());
+        context.metadata.insert(
+            crate::tools::hooks::TOOL_ARGUMENTS_PATCH_METADATA_KEY.to_string(),
+            arguments,
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillBefore, &mut context)
+            .await;
+
+        assert_eq!(
+            decision.control,
+            crate::tools::hooks::HookControl::SkipOperation
+        );
+        assert!(context.error.is_none());
+        let feedback = context
+            .metadata
+            .get(METHODOLOGY_RECOVERY_FEEDBACK_KEY)
+            .and_then(Value::as_array)
+            .expect("recoverable methodology feedback");
+        assert!(feedback.iter().any(|item| {
+            item["methodology_id"] == "methodology:cost-awareness"
+                && item["anti_pattern"] == "blind full scan"
+                && item["required_next_action"]
+                    .as_str()
+                    .is_some_and(|action| action.contains("precise search"))
+        }));
+        let gate = inner.read();
+        assert!(gate.usage_history().iter().any(|usage| {
+            usage.methodology_id == "methodology:cost-awareness" && !usage.success
+        }));
+    }
+
+    #[test]
+    fn security_and_authorization_methodologies_remain_fatal() {
+        let result = AntiPatternGateResult {
+            methodology_id: "methodology:boundary-enforcement".to_string(),
+            anti_pattern_name: "boundary overstep".to_string(),
+            description: "outside task authorization".to_string(),
+            gate_ask: "authorized?".to_string(),
+            gate_action: "STOP — request authorization".to_string(),
+            should_block: true,
+            violation_confirmed: true,
+            message: "internal policy detail".to_string(),
+        };
+        assert!(is_fatal_methodology_violation(&result));
+
+        let mut ordinary = result;
+        ordinary.methodology_id = "methodology:cost-awareness".to_string();
+        ordinary.anti_pattern_name = "blind full scan".to_string();
+        ordinary.gate_action = "STOP — use precise search".to_string();
+        assert!(!is_fatal_methodology_violation(&ordinary));
+        ordinary.gate_action = "ABORT — unsafe operation".to_string();
+        assert!(is_fatal_methodology_violation(&ordinary));
+    }
+
+    #[tokio::test]
+    async fn absolute_workspace_path_is_not_inferred_to_be_a_boundary_violation() {
+        let mut gate = test_gate();
+        gate.activate("methodology:boundary-enforcement", TriggerSource::Manual);
+        let handle = MethodologyGateHandle::new(gate);
+        let manager = HookManager::new();
+        handle.register_hooks(&manager);
+        let mut context = test_context(HookPoint::SkillBefore, "PA", Some("grep_search"));
+        let arguments = serde_json::json!({
+            "query": ".",
+            "path": "/tmp/authorized-workspace"
+        });
+        context
+            .data
+            .insert("arguments".to_string(), arguments.clone());
+        context.metadata.insert(
+            crate::tools::hooks::TOOL_ARGUMENTS_PATCH_METADATA_KEY.to_string(),
+            arguments,
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillBefore, &mut context)
+            .await;
+
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Continue);
+        assert!(context.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_security_violation_uses_opaque_terminal_channel() {
+        let mut gate = test_gate();
+        gate.activate("methodology:boundary-enforcement", TriggerSource::Manual);
+        let handle = MethodologyGateHandle::new(gate);
+        let manager = HookManager::new();
+        handle.register_hooks(&manager);
+        let mut context = test_context(HookPoint::SkillBefore, "DA", Some("bash"));
+        context.metadata.insert(
+            "confirmed_methodology_violations".to_string(),
+            serde_json::json!(["boundary overstep"]),
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillBefore, &mut context)
+            .await;
+
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Abort);
+        assert_eq!(
+            context.error.as_deref(),
+            Some("Tool call rejected by a safety or authorization policy")
+        );
+        assert!(!context
+            .metadata
+            .contains_key(METHODOLOGY_RECOVERY_FEEDBACK_KEY));
+        assert!(!context
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("boundary overstep"));
+    }
+
+    #[tokio::test]
+    async fn registered_hook_allows_exact_bounded_ca_file_read() {
+        let mut gate = test_gate();
+        gate.activate("methodology:cost-awareness", TriggerSource::Manual);
+        let handle = MethodologyGateHandle::new(gate);
+        let manager = HookManager::new();
+        handle.register_hooks(&manager);
+        let mut context = test_context(HookPoint::SkillBefore, "CA", Some("file_read"));
+        let arguments =
+            serde_json::json!({"path": "AI_Agent_Research_Report.md", "offset": 0, "limit": 100});
+        context
+            .data
+            .insert("arguments".to_string(), arguments.clone());
+        context.metadata.insert(
+            crate::tools::hooks::TOOL_ARGUMENTS_PATCH_METADATA_KEY.to_string(),
+            arguments,
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillBefore, &mut context)
+            .await;
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Continue);
+        assert!(context.error.is_none());
     }
 
     #[test]
@@ -1626,9 +2061,7 @@ mod tests {
 
     fn activate_tool_window(gate: &mut MethodologyGate, tool: &str) -> HookContext {
         let ctx = test_context(HookPoint::SkillBefore, "DA", Some(tool));
-        let activated = gate.on_hook_trigger(HookPoint::SkillBefore, &ctx);
-        gate.pending_skill_activation =
-            activated.iter().map(|a| a.methodology_id.clone()).collect();
+        gate.open_skill_usage_window(&ctx);
         ctx
     }
 
@@ -1652,7 +2085,7 @@ mod tests {
     #[test]
     fn test_settle_pending_skill_failure() {
         let mut gate = test_gate();
-        let ctx = activate_tool_window(&mut gate, "glob");
+        let _ctx = activate_tool_window(&mut gate, "glob");
         let mut error_ctx = test_context(HookPoint::TaskError, "DA", Some("glob"));
         error_ctx.error = Some("boom".to_string());
 
@@ -1691,6 +2124,39 @@ mod tests {
 
         assert_eq!(second.len(), first.len());
         assert_eq!(gate.usage_count(), first.len() + second.len());
+    }
+
+    #[test]
+    fn concurrent_tool_windows_are_correlated_and_settled_independently() {
+        let mut gate = test_gate();
+        let mut first_ctx = test_context(HookPoint::SkillBefore, "DA", Some("glob"));
+        first_ctx.agent_id = "da_child_a".to_string();
+        first_ctx.task_iri = Some("iri://task/root/child/a".to_string());
+        first_ctx.data.insert(
+            "tool_call_id".to_string(),
+            Value::String("call_a".to_string()),
+        );
+        let mut second_ctx = test_context(HookPoint::SkillBefore, "DA", Some("glob"));
+        second_ctx.agent_id = "da_child_b".to_string();
+        second_ctx.task_iri = Some("iri://task/root/child/b".to_string());
+        second_ctx.data.insert(
+            "tool_call_id".to_string(),
+            Value::String("call_b".to_string()),
+        );
+
+        gate.open_skill_usage_window(&first_ctx);
+        gate.open_skill_usage_window(&second_ctx);
+        let first = gate.settle_pending_skill_usage(true, None, &first_ctx);
+        assert!(!first.is_empty());
+        assert!(gate.active_count() > 0, "the second window is still open");
+        let second = gate.settle_pending_skill_usage(false, Some("boom"), &second_ctx);
+
+        assert_eq!(second.len(), first.len());
+        assert!(first.iter().all(|record| record.agent_id == "da_child_a"));
+        assert!(second.iter().all(|record| record.agent_id == "da_child_b"));
+        assert!(second.iter().all(|record| !record.success));
+        assert_eq!(gate.usage_count(), first.len() + second.len());
+        assert_eq!(gate.active_count(), 0);
     }
 
     // ─── Governance Suggestions ───

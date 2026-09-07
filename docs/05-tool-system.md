@@ -521,7 +521,7 @@ sequenceDiagram
 ```yaml
 tool_result_compressor:
   enabled: true
-  max_full_results: 2
+  max_full_results: 2       # 保留最近 2 个完整 ReAct 工具批次，同轮结果作为原子工作集
   max_summary_length: 200
   compression_trigger: 10
 ```

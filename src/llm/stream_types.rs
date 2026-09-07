@@ -173,7 +173,12 @@ impl StreamAccumulator {
                 }
             },
             StreamEvent::MessageDelta(e) => {
-                self.finish_reason = e.finish_reason.clone();
+                // Providers commonly emit a finish delta followed by a
+                // usage-only delta.  The latter must enrich accounting, not
+                // erase the authoritative `length`/`stop` reason.
+                if let Some(finish_reason) = &e.finish_reason {
+                    self.finish_reason = Some(finish_reason.clone());
+                }
                 if let Some(ref usage) = e.usage {
                     self.usage = Some(usage.clone());
                 }
@@ -199,7 +204,7 @@ impl StreamAccumulator {
 
     pub fn is_tool_call(&self) -> bool {
         self.finish_reason.as_deref() == Some("tool_calls")
-            || !self.tool_calls.iter().any(|tc| !tc.name.is_empty())
+            || self.tool_calls.iter().any(|tc| !tc.name.is_empty())
     }
 }
 
@@ -319,5 +324,41 @@ mod tests {
         }));
 
         assert_eq!(acc.thinking, "Let me think... Step 1");
+    }
+
+    #[test]
+    fn usage_only_delta_does_not_erase_finish_reason() {
+        let mut acc = StreamAccumulator::new();
+        acc.process_event(&StreamEvent::MessageDelta(MessageDeltaEvent {
+            finish_reason: Some("length".to_string()),
+            usage: None,
+        }));
+        acc.process_event(&StreamEvent::MessageDelta(MessageDeltaEvent {
+            finish_reason: None,
+            usage: Some(Usage {
+                prompt_tokens: 7,
+                completion_tokens: 11,
+                total_tokens: 18,
+            }),
+        }));
+
+        assert_eq!(acc.finish_reason.as_deref(), Some("length"));
+        assert_eq!(acc.usage.as_ref().map(|usage| usage.total_tokens), Some(18));
+    }
+
+    #[test]
+    fn tool_call_detection_does_not_invert_empty_state() {
+        let mut accumulator = StreamAccumulator::new();
+        assert!(!accumulator.is_tool_call());
+
+        accumulator.process_event(&StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ToolCallDelta {
+                id: Some(" raw-call-id ".to_string()),
+                name: Some("file_read".to_string()),
+                arguments: Some("{}".to_string()),
+            },
+        }));
+        assert!(accumulator.is_tool_call());
     }
 }

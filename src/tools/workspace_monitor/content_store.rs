@@ -77,7 +77,7 @@ impl ContentStore {
     /// * `max_cache_bytes` - Approximate maximum cache memory usage.
     /// * `db` - Optional redb database for historical version storage.
     pub fn new(cache_capacity: usize, max_cache_bytes: usize, db: Option<Database>) -> Self {
-        Self {
+        let store = Self {
             lines_cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             )),
@@ -85,7 +85,14 @@ impl ContentStore {
             version_store: db,
             snapshot_blobs: Mutex::new(HashMap::new()),
             max_cache_bytes,
-        }
+        };
+        // Upgrade cleanup: old workspace inventories could expose the
+        // monitor's own redb files, after which file_read persisted copies of
+        // those files back into this database.  Remove such path-version rows
+        // before serving any reads so the feedback data cannot survive a
+        // restart. Freed redb pages remain reusable by legitimate content.
+        store.purge_workspace_runtime_versions();
+        store
     }
 
     /// Read a file from disk, applying caching and optional diff.
@@ -319,6 +326,61 @@ impl ContentStore {
         debug!("ContentStore: all caches cleared");
     }
 
+    /// Delete historical file versions whose source path is workspace-local
+    /// process state. Snapshot blobs use content hashes rather than paths and
+    /// are deliberately not guessed at here.
+    fn purge_workspace_runtime_versions(&self) -> usize {
+        let Some(db) = self.version_store.as_ref() else {
+            return 0;
+        };
+        let keys = (|| {
+            let read_txn = db.begin_read().ok()?;
+            let table = read_txn.open_table(VERSION_STORE).ok()?;
+            let iter = table.iter().ok()?;
+            Some(
+                iter.filter_map(Result::ok)
+                    .filter_map(|(key, _)| {
+                        let key = key.value().to_string();
+                        let path = version_store_key_path(&key)?;
+                        crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(
+                            std::path::Path::new(path),
+                        )
+                        .then_some(key)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })()
+        .unwrap_or_default();
+        if keys.is_empty() {
+            return 0;
+        }
+
+        let Ok(write_txn) = db.begin_write() else {
+            warn!(
+                count = keys.len(),
+                "ContentStore: failed to begin runtime-version cleanup"
+            );
+            return 0;
+        };
+        let mut removed = 0usize;
+        if let Ok(mut table) = write_txn.open_table(VERSION_STORE) {
+            for key in &keys {
+                if table.remove(key.as_str()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if write_txn.commit().is_err() {
+            warn!("ContentStore: failed to commit runtime-version cleanup");
+            return 0;
+        }
+        debug!(
+            removed,
+            "ContentStore: purged workspace-runtime version rows"
+        );
+        removed
+    }
+
     /// Retrieve a specific version of file content from redb.
     pub fn get_version_content(&self, path: &str, version: u64) -> Option<String> {
         let db = self.version_store.as_ref()?;
@@ -356,6 +418,44 @@ impl ContentStore {
             .lock()
             .insert(hash.to_string(), bytes.clone());
         Some(bytes)
+    }
+
+    /// Remove content-addressed blobs that belonged exclusively to rejected
+    /// legacy snapshot manifests. Callers must first exclude hashes still
+    /// referenced by a valid manifest.
+    pub(crate) fn remove_snapshot_blobs(&self, hashes: &[String]) -> usize {
+        if hashes.is_empty() {
+            return 0;
+        }
+        {
+            let mut cache = self.snapshot_blobs.lock();
+            for hash in hashes {
+                cache.remove(hash);
+            }
+        }
+        let Some(db) = self.version_store.as_ref() else {
+            return 0;
+        };
+        let Ok(write_txn) = db.begin_write() else {
+            warn!(
+                count = hashes.len(),
+                "ContentStore: failed to begin rejected-snapshot blob cleanup"
+            );
+            return 0;
+        };
+        let mut removed = 0usize;
+        if let Ok(mut table) = write_txn.open_table(SNAPSHOT_BLOBS) {
+            for hash in hashes {
+                if table.remove(hash.as_str()).ok().flatten().is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        if write_txn.commit().is_err() {
+            warn!("ContentStore: failed to commit rejected-snapshot blob cleanup");
+            return 0;
+        }
+        removed
     }
 
     // ── Private helpers ──
@@ -417,6 +517,13 @@ impl ContentStore {
             }
         }
     }
+}
+
+fn version_store_key_path(key: &str) -> Option<&str> {
+    let body = key.strip_prefix("version:")?;
+    let (path, version) = body.rsplit_once(":v")?;
+    (!path.is_empty() && !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(path)
 }
 
 /// Compute SHA-256 hash of content.
@@ -612,5 +719,44 @@ mod tests {
             all.contains("..."),
             "Should contain snip markers between changes"
         );
+    }
+
+    #[test]
+    fn startup_purges_legacy_self_indexed_runtime_versions() {
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let runtime_key = "version:/workspace/.gliding_horse/ws_monitor/content:v9";
+        let source_key = "version:/workspace/src/main.rs:v2";
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(VERSION_STORE).unwrap();
+                table
+                    .insert(runtime_key, b"recursive database bytes".as_slice())
+                    .unwrap();
+                table
+                    .insert(source_key, b"fn main() {}".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let store = ContentStore::new(10, 65_536, Some(db));
+        let db = store.version_store.as_ref().unwrap();
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(VERSION_STORE).unwrap();
+        assert!(table.get(runtime_key).unwrap().is_none());
+        assert!(table.get(source_key).unwrap().is_some());
+    }
+
+    #[test]
+    fn version_store_key_parser_handles_colons_in_paths() {
+        assert_eq!(
+            version_store_key_path(r"version:C:\work\.gliding_horse\content:v12"),
+            Some(r"C:\work\.gliding_horse\content")
+        );
+        assert_eq!(version_store_key_path("not-a-version-key"), None);
+        assert_eq!(version_store_key_path("version:/workspace/a:vx"), None);
     }
 }

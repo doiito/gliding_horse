@@ -46,6 +46,7 @@ impl ToolResultAging {
         &self,
         messages: &mut Vec<ChatMessage>,
         tool_executor: &RwLock<crate::tools::tool_executor::ToolExecutor>,
+        session_id: &str,
     ) -> (usize, usize) {
         // Collect all tool message indices (skip non-tool messages like system/perception)
         let tool_indices: Vec<usize> = messages
@@ -88,16 +89,37 @@ impl ToolResultAging {
 
             if rev_position < microtool_end {
                 // Second-oldest batch: try micro-tool reference compression
-                let micro_tool_name = format!("read_full_result_{}", call_id);
+                // ChatMessage intentionally preserves only the provider's raw
+                // tool_call_id. It cannot reconstruct a full routing identity
+                // after that ID is reused by another LLM request, so accept
+                // only the exact router-issued IRI/reader carried in content.
+                let Some(routing) = crate::tools::result_router::routing_identity_from_content(
+                    &msg.content,
+                    session_id,
+                    &call_id,
+                ) else {
+                    let preview: String = msg.content.chars().take(150).collect();
+                    messages[msg_idx].content =
+                        format!("[Old result {} bytes] {}...", original_len, preview);
+                    freed += original_len.saturating_sub(messages[msg_idx].content.len());
+                    aged += 1;
+                    continue;
+                };
+                let micro_tool_name = routing.reader_name;
+                // A fully consumed result reader intentionally retains its
+                // handler long enough to settle calls already authorized in
+                // the provider request that completed it, while withdrawing
+                // its schema from subsequent requests. Handler existence is
+                // therefore not proof that aging may create a live reference.
                 let has_micro_tool = tool_executor
                     .read()
-                    .try_get_handler(&micro_tool_name)
+                    .micro_tool_definition(&micro_tool_name)
                     .is_some();
 
                 if has_micro_tool {
-                    let iri = format!("iri://tool-result/{}", call_id);
+                    let iri = routing.storage_iri;
                     messages[msg_idx].content = format!(
-                        "[Compressed {} bytes] Full result available via `{}` tool\nIRI: {}",
+                        "[Compressed {} bytes] Session reader: `{}`\nCall it only while that exact name is advertised in the current turn.\nIRI: {}",
                         original_len, micro_tool_name, iri,
                     );
                 } else {
@@ -174,7 +196,7 @@ mod tests {
             msgs.push(make_tool_msg(&"x".repeat(500), &format!("call_{}", i)));
         }
 
-        let (aged, _) = aging.age_tool_results(&mut msgs, &executor);
+        let (aged, _) = aging.age_tool_results(&mut msgs, &executor, "l1-aging-test");
 
         // keep_full=3: keep newest 3 (call_4/3/2), oldest 2 are compressed (call_0/1)
         // call_0/1 rev_position 4/3 < microtool_end(6) → [Old result] prefix
@@ -222,7 +244,7 @@ mod tests {
             msgs.push(make_tool_msg(&"y".repeat(200), &format!("call_{}", i)));
         }
 
-        let (aged, _) = aging.age_tool_results(&mut msgs, &executor);
+        let (aged, _) = aging.age_tool_results(&mut msgs, &executor, "l1-aging-test");
 
         // total=4, keep_full=1, microtool_end=3
         // rev_positions: call_0=3, call_1=2, call_2=1, call_3=0
@@ -271,7 +293,7 @@ mod tests {
             msgs.push(make_tool_msg(&"small".to_string(), &format!("call_{}", i)));
         }
 
-        let (aged, _) = aging.age_tool_results(&mut msgs, &executor);
+        let (aged, _) = aging.age_tool_results(&mut msgs, &executor, "l1-aging-test");
         assert_eq!(aged, 0, "small results should not be aged");
     }
 
@@ -285,7 +307,126 @@ mod tests {
             msgs.push(make_tool_msg(&"x".repeat(500), &format!("call_{}", i)));
         }
 
-        let (_, freed) = aging.age_tool_results(&mut msgs, &executor);
+        let (_, freed) = aging.age_tool_results(&mut msgs, &executor, "l1-aging-test");
         assert!(freed > 0, "should free bytes from aging");
+    }
+
+    #[test]
+    fn aging_uses_embedded_full_identity_for_reused_raw_call_id() {
+        use crate::tools::result_router::ResultRoutingIdentity;
+        use crate::tools::tool_executor::MicroToolContext;
+
+        let session_id = "l1-aging-reused";
+        let first =
+            ResultRoutingIdentity::for_tool_call("agent", session_id, "request-1", "call_0");
+        let second =
+            ResultRoutingIdentity::for_tool_call("agent", session_id, "request-2", "call_0");
+        let executor = RwLock::new(ToolExecutor::new());
+        for routing in [&first, &second] {
+            executor.write().register_micro_tool(
+                &routing.reader_name,
+                MicroToolContext {
+                    routing_call_key: routing.routing_call_key.clone(),
+                    provider_call_id: routing.provider_call_id.clone(),
+                    storage_key: routing.storage_iri.clone(),
+                    tool_name: "bash".to_string(),
+                    entity_types: Vec::new(),
+                    preview_size: 100,
+                },
+            );
+        }
+        let routed = |routing: &ResultRoutingIdentity, marker: char| {
+            format!(
+                "{}\nIRI: {}\nSession reader: {}",
+                marker.to_string().repeat(200),
+                routing.storage_iri,
+                routing.reader_name
+            )
+        };
+        let mut messages = vec![
+            make_tool_msg(&routed(&first, 'a'), "call_0"),
+            make_tool_msg(&routed(&second, 'b'), "call_0"),
+        ];
+        let aging = ToolResultAging::new(&ToolResultAgingSettings {
+            enabled: true,
+            keep_full: 0,
+            try_microtool: 2,
+            compress_threshold: 10,
+        });
+
+        let (aged, _) = aging.age_tool_results(&mut messages, &executor, session_id);
+
+        assert_eq!(aged, 2);
+        assert!(messages[0].content.contains(&first.reader_name));
+        assert!(!messages[0].content.contains(&second.reader_name));
+        assert!(messages[1].content.contains(&second.reader_name));
+        assert!(!messages[1].content.contains(&first.reader_name));
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    #[test]
+    fn aging_never_creates_a_reference_to_a_retired_result_reader() {
+        use crate::tools::result_router::ResultRoutingIdentity;
+        use crate::tools::tool_executor::MicroToolContext;
+
+        let session_id = "l1-aging-retired-reader";
+        let routing = ResultRoutingIdentity::for_tool_call(
+            "agent-aging-retired",
+            session_id,
+            "request-aging-retired",
+            "call_0",
+        );
+        let mut owned_executor = ToolExecutor::new();
+        owned_executor.store_micro_tool_data(
+            &routing.storage_iri,
+            serde_json::json!({"content": "complete archived result"}),
+        );
+        owned_executor.register_micro_tool(
+            &routing.reader_name,
+            MicroToolContext {
+                routing_call_key: routing.routing_call_key.clone(),
+                provider_call_id: routing.provider_call_id.clone(),
+                storage_key: routing.storage_iri.clone(),
+                tool_name: "web_fetch".to_string(),
+                entity_types: Vec::new(),
+                preview_size: 1_000,
+            },
+        );
+        let delivered = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(owned_executor.execute(&routing.reader_name, serde_json::json!({})))
+            .unwrap();
+        assert_eq!(delivered["complete"], true);
+        assert!(owned_executor
+            .try_get_handler(&routing.reader_name)
+            .is_some());
+        assert!(owned_executor
+            .micro_tool_definition(&routing.reader_name)
+            .is_none());
+
+        let executor = RwLock::new(owned_executor);
+        let mut messages = vec![make_tool_msg(
+            &format!(
+                "{}\nIRI: {}\nSession reader: {}",
+                "x".repeat(200),
+                routing.storage_iri,
+                routing.reader_name,
+            ),
+            "call_0",
+        )];
+        let aging = ToolResultAging::new(&ToolResultAgingSettings {
+            enabled: true,
+            keep_full: 0,
+            try_microtool: 1,
+            compress_threshold: 10,
+        });
+
+        let (aged, _) = aging.age_tool_results(&mut messages, &executor, session_id);
+
+        assert_eq!(aged, 1);
+        assert!(messages[0].content.starts_with("[Old result"));
+        assert!(!messages[0].content.contains(&routing.reader_name));
+        assert!(!messages[0].content.contains(&routing.storage_iri));
     }
 }

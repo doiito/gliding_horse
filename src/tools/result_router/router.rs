@@ -1,5 +1,6 @@
 use super::{RouteDecision, ToolResultMeta};
 use crate::config::settings::ToolResultRouterSettings;
+use crate::tools::result_router::micro_tools::ArchivedReaderView;
 
 pub struct ResultRouter {
     enabled: bool,
@@ -7,6 +8,8 @@ pub struct ResultRouter {
     threshold_large: usize,
     micro_tool_threshold: usize,
     preview_size: usize,
+    file_read_inline_max_lines: usize,
+    file_read_inline_max_bytes: usize,
 }
 
 impl ResultRouter {
@@ -17,6 +20,8 @@ impl ResultRouter {
             threshold_large: settings.threshold_large,
             micro_tool_threshold: settings.micro_tool_threshold,
             preview_size: settings.preview_size,
+            file_read_inline_max_lines: settings.file_read_inline_max_lines,
+            file_read_inline_max_bytes: settings.file_read_inline_max_bytes,
         }
     }
 
@@ -27,14 +32,30 @@ impl ResultRouter {
 
         let size = result_str.len();
 
-        // file_read: small files (≤300 lines AND ≤4KB) pass through fully;
-        // larger files go to FileReadPreview (JSON skeleton + first 200 lines inline).
-        // Byte cap on multi-line files closes the gap where a 32KB file with <1000
-        // lines previously entered context in full (game.js pattern).
-        if tool_name == "file_read" {
+        // `file_read` is already a bounded, replayable tool. Deliver a complete
+        // returned page inline when both its actual line count and serialized
+        // envelope fit the configured budgets. `total_lines` describes the
+        // source file, not this page; using it here would make every bounded
+        // read of a >300-line file recursively archive itself.
+        if tool_name == "file_read"
+            && ArchivedReaderView::for_result(tool_name, result_str)
+                == ArchivedReaderView::FileLines
+        {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) {
                 if let Some(total_lines) = val.get("total_lines").and_then(|v| v.as_u64()) {
-                    if total_lines <= 300 && size <= 4096 {
+                    let returned_lines = val
+                        .get("lines")
+                        .and_then(|value| value.as_array())
+                        .map(Vec::len)
+                        .or_else(|| {
+                            val.get("returned")
+                                .and_then(|value| value.as_u64())
+                                .and_then(|value| usize::try_from(value).ok())
+                        })
+                        .unwrap_or_else(|| usize::try_from(total_lines).unwrap_or(usize::MAX));
+                    if returned_lines <= self.file_read_inline_max_lines
+                        && size <= self.file_read_inline_max_bytes
+                    {
                         return RouteDecision::PassThrough;
                     }
                     return RouteDecision::FileReadPreview {
@@ -44,6 +65,20 @@ impl ResultRouter {
                     };
                 }
             }
+        }
+
+        // Shell-like tools return an execution envelope rather than business
+        // entities. For large envelopes, preserve the diagnostic outcome
+        // instead of graphifying the JSON object or previewing a long command.
+        if matches!(tool_name, "bash" | "powershell" | "code_execute")
+            && size >= self.threshold_small
+            && ArchivedReaderView::for_result(tool_name, result_str)
+                == ArchivedReaderView::ExecutionStream
+        {
+            return RouteDecision::ExecutionPreview {
+                call_id: call_id.to_string(),
+                max_chars: self.preview_size.clamp(1_024, 4_096),
+            };
         }
 
         if size < self.threshold_small {
@@ -204,6 +239,48 @@ mod tests {
     }
 
     #[test]
+    fn test_large_shell_envelope_uses_execution_preview() {
+        let router = ResultRouter::new(&default_settings());
+        let result = serde_json::json!({
+            "command": "python3 -m pytest",
+            "exit_code": 0,
+            "duration_ms": 42,
+            "stdout": "29 passed\n".repeat(2_000),
+            "stderr": "",
+        })
+        .to_string();
+        assert!(result.len() >= default_settings().threshold_small);
+        assert!(matches!(
+            router.route(&result, "bash", "call_verify"),
+            RouteDecision::ExecutionPreview { .. }
+        ));
+    }
+
+    #[test]
+    fn large_non_envelope_shell_text_uses_raw_reader_routing() {
+        let router = ResultRouter::new(&default_settings());
+        let result = "plain shell adapter output\n".repeat(1_000);
+        assert!(result.len() >= default_settings().threshold_small);
+        assert!(matches!(
+            router.route(&result, "bash", "call_plain_shell"),
+            RouteDecision::Summarize { .. }
+        ));
+    }
+
+    #[test]
+    fn nonstandard_file_result_does_not_advertise_a_file_lines_view() {
+        let router = ResultRouter::new(&default_settings());
+        let result = serde_json::json!({
+            "path": "docs/nonstandard.md",
+            "total_lines": 1_000,
+            "content": "x".repeat(20_000),
+        })
+        .to_string();
+        let decision = router.route(&result, "file_read", "call_nonstandard_file");
+        assert!(!matches!(decision, RouteDecision::FileReadPreview { .. }));
+    }
+
+    #[test]
     fn test_large_simple_json_summarize() {
         let router = ResultRouter::new(&default_settings());
         let result = format!("{{\"data\": \"{}\"}}", "x".repeat(35000));
@@ -233,7 +310,8 @@ mod tests {
 
     #[test]
     fn test_file_read_small_passthrough() {
-        let router = ResultRouter::new(&default_settings());
+        let settings = default_settings();
+        let router = ResultRouter::new(&settings);
         let result = serde_json::json!({
             "path": "/tmp/a.js",
             "total_lines": 50,
@@ -242,9 +320,83 @@ mod tests {
             "returned": 50,
         })
         .to_string();
-        assert!(result.len() <= 4096);
+        assert!(result.len() <= settings.file_read_inline_max_bytes);
         let decision = router.route(&result, "file_read", "call_r1");
         assert_eq!(decision, RouteDecision::PassThrough);
+    }
+
+    #[test]
+    fn file_read_ascii_and_cjk_envelopes_between_four_and_eight_kib_stay_inline() {
+        let settings = default_settings();
+        let router = ResultRouter::new(&settings);
+        for (path, line) in [
+            ("docs/ascii.md", "a".repeat(7_000)),
+            ("docs/cjk.md", "界".repeat(2_300)),
+        ] {
+            let result = serde_json::json!({
+                "path": path,
+                "content_sha256": "a".repeat(64),
+                "total_lines": 1,
+                "offset": 0,
+                "lines": [line],
+                "returned": 1,
+            })
+            .to_string();
+            assert!(result.len() > 4 * 1024, "test must cross the former cap");
+            assert!(
+                result.len() <= settings.file_read_inline_max_bytes,
+                "{} serialized bytes must fit the configured inline envelope",
+                result.len()
+            );
+            assert_eq!(
+                router.route(&result, "file_read", "call_unicode"),
+                RouteDecision::PassThrough
+            );
+        }
+    }
+
+    #[test]
+    fn file_read_serialized_envelope_above_configured_cap_uses_preview() {
+        let settings = default_settings();
+        let router = ResultRouter::new(&settings);
+        for line in ["a".repeat(8_300), "界".repeat(2_800)] {
+            let result = serde_json::json!({
+                "path": "docs/over-budget.md",
+                "total_lines": 1,
+                "offset": 0,
+                "lines": [line],
+                "returned": 1,
+            })
+            .to_string();
+            assert!(result.len() > settings.file_read_inline_max_bytes);
+            assert!(matches!(
+                router.route(&result, "file_read", "call_over_budget"),
+                RouteDecision::FileReadPreview { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn bounded_page_of_a_large_source_uses_returned_lines_not_total_lines() {
+        let settings = default_settings();
+        let router = ResultRouter::new(&settings);
+        let lines = (0..100)
+            .map(|line| format!("line {line:03}"))
+            .collect::<Vec<_>>();
+        let result = serde_json::json!({
+            "path": "docs/large-source.md",
+            "content_sha256": "b".repeat(64),
+            "total_lines": 10_000,
+            "offset": 500,
+            "returned": lines.len(),
+            "lines": lines,
+        })
+        .to_string();
+        assert!(result.len() <= settings.file_read_inline_max_bytes);
+        assert_eq!(
+            router.route(&result, "file_read", "call_bounded_page"),
+            RouteDecision::PassThrough
+        );
     }
 
     #[test]

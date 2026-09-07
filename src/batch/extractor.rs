@@ -11,9 +11,10 @@ use crate::batch::types::{
 };
 use crate::batch::validator::OutputValidator;
 use crate::gateway::unified_gateway::{ChatMessage, UnifiedGateway};
+use crate::llm::{LlmInteractionScope, LlmInteractionService};
 
 pub struct ExtractorPipeline {
-    gateway: Arc<UnifiedGateway>,
+    interactions: Arc<LlmInteractionService>,
     prompt_engine: Arc<DynamicPromptEngine>,
     validator: OutputValidator,
     metrics: Arc<std::sync::Mutex<BatchMetrics>>,
@@ -26,7 +27,7 @@ impl ExtractorPipeline {
         metrics: Arc<std::sync::Mutex<BatchMetrics>>,
     ) -> Self {
         Self {
-            gateway,
+            interactions: LlmInteractionService::shared(gateway),
             prompt_engine,
             validator: OutputValidator::new(),
             metrics,
@@ -140,8 +141,9 @@ impl ExtractorPipeline {
 
             let model = config.model.as_deref().unwrap_or("default");
             let response = self
-                .gateway
+                .interactions
                 .chat_with_params(
+                    LlmInteractionScope::new("batch_extraction"),
                     model,
                     messages,
                     config.temperature,

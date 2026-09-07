@@ -2,7 +2,8 @@ use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
 use crate::core::agent_instance::AgentRole;
-use crate::core::agent_runner::{TaskContext, TaskResult};
+use crate::core::agent_runner::{TaskContext, TaskResult, TaskVerdict};
+use crate::core::context_model::{AgentSpecSourceKind, AgentSpecSourceRecord};
 use crate::core::policy_learning::{
     learning_families_compatible, learning_task_context, LearningTaskContext,
 };
@@ -35,8 +36,10 @@ struct LearningTreatmentMetrics {
     experience_hint_fingerprints: Vec<String>,
     skills_observed: usize,
     skill_iris_observed: Vec<String>,
+    skill_iris_injected: Vec<String>,
     knowledge_fragments_observed: usize,
     knowledge_fragment_iris_observed: Vec<String>,
+    knowledge_fragment_iris_injected: Vec<String>,
     hints_injected: usize,
     hint_chars_injected: usize,
     task_family_raw_features: Vec<String>,
@@ -54,7 +57,28 @@ struct LearningTreatmentMetrics {
     orchestration_mode: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LearningHintSource {
+    Experience,
+    Skill { iri: String },
+    Knowledge { iri: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LearningHintCandidate {
+    text: String,
+    source: LearningHintSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MaterializedLearningTreatment {
+    hints: Vec<String>,
+    skill_iris: Vec<String>,
+    knowledge_fragment_iris: Vec<String>,
+}
+
 /// Deduplicate hints preserving first-seen order, then truncate to `cap`.
+#[cfg(test)]
 fn dedup_hints(
     hints: Vec<String>,
     cap: usize,
@@ -135,6 +159,8 @@ fn rank_knowledge_fragments(
         };
         score(right).cmp(&score(left))
     });
+    let mut seen = std::collections::HashSet::new();
+    fragments.retain(|fragment| seen.insert(fragment.fragment_iri.clone()));
     fragments.truncate(max_fragments);
     fragments
 }
@@ -176,6 +202,7 @@ fn eligible_policy_candidates(
 /// Materialize the treatment selected by the constrained policy. `baseline`
 /// is a real ablation (no durable history), while each learned arm receives
 /// the same bounded evidence in a different source-priority order.
+#[cfg(test)]
 fn policy_treatment_hints(
     action: &str,
     experience: &[String],
@@ -185,28 +212,217 @@ fn policy_treatment_hints(
     max_hint_chars: usize,
     max_total_chars: usize,
 ) -> Vec<String> {
-    let arm = crate::core::retrieval_policy::RetrievalPolicyArm::parse(action)
-        .unwrap_or(crate::core::retrieval_policy::RetrievalPolicyArm::Baseline);
-    let hints = arm.order_hints(experience, skills, knowledge);
-    dedup_hints(hints, max_hints, max_hint_chars, max_total_chars)
+    let candidates = |hints: &[String], source: LearningHintSource| {
+        hints
+            .iter()
+            .map(|text| LearningHintCandidate {
+                text: text.clone(),
+                source: source.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    materialize_policy_treatment(
+        action,
+        &candidates(experience, LearningHintSource::Experience),
+        &candidates(skills, LearningHintSource::Experience),
+        &candidates(knowledge, LearningHintSource::Experience),
+        max_hints,
+        max_hint_chars,
+        max_total_chars,
+    )
+    .hints
 }
 
-/// Existing-workspace tasks can often be accepted by CA→AA without any
-/// implementation.  Detailed fallback planning is intentionally deferred
-/// until that verification fails, avoiding a full planning LLM call whose
-/// result would otherwise never be executed.
-fn should_defer_fallback_planning(ctx: &TaskContext, complexity: TaskComplexity) -> bool {
-    ctx.workspace_file_summary.is_some()
-        && ctx.resumed_messages.is_none()
-        && ctx.workflow_jsonld.is_none()
-        && !ctx.effective_effect_policy().requires_workspace_mutation()
-        && !matches!(complexity, TaskComplexity::Instant | TaskComplexity::Simple)
+/// Apply policy ordering and prompt limits while retaining the provenance of
+/// each hint that actually survives deduplication and truncation. Keeping the
+/// source beside the string avoids reconstructing adoption from rendered
+/// content, which can collide or change as templates evolve.
+fn materialize_policy_treatment(
+    action: &str,
+    experience: &[LearningHintCandidate],
+    skills: &[LearningHintCandidate],
+    knowledge: &[LearningHintCandidate],
+    max_hints: usize,
+    max_hint_chars: usize,
+    max_total_chars: usize,
+) -> MaterializedLearningTreatment {
+    use crate::core::retrieval_policy::RetrievalPolicyArm;
+
+    let arm = RetrievalPolicyArm::parse(action).unwrap_or(RetrievalPolicyArm::Baseline);
+    let groups: [&[LearningHintCandidate]; 3] = match arm {
+        RetrievalPolicyArm::Baseline => [&[], &[], &[]],
+        RetrievalPolicyArm::ExperienceFirst => [experience, knowledge, skills],
+        RetrievalPolicyArm::KnowledgeFirst => [knowledge, experience, skills],
+        RetrievalPolicyArm::SkillFirst => [skills, experience, knowledge],
+    };
+    let mut materialized = MaterializedLearningTreatment::default();
+    let mut seen_hints = std::collections::HashSet::new();
+    let mut seen_skills = std::collections::HashSet::new();
+    let mut seen_knowledge = std::collections::HashSet::new();
+    let mut total_chars = 0usize;
+    for candidate in groups.into_iter().flatten() {
+        if materialized.hints.len() >= max_hints || total_chars >= max_total_chars {
+            break;
+        }
+        let mut bounded = candidate
+            .text
+            .chars()
+            .take(max_hint_chars)
+            .collect::<String>();
+        if candidate.text.chars().count() > max_hint_chars {
+            bounded.push('…');
+        }
+        let remaining = max_total_chars.saturating_sub(total_chars);
+        bounded = bounded.chars().take(remaining).collect();
+        if bounded.is_empty() || !seen_hints.insert(bounded.clone()) {
+            continue;
+        }
+        total_chars = total_chars.saturating_add(bounded.chars().count());
+        materialized.hints.push(bounded);
+        match &candidate.source {
+            LearningHintSource::Experience => {}
+            LearningHintSource::Skill { iri } if seen_skills.insert(iri.clone()) => {
+                materialized.skill_iris.push(iri.clone());
+            }
+            LearningHintSource::Knowledge { iri } if seen_knowledge.insert(iri.clone()) => {
+                materialized.knowledge_fragment_iris.push(iri.clone());
+            }
+            LearningHintSource::Skill { .. } | LearningHintSource::Knowledge { .. } => {}
+        }
+    }
+    materialized
+}
+
+/// Materialize verify-first from the CA/AA definitions in the exact LLM plan.
+/// The kernel changes only execution topology. It must never substitute a
+/// generic CA/AA business profile for the model-authored role definitions.
+fn materialize_verify_first_from_llm_plan(
+    plan: &mut ExecutionPlan,
+    task_iri: &str,
+) -> Result<(), CoreError> {
+    let mut verify_ca = plan
+        .steps
+        .iter()
+        .find(|step| step.role == AgentRole::Check)
+        .cloned()
+        .ok_or_else(|| CoreError::InteractionRejected {
+            stage: "sa_verify_first_plan".to_string(),
+            reason: "verify-first requires an LLM-authored CA definition".to_string(),
+        })?;
+    let mut verify_aa = plan
+        .steps
+        .iter()
+        .find(|step| step.role == AgentRole::Act)
+        .cloned()
+        .ok_or_else(|| CoreError::InteractionRejected {
+            stage: "sa_verify_first_plan".to_string(),
+            reason: "verify-first requires an LLM-authored AA definition".to_string(),
+        })?;
+
+    let source_for = |step: &PlanStep| -> Result<AgentSpecSourceRecord, CoreError> {
+        let source = plan
+            .agent_spec_source_for_step(&step.step_id)
+            .map_err(|error| CoreError::InteractionRejected {
+                stage: "sa_verify_first_plan".to_string(),
+                reason: format!(
+                    "verify-first cannot resolve provenance for LLM step '{}': {error}",
+                    step.step_id
+                ),
+            })?
+            .ok_or_else(|| CoreError::InteractionRejected {
+                stage: "sa_verify_first_plan".to_string(),
+                reason: format!(
+                    "verify-first step '{}' has no model interaction provenance",
+                    step.step_id
+                ),
+            })?;
+        if source.kind != AgentSpecSourceKind::LlmGeneratedPlan {
+            return Err(CoreError::InteractionRejected {
+                stage: "sa_verify_first_plan".to_string(),
+                reason: format!(
+                    "verify-first refuses non-LLM role definition for step '{}': {:?}",
+                    step.step_id, source.kind
+                ),
+            });
+        }
+        Ok(source)
+    };
+    let mut ca_source = source_for(&verify_ca)?;
+    let mut aa_source = source_for(&verify_aa)?;
+    let original_ca_id = verify_ca.step_id.clone();
+    let original_aa_id = verify_aa.step_id.clone();
+
+    plan.fallback_steps = plan.steps.clone();
+    plan.verify_first = true;
+    verify_ca.step_id = "verify_first_ca".to_string();
+    verify_ca.dependencies.clear();
+    verify_aa.step_id = "verify_first_aa".to_string();
+    verify_aa.dependencies = vec![verify_ca.step_id.clone()];
+
+    let specialize_source =
+        |source: &mut AgentSpecSourceRecord, original_step_id: &str, verify_step_id: &str| {
+            let source_ref = source
+                .source_ref
+                .take()
+                .unwrap_or_else(|| format!("{task_iri}#llm-plan"));
+            source.source_ref = Some(format!(
+                "{source_ref}/verify-first-clone/{original_step_id}/as/{verify_step_id}"
+            ));
+        };
+    specialize_source(&mut ca_source, &original_ca_id, &verify_ca.step_id);
+    specialize_source(&mut aa_source, &original_aa_id, &verify_aa.step_id);
+
+    let original_description = plan.description.clone();
+    plan.steps = vec![verify_ca, verify_aa];
+    plan.agent_sequence = vec![AgentRole::Check, AgentRole::Act];
+    plan.parallel_groups.clear();
+    plan.description =
+        format!("[Verify-first using LLM-authored CA/AA] Fallback plan: {original_description}");
+    plan.set_agent_spec_step_source("verify_first_ca", ca_source)
+        .map_err(|error| CoreError::InteractionRejected {
+            stage: "sa_verify_first_plan".to_string(),
+            reason: format!("failed to bind verify-first CA provenance: {error}"),
+        })?;
+    plan.set_agent_spec_step_source("verify_first_aa", aa_source)
+        .map_err(|error| CoreError::InteractionRejected {
+            stage: "sa_verify_first_plan".to_string(),
+            reason: format!("failed to bind verify-first AA provenance: {error}"),
+        })?;
+    Ok(())
 }
 
 /// Build a PDCA delta plan beginning at the failed step. Completed upstream
 /// nodes are retained as evidence in cycle feedback instead of being executed
 /// again. External DAG workflows keep their own retry/branch topology and are
 /// therefore never rewritten here.
+fn recovery_descendant_step_ids(
+    plan: &ExecutionPlan,
+    failed_step_id: &str,
+) -> Option<std::collections::HashSet<String>> {
+    plan.steps
+        .iter()
+        .any(|step| step.step_id == failed_step_id)
+        .then_some(())?;
+    let mut selected = std::collections::HashSet::from([failed_step_id.to_string()]);
+    loop {
+        let before = selected.len();
+        for step in &plan.steps {
+            if !selected.contains(&step.step_id)
+                && step
+                    .dependencies
+                    .iter()
+                    .any(|dependency| selected.contains(dependency))
+            {
+                selected.insert(step.step_id.clone());
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    Some(selected)
+}
+
 pub(super) fn scoped_recovery_plan(
     plan: &ExecutionPlan,
     failed_step_id: &str,
@@ -215,21 +431,23 @@ pub(super) fn scoped_recovery_plan(
     if plan.dag_jsonld.is_some() {
         return None;
     }
-    let failed_index = plan
-        .steps
-        .iter()
-        .position(|step| step.step_id == failed_step_id)?;
+    let retained = recovery_descendant_step_ids(plan, failed_step_id)?;
     let mut scoped = plan.clone();
     scoped.plan_id = format!("{}_delta_{}", plan.plan_id, revision);
-    scoped.steps = plan.steps[failed_index..].to_vec();
-    let retained = scoped
+    scoped.steps = plan
         .steps
         .iter()
-        .map(|step| step.step_id.clone())
-        .collect::<std::collections::HashSet<_>>();
+        .filter(|step| retained.contains(&step.step_id))
+        .cloned()
+        .collect();
     for step in &mut scoped.steps {
         step.dependencies
             .retain(|dependency| retained.contains(dependency));
+    }
+    if let Some(provenance) = scoped.agent_spec_provenance.as_mut() {
+        provenance
+            .step_sources
+            .retain(|step_id, _| retained.contains(step_id));
     }
     scoped.agent_sequence = scoped.steps.iter().map(|step| step.role).collect();
     scoped.parallel_groups.clear();
@@ -242,14 +460,112 @@ pub(super) fn scoped_recovery_plan(
     Some(scoped)
 }
 
-fn recovery_failed_step(summary: &str) -> Option<&str> {
-    let marker = "failed_step=";
-    let start = summary.find(marker)? + marker.len();
-    let tail = &summary[start..];
-    Some(
-        tail.split(|character: char| character.is_whitespace())
-            .next()
-            .unwrap_or(tail),
+/// Read only kernel-authored recovery provenance from the result error list.
+/// The same words in model prose have no routing authority.
+pub(super) fn kernel_recovery_route(
+    result: &TaskResult,
+) -> Option<(crate::core::recovery::RecoveryDirective, String)> {
+    const PREFIX: &str = "SA kernel recovery route: directive=";
+    result.errors.iter().rev().find_map(|error| {
+        let encoded = error.strip_prefix(PREFIX)?;
+        let (directive, failed_step) = encoded.split_once(";failed_step=")?;
+        if failed_step.is_empty() || failed_step.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let directive = match directive {
+            "RetryCa" => crate::core::recovery::RecoveryDirective::RetryCa,
+            "RetryDa" => crate::core::recovery::RecoveryDirective::RetryDa,
+            "ReplanPa" => crate::core::recovery::RecoveryDirective::ReplanPa,
+            "Blocked" => crate::core::recovery::RecoveryDirective::Blocked,
+            _ => return None,
+        };
+        Some((directive, failed_step.to_string()))
+    })
+}
+
+pub(super) fn kernel_recovery_directive(
+    result: &TaskResult,
+) -> Option<crate::core::recovery::RecoveryDirective> {
+    kernel_recovery_route(result).map(|(directive, _)| directive)
+}
+
+/// Resolve a structured role-owned retry into a PDCA delta plan.
+///
+/// `RetryDa` begins at the nearest implementation boundary. `RetryCa` begins
+/// at the verifier and therefore cannot replay completed implementation or
+/// acquire mutation authority merely because an evidence receipt was absent.
+/// Recovery markers are emitted by SA; model-authored prose alone is never
+/// treated as capability authority.
+/// External DAG workflows retain their own retry/branch topology and are not
+/// rewritten here.
+pub(super) fn scoped_retry_plan_for_decision(
+    plan: &ExecutionPlan,
+    decision: &crate::core::recovery::DecisionReport,
+    kernel_failed_step: Option<&str>,
+) -> Option<ExecutionPlan> {
+    if !matches!(
+        decision.directive,
+        crate::core::recovery::RecoveryDirective::RetryDa
+            | crate::core::recovery::RecoveryDirective::RetryCa
+    ) || plan.dag_jsonld.is_some()
+    {
+        return None;
+    }
+
+    let reported_index = kernel_failed_step.and_then(|failed_step| {
+        plan.steps
+            .iter()
+            .position(|step| step.step_id == failed_step)
+    });
+    let start_index = if decision.directive == crate::core::recovery::RecoveryDirective::RetryCa {
+        reported_index
+            .filter(|index| plan.steps[*index].role == AgentRole::Check)
+            .or_else(|| {
+                plan.steps
+                    .iter()
+                    .position(|step| step.role == AgentRole::Check)
+            })?
+    } else {
+        let nearest_reported_da = reported_index.and_then(|index| {
+            (0..=index)
+                .rev()
+                .find(|candidate| plan.steps[*candidate].role == AgentRole::Do)
+        });
+        let first_da = plan
+            .steps
+            .iter()
+            .position(|step| step.role == AgentRole::Do);
+        let first_downstream_gate = plan
+            .steps
+            .iter()
+            .position(|step| matches!(step.role, AgentRole::Check | AgentRole::Act));
+        nearest_reported_da
+            .or(first_da)
+            .or_else(|| {
+                reported_index.filter(|index| {
+                    matches!(plan.steps[*index].role, AgentRole::Check | AgentRole::Act)
+                })
+            })
+            .or(first_downstream_gate)?
+    };
+
+    if decision.directive == crate::core::recovery::RecoveryDirective::RetryCa {
+        let retained = recovery_descendant_step_ids(plan, &plan.steps[start_index].step_id)?;
+        // A verifier-only recovery cannot cross a downstream implementation
+        // boundary. Reject malformed/mixed-role topology instead of silently
+        // granting DA mutation or deleting dependencies by suffix position.
+        if plan.steps.iter().any(|step| {
+            retained.contains(&step.step_id)
+                && !matches!(step.role, AgentRole::Check | AgentRole::Act)
+        }) {
+            return None;
+        }
+    }
+
+    scoped_recovery_plan(
+        plan,
+        &plan.steps[start_index].step_id,
+        decision.plan_revision.saturating_add(1),
     )
 }
 
@@ -388,6 +704,115 @@ fn task_audit_evidence_iri(task_iri: &str) -> String {
 }
 
 impl SupervisorAgent {
+    /// Terminate before role materialization when SA could not obtain a real,
+    /// task-specific execution plan.  There is deliberately no synthetic
+    /// `ExecutionPlan` or resume contract here: both would give a kernel
+    /// fallback the appearance of LLM-authored PA/DA/CA/AA authority.
+    /// Because no role or tool has run, submitting the same task again is a
+    /// safe planning retry. Contract rejection and provider unavailability
+    /// remain distinct so the operator is not sent toward the wrong remedy.
+    async fn planning_blocked_result(
+        &mut self,
+        task_iri: &str,
+        cycle_id: &str,
+        error: &CoreError,
+        previous_result: Option<TaskResult>,
+    ) -> TaskResult {
+        let diagnostic = error.to_string();
+        let (block_reason, error_code, blocked_stage, retry_guidance, required_action) = match error {
+            CoreError::InteractionRejected { stage, .. }
+                if stage == "sa_plan_contract_rejected" => (
+                "sa_plan_contract_rejected",
+                "SA_PLAN_CONTRACT_REJECTED",
+                stage.as_str(),
+                "The configured LLM responded, but its plan and bounded correction were rejected by the planning contract. Inspect the diagnostic before resubmitting the task.",
+                "inspect the planning diagnostic and retry with a contract-valid plan",
+            ),
+            _ => (
+                "sa_planning_unavailable",
+                "SA_PLANNING_UNAVAILABLE",
+                "sa_plan_generation",
+                "It is safe to submit the same task again after the configured LLM becomes available.",
+                "retry planning after the configured LLM is available",
+            ),
+        };
+        let summary = if previous_result.is_none() {
+            format!(
+                "Planning blocked before role dispatch: SA could not obtain a valid task-specific LLM plan. No generic PA/DA/CA/AA fallback was executed. {retry_guidance} Diagnostic: {diagnostic}"
+            )
+        } else {
+            format!(
+                "Planning blocked before fallback role dispatch: SA could not obtain a valid task-specific LLM plan. Earlier verify-first evidence is preserved, and no generic PA/DA/CA/AA fallback was executed. {retry_guidance} Diagnostic: {diagnostic}"
+            )
+        };
+        warn!(
+            task_iri = %task_iri,
+            cycle_id = %cycle_id,
+            error = %diagnostic,
+            "SA planning failed closed before role dispatch"
+        );
+
+        if let Some(cycle) = self.active_cycles.get_mut(cycle_id) {
+            cycle.phase = CyclePhase::Idle;
+            cycle.task_completed = false;
+            cycle.phase_history.push("PlanningBlocked".to_string());
+        }
+        self.emit_sa_thought(task_iri, &summary, "planning_blocked")
+            .await;
+        self.event_bus
+            .emit(
+                task_iri,
+                "RECOVERY_BLOCKED",
+                "SA",
+                &serde_json::json!({
+                    "reason": block_reason,
+                    "stage": blocked_stage,
+                    "diagnostic": diagnostic,
+                    "automatic_role_dispatch": false,
+                    "generic_plan_fallback": false,
+                    "resume_safe": true,
+                    "resume_mode": "resubmit_same_task",
+                    "required_action": required_action,
+                })
+                .to_string(),
+            )
+            .await;
+        let unprocessed_commands = self
+            .event_bus
+            .close_and_take_supplementary_commands(task_iri)
+            .len();
+
+        let mut result = previous_result.unwrap_or_else(|| TaskResult {
+            task_iri: task_iri.to_string(),
+            status: "blocked".to_string(),
+            verdict: Some(TaskVerdict::Blocked),
+            summary: String::new(),
+            output: None,
+            jsonld_output: None,
+            artifacts: Vec::new(),
+            errors: Vec::new(),
+            turn_count: 0,
+            tool_call_count: 0,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: None,
+        });
+        result.status = "blocked".to_string();
+        result.verdict = Some(TaskVerdict::Blocked);
+        result.summary = if result.summary.trim().is_empty() {
+            summary
+        } else {
+            format!("{}\n\n{}", result.summary, summary)
+        };
+        result.errors.push(format!("{error_code}: {diagnostic}"));
+        if unprocessed_commands > 0 {
+            result.errors.push(format!(
+                "{unprocessed_commands} supplementary command(s) arrived after the planning retry boundary"
+            ));
+        }
+        result
+    }
+
     #[instrument(skip(self, user_input), fields(task_iri = %task_iri))]
     pub async fn process_task(
         &mut self,
@@ -410,24 +835,54 @@ impl SupervisorAgent {
         task_iri: &str,
         ctx: TaskContext,
     ) -> Result<TaskResult, CoreError> {
+        let canonical_user_input = if let Some(state) = ctx.resumed_state.as_ref() {
+            state.validate()?;
+            state.contract.original_user_task.clone()
+        } else {
+            user_input.to_string()
+        };
+        let user_input = canonical_user_input.as_str();
+        // The lease keeps a root scope resident while all parallel BizAgent
+        // children contribute to it and retires counters on every return,
+        // error, or cancellation path when this future is dropped.
+        let _task_accounting_lease = self
+            .runner
+            .llm_interactions
+            .begin_scope_accounting(task_iri);
+        self.event_bus.open_supplementary_commands(task_iri);
         let cycle_id = self.start_cycle(user_input, task_iri).await?;
         let task_started_at = std::time::Instant::now();
 
-        // AgentRunner counters are intentionally process-wide so the UI can
-        // display cumulative usage. A task budget, however, is task-scoped;
-        // never charge this task for tokens consumed by an earlier task on
-        // the same SupervisorAgent instance.
-        let task_prompt_tokens_start = self
-            .runner
-            .total_prompt_tokens
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let task_completion_tokens_start = self
-            .runner
-            .total_completion_tokens
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // This is the authoritative, mutable task contract for the complete
+        // outer PDCA lifetime. A supplementary delivery update received in
+        // one execute_plan call must survive retries/replans instead of
+        // reverting to the immutable entry context on the next cycle.
+        let mut effective_task_constraints = ctx
+            .resumed_state
+            .as_ref()
+            .map(|state| state.contract.constraints_hash_map())
+            .unwrap_or_else(|| ctx.constraints.clone());
+        let mut effective_task_effect_policy = ctx
+            .resumed_state
+            .as_ref()
+            .map(|state| state.contract.effect_policy.clone())
+            .unwrap_or_else(|| ctx.effective_effect_policy());
 
-        let declared_effect_execution = ctx
-            .constraints
+        // UI counters remain process-wide, while budgets and learning costs
+        // use the interaction plane's root-task ledger. This includes every
+        // BizAgent child but excludes unrelated/background model traffic.
+        let task_usage_start = self
+            .runner
+            .llm_interactions
+            .usage_snapshot_for_scope(task_iri);
+        let task_prompt_tokens_start = task_usage_start.prompt_tokens;
+        let task_completion_tokens_start = task_usage_start.completion_tokens;
+        let task_context_quality_start = self
+            .runner
+            .llm_interactions
+            .context_quality_snapshot_for_scope(task_iri);
+
+        let declared_effect_execution = effective_task_constraints
             .get("required_effect")
             .is_some_and(|value| value == "workspace_mutation");
         let extraction_started_at = std::time::Instant::now();
@@ -531,8 +986,8 @@ impl SupervisorAgent {
         // Enrich with skill discovery results if a discovery engine is available.
         // Keep sources separate until after policy selection so every action
         // corresponds to the treatment recorded in the learning evaluation.
-        let mut skill_hints = Vec::new();
-        let mut knowledge_hints = Vec::new();
+        let mut skill_hints: Vec<LearningHintCandidate> = Vec::new();
+        let mut knowledge_hints: Vec<LearningHintCandidate> = Vec::new();
         // The original objective is deterministic for matched tasks. Using
         // model-generated 5W2H text here fragments identical observations
         // because the extraction paraphrases `what` on every call.
@@ -547,7 +1002,7 @@ impl SupervisorAgent {
             if let Some(ref de) = self.discovery_engine {
                 let mut discovery_constraints = five_w2h.why.success_criteria.clone();
                 discovery_constraints.extend(
-                    ctx.constraints
+                    effective_task_constraints
                         .iter()
                         .map(|(key, value)| format!("{key}={value}")),
                 );
@@ -569,18 +1024,27 @@ impl SupervisorAgent {
                         } else {
                             m.skill.skill_iri.rsplit('/').next()?.to_string()
                         };
-                        Some(format!(
-                            "[Skill source={} relevance={:.2}] {}",
-                            m.skill.skill_iri, m.relevance_score, name
-                        ))
+                        Some(LearningHintCandidate {
+                            text: format!(
+                                "[Skill source={} relevance={:.2}] {}",
+                                m.skill.skill_iri, m.relevance_score, name
+                            ),
+                            source: LearningHintSource::Skill {
+                                iri: m.skill.skill_iri.clone(),
+                            },
+                        })
                     })
                     .take(prompt_settings.max_discovered_skill_hints)
                     .collect();
-                observed_skill_iris = matches
+                observed_skill_iris = skill_hints
                     .iter()
-                    .take(prompt_settings.max_discovered_skill_hints)
-                    .map(|matched| matched.skill.skill_iri.clone())
+                    .filter_map(|hint| match &hint.source {
+                        LearningHintSource::Skill { iri } => Some(iri.clone()),
+                        _ => None,
+                    })
                     .collect();
+                let mut seen_skill_iris = std::collections::HashSet::new();
+                observed_skill_iris.retain(|iri| seen_skill_iris.insert(iri.clone()));
                 knowledge_hints = if let Some(graph) = self.runner.skill_graph_store.as_ref() {
                     let fragments = rank_knowledge_fragments(
                         matches
@@ -594,7 +1058,15 @@ impl SupervisorAgent {
                         .iter()
                         .map(|fragment| fragment.fragment_iri.clone())
                         .collect();
-                    fragments.iter().map(render_knowledge_hint).collect()
+                    fragments
+                        .iter()
+                        .map(|fragment| LearningHintCandidate {
+                            text: render_knowledge_hint(fragment),
+                            source: LearningHintSource::Knowledge {
+                                iri: fragment.fragment_iri.clone(),
+                            },
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -620,10 +1092,17 @@ impl SupervisorAgent {
                 candidates: policy_candidates,
             }
         };
-        let all_hints = if self.learning_mode.injects_history() {
-            policy_treatment_hints(
+        let experience_hint_candidates = perception_hints
+            .iter()
+            .map(|text| LearningHintCandidate {
+                text: text.clone(),
+                source: LearningHintSource::Experience,
+            })
+            .collect::<Vec<_>>();
+        let materialized_treatment = if self.learning_mode.injects_history() {
+            materialize_policy_treatment(
                 &policy_choice.action,
-                &perception_hints,
+                &experience_hint_candidates,
                 &skill_hints,
                 &knowledge_hints,
                 prompt_settings.max_learning_hints,
@@ -631,8 +1110,9 @@ impl SupervisorAgent {
                 prompt_settings.max_learning_hint_total_chars,
             )
         } else {
-            Vec::new()
+            MaterializedLearningTreatment::default()
         };
+        let all_hints = materialized_treatment.hints.clone();
         if !all_hints.is_empty() {
             tracing::info!(
                 task_iri = %task_iri,
@@ -655,8 +1135,10 @@ impl SupervisorAgent {
                 .unwrap_or_default(),
             skills_observed: discovered_skill_count,
             skill_iris_observed: observed_skill_iris,
+            skill_iris_injected: materialized_treatment.skill_iris,
             knowledge_fragments_observed: discovered_knowledge_count,
             knowledge_fragment_iris_observed: observed_knowledge_fragment_iris,
+            knowledge_fragment_iris_injected: materialized_treatment.knowledge_fragment_iris,
             hints_injected: all_hints.len(),
             hint_chars_injected: all_hints.iter().map(|hint| hint.chars().count()).sum(),
             task_family_raw_features: task_context.raw_features,
@@ -700,11 +1182,10 @@ impl SupervisorAgent {
             )
             .await;
 
-        let initial_complexity = self.classify_complexity(user_input);
-        let defer_fallback_planning = should_defer_fallback_planning(&ctx, initial_complexity);
         // Unified execution path: build ExecutionPlan from JSON-LD workflow or LLM.
-        // For verify-first candidates, use a cheap structural fallback now and
-        // generate the detailed fallback only if CA→AA says execution is needed.
+        // Normal TUI tasks always obtain the detailed LLM plan before any
+        // role dispatch. Verify-first may reorder its LLM-authored CA/AA, but
+        // may not defer planning through a generic kernel role profile.
         let mut plan = if let Some(ref wf_jsonld) = ctx.workflow_jsonld {
             info!(task_iri = %task_iri, "Using JSON-LD workflow mode — converting through adapter to ExecutionPlan");
             let def =
@@ -722,28 +1203,32 @@ impl SupervisorAgent {
                 crate::core::workflow::adapter::dag_to_execution_plan(&dag, &def, task_iri);
             plan.dag_jsonld = Some(wf_jsonld.clone());
             plan
-        } else if ctx.resumed_messages.is_some() {
-            self.build_resume_plan()
-        } else if defer_fallback_planning {
-            info!(task_iri = %task_iri, complexity = ?initial_complexity, "Deferring detailed fallback planning until verify-first fails");
-            self.build_plan_from_complexity(initial_complexity)
-        } else if declared_effect_execution {
-            // SA owns orchestration; PA owns detailed planning. Asking SA for
-            // a complete model-generated plan and then dispatching PA to plan
-            // it again duplicates latency, completion tokens, and inspection.
-            // The structural plan preserves PDCA/DAG semantics while leaving
-            // domain planning to the BizAgent abstraction designed for it.
-            info!(task_iri = %task_iri, complexity = ?initial_complexity, "Using structural SA plan; detailed planning delegated once to PA");
-            self.build_plan_from_complexity(initial_complexity)
+        } else if let Some(state) = ctx.resumed_state.as_ref() {
+            state.contract.execution_plan.clone()
         } else {
-            self.analyze_task_with_llm(
-                task_iri,
-                user_input,
-                &five_w2h,
-                &all_hints,
-                &ctx.constraints,
-            )
-            .await
+            // SA's planner supplies the task-specific definitions from which
+            // every isolated PA/DA/CA/AA BizAgent materializes its own
+            // agent.md. Workspace-effect tasks follow the same path: a generic
+            // kernel PlanStep would preserve control flow but silently replace
+            // the model-generated role specification that provides business
+            // isolation and specialization.
+            match self
+                .analyze_task_with_llm(
+                    task_iri,
+                    user_input,
+                    &five_w2h,
+                    &all_hints,
+                    &effective_task_constraints,
+                )
+                .await
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return Ok(self
+                        .planning_blocked_result(task_iri, &cycle_id, &error, None)
+                        .await);
+                }
+            }
         };
         tracing::info!(
             task_iri = %task_iri,
@@ -753,15 +1238,13 @@ impl SupervisorAgent {
         );
 
         // ── Verify-first optimization ──
-        // When workspace has existing files and plan is non-trivial:
-        // prepend CA→AA to check existing code first, store original as fallback_steps.
-        // execute_plan returns "failed" if verify CA fails → retry loop uses fallback_steps.
+        // Existing work may be accepted before DA, but both preflight roles
+        // must remain clones of the exact LLM-authored plan definitions.
         if !plan.verify_first
             && ctx.workspace_file_summary.is_some()
-            && ctx.resumed_messages.is_none()
+            && ctx.resumed_state.is_none()
             && ctx.workflow_jsonld.is_none()
-            && !ctx
-                .constraints
+            && !effective_task_constraints
                 .get("required_effect")
                 .is_some_and(|value| value == "workspace_mutation")
             && plan.steps.len() >= 2
@@ -774,56 +1257,13 @@ impl SupervisorAgent {
                 .workspace_file_summary
                 .as_deref()
                 .unwrap_or("workspace has files");
-            plan.fallback_steps = plan.steps.clone();
-            plan.verify_first = true;
+            if let Err(error) = materialize_verify_first_from_llm_plan(&mut plan, task_iri) {
+                return Ok(self
+                    .planning_blocked_result(task_iri, &cycle_id, &error, None)
+                    .await);
+            }
 
-            let verify_ca = PlanStep {
-                step_id: "verify_ca".to_string(),
-                role: AgentRole::Check,
-                objective: format!(
-                    "Check if existing workspace files already satisfy the task requirement.\n\
-                     Workspace inventory: {}\n\
-                     If existing code meets requirements, report VERIFIED-PASS with evidence.\n\
-                     If not, report what is missing or needs modification.",
-                    ws_summary
-                ),
-                expected_output:
-                    "Verification result: PASS (existing code sufficient) or FAIL (list gaps)"
-                        .to_string(),
-                dependencies: vec![],
-                tools_allowed: vec![],
-                success_criteria: "Clear pass/fail verdict with evidence from workspace"
-                    .to_string(),
-                branch_on_failure: false,
-                branch_fallback: None,
-                retry_count: 0,
-                retry_delay_secs: 0,
-                effect_policy: crate::core::effect::EffectPolicy::EvidenceOnly,
-            };
-            let verify_aa = PlanStep {
-                step_id: "verify_aa".to_string(),
-                role: AgentRole::Act,
-                objective: "Evaluate verification results. If existing code already satisfies requirements, confirm task complete. Otherwise indicate full execution is needed.".to_string(),
-                expected_output: "Final verdict: task already done vs needs full execution".to_string(),
-                dependencies: vec!["verify_ca".to_string()],
-                tools_allowed: vec![],
-                success_criteria: "Decision clear with justification".to_string(),
-                branch_on_failure: false,
-                branch_fallback: None,
-                retry_count: 0,
-                retry_delay_secs: 0,
-                effect_policy: crate::core::effect::EffectPolicy::DecisionOnly,
-            };
-            // Store original description, prepend verify steps
-            let original_desc = plan.description.clone();
-            plan.steps = vec![verify_ca, verify_aa];
-            plan.agent_sequence = vec![AgentRole::Check, AgentRole::Act];
-            plan.description = format!(
-                "[Verify-first] Check existing workspace code before full PDCA. Fallback: {}",
-                original_desc
-            );
-
-            info!(task_iri = %task_iri, ws = %ws_summary, "Verify-first: CA→AA prepended, fallback_steps={}", plan.fallback_steps.len());
+            info!(task_iri = %task_iri, ws = %ws_summary, "Verify-first: LLM-authored CA→AA cloned, fallback_steps={}", plan.fallback_steps.len());
         }
 
         // Adapt relevance tracker decay λ to task complexity
@@ -850,91 +1290,10 @@ impl SupervisorAgent {
                 .push(format!("Plan: {}", plan.description));
         }
 
-        let mut pending_interventions: Vec<crate::perception::proactive_engine::InterventionPlan> =
-            Vec::new();
-        if let Some(ref mut receiver) = self.event_receiver {
-            while let Ok(event) = receiver.try_recv() {
-                if event.task_iri != task_iri {
-                    continue;
-                }
-                match event.event_type.as_str() {
-                    "INTERVENTION_REQUIRED" => {
-                        if let Ok(plan) = serde_json::from_str::<
-                            crate::perception::proactive_engine::InterventionPlan,
-                        >(&event.payload)
-                        {
-                            pending_interventions.push(plan);
-                        }
-                    }
-                    "DEADLINE_APPROACHING" => {
-                        warn!("Deadline approaching, marking task as urgent");
-                    }
-                    "HUMAN_APPROVAL_RESULT" => {
-                        if let Ok(result) =
-                            serde_json::from_str::<serde_json::Value>(&event.payload)
-                        {
-                            let request_id = result
-                                .get("request_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let approved = result
-                                .get("approved")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            if !request_id.is_empty() {
-                                self.pending_approvals
-                                    .lock()
-                                    .await
-                                    .insert(request_id.to_string(), approved);
-                                info!(request_id = %request_id, approved = %approved, "Received human approval result");
-                            }
-                        }
-                    }
-                    event_type if super::event_requires_blocked_intervention(event_type) => {
-                        let plan = self
-                            .perception
-                            .on_agent_blocked(&event.source_agent_iri, task_iri);
-                        if plan.should_interrupt {
-                            pending_interventions.push(plan);
-                        }
-                    }
-                    "AGENT_ERROR" => {
-                        info!(
-                            agent = %event.source_agent_iri,
-                            "Recoverable agent/tool error retained as evidence; no SA blocked intervention"
-                        );
-                    }
-                    "THRESHOLD_EXCEEDED" => {
-                        if let Ok(payload) =
-                            serde_json::from_str::<serde_json::Value>(&event.payload)
-                        {
-                            let plan = self.perception.on_quality_degradation(&payload, task_iri);
-                            if plan.should_interrupt {
-                                pending_interventions.push(plan);
-                            }
-                        }
-                    }
-                    "CYCLE_ITERATION" => {
-                        if let Ok(payload) =
-                            serde_json::from_str::<serde_json::Value>(&event.payload)
-                        {
-                            let plan = self.perception.on_progress_anomaly(&payload, task_iri);
-                            if plan.should_interrupt {
-                                pending_interventions.push(plan);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        for plan in pending_interventions {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(self.execution_timeout_secs),
-                self.execute_intervention_for_cycle(plan, task_iri),
-            )
-            .await;
-        }
+        // Route planning-time events through the same owner used between
+        // execution steps. This prevents one drain site from consuming a user
+        // command or approval intended for another stage.
+        self.drain_and_route_runtime_events(task_iri).await;
 
         // ── Outer SA-level PDCA retry loop ──
         // Ensure at least 2 cycles when verify_first is active
@@ -952,9 +1311,9 @@ impl SupervisorAgent {
         // task rather than only its last cycle.
         let mut task_execution_facts = super::execution::TaskExecutionFacts::default();
         let mut plan_revision = 1u32;
-        let mut fallback_plan_generated = !defer_fallback_planning;
         let mut next_scoped_plan: Option<ExecutionPlan> = None;
         let mut task_scope_replans_used = 0u32;
+        let mut recovery_state = super::execution::PdcaRecoveryState::default();
         let token_budget = five_w2h.how_much.as_ref().and_then(|h| h.token_budget);
         tracing::info!(
             task_iri = %task_iri,
@@ -965,6 +1324,9 @@ impl SupervisorAgent {
         );
 
         for cycle_num in 0..max_cycles {
+            // A previous cycle may have atomically closed its terminal input
+            // boundary before returning a retryable failure.
+            self.event_bus.open_supplementary_commands(task_iri);
             // Reset only the current PDCA attempt clock. The task lifetime
             // `started_at` remains unchanged for end-to-end SLO metrics.
             let now = chrono::Utc::now();
@@ -985,13 +1347,9 @@ impl SupervisorAgent {
             if let Some(limit) = token_budget {
                 let cumulative_used = self
                     .runner
-                    .total_prompt_tokens
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(
-                        self.runner
-                            .total_completion_tokens
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    );
+                    .llm_interactions
+                    .usage_snapshot_for_scope(task_iri)
+                    .total_tokens();
                 let baseline_used =
                     task_prompt_tokens_start.saturating_add(task_completion_tokens_start);
                 let used = cumulative_used.saturating_sub(baseline_used);
@@ -1047,34 +1405,11 @@ impl SupervisorAgent {
             } else {
                 None
             };
-
-            // Generate a detailed fallback only after verify-first actually
-            // fails. This preserves full PA→DA quality while removing the
-            // dominant latency/token cost from already-complete tasks.
-            if cycle_num >= 1 && plan.verify_first && !fallback_plan_generated {
-                let detailed = self
-                    .analyze_task_with_llm(
-                        task_iri,
-                        user_input,
-                        &five_w2h,
-                        &all_hints,
-                        &ctx.constraints,
-                    )
-                    .await;
-                plan.fallback_steps = detailed.steps;
-                plan.parallel_groups = detailed.parallel_groups;
-                plan.task_complexity = detailed.task_complexity;
-                plan.context_requirements = detailed.context_requirements;
-                plan.success_metrics = detailed.success_metrics;
-                plan.max_recursion_depth = detailed.max_recursion_depth;
-                plan.sub_tasks = detailed.sub_tasks;
-                plan.description = format!(
-                    "[Verify-first] Check existing workspace before full PDCA. Fallback: {}",
-                    detailed.description
-                );
-                fallback_plan_generated = true;
-                info!(task_iri = %task_iri, fallback_steps = plan.fallback_steps.len(), "Verify-first failed; detailed fallback plan generated lazily");
-            }
+            let conversation_history = if cycle_num == 0 {
+                ctx.conversation_history.clone()
+            } else {
+                None
+            };
 
             // On retry after verify-first failed, switch to fallback_steps (full PDCA)
             let current_plan = if let Some(scoped) = next_scoped_plan.take() {
@@ -1085,6 +1420,16 @@ impl SupervisorAgent {
                 plan_revision = cycle_num as u32 + 1;
                 fb.plan_id = format!("{}_rev_{}", plan.plan_id, plan_revision);
                 fb.steps = plan.fallback_steps.clone();
+                let retained_step_ids = fb
+                    .steps
+                    .iter()
+                    .map(|step| step.step_id.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                if let Some(provenance) = fb.agent_spec_provenance.as_mut() {
+                    provenance
+                        .step_sources
+                        .retain(|step_id, _| retained_step_ids.contains(step_id.as_str()));
+                }
                 fb.verify_first = false;
                 fb.agent_sequence = fb.steps.iter().map(|s| s.role).collect();
                 fb.description = format!(
@@ -1145,12 +1490,75 @@ impl SupervisorAgent {
                     &five_w2h_iri,
                     resumed,
                     resumed_state,
+                    conversation_history,
                     cycle_feedback.clone(),
-                    ctx.effective_effect_policy(),
-                    ctx.constraints.clone(),
+                    ctx.workspace_file_summary.as_deref(),
+                    &mut effective_task_effect_policy,
+                    &mut effective_task_constraints,
+                    &mut recovery_state,
                 )
                 .await?;
             task_execution_facts.record(&result);
+
+            // A timeout/blocked phase has an indeterminate replay boundary:
+            // its durable journal may already contain a committed tool
+            // effect even though the cancelled BizAgent could not return its
+            // in-memory action ledger. Do not classify it as RetryDa/ReplanPa
+            // below. Stop the outer PDCA loop and require an explicit,
+            // journal-aware resume decision instead.
+            if super::execution::requires_safe_plan_stop(&result) {
+                task_execution_facts.apply_to(&mut result);
+                warn!(
+                    task_iri = %task_iri,
+                    cycle_num = cycle_num + 1,
+                    status = %result.status,
+                    "PDCA recovery stopped at an indeterminate side-effect boundary"
+                );
+                self.event_bus
+                    .emit(
+                        task_iri,
+                        "RECOVERY_BLOCKED",
+                        "SA",
+                        &serde_json::json!({
+                            "reason": "indeterminate_side_effect_boundary",
+                            "status": &result.status,
+                            "automatic_retry": false,
+                            "required_action": "inspect_durable_journal_before_resume",
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                final_result = Some(result);
+                break;
+            }
+
+            // A bounded CA-only retry that still cannot obtain admissible
+            // evidence is terminal for automatic recovery. Replaying PA/DA
+            // cannot create a verifier receipt and may duplicate or corrupt
+            // an already-complete implementation. This marker is accepted
+            // only from the kernel-authored error list above, never from LLM
+            // prose.
+            if kernel_recovery_directive(&result)
+                == Some(crate::core::recovery::RecoveryDirective::Blocked)
+            {
+                task_execution_facts.apply_to(&mut result);
+                self.event_bus
+                    .emit(
+                        task_iri,
+                        "RECOVERY_BLOCKED",
+                        "SA",
+                        &serde_json::json!({
+                            "reason": "ca_verification_evidence_missing",
+                            "status": &result.status,
+                            "automatic_retry": false,
+                            "required_action": "inspect or explicitly rerun the named acceptance check",
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                final_result = Some(result);
+                break;
+            }
 
             // Verify-first: the AA's finish action hardcodes status "success" even when it
             // concluded full execution is needed, so that status is unusable here. Only treat
@@ -1160,10 +1568,23 @@ impl SupervisorAgent {
             let needs_execution_after_verify =
                 cycle_num == 0 && plan.verify_first && verify_aa_needs_execution(&result);
 
+            let declared_recovery_route = kernel_recovery_route(&result);
+            let declared_recovery = declared_recovery_route
+                .as_ref()
+                .map(|(directive, _)| *directive);
+            let declared_local_recovery = matches!(
+                declared_recovery,
+                Some(crate::core::recovery::RecoveryDirective::RetryCa)
+                    | Some(crate::core::recovery::RecoveryDirective::RetryDa)
+            );
             let task_scope_failure = result.summary.contains("[Recovery] scope=Task")
                 || result.summary.contains("scope=Task");
-            let local_failure =
-                result.status != "success" && !needs_execution_after_verify && !task_scope_failure;
+            // A kernel-owned local directive takes precedence over incidental
+            // `scope=Task` text in accumulated model summaries. Conversely,
+            // summary prose can never manufacture a local retry capability.
+            let local_failure = result.status != "success"
+                && !needs_execution_after_verify
+                && (declared_local_recovery || !task_scope_failure);
             let decision_report = if result.status == "success" && !needs_execution_after_verify {
                 crate::core::recovery::DecisionReport {
                     mode,
@@ -1173,11 +1594,28 @@ impl SupervisorAgent {
                     plan_revision,
                 }
             } else if local_failure {
+                let directive = declared_recovery
+                    .filter(|directive| {
+                        matches!(
+                            directive,
+                            crate::core::recovery::RecoveryDirective::RetryCa
+                                | crate::core::recovery::RecoveryDirective::RetryDa
+                        )
+                    })
+                    .unwrap_or(crate::core::recovery::RecoveryDirective::RetryDa);
                 crate::core::recovery::DecisionReport {
                     mode,
-                    directive: crate::core::recovery::RecoveryDirective::RetryDa,
-                    reason: crate::core::recovery::RecoveryReason::LocalExecutionGap,
-                    scope: crate::core::recovery::RepairScope::Step,
+                    directive,
+                    reason: if directive == crate::core::recovery::RecoveryDirective::RetryCa {
+                        crate::core::recovery::RecoveryReason::EvidenceMissing
+                    } else {
+                        crate::core::recovery::RecoveryReason::LocalExecutionGap
+                    },
+                    scope: if directive == crate::core::recovery::RecoveryDirective::RetryCa {
+                        crate::core::recovery::RepairScope::Phase
+                    } else {
+                        crate::core::recovery::RepairScope::Step
+                    },
                     plan_revision,
                 }
             } else {
@@ -1203,6 +1641,25 @@ impl SupervisorAgent {
                 .await;
 
             if result.status == "success" && !needs_execution_after_verify {
+                let terminal_commands = self
+                    .event_bus
+                    .close_and_take_supplementary_commands(task_iri);
+                if !terminal_commands.is_empty() {
+                    // execute_plan normally closes and drains this boundary.
+                    // Refuse a success if a future execution path ever returns
+                    // without doing so.
+                    result.status = "failed".to_string();
+                    result.verdict = Some(TaskVerdict::Failed);
+                    result.errors.push(format!(
+                        "{} supplementary command(s) reached the terminal boundary without processing",
+                        terminal_commands.len()
+                    ));
+                    for event in terminal_commands {
+                        self.enqueue_supplementary_input(task_iri, &event.payload);
+                    }
+                    final_result = Some(result);
+                    continue;
+                }
                 task_execution_facts.apply_to(&mut result);
                 info!(task_iri = %task_iri, cycle_num = cycle_num + 1, "PDCA cycle passed");
                 self.emit_sa_thought(
@@ -1223,7 +1680,8 @@ impl SupervisorAgent {
                     task_started_at,
                     task_prompt_tokens_start,
                     task_completion_tokens_start,
-                    ctx.effective_effect_policy().requires_workspace_mutation(),
+                    task_context_quality_start,
+                    effective_task_effect_policy.requires_workspace_mutation(),
                 )
                 .await;
                 return Ok(result);
@@ -1245,7 +1703,11 @@ impl SupervisorAgent {
                 break;
             }
 
-            if local_failure {
+            if matches!(
+                decision_report.directive,
+                crate::core::recovery::RecoveryDirective::RetryDa
+                    | crate::core::recovery::RecoveryDirective::RetryCa
+            ) {
                 if mode == crate::core::recovery::OrchestrationMode::Dag {
                     // DAG node-level retry/branch semantics are authoritative;
                     // rewriting and replaying the external graph would violate
@@ -1253,15 +1715,25 @@ impl SupervisorAgent {
                     final_result = Some(result);
                     break;
                 }
-                if let Some(failed_step) = recovery_failed_step(&result.summary) {
-                    next_scoped_plan = scoped_recovery_plan(
-                        &executed_plan,
-                        failed_step,
-                        plan_revision.saturating_add(1),
-                    );
+                next_scoped_plan = scoped_retry_plan_for_decision(
+                    &executed_plan,
+                    &decision_report,
+                    declared_recovery_route
+                        .as_ref()
+                        .map(|(_, failed_step)| failed_step.as_str()),
+                );
+                if next_scoped_plan.is_none() {
+                    result.errors.push(format!(
+                        "{:?} recovery could not identify its role-owned boundary",
+                        decision_report.directive
+                    ));
+                    final_result = Some(result);
+                    break;
                 }
             }
-            if !local_failure && !needs_execution_after_verify {
+            if decision_report.directive == crate::core::recovery::RecoveryDirective::ReplanPa
+                && !needs_execution_after_verify
+            {
                 let max_plan_revisions = self
                     .runner
                     .agent_settings
@@ -1283,18 +1755,39 @@ impl SupervisorAgent {
             // not misreport every retry as an AA rejection.
             // The CA→DA correction loop (in execute_plan) already handles in-cycle fixes;
             // this SA-level feedback addresses persistent failures requiring plan adjustment.
-            let task_level_audit = result.summary.contains("[Recovery] scope=Task");
-            let da_fixes = !task_level_audit
-                && (result.summary.contains("Dimension Audit")
-                    || result.summary.contains("execution failed")
-                    || result.summary.contains("not completed"));
+            // This summary becomes model input for a new PA/DA AgentInstance.
+            // Keep stable AgentTurn references, but strip all result tools and
+            // tool-result IRIs whose authority ended with the prior L1.
+            let quality_gate_summary =
+                crate::tools::tool_executor::sanitize_session_tool_references(&result.summary).0;
+            let task_level_audit = quality_gate_summary.contains("[Recovery] scope=Task");
+            let ca_recheck =
+                decision_report.directive == crate::core::recovery::RecoveryDirective::RetryCa;
+            let da_fixes = !ca_recheck
+                && !task_level_audit
+                && (quality_gate_summary.contains("Dimension Audit")
+                    || quality_gate_summary.contains("execution failed")
+                    || quality_gate_summary.contains("not completed"));
 
             let authoritative_contract = super::execution::authoritative_task_contract(
                 user_input,
                 &five_w2h,
-                &ctx.constraints,
+                &effective_task_constraints,
             );
-            cycle_feedback = Some(if da_fixes {
+            cycle_feedback = Some(if ca_recheck {
+                format!(
+                    "{}\n\nPDCA Cycle #{} (plan revision {}): implementation is preserved; the latest CA lacked admissible verification evidence.\n\
+                     Status: {}\n\n\
+                     CA evidence gap:\n{}\n\n\
+                     ---\n\
+                     Re-run only the named missing acceptance checks in a fresh isolated CA. Do not route this gap to DA and do not modify workspace content.",
+                    authoritative_contract,
+                    cycle_num + 1,
+                    plan_revision,
+                    result.status,
+                    quality_gate_summary
+                )
+            } else if da_fixes {
                 format!(
                     "{}\n\nPDCA Cycle #{} (plan revision {}): the latest quality gate identified execution-level issues.\n\
                      Status: {}\n\n\
@@ -1308,7 +1801,7 @@ impl SupervisorAgent {
                     cycle_num + 1,
                     plan_revision,
                     result.status,
-                    result.summary
+                    quality_gate_summary
                 )
             } else {
                 format!(
@@ -1321,7 +1814,7 @@ impl SupervisorAgent {
                     cycle_num + 1,
                     plan_revision,
                     result.status,
-                    result.summary
+                    quality_gate_summary
                 )
             });
             final_result = Some(result);
@@ -1345,7 +1838,16 @@ impl SupervisorAgent {
             verdict: None,
             archive_iri: None,
         });
+        let unprocessed_terminal_commands = self
+            .event_bus
+            .close_and_take_supplementary_commands(task_iri)
+            .len();
         task_execution_facts.apply_to(&mut final_result);
+        if unprocessed_terminal_commands > 0 {
+            final_result.errors.push(format!(
+                "{unprocessed_terminal_commands} supplementary command(s) arrived after the last executable recovery boundary"
+            ));
+        }
         self.record_final_learning_outcome(
             task_iri,
             &final_result,
@@ -1354,7 +1856,8 @@ impl SupervisorAgent {
             task_started_at,
             task_prompt_tokens_start,
             task_completion_tokens_start,
-            ctx.effective_effect_policy().requires_workspace_mutation(),
+            task_context_quality_start,
+            effective_task_effect_policy.requires_workspace_mutation(),
         )
         .await;
         Ok(final_result)
@@ -1369,18 +1872,22 @@ impl SupervisorAgent {
         task_started_at: std::time::Instant,
         prompt_tokens_start: u64,
         completion_tokens_start: u64,
+        context_quality_start: crate::llm::interaction::LlmContextQualitySnapshot,
         workspace_mutation_required: bool,
     ) {
-        let prompt_tokens = self
+        let task_usage = self
             .runner
-            .total_prompt_tokens
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(prompt_tokens_start);
-        let completion_tokens = self
-            .runner
-            .total_completion_tokens
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .llm_interactions
+            .usage_snapshot_for_scope(task_iri);
+        let prompt_tokens = task_usage.prompt_tokens.saturating_sub(prompt_tokens_start);
+        let completion_tokens = task_usage
+            .completion_tokens
             .saturating_sub(completion_tokens_start);
+        let context_quality = self
+            .runner
+            .llm_interactions
+            .context_quality_snapshot_for_scope(task_iri)
+            .saturating_sub(context_quality_start);
         let elapsed_ms = task_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let reward = policy_reward_breakdown(
             result,
@@ -1489,8 +1996,11 @@ impl SupervisorAgent {
             policy_candidates: policy_choice.candidates.clone(),
             policy_model_version: self.policy_learning.model_version(),
             policy_explored: policy_choice.explored,
-            selected_skill_iris: treatment.skill_iris_observed.clone(),
-            selected_knowledge_fragment_iris: treatment.knowledge_fragment_iris_observed.clone(),
+            observed_skill_iris: treatment.skill_iris_observed.clone(),
+            observed_knowledge_fragment_iris: treatment.knowledge_fragment_iris_observed.clone(),
+            injected_skill_iris: treatment.skill_iris_injected.clone(),
+            injected_knowledge_fragment_iris: treatment.knowledge_fragment_iris_injected.clone(),
+            context_quality,
             evidence_iris: trajectory_evidence_iris,
             tool_steps: result
                 .tracked_actions
@@ -1644,6 +2154,26 @@ impl SupervisorAgent {
                         name: "total_tokens".into(),
                         value: prompt_tokens.saturating_add(completion_tokens) as f64,
                     },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "context_drop_rate".into(),
+                        value: context_quality.drop_rate(),
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "context_truncate_rate".into(),
+                        value: context_quality.truncate_rate(),
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "context_expired_rate".into(),
+                        value: context_quality.expired_rate(),
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "context_required_budget_overflow_rate".into(),
+                        value: context_quality.required_budget_overflow_rate(),
+                    },
+                    crate::core::learning_health::HealthMetricValue {
+                        name: "context_chars_per_dispatch".into(),
+                        value: context_quality.chars_per_dispatch(),
+                    },
                 ],
                 created_at: chrono::Utc::now(),
             };
@@ -1707,6 +2237,7 @@ impl SupervisorAgent {
             "tool_call_count": result.tool_call_count,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "context_quality": context_quality,
             "elapsed_ms": elapsed_ms,
             "reward": reward,
             "policy_evaluation": evaluation,
@@ -1903,33 +2434,133 @@ mod tests {
     }
 
     #[test]
-    fn verify_first_defers_detailed_planning_only_for_existing_nontrivial_tasks() {
-        let mut ctx = TaskContext::new("iri://task/lazy-plan", "verify", 20);
-        ctx.workspace_file_summary = Some("12 files".to_string());
-        assert!(should_defer_fallback_planning(
-            &ctx,
-            TaskComplexity::Complex
-        ));
-        assert!(!should_defer_fallback_planning(
-            &ctx,
-            TaskComplexity::Simple
-        ));
-
-        ctx.constraints.insert(
-            "required_effect".to_string(),
-            "workspace_mutation".to_string(),
+    fn injected_skill_and_knowledge_provenance_tracks_budgeted_records_not_text_matches() {
+        let knowledge = vec![
+            LearningHintCandidate {
+                text: "same rendered hint".into(),
+                source: LearningHintSource::Knowledge {
+                    iri: "iri://knowledge/first".into(),
+                },
+            },
+            LearningHintCandidate {
+                text: "same rendered hint".into(),
+                source: LearningHintSource::Knowledge {
+                    iri: "iri://knowledge/deduplicated".into(),
+                },
+            },
+        ];
+        let skills = vec![LearningHintCandidate {
+            text: "skill hint".into(),
+            source: LearningHintSource::Skill {
+                iri: "iri://skills/budgeted-out".into(),
+            },
+        }];
+        let treatment = materialize_policy_treatment(
+            "knowledge_first",
+            &[],
+            &skills,
+            &knowledge,
+            1,
+            700,
+            6_000,
         );
-        assert!(!should_defer_fallback_planning(
-            &ctx,
-            TaskComplexity::Complex
-        ));
-        ctx.constraints.clear();
+        assert_eq!(treatment.hints, vec!["same rendered hint"]);
+        assert_eq!(
+            treatment.knowledge_fragment_iris,
+            vec!["iri://knowledge/first"]
+        );
+        assert!(treatment.skill_iris.is_empty());
+        assert!(!treatment
+            .knowledge_fragment_iris
+            .contains(&"iri://knowledge/deduplicated".to_string()));
+    }
 
-        ctx.workflow_jsonld = Some("{}".to_string());
-        assert!(!should_defer_fallback_planning(
-            &ctx,
-            TaskComplexity::Complex
-        ));
+    #[test]
+    fn verify_first_clones_llm_ca_aa_and_preserves_exact_interaction_provenance() {
+        let make_step = |step_id: &str, role: AgentRole, dependency: Option<&str>| PlanStep {
+            step_id: step_id.to_string(),
+            role,
+            objective: format!("model objective for {role}"),
+            expected_output: format!("model output for {role}"),
+            dependencies: dependency.into_iter().map(str::to_string).collect(),
+            tools_allowed: Vec::new(),
+            success_criteria: format!("model criterion for {role}"),
+            work_packages: Vec::new(),
+            branch_on_failure: false,
+            branch_fallback: None,
+            retry_count: 0,
+            retry_delay_secs: 0,
+            effect_policy: match role {
+                AgentRole::Plan | AgentRole::Check => {
+                    crate::core::effect::EffectPolicy::EvidenceOnly
+                }
+                AgentRole::Act => crate::core::effect::EffectPolicy::DecisionOnly,
+                AgentRole::Do => crate::core::effect::EffectPolicy::None,
+            },
+        };
+        let mut plan = ExecutionPlan {
+            plan_id: "llm-plan".to_string(),
+            agent_sequence: vec![
+                AgentRole::Plan,
+                AgentRole::Do,
+                AgentRole::Check,
+                AgentRole::Act,
+            ],
+            parallel_groups: Vec::new(),
+            task_complexity: TaskComplexity::Standard,
+            description: "model plan".to_string(),
+            steps: vec![
+                make_step("pa", AgentRole::Plan, None),
+                make_step("da", AgentRole::Do, Some("pa")),
+                make_step("ca", AgentRole::Check, Some("da")),
+                make_step("aa", AgentRole::Act, Some("ca")),
+            ],
+            agent_spec_provenance: None,
+            context_requirements: std::collections::HashMap::new(),
+            success_metrics: vec!["model metric".to_string()],
+            max_recursion_depth: 0,
+            sub_tasks: Vec::new(),
+            dag_jsonld: None,
+            verify_first: false,
+            fallback_steps: Vec::new(),
+        };
+        plan.set_agent_spec_provenance(crate::core::context_model::ExecutionPlanProvenance::new(
+            AgentSpecSourceRecord::new(AgentSpecSourceKind::LlmGeneratedPlan)
+                .with_source_ref("iri://task/verify-first#llm-plan")
+                .with_producer("SupervisorAgent.plan_generation")
+                .with_model("test-model")
+                .with_interaction_id("llm-plan-interaction"),
+        ))
+        .unwrap();
+        let original_ca = plan.steps[2].clone();
+        let original_aa = plan.steps[3].clone();
+
+        materialize_verify_first_from_llm_plan(&mut plan, "iri://task/verify-first").unwrap();
+
+        assert!(plan.verify_first);
+        assert_eq!(plan.fallback_steps.len(), 4);
+        assert_eq!(
+            plan.steps.iter().map(|step| step.role).collect::<Vec<_>>(),
+            vec![AgentRole::Check, AgentRole::Act]
+        );
+        assert_eq!(plan.steps[0].objective, original_ca.objective);
+        assert_eq!(plan.steps[0].expected_output, original_ca.expected_output);
+        assert_eq!(plan.steps[0].success_criteria, original_ca.success_criteria);
+        assert_eq!(plan.steps[1].objective, original_aa.objective);
+        assert!(plan.steps[0].dependencies.is_empty());
+        assert_eq!(plan.steps[1].dependencies, vec!["verify_first_ca"]);
+        for step in &plan.steps {
+            let source = plan
+                .agent_spec_source_for_step(&step.step_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.kind, AgentSpecSourceKind::LlmGeneratedPlan);
+            assert_eq!(source.model.as_deref(), Some("test-model"));
+            assert_eq!(
+                source.interaction_id.as_deref(),
+                Some("llm-plan-interaction")
+            );
+        }
     }
 
     #[test]

@@ -787,6 +787,7 @@ mod tests {
             gate_ask: "Should you do this?".to_string(),
             gate_action: "STOP".to_string(),
             should_block: true,
+            violation_confirmed: true,
             message: "⚠️ Blocked".to_string(),
         };
 

@@ -26,8 +26,8 @@ workspace:
   change_history_capacity: 2048
   learning_snapshot_max_files: 100000
   learning_snapshot_max_bytes: 2147483648
-  # Shell-like mutation calls are confirmed by bounded before/after content
-  # fingerprints. Oversized workspaces degrade to monitor generation evidence.
+  # Shell-like mutation calls require bounded before/after content manifests.
+  # Exceeding either bound makes exact effect attribution incomplete.
   effect_snapshot_max_files: 10000
   effect_snapshot_max_bytes: 67108864
   exclude_patterns:
@@ -35,6 +35,20 @@ workspace:
     - "target/"
     - ".git/"
     - "dist/"
+    - "build/"
+    - "__pycache__/"
+    - ".pytest_cache/"
+    - ".mypy_cache/"
+    - ".ruff_cache/"
+    - ".tox/"
+    - ".nox/"
+    - "htmlcov/"
+    - ".coverage"
+    - ".venv/"
+    - "venv/"
+    - ".next/"
+    - "data/"
+    - ".gliding_horse/"
 
 # Generic continuous-learning promotion gate. These values govern bounded
 # hint-ordering policy trials; they never bypass CA/AA quality decisions.
@@ -103,6 +117,14 @@ agents:
     # Omitted/null role values inherit max_iterations. Avoid fixed small caps
     # for complex PA/CA/AA work; operators may set workload-specific ceilings.
     role_max_turns: {}
+    # Explicitly bound provider-side hidden reasoning on every ordinary ReAct
+    # decision. These role-specific values apply equally to sync and streaming
+    # execution; BizAgent decomposition keeps its independent `disabled` policy.
+    react_reasoning_effort:
+      plan: low
+      do_agent: low
+      check: low
+      act: low
     early_warning_remaining: 8
     final_warning_remaining: 3
     effect_progress_warning_turns: 5
@@ -112,16 +134,58 @@ agents:
     # CA→DA repair begins from supplied audit evidence; 0 inherits the general threshold.
     da_repair_effect_block_turns: 4
     # 0 disables; complex audits may raise this without changing code.
-    ca_evidence_focus_turns: 5
-    # 0 disables; this caps CA evidence tool turns, not the task/DA turn budget.
-    ca_evidence_close_turns: 10
+    ca_evidence_focus_turns: 4
+    # 0 disables. At this many broad CA audit-tool turns, close immediately
+    # when no executable verifier is authorized; otherwise expose one final
+    # verifier-only turn before closing. This never changes the task/DA budget.
+    ca_evidence_close_turns: 7
+    # Fresh CA instances may close missing verifier receipts without routing
+    # the gap through mutation-capable DA or replaying completed work.
+    max_ca_evidence_rechecks: 2
     # 0 disables; bounds PA inspection without reducing DA execution budget.
     pa_planning_focus_turns: 4
     # Evidence-only DA: stop broad discovery, then force synthesis. These do
     # not cap implementation DA turns for workspace-changing complex tasks.
     da_evidence_focus_turns: 5
     da_evidence_close_turns: 8
-    max_sub_agents: 5
+    # Workspace-changing DA: after a successful test/check against the latest
+    # changed state, narrow tools immediately. After 3 stable turns, required
+    # project delivery gets an acceptance-review prompt but retains narrowed
+    # write/check tools; other policies close. A passing test alone cannot
+    # prove that later README/design/docs artifacts are complete. Any new
+    # mutation or failed verification resets this adaptive window.
+    da_post_effect_verification_focus_turns: 1
+    da_post_effect_verification_close_turns: 3
+    # If the changed state has no recognisable verifier yet, stop broad reads
+    # after 2 turns and request an honest terminal handoff after 4. Required
+    # delivery retains narrowed write/check tools so pending artifacts are not
+    # stranded. This does not assert success; CA still verifies acceptance.
+    da_post_effect_inspection_focus_turns: 2
+    da_post_effect_inspection_close_turns: 4
+    # Total canonical child-work-package capacity for one BizAgent. This is
+    # deliberately separate from the concurrency ceiling: a design → build →
+    # test → docs task commonly needs six bounded packages without running all
+    # of them at once.
+    max_sub_agents: 8
+    # Every PA/DA/CA/AA may ask the LLM for a bounded same-role child plan.
+    # Atomic work remains MONO; set false for cost-sensitive deployments.
+    biz_agent_orchestration_enabled: true
+    biz_agent_decomposition_context_max_chars: 24000
+    # Decomposition is a bounded JSON control call. `disabled` is encoded only
+    # for a known provider dialect; terminal correctness never depends on the
+    # provider actually disabling hidden thought.
+    biz_agent_decomposition_max_tokens: 4096
+    biz_agent_decomposition_reasoning_effort: disabled
+    # Optional fan-out planning must never inherit the 120s general API
+    # timeout. A timeout falls back to the same parent Agent in MONO mode.
+    biz_agent_decomposition_timeout_seconds: 15
+    # Parent synthesis sees bounded child evidence; the durable child manifest remains complete.
+    biz_agent_aggregation_context_max_chars: 48000
+    biz_agent_aggregation_max_tokens: 4096
+    # Aggregation is advisory prose over an already complete deterministic
+    # ledger. `disabled` uses a capability-gated provider encoding.
+    biz_agent_aggregation_reasoning_effort: disabled
+    biz_agent_aggregation_timeout_seconds: 5
     ca_handoff_max_chars: 6000
     recursive_handoff_max_chars: 4000
     sa_stream_emit_min_chars: 128
@@ -142,7 +206,29 @@ agents:
   max_parallel_agents: 10
   timeout_seconds: 300
   api_timeout_seconds: 120
-  event_bus_capacity: 100
+  # Interaction/hook telemetry can burst during parallel BizAgent work. The
+  # TUI can replay bounded history after lag, while this larger live window
+  # avoids making replay the normal path.
+  event_bus_capacity: 1024
+  hooks:
+    # Metadata-only observability hooks are enabled by default.
+    logging: true
+    timing: true
+    metrics: true
+    # Behavior-changing request throttling is opt-in.
+    llm_rate_limit:
+      enabled: false
+      max_calls: 100
+      window_seconds: 60
+    # External commands execute only when this switch is true. Input rewriting
+    # requires its own opt-in and remains subject to all runtime policy checks.
+    external_tools:
+      enabled: false
+      pre_tool_use: []
+      post_tool_use: []
+      post_tool_use_failure: []
+      timeout_ms: 30000
+      allow_input_rewrite: false
   max_active: 20
   snapshot_frequency: 1000
   max_full_snapshots: 10
@@ -213,6 +299,10 @@ tool_result_router:
   prepare_threshold: 3072
   micro_tool_page_size: 100
   micro_tool_max_page_size: 200
+  # Complete file_read pages stay inline up to these limits. Byte size is the
+  # serialized JSON envelope (metadata plus UTF-8 file content), not raw file size.
+  file_read_inline_max_lines: 300
+  file_read_inline_max_bytes: 8192
 
 embedding:
   enabled: true

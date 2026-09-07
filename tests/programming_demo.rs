@@ -120,12 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[AgentRunner] 开始执行 (LLM 自动规划工具调用)...\n");
 
     let mut agent = AgentInstance::new("da_1".to_string(), AgentRole::Do);
-    let context = TaskContext {
-        task_iri: "iri://task/calc".to_string(),
-        objective: USER_INPUT.to_string(),
-        max_iterations: 15,
-        ..Default::default()
-    };
+    let context = TaskContext::new("iri://task/calc", USER_INPUT, 15);
 
     let result = runner.execute(&mut agent, context).await?;
     if !result.errors.is_empty() {

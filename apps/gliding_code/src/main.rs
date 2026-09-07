@@ -19,6 +19,13 @@ struct Cli {
     model: String,
 
     #[arg(
+        long = "react-reasoning-effort",
+        value_name = "EFFORT",
+        help = "Override provider reasoning policy for all ReAct roles: none (provider default), disabled (capability-gated), low, high, or max"
+    )]
+    react_reasoning_effort: Option<glidinghorse::config::settings::ReasoningEffort>,
+
+    #[arg(
         short = 'w',
         long = "workspace",
         default_value = ".",
@@ -112,6 +119,12 @@ struct Cli {
         help = "Verify one task's hash-linked execution evidence and terminal seal as JSON"
     )]
     verify_task_evidence: Option<String>,
+
+    #[arg(
+        long = "list-task-evidence",
+        help = "List durable terminal task-evidence seals with complete task IRIs as JSON"
+    )]
+    list_task_evidence: bool,
 
     #[arg(
         long = "inspect-ann-health",
@@ -250,6 +263,7 @@ impl Cli {
             || self.summarize_learning_evaluations
             || self.list_offline_retrieval_evaluations
             || self.verify_task_evidence.is_some()
+            || self.list_task_evidence
             || self.inspect_ann_health
             || self.list_learning_health
             || self.list_learning_deltas
@@ -331,6 +345,7 @@ fn main() -> anyhow::Result<()> {
         cli.workflow,
         cli.skill_dir,
     );
+    config.react_reasoning_effort_override = cli.react_reasoning_effort;
     for entry in &cli.mcp_server {
         if let Some((name, url)) = entry.split_once('=') {
             let name = name.to_lowercase();
@@ -395,6 +410,11 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(ref task_iri) = cli.verify_task_evidence {
         verify_task_evidence(&config, task_iri)?;
+        return Ok(());
+    }
+
+    if cli.list_task_evidence {
+        list_task_evidence(&config)?;
         return Ok(());
     }
 
@@ -712,6 +732,12 @@ fn verify_task_evidence(
     }
 }
 
+fn list_task_evidence(config: &code_cli::config::CliConfig) -> anyhow::Result<()> {
+    let seals = code_cli::engine::CodeCliEngine::list_task_evidence_from_config(config)?;
+    println!("{}", serde_json::to_string_pretty(&seals)?);
+    Ok(())
+}
+
 fn inspect_ann_health(config: code_cli::config::CliConfig) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let engine = {
@@ -892,6 +918,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_typed_react_reasoning_override() {
+        let cli = Cli::try_parse_from(["glidingcode", "--react-reasoning-effort", "none"])
+            .expect("reasoning override should be registered");
+        assert_eq!(
+            cli.react_reasoning_effort,
+            Some(glidinghorse::config::settings::ReasoningEffort::None)
+        );
+
+        assert!(
+            Cli::try_parse_from(["glidingcode", "--react-reasoning-effort", "medium",]).is_err()
+        );
+    }
+
+    #[test]
     fn parses_learning_evaluation_audit_command() {
         let cli = Cli::try_parse_from(["glidingcode", "--list-learning-evaluations"])
             .expect("learning evaluation command should be registered");
@@ -966,6 +1006,10 @@ mod tests {
             Some("iri://task/example")
         );
 
+        let list = Cli::try_parse_from(["glidingcode", "--list-task-evidence"])
+            .expect("task evidence listing command should be registered");
+        assert!(list.list_task_evidence);
+
         let inspect = Cli::try_parse_from(["glidingcode", "--inspect-ann-health"])
             .expect("ANN health inspection command should be registered");
         assert!(inspect.inspect_ann_health);
@@ -980,6 +1024,10 @@ mod tests {
         ])
         .expect("task evidence command should parse");
         assert!(verify.is_local_management_command());
+
+        let list = Cli::try_parse_from(["glidingcode", "--list-task-evidence"])
+            .expect("task evidence listing command should parse");
+        assert!(list.is_local_management_command());
 
         let prompt = Cli::try_parse_from(["glidingcode", "answer the task"])
             .expect("one-shot prompt should parse");

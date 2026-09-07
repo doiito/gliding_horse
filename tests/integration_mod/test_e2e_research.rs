@@ -458,7 +458,10 @@ fn test_sa_research_plan_structure() {
 
     let plan = sa.analyze_task("Research and compare different AI Agent frameworks");
     assert_eq!(plan.task_complexity, TaskComplexity::Exploratory);
-    assert!(plan.parallel_groups.len() > 0, "探索性任务应该有并行组");
+    assert!(
+        plan.parallel_groups.len() > 0,
+        "探索性结构计划应向 BizAgent 提供有界 fan-out 提示"
+    );
     assert!(
         plan.agent_sequence.contains(&AgentRole::Plan),
         "应该包含 PA"
@@ -474,10 +477,14 @@ fn test_sa_research_plan_structure() {
         .iter()
         .filter(|r| **r == AgentRole::Do)
         .count();
-    assert!(
-        da_count >= 2,
-        "探索性任务应该有多个 DA，实际有 {}",
-        da_count
+    assert_eq!(
+        da_count, 1,
+        "SA 只应调度一个 DA BizAgent 阶段；同角色并行由该父 BizAgent 负责"
+    );
+    assert_eq!(
+        plan.parallel_groups,
+        vec![vec![AgentRole::Do; 3]],
+        "legacy parallel_groups 只传递建议 fan-out，不代表 SA 创建三个 DA"
     );
 
     tracing::info!("探索性任务计划: {:?}", plan.description);

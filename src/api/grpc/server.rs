@@ -690,9 +690,12 @@ trait RequestSettings {
 impl AgentOSService {
     pub async fn send_supplementary_input(&self, task_iri: &str, content: &str) {
         tracing::info!(task_iri = %task_iri, "Received user supplementary input");
-        self.event_bus
-            .emit(task_iri, "USER_SUPPLEMENTARY_INPUT", "external", content)
-            .await;
+        if let Err(error) = self
+            .event_bus
+            .submit_supplementary_command(task_iri, "external", content)
+        {
+            tracing::warn!(task_iri = %task_iri, %error, "Supplementary input rejected");
+        }
     }
 }
 
@@ -1485,21 +1488,35 @@ mod tests {
 
     #[test]
     fn grpc_projection_preserves_serialized_tool_execution_events() {
+        let identity = crate::core::execution_journal::ToolCallIdentity::new(
+            "DA",
+            "l1-da",
+            "request-da-1",
+            "call-1",
+        );
         let bus_event = serialized_execution_bus_event(
-            ExecutionEventKind::ToolResult(crate::core::execution_event::ToolResult {
-                call_id: "call-1".into(),
-                tool_name: "file_write".into(),
-                result: "{\"changed\":true}".into(),
-                success: true,
-                result_size_bytes: 16,
-                duration_ms: 23,
-                agent_id: "DA".into(),
-            }),
+            ExecutionEventKind::ToolResult(
+                crate::core::execution_event::ToolResult::from_identity(
+                    &identity,
+                    "file_write",
+                    "{\"changed\":true}",
+                    true,
+                    true,
+                    None,
+                    16,
+                    23,
+                ),
+            ),
             "TOOL_RESULT",
         );
 
         let (core, proto) = convert_event_bus_to_grpc(&bus_event).unwrap();
-        assert!(matches!(core.event, ExecutionEventKind::ToolResult(_)));
+        let ExecutionEventKind::ToolResult(result) = &core.event else {
+            panic!("expected tool result")
+        };
+        assert_eq!(result.call_id, "call-1");
+        assert_eq!(result.l1_session_id, "l1-da");
+        assert_eq!(result.llm_request_id, "request-da-1");
         assert!(proto.event.is_some());
         assert!(should_stream_execution_event(&core, false, true));
         assert!(!should_stream_execution_event(&core, false, false));

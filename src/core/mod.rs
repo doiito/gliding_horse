@@ -5,6 +5,7 @@ pub mod biz_agent;
 pub mod checkpoint;
 pub mod constitution;
 pub mod context_compressor;
+pub mod context_model;
 pub mod core_types;
 pub mod effect;
 pub mod event_bus;
@@ -40,6 +41,16 @@ pub use agent_runner::AgentRunner;
 pub use ann_health::{AnnHealthEvidence, AnnHealthMonitor, ANN_HEALTH_EVIDENCE_PREFIX};
 pub use checkpoint::CheckpointManager;
 pub use context_compressor::{ContextWindowManager, ToolResultCompressor};
+pub use context_model::{
+    AgentSpecSourceKind, AgentSpecSourceRecord, CompiledAgentPrompt, ContextAdmissionRule,
+    ContextDisposition, ContextFragment, ContextFragmentKind, ContextFreshnessPolicy,
+    ContextPayloadConstraint, ContextPolicyDecision, ContextPolicyRejectionReason, ContextScope,
+    ContextSlot, ContextSlotSelector, ContextSourceKind, ContextSourceRecord, ContextTrustClass,
+    EffectiveContextManifest, EffectiveContextManifestEntry, EffectiveRoleContext,
+    ExecutionPlanProvenance, ExecutionPlanProvenanceError, GeneratedAgentSpec, RoleContext,
+    RoleContextPolicy, AGENT_SPEC_SCHEMA_VERSION, EXECUTION_PLAN_PROVENANCE_SCHEMA_VERSION,
+    ROLE_CONTEXT_SCHEMA_VERSION,
+};
 pub use core_types::{CoreConfig, CoreError, SemanticCore};
 pub use event_bus::EventBus;
 pub use evolution_delta_gate::{
@@ -49,8 +60,8 @@ pub use execution_event::{
     ExecutionEvent, ExecutionEventEmitter, ExecutionEventKind, ExecutionState,
 };
 pub use execution_journal::{
-    PayloadReference, TaskEvidenceVerification, TaskExecutionJournal, TaskExecutionJournalEvent,
-    TaskExecutionJournalKind,
+    JournalToolCall, PayloadReference, ResumeSafetyAssessment, TaskEvidenceVerification,
+    TaskExecutionJournal, TaskExecutionJournalEvent, TaskExecutionJournalKind, ToolCallIdentity,
 };
 pub use five_w2h::*;
 pub use learning_health::{

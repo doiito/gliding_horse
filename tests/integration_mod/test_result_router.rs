@@ -3,7 +3,7 @@ use glidinghorse::tools::result_router::graphify::GraphifyEngine;
 use glidinghorse::tools::result_router::micro_tools::MicroToolGenerator;
 use glidinghorse::tools::result_router::router::ResultRouter;
 use glidinghorse::tools::result_router::summary;
-use glidinghorse::tools::result_router::{RouteDecision, SchemaAnalysis};
+use glidinghorse::tools::result_router::{ResultRoutingIdentity, RouteDecision, SchemaAnalysis};
 use serde_json::json;
 
 #[test]
@@ -88,7 +88,8 @@ fn test_text_summary_generation() {
     let summary_text = summary::generate_text_summary(&text, "test_tool", 200);
     assert!(summary_text.contains("test_tool"));
     assert!(summary_text.contains("1000 lines"));
-    assert!(summary_text.contains("read_full_result"));
+    assert!(summary_text.contains("exact session reader"));
+    assert!(!summary_text.contains("read_full_result_*"));
 }
 
 #[test]
@@ -122,20 +123,24 @@ fn test_micro_tools_generation() {
         total_entities: 10,
         total_relations: 5,
     };
-    let tools = MicroToolGenerator::generate_from_schema(&analysis, "integ_call_3", 5);
+    let routing = ResultRoutingIdentity::new("l1-integration-microtools", "integ_call_3");
+    let tools = MicroToolGenerator::generate_from_schema(&analysis, &routing, 5);
     assert!(tools.len() >= 2);
-    assert!(tools.iter().any(|t| t.name == "query_person"));
-    assert!(tools.iter().any(|t| t.name == "get_entity_details"));
+    assert!(tools.iter().any(|t| t.name == routing.query_name("Person")));
+    assert!(tools
+        .iter()
+        .any(|t| t.name == routing.entity_details_name()));
 
     let msg = MicroToolGenerator::format_tool_injection_message("测试摘要", &tools);
     assert!(msg.contains("测试摘要"));
-    assert!(msg.contains("query_person"));
+    assert!(msg.contains(&routing.query_name("Person")));
 }
 
 #[test]
 fn test_micro_tools_read_full() {
-    let tool = MicroToolGenerator::generate_read_full_tool("integ_call_4", "storage_key", 2000);
-    assert_eq!(tool.name, "read_full_result");
+    let routing = ResultRoutingIdentity::new("l1-integration-reader", "integ_call_4");
+    let tool = MicroToolGenerator::generate_read_full_tool(&routing, "storage_key", 2000);
+    assert_eq!(tool.name, routing.reader_name);
 }
 
 #[test]
@@ -187,8 +192,9 @@ fn test_full_pipeline_json_graphify() {
             total_entities: graphify_result.entity_count,
             total_relations: graphify_result.relation_count,
         };
+        let routing = ResultRoutingIdentity::new("l1-integration-pipeline", &call_id);
         let tools =
-            MicroToolGenerator::generate_from_schema(&analysis, &call_id, settings.max_micro_tools);
+            MicroToolGenerator::generate_from_schema(&analysis, &routing, settings.max_micro_tools);
         assert!(!tools.is_empty());
 
         let msg =
@@ -210,6 +216,7 @@ fn test_full_pipeline_text_summarize() {
     if let RouteDecision::Summarize { preview_size, .. } = decision {
         let preview = summary::generate_text_summary(&result_str, "test_tool", preview_size);
         assert!(preview.contains("test_tool"));
-        assert!(preview.contains("read_full_result"));
+        assert!(preview.contains("exact session reader"));
+        assert!(!preview.contains("read_full_result_*"));
     }
 }

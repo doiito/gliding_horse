@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -5,9 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::core::event_bus::EventBus;
+use crate::core::execution_journal::ToolCallIdentity;
+use crate::tools::result_router::ResultRoutingIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionEventType {
@@ -53,22 +56,211 @@ pub struct LlmContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Raw provider-issued protocol correlation ID.  This value is preserved
+    /// verbatim and must never be replaced with an internal composite key.
     pub call_id: String,
     pub tool_name: String,
     pub arguments_json: String,
     pub agent_id: String,
+    /// Isolated L1 execution session which received the provider response.
+    #[serde(default)]
+    pub l1_session_id: String,
+    /// Unique model request which produced this call. Provider call IDs may be
+    /// reused by later requests, including within the same L1 session.
+    #[serde(default)]
+    pub llm_request_id: String,
+    /// Collision-resistant internal correlation key. This is observability
+    /// metadata only and is never sent back through the provider protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_call_key: Option<String>,
     pub sequence: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
+    /// Raw provider-issued protocol correlation ID, byte-for-byte equivalent
+    /// to the corresponding [`ToolCall::call_id`].
     pub call_id: String,
     pub tool_name: String,
     pub result: String,
     pub success: bool,
+    /// Whether the tool handler actually ran. Policy and lifecycle rejections
+    /// are terminal results with `executed = false` and `success = false`.
+    #[serde(default = "legacy_tool_result_was_executed")]
+    pub executed: bool,
+    /// Stable machine-readable explanation for a rejected or exceptional
+    /// terminal path. Human-readable detail remains in `result`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub result_size_bytes: u32,
     pub duration_ms: u32,
     pub agent_id: String,
+    #[serde(default)]
+    pub l1_session_id: String,
+    #[serde(default)]
+    pub llm_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_call_key: Option<String>,
+}
+
+fn legacy_tool_result_was_executed() -> bool {
+    true
+}
+
+/// Stable reason codes for non-standard tool terminal events.
+pub mod tool_terminal_reason {
+    pub const UNADVERTISED_TOOL: &str = "unadvertised_tool";
+    pub const SKILL_BEFORE_SKIPPED: &str = "skill_before_skipped";
+    /// A trusted pre-execution hook declined the operation but supplied
+    /// recoverable coaching. The handler did not run, so this is policy
+    /// guidance rather than a tool execution failure.
+    pub const RECOVERABLE_POLICY_GUIDANCE: &str = "recoverable_policy_guidance";
+    pub const SKILL_BEFORE_ABORTED: &str = "skill_before_aborted";
+    pub const SKILL_BEFORE_RETRY: &str = "skill_before_retry";
+    pub const EFFECT_POLICY_DENIED: &str = "effect_policy_denied";
+    pub const RECOVERY_GUARD_DENIED: &str = "recovery_guard_denied";
+    /// A CA emitted verifier-shaped shell syntax whose status/output cannot be
+    /// attributed to exactly one foreground process. The handler never ran.
+    pub const VERIFICATION_COMMAND_NOT_ATTRIBUTABLE: &str = "verification_command_not_attributable";
+    pub const SOFT_LIMIT_FORCE_FINISH: &str = "soft_limit_force_finish";
+    pub const ROLE_POLICY_FORCE_FINISH: &str = "role_policy_force_finish";
+    pub const JOURNAL_START_FAILED: &str = "journal_start_failed";
+    pub const BATCH_CANCELLED: &str = "batch_cancelled";
+    pub const INTERNAL_TERMINATION: &str = "internal_termination";
+    pub const RESULT_DISCLOSURE_DENIED: &str = "result_disclosure_denied";
+    pub const EXECUTION_FAILED: &str = "execution_failed";
+}
+
+fn routing_call_key(identity: &ToolCallIdentity) -> String {
+    ResultRoutingIdentity::for_tool_call(
+        &identity.agent_id,
+        &identity.l1_session_id,
+        &identity.llm_request_id,
+        &identity.provider_call_id,
+    )
+    .routing_call_key
+}
+
+impl ToolCall {
+    pub fn from_identity(
+        identity: &ToolCallIdentity,
+        tool_name: impl Into<String>,
+        arguments_json: impl Into<String>,
+        sequence: u32,
+    ) -> Self {
+        Self {
+            call_id: identity.provider_call_id.clone(),
+            tool_name: tool_name.into(),
+            arguments_json: arguments_json.into(),
+            agent_id: identity.agent_id.clone(),
+            l1_session_id: identity.l1_session_id.clone(),
+            llm_request_id: identity.llm_request_id.clone(),
+            routing_call_key: Some(routing_call_key(identity)),
+            sequence,
+        }
+    }
+}
+
+impl ToolResult {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_identity(
+        identity: &ToolCallIdentity,
+        tool_name: impl Into<String>,
+        result: impl Into<String>,
+        success: bool,
+        executed: bool,
+        reason: Option<&str>,
+        result_size_bytes: u32,
+        duration_ms: u32,
+    ) -> Self {
+        Self {
+            call_id: identity.provider_call_id.clone(),
+            tool_name: tool_name.into(),
+            result: result.into(),
+            success,
+            executed,
+            reason: reason.map(str::to_string),
+            result_size_bytes,
+            duration_ms,
+            agent_id: identity.agent_id.clone(),
+            l1_session_id: identity.l1_session_id.clone(),
+            llm_request_id: identity.llm_request_id.clone(),
+            routing_call_key: Some(routing_call_key(identity)),
+        }
+    }
+
+    /// True only for a kernel-classified, recoverable pre-execution denial.
+    /// Requiring all three fields prevents an executed failure, a post-hook
+    /// disclosure denial, or a malformed success event from being presented
+    /// as harmless guidance merely because its text sounds recoverable.
+    pub fn is_recoverable_policy_guidance(&self) -> bool {
+        !self.success
+            && !self.executed
+            && matches!(
+                self.reason.as_deref(),
+                Some(
+                    tool_terminal_reason::RECOVERABLE_POLICY_GUIDANCE
+                        | tool_terminal_reason::VERIFICATION_COMMAND_NOT_ATTRIBUTABLE
+                )
+            )
+    }
+}
+
+/// Per-AgentRunner publication ledger enforcing a one-call/one-terminal-event
+/// contract. It is deliberately keyed by the full durable identity rather
+/// than the provider-local `call_id`.
+#[derive(Debug, Default)]
+pub(crate) struct ToolExecutionEventLedger {
+    calls: HashMap<ToolCallIdentity, String>,
+    results: HashSet<ToolCallIdentity>,
+}
+
+impl ToolExecutionEventLedger {
+    pub(crate) fn register_call(
+        &mut self,
+        identity: &ToolCallIdentity,
+        tool_name: &str,
+    ) -> Result<(), String> {
+        if self.results.contains(identity) {
+            return Err("tool result was registered before its call".to_string());
+        }
+        match self.calls.get(identity) {
+            Some(existing) if existing == tool_name => {
+                Err("duplicate tool-call execution event".to_string())
+            }
+            Some(_) => Err("tool-call identity was reused for another tool".to_string()),
+            None => {
+                self.calls.insert(identity.clone(), tool_name.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn register_result(
+        &mut self,
+        identity: &ToolCallIdentity,
+        tool_name: &str,
+    ) -> Result<(), String> {
+        match self.calls.get(identity) {
+            None => return Err("orphan tool-result execution event".to_string()),
+            Some(existing) if existing != tool_name => {
+                return Err("tool-result name does not match its tool call".to_string())
+            }
+            Some(_) => {}
+        }
+        if !self.results.insert(identity.clone()) {
+            return Err("duplicate terminal tool-result execution event".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending(&self) -> Vec<(ToolCallIdentity, String)> {
+        self.calls
+            .iter()
+            .filter(|(identity, _)| !self.results.contains(*identity))
+            .map(|(identity, tool_name)| (identity.clone(), tool_name.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +332,7 @@ pub struct ExecutionEventEmitter {
     token_total: AtomicU64,
     tool_call_total: AtomicU64,
     turn_total: AtomicU64,
+    tool_event_ledger: std::sync::Mutex<ToolExecutionEventLedger>,
 }
 
 impl ExecutionEventEmitter {
@@ -159,6 +352,7 @@ impl ExecutionEventEmitter {
             token_total: AtomicU64::new(0),
             tool_call_total: AtomicU64::new(0),
             turn_total: AtomicU64::new(0),
+            tool_event_ledger: std::sync::Mutex::new(ToolExecutionEventLedger::default()),
         }
     }
 
@@ -180,6 +374,7 @@ impl ExecutionEventEmitter {
             token_total: AtomicU64::new(0),
             tool_call_total: AtomicU64::new(0),
             turn_total: AtomicU64::new(0),
+            tool_event_ledger: std::sync::Mutex::new(ToolExecutionEventLedger::default()),
         }
     }
 
@@ -302,13 +497,21 @@ impl ExecutionEventEmitter {
 
     pub fn emit_tool_call(
         &self,
-        call_id: &str,
+        identity: &ToolCallIdentity,
         tool_name: &str,
         args: &Value,
-        agent_id: &str,
         sequence: u32,
     ) {
         if !self.include_tool_calls {
+            return;
+        }
+        if let Err(error) = self
+            .tool_event_ledger
+            .lock()
+            .expect("execution-event tool ledger poisoned")
+            .register_call(identity, tool_name)
+        {
+            warn!(%error, "ExecutionEventEmitter suppressed invalid tool-call event");
             return;
         }
         self.tool_call_total.fetch_add(1, Ordering::Relaxed);
@@ -316,13 +519,12 @@ impl ExecutionEventEmitter {
             event_id: Self::generate_event_id(),
             task_iri: self.task_iri.clone(),
             timestamp: Utc::now().timestamp_millis(),
-            event: ExecutionEventKind::ToolCall(ToolCall {
-                call_id: call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                arguments_json: serde_json::to_string(args).unwrap_or_default(),
-                agent_id: agent_id.to_string(),
+            event: ExecutionEventKind::ToolCall(ToolCall::from_identity(
+                identity,
+                tool_name,
+                serde_json::to_string(args).unwrap_or_default(),
                 sequence,
-            }),
+            )),
         };
         self.emit(event.clone());
         self.emit_to_event_bus(
@@ -333,30 +535,41 @@ impl ExecutionEventEmitter {
 
     pub fn emit_tool_result(
         &self,
-        call_id: &str,
+        identity: &ToolCallIdentity,
         tool_name: &str,
         result: &str,
         success: bool,
+        executed: bool,
+        reason: Option<&str>,
         size_bytes: u32,
         duration_ms: u32,
-        agent_id: &str,
     ) {
         if !self.include_tool_calls {
+            return;
+        }
+        if let Err(error) = self
+            .tool_event_ledger
+            .lock()
+            .expect("execution-event tool ledger poisoned")
+            .register_result(identity, tool_name)
+        {
+            warn!(%error, "ExecutionEventEmitter suppressed invalid tool-result event");
             return;
         }
         let event = ExecutionEvent {
             event_id: Self::generate_event_id(),
             task_iri: self.task_iri.clone(),
             timestamp: Utc::now().timestamp_millis(),
-            event: ExecutionEventKind::ToolResult(ToolResult {
-                call_id: call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                result: result.to_string(),
+            event: ExecutionEventKind::ToolResult(ToolResult::from_identity(
+                identity,
+                tool_name,
+                result,
                 success,
-                result_size_bytes: size_bytes,
+                executed,
+                reason,
+                size_bytes,
                 duration_ms,
-                agent_id: agent_id.to_string(),
-            }),
+            )),
         };
         self.emit(event.clone());
         self.emit_to_event_bus(
@@ -598,17 +811,17 @@ mod tests {
     #[test]
     fn test_execution_state_tool_call_and_result() {
         let mut state = ExecutionState::new();
+        let identity = ToolCallIdentity::new("da_001", "l1-da-1", "request-1", "tc_1");
         let tool_call_event = ExecutionEvent {
             event_id: "evt_3".to_string(),
             task_iri: "iri://task/1".to_string(),
             timestamp: 3000,
-            event: ExecutionEventKind::ToolCall(ToolCall {
-                call_id: "tc_1".to_string(),
-                tool_name: "write_file".to_string(),
-                arguments_json: "{}".to_string(),
-                agent_id: "da_001".to_string(),
-                sequence: 1,
-            }),
+            event: ExecutionEventKind::ToolCall(ToolCall::from_identity(
+                &identity,
+                "write_file",
+                "{}",
+                1,
+            )),
         };
         state.update_from_event(&tool_call_event);
         assert_eq!(state.current_tool, Some("write_file".to_string()));
@@ -617,15 +830,16 @@ mod tests {
             event_id: "evt_4".to_string(),
             task_iri: "iri://task/1".to_string(),
             timestamp: 3100,
-            event: ExecutionEventKind::ToolResult(ToolResult {
-                call_id: "tc_1".to_string(),
-                tool_name: "write_file".to_string(),
-                result: "OK".to_string(),
-                success: true,
-                result_size_bytes: 100,
-                duration_ms: 50,
-                agent_id: "da_001".to_string(),
-            }),
+            event: ExecutionEventKind::ToolResult(ToolResult::from_identity(
+                &identity,
+                "write_file",
+                "OK",
+                true,
+                true,
+                None,
+                100,
+                50,
+            )),
         };
         state.update_from_event(&tool_result_event);
         assert_eq!(state.current_tool, None);
@@ -718,7 +932,8 @@ mod tests {
             ExecutionEventEmitter::with_options("iri://task/test2", Some(tx), None, false, false);
 
         emitter.emit_thought("pa_001", "thinking...", "continue", &[]);
-        emitter.emit_tool_call("tc_1", "write_file", &serde_json::json!({}), "da_001", 1);
+        let identity = ToolCallIdentity::new("da_001", "l1-da-1", "request-1", "tc_1");
+        emitter.emit_tool_call(&identity, "write_file", &serde_json::json!({}), 1);
 
         assert!(rx.try_recv().is_err());
     }
@@ -734,5 +949,112 @@ mod tests {
         let (turns, _tool_calls, tokens) = emitter.get_stats();
         assert_eq!(turns, 2);
         assert_eq!(tokens, 450);
+    }
+
+    #[test]
+    fn tool_events_preserve_raw_provider_id_and_expose_unique_request_identity() {
+        let raw = " provider/CALL:Raw#09 ";
+        let first = ToolCallIdentity::new("agent", "l1", "request-1", raw);
+        let second = ToolCallIdentity::new("agent", "l1", "request-2", raw);
+        let call = ToolCall::from_identity(&first, "bash", r#"{"command":"true"}"#, 1);
+        let result =
+            ToolResult::from_identity(&first, "bash", r#"{"ok":true}"#, true, true, None, 11, 2);
+        let later = ToolCall::from_identity(&second, "bash", "{}", 2);
+
+        assert_eq!(call.call_id, raw);
+        assert_eq!(result.call_id, raw);
+        assert_eq!(call.l1_session_id, "l1");
+        assert_eq!(call.llm_request_id, "request-1");
+        assert_eq!(call.routing_call_key, result.routing_call_key);
+        assert_ne!(call.routing_call_key, later.routing_call_key);
+
+        let encoded = serde_json::to_string(&call).unwrap();
+        let decoded: ToolCall = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.call_id.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn recoverable_policy_guidance_requires_unexecuted_failed_terminal_identity() {
+        let identity = ToolCallIdentity::new("agent", "l1", "request", "call_0");
+        let result = |success, executed, reason| {
+            ToolResult::from_identity(
+                &identity,
+                "bash",
+                r#"{"classification":"recoverable_methodology_constraint"}"#,
+                success,
+                executed,
+                reason,
+                64,
+                0,
+            )
+        };
+
+        assert!(result(
+            false,
+            false,
+            Some(tool_terminal_reason::RECOVERABLE_POLICY_GUIDANCE),
+        )
+        .is_recoverable_policy_guidance());
+        assert!(result(
+            false,
+            false,
+            Some(tool_terminal_reason::VERIFICATION_COMMAND_NOT_ATTRIBUTABLE),
+        )
+        .is_recoverable_policy_guidance());
+        assert!(!result(
+            false,
+            true,
+            Some(tool_terminal_reason::VERIFICATION_COMMAND_NOT_ATTRIBUTABLE),
+        )
+        .is_recoverable_policy_guidance());
+        assert!(!result(
+            false,
+            true,
+            Some(tool_terminal_reason::RECOVERABLE_POLICY_GUIDANCE),
+        )
+        .is_recoverable_policy_guidance());
+        assert!(!result(
+            false,
+            false,
+            Some(tool_terminal_reason::SKILL_BEFORE_SKIPPED),
+        )
+        .is_recoverable_policy_guidance());
+        assert!(!result(
+            false,
+            true,
+            Some(tool_terminal_reason::RESULT_DISCLOSURE_DENIED),
+        )
+        .is_recoverable_policy_guidance());
+        assert!(
+            !result(false, true, Some(tool_terminal_reason::EXECUTION_FAILED),)
+                .is_recoverable_policy_guidance()
+        );
+    }
+
+    #[test]
+    fn legacy_tool_result_deserialization_marks_execution_as_legacy_completed() {
+        let result: ToolResult = serde_json::from_str(
+            r#"{"call_id":"call_0","tool_name":"bash","result":"{}","success":true,"result_size_bytes":2,"duration_ms":1,"agent_id":"da"}"#,
+        )
+        .unwrap();
+        assert!(result.executed);
+        assert!(result.l1_session_id.is_empty());
+        assert!(result.llm_request_id.is_empty());
+        assert!(result.routing_call_key.is_none());
+    }
+
+    #[test]
+    fn event_ledger_rejects_duplicate_and_orphan_terminal_events() {
+        let identity = ToolCallIdentity::new("agent", "l1", "request", "call_0");
+        let orphan = ToolCallIdentity::new("agent", "l1", "request", "call_1");
+        let mut ledger = ToolExecutionEventLedger::default();
+
+        assert!(ledger.register_result(&orphan, "bash").is_err());
+        assert!(ledger.register_call(&identity, "bash").is_ok());
+        assert!(ledger.register_call(&identity, "bash").is_err());
+        assert_eq!(ledger.pending().len(), 1);
+        assert!(ledger.register_result(&identity, "bash").is_ok());
+        assert!(ledger.register_result(&identity, "bash").is_err());
+        assert!(ledger.pending().is_empty());
     }
 }

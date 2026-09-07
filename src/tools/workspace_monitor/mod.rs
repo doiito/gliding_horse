@@ -24,7 +24,12 @@ pub mod watch_engine;
 
 pub use content_store::{ContentStore, ReadMode, ReadResult};
 pub use diff_engine::DiffEngine;
-pub use inventory::{FileEntry, FileInventory, FileState};
+pub use inventory::{
+    FileEntry, FileInventory, FileState, WorkspaceEffectDelta, WorkspaceEffectManifest,
+    WorkspaceFileModification, WorkspaceFileRevision, WorkspaceManifestIssue,
+    WorkspaceManifestIssueKind, WorkspaceManifestIssueStage,
+    WORKSPACE_EFFECT_MANIFEST_SCHEMA_VERSION,
+};
 pub use snapshot::{RollbackPlan, RollbackResult, SnapshotManager, WorkspaceSnapshot};
 pub use watch_engine::{WatchConfig, WatchEngine};
 
@@ -35,6 +40,10 @@ pub struct WorkspaceMonitorConfig {
     pub workspace_root: PathBuf,
     /// Glob patterns to exclude from file scanning.
     pub exclude_patterns: Vec<String>,
+    /// Canonical-workspace-relative regular files to exclude by exact path.
+    /// These entries never acquire glob, basename, suffix, or directory
+    /// semantics and are validated during initialization.
+    pub exact_exclude_paths: Vec<PathBuf>,
     /// Maximum content cache size in bytes.
     pub content_store_max_bytes: usize,
     /// Maximum number of files in LRU content cache.
@@ -73,12 +82,20 @@ impl Default for WorkspaceMonitorConfig {
                 "dist/".into(),
                 "build/".into(),
                 "__pycache__/".into(),
+                ".pytest_cache/".into(),
+                ".mypy_cache/".into(),
+                ".ruff_cache/".into(),
+                ".tox/".into(),
+                ".nox/".into(),
+                "htmlcov/".into(),
+                ".coverage".into(),
                 ".venv/".into(),
                 "venv/".into(),
                 ".next/".into(),
                 "data/".into(),
                 ".gliding_horse/".into(),
             ],
+            exact_exclude_paths: Vec::new(),
             content_store_max_bytes: 64 * 1024 * 1024, // 64 MB
             content_cache_capacity: 1000,
             watch_enabled: true,
@@ -179,6 +196,9 @@ fn record_workspace_change(
     kind: WorkspaceChangeKind,
     origin: WorkspaceChangeOrigin,
 ) {
+    if inventory::is_workspace_runtime_path(std::path::Path::new(path)) {
+        return;
+    }
     let next = generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     let mut history = changes.write();
     history.push_back(WorkspaceChange {
@@ -204,10 +224,33 @@ impl WorkspaceMonitor {
     /// 5. WatchEngine for file system events
     #[instrument(skip(config, blackboard, event_bus))]
     pub fn initialize(
-        config: WorkspaceMonitorConfig,
+        mut config: WorkspaceMonitorConfig,
         blackboard: Option<Arc<Blackboard>>,
         event_bus: Option<Arc<EventBus>>,
     ) -> Result<Self, String> {
+        // This is a process-safety boundary, not a user preference.  A caller
+        // may replace the default exclude list (as the TUI does from config),
+        // but it must never make the monitor's own workspace-local databases
+        // visible to scans or watchers.
+        if !config.exclude_patterns.iter().any(|pattern| {
+            pattern.trim_end_matches(['/', '\\']) == inventory::WORKSPACE_RUNTIME_DIR
+        }) {
+            config
+                .exclude_patterns
+                .push(format!("{}/", inventory::WORKSPACE_RUNTIME_DIR));
+        }
+        let (exact_exclude_workspace_root, exact_exclude_paths) =
+            if config.exact_exclude_paths.is_empty() {
+                (None, std::collections::BTreeSet::new())
+            } else {
+                let (canonical_root, validated) = inventory::validate_exact_exclude_paths(
+                    &config.workspace_root,
+                    &config.exact_exclude_paths,
+                )?;
+                config.workspace_root = canonical_root.clone();
+                config.exact_exclude_paths = validated.iter().cloned().collect();
+                (Some(canonical_root), validated)
+            };
         let root = config.workspace_root.to_string_lossy().to_string();
 
         // Initialize redb database
@@ -223,11 +266,15 @@ impl WorkspaceMonitor {
         ));
 
         // FileInventory
-        let inventory = Arc::new(RwLock::new(FileInventory::new(
-            blackboard.clone(),
-            meta_db,
-            config.exclude_patterns.clone(),
-        )));
+        let inventory = Arc::new(RwLock::new(
+            FileInventory::new_with_validated_exact_exclude_paths(
+                blackboard.clone(),
+                meta_db,
+                config.exclude_patterns.clone(),
+                exact_exclude_workspace_root,
+                exact_exclude_paths,
+            ),
+        ));
 
         // Workspace manifests must survive a process restart.  Content blobs
         // live in ContentStore's database; this independent manifest database
@@ -303,6 +350,16 @@ impl WorkspaceMonitor {
     /// Read a file through ContentStore with cache/diff support.
     pub fn read_file(&self, path: &str, mode: ReadMode) -> std::io::Result<ReadResult> {
         let normalized = self.normalize_path(path);
+        if self
+            .inventory
+            .read()
+            .is_excluded(std::path::Path::new(&normalized))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "workspace runtime state is excluded from project reads",
+            ));
+        }
         let result = self.content_store.read_file(&normalized, mode)?;
 
         // Update FileInventory state
@@ -332,6 +389,10 @@ impl WorkspaceMonitor {
     pub fn mark_file_written(&self, path: &str) {
         let path = self.normalize_path(path);
         let inv = self.inventory.read();
+        if inv.is_excluded(std::path::Path::new(&path)) {
+            inv.remove(&path);
+            return;
+        }
         let existed = inv.get_entry(&path).is_some();
         inv.mark_written(&path);
         self.content_store.invalidate(&path);
@@ -375,6 +436,28 @@ impl WorkspaceMonitor {
             &self.config.workspace_root,
             self.config.effect_snapshot_max_files,
             self.config.effect_snapshot_max_bytes,
+        )
+    }
+
+    /// Capture a bounded, content-addressed per-path view suitable for a
+    /// before/after tool-execution window.  Unlike workspace views used for
+    /// prompting, this reads the filesystem directly and has no dependency on
+    /// watcher delivery or inventory generation.
+    pub fn capture_effect_manifest(&self) -> WorkspaceEffectManifest {
+        self.inventory.read().capture_effect_manifest(
+            &self.config.workspace_root,
+            self.config.effect_snapshot_max_files,
+            self.config.effect_snapshot_max_bytes,
+        )
+    }
+
+    /// Compute a bounded digest of directory paths for structure-only effect
+    /// confirmation. It is kept separate from the file-content digest so a
+    /// no-op content command cannot borrow evidence from metadata churn.
+    pub fn structural_effect_fingerprint(&self) -> Result<String, String> {
+        self.inventory.read().structural_fingerprint(
+            &self.config.workspace_root,
+            self.config.effect_snapshot_max_files,
         )
     }
 
@@ -441,7 +524,10 @@ impl WorkspaceMonitor {
             .changes
             .read()
             .iter()
-            .filter(|change| change.generation > since)
+            .filter(|change| {
+                change.generation > since
+                    && !inventory::is_workspace_runtime_path(std::path::Path::new(&change.path))
+            })
             .cloned()
             .collect();
         WorkspaceView {
@@ -463,7 +549,10 @@ impl WorkspaceMonitor {
             .changes
             .read()
             .iter()
-            .filter(|change| change.generation > since_generation)
+            .filter(|change| {
+                change.generation > since_generation
+                    && !inventory::is_workspace_runtime_path(std::path::Path::new(&change.path))
+            })
             .take(max_changes)
             .map(|change| {
                 format!(
@@ -551,6 +640,14 @@ impl WorkspaceMonitor {
                 match receiver.recv().await {
                     Ok(event) => {
                         let path = event.payload.clone();
+                        if inventory.read().is_excluded(std::path::Path::new(&path)) {
+                            // Purge stale cache/L2 state from older versions,
+                            // but never publish runtime-tree changes to model
+                            // perception, causality, or workspace deltas.
+                            inventory.read().remove(&path);
+                            recent_agent_writes.write().remove(&path);
+                            continue;
+                        }
                         let event_type_name = event.event_type.clone();
                         match EventType::from_str(&event_type_name) {
                             EventType::WorkspaceFileCreated => {
@@ -1120,6 +1217,84 @@ mod tests {
     }
 
     #[test]
+    fn exact_file_exclusion_is_path_exact_for_full_scan_and_effect_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("tools")).unwrap();
+        let runtime_executable = dir.path().join("glidingcode");
+        let same_named_project_file = dir.path().join("tools/glidingcode");
+        std::fs::write(&runtime_executable, vec![b'x'; 128]).unwrap();
+        std::fs::write(&same_named_project_file, b"code").unwrap();
+        let unfiltered =
+            FileInventory::new(None, None, Vec::new()).capture_effect_manifest(dir.path(), 10, 16);
+        assert!(!unfiltered.complete);
+        assert!(unfiltered
+            .errors
+            .iter()
+            .any(|issue| issue.kind == WorkspaceManifestIssueKind::ByteLimitExceeded));
+
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                exact_exclude_paths: vec![PathBuf::from("glidingcode")],
+                watch_enabled: false,
+                effect_snapshot_max_files: 10,
+                effect_snapshot_max_bytes: 16,
+                ..WorkspaceMonitorConfig::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(ws
+            .inventory
+            .read()
+            .get_entry(&runtime_executable.to_string_lossy())
+            .is_none());
+        assert!(ws
+            .inventory
+            .read()
+            .get_entry(&same_named_project_file.to_string_lossy())
+            .is_some());
+        let manifest = ws.capture_effect_manifest();
+        assert!(manifest.complete, "{:?}", manifest.errors);
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tools/glidingcode"]
+        );
+    }
+
+    #[test]
+    fn exact_file_exclusion_rejects_absolute_parent_and_directory_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("glidingcode");
+        std::fs::write(&file, b"runtime").unwrap();
+        std::fs::create_dir(dir.path().join("runtime-dir")).unwrap();
+
+        for invalid in [
+            file,
+            PathBuf::from("../glidingcode"),
+            PathBuf::from("runtime-dir"),
+        ] {
+            let result = WorkspaceMonitor::initialize(
+                WorkspaceMonitorConfig {
+                    workspace_root: dir.path().to_path_buf(),
+                    exact_exclude_paths: vec![invalid],
+                    watch_enabled: false,
+                    ..WorkspaceMonitorConfig::default()
+                },
+                None,
+                None,
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
     fn test_register_hooks_read_stale_warning() {
         let (ws, dir) = temp_ws_monitor();
         let file_path = dir.path().join("test.rs");
@@ -1220,6 +1395,93 @@ mod tests {
             entry.is_some(),
             "File should be in inventory after Create event"
         );
+    }
+
+    #[tokio::test]
+    async fn event_consumer_honors_exact_file_exclusion_without_hiding_same_name() {
+        let bus = Arc::new(EventBus::new(100));
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("tools")).unwrap();
+        let runtime_executable = dir.path().join("glidingcode");
+        let same_named_project_file = dir.path().join("tools/glidingcode");
+        std::fs::write(&runtime_executable, b"runtime").unwrap();
+        std::fs::write(&same_named_project_file, b"project").unwrap();
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                exact_exclude_paths: vec![PathBuf::from("glidingcode")],
+                watch_enabled: false,
+                defer_initial_scan: true,
+                ..WorkspaceMonitorConfig::default()
+            },
+            None,
+            Some(bus.clone()),
+        )
+        .unwrap();
+        ws.register_event_consumers();
+        let initial_generation = ws.generation();
+
+        for path in [&runtime_executable, &same_named_project_file] {
+            bus.emit(
+                "iri://test_task",
+                EventType::WorkspaceFileCreated.as_str(),
+                "iri://test_agent",
+                &path.to_string_lossy(),
+            )
+            .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(ws
+            .inventory
+            .read()
+            .get_entry(&runtime_executable.to_string_lossy())
+            .is_none());
+        assert!(ws
+            .inventory
+            .read()
+            .get_entry(&same_named_project_file.to_string_lossy())
+            .is_some());
+        assert_eq!(ws.generation(), initial_generation + 1);
+    }
+
+    #[tokio::test]
+    async fn event_consumer_drops_nested_runtime_tree_changes() {
+        let bus = Arc::new(EventBus::new(100));
+        let dir = tempfile::TempDir::new().unwrap();
+        let ps = Arc::new(PerceptionStore::new());
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                exclude_patterns: vec![],
+                watch_enabled: false,
+                ..WorkspaceMonitorConfig::default()
+            },
+            None,
+            Some(bus.clone()),
+        )
+        .unwrap()
+        .with_perception_store(ps.clone());
+        ws.register_event_consumers();
+        let initial_generation = ws.generation();
+        let runtime_file = dir
+            .path()
+            .join("generated/.gliding_horse/ws_monitor/content");
+        std::fs::create_dir_all(runtime_file.parent().unwrap()).unwrap();
+        std::fs::write(&runtime_file, "runtime").unwrap();
+
+        bus.emit(
+            "iri://runtime-filter-test",
+            EventType::WorkspaceFileCreated.as_str(),
+            "iri://workspace_monitor",
+            &runtime_file.to_string_lossy(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(ws.generation(), initial_generation);
+        assert_eq!(ws.workspace_view(None, None, 10).total_files, 0);
+        assert!(!ps.has_new("iri://runtime-filter-test"));
     }
 
     #[tokio::test]
@@ -2294,5 +2556,85 @@ mod tests {
         ws.start_async_components();
         assert!(ws.wait_for_initial_scan().await);
         assert_eq!(ws.workspace_view(None, None, 10).total_files, 1);
+    }
+
+    #[test]
+    fn tui_runtime_databases_stay_out_of_empty_workspace_views() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime_db = dir.path().join(".gliding_horse/ws_monitor");
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                // Reproduce a TUI settings list which replaces defaults and
+                // omits the runtime directory.
+                exclude_patterns: vec!["target/".into()],
+                watch_enabled: false,
+                db_path: Some(runtime_db.clone()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(runtime_db.join("metadata").exists());
+        assert!(ws
+            .config
+            .exclude_patterns
+            .iter()
+            .any(|pattern| pattern == ".gliding_horse/"));
+        let view = ws.workspace_view(None, Some("create a project"), 100);
+        assert!(view.scan_complete);
+        assert_eq!(view.total_files, 0);
+        assert!(view.files.is_empty());
+        assert!(view.changes.is_empty());
+        assert!(ws.get_file_inventory_summary().is_none());
+        assert!(ws.generate_perception_text(None).is_none());
+
+        // Incremental hooks/events cannot re-admit a runtime database file.
+        let content_db = runtime_db.join("content");
+        ws.mark_file_written(&content_db.to_string_lossy());
+        let read_error = ws
+            .read_file(&content_db.to_string_lossy(), ReadMode::Full)
+            .unwrap_err();
+        assert_eq!(read_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(ws.workspace_view(None, None, 100).total_files, 0);
+        assert_eq!(ws.generation(), 1);
+    }
+
+    #[test]
+    fn monitor_effect_manifest_wrapper_is_direct_bounded_filesystem_evidence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = WorkspaceMonitor::initialize(
+            WorkspaceMonitorConfig {
+                workspace_root: dir.path().to_path_buf(),
+                exclude_patterns: vec![],
+                watch_enabled: false,
+                effect_snapshot_max_files: 4,
+                effect_snapshot_max_bytes: 64,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let generation = ws.generation();
+        let before = ws.capture_effect_manifest();
+        assert!(before.complete, "{:?}", before.errors);
+
+        std::fs::create_dir(dir.path().join("project")).unwrap();
+        std::fs::write(dir.path().join("project/report.md"), "report").unwrap();
+        let after = ws.capture_effect_manifest();
+        let delta = WorkspaceEffectDelta::between(&before, &after);
+
+        assert!(delta.complete, "{:?}", delta.errors);
+        assert_eq!(delta.directories_created, vec!["project"]);
+        assert_eq!(delta.files_created.len(), 1);
+        assert_eq!(delta.files_created[0].path, "project/report.md");
+        assert_eq!(delta.files_created[0].size_bytes, 6);
+        assert!(delta.files_created[0].content_sha256.starts_with("sha256:"));
+        // Direct evidence capture must neither need nor mutate asynchronous
+        // watcher/generation state.
+        assert_eq!(ws.generation(), generation);
     }
 }

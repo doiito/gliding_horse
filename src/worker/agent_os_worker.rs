@@ -115,11 +115,11 @@ impl WorkerConfig {
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(3600),
-                    default_action: crate::tools::hooks::DefaultAction::Approve,
+                    default_action: crate::tools::hooks::DefaultAction::Reject,
                     stages: Vec::new(),
                 }],
                 default_timeout_seconds: 3600,
-                default_action: crate::tools::hooks::DefaultAction::Approve,
+                default_action: crate::tools::hooks::DefaultAction::Reject,
             })
         } else {
             None
@@ -614,7 +614,7 @@ mod tests {
                 enabled: true,
                 approval_points: vec![ApprovalPoint::default()],
                 default_timeout_seconds: 3600,
-                default_action: crate::tools::hooks::DefaultAction::Approve,
+                default_action: crate::tools::hooks::DefaultAction::Reject,
             }),
             ..Default::default()
         };

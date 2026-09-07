@@ -8,6 +8,7 @@ use crate::core::agent_runner::TaskResult;
 use crate::core::event_bus::EventBus;
 use crate::core::execution_journal::TaskExecutionJournal;
 use crate::memory::l0_store::L0Store;
+use crate::CoreError;
 use tracing::warn;
 
 /// Emits the canonical terminal task event after an executor returns a result.
@@ -38,17 +39,23 @@ impl TaskFinalizer {
         }
     }
 
-    /// Publish a `TASK_FINALIZED` event and return its event ID.
-    pub async fn finalize(&self, task_iri: &str, result: &TaskResult) -> String {
+    /// Seal durable evidence, publish `TASK_FINALIZED`, and return its event
+    /// ID. Product entry points that promise a durable evidence ledger must
+    /// use this checked path: a seal failure is a terminal persistence error,
+    /// not a warning attached to an otherwise successful task.
+    pub async fn finalize_checked(
+        &self,
+        task_iri: &str,
+        result: &TaskResult,
+    ) -> Result<String, CoreError> {
         if let Some(l0) = &self.l0 {
-            match TaskExecutionJournal::open(l0.clone(), task_iri)
+            TaskExecutionJournal::open(l0.clone(), task_iri)
                 .and_then(|journal| journal.seal(&result.status))
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    warn!(task_iri = %task_iri, %error, "Failed to seal task evidence during finalization")
-                }
-            }
+                .map_err(|error| CoreError::Internal {
+                    message: format!(
+                        "Failed to seal task evidence during finalization for {task_iri}: {error}"
+                    ),
+                })?;
         }
         let actions = result
             .tracked_actions
@@ -75,14 +82,27 @@ impl TaskFinalizer {
             "tracked_actions": actions,
         });
 
-        self.event_bus
+        Ok(self
+            .event_bus
             .emit(
                 task_iri,
                 "TASK_FINALIZED",
                 "system:task-finalizer",
                 &payload.to_string(),
             )
-            .await
+            .await)
+    }
+
+    /// Compatibility path for transports that do not own a durable evidence
+    /// ledger. Ledger-backed products should call `finalize_checked`.
+    pub async fn finalize(&self, task_iri: &str, result: &TaskResult) -> String {
+        match self.finalize_checked(task_iri, result).await {
+            Ok(event_id) => event_id,
+            Err(error) => {
+                warn!(task_iri = %task_iri, %error, "Task finalization failed");
+                self.finalize_error(task_iri, &error.to_string()).await
+            }
+        }
     }
 
     /// Publish a terminal failure when execution failed before a `TaskResult`

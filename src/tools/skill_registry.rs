@@ -990,7 +990,7 @@ impl SkillRegistry {
         // business capabilities. Attribute their read-only outcome to the
         // canonical file-read skill so execution security and evolution use
         // the same IRI without manufacturing one node per tool call.
-        if tool_name.starts_with("read_full_result_") || tool_name.starts_with("query_") {
+        if crate::tools::result_router::is_session_scoped_micro_tool_name(tool_name) {
             return skills
                 .get("iri://skills/file_read")
                 .map(|cached| cached.basic.skill_iri.clone());
@@ -1460,13 +1460,34 @@ mod tests {
     #[test]
     fn test_resolve_ephemeral_read_micro_tools_to_canonical_skill() {
         let registry = SkillRegistry::new();
+        let routing = crate::tools::result_router::ResultRoutingIdentity::new(
+            "l1-skill-resolution",
+            "call_0",
+        );
 
-        for tool in ["read_full_result_call_123", "query_call_456"] {
+        for tool in [
+            routing.reader_name.clone(),
+            routing.query_name("Person"),
+            routing.entity_details_name(),
+            routing.relation_expansion_name(),
+        ] {
             assert_eq!(
-                registry.skill_iri_for_tool_name(tool).as_deref(),
+                registry.skill_iri_for_tool_name(&tool).as_deref(),
                 Some("iri://skills/file_read")
             );
         }
+        assert_eq!(
+            registry.skill_iri_for_tool_name("query_customer_status"),
+            None
+        );
+        assert_eq!(
+            registry.skill_iri_for_tool_name("query_s1234567890abcdef_c1234567890abcdef_customer"),
+            None
+        );
+        assert_eq!(
+            registry.skill_iri_for_tool_name("read_full_result_call_0"),
+            None
+        );
         assert_eq!(registry.skill_iri_for_tool_name("unknown_call_123"), None);
     }
 

@@ -93,6 +93,8 @@ prometheus = "0.13"
 glob = "0.3"
 walkdir = "2.4"
 regex = "1.10"
+libc = "0.2"
+tempfile = "3.10"
 
 # 配置
 config = "0.14"
@@ -134,7 +136,6 @@ tokio-test = "0.4"
 mockall = "0.12"
 criterion = "0.5"
 testcontainers = "0.15"
-tempfile = "3.10"
 
 [build-dependencies]
 tonic-build = "0.10"

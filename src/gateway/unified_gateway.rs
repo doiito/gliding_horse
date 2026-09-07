@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::config::settings::GatewaySettings;
+use crate::config::settings::{GatewaySettings, ReasoningEffort};
 use crate::gateway::{RateLimiter, ResponseCache};
+use crate::llm::sse::SseDialect;
 use crate::llm::stream_processor::MessageStream;
 use crate::CoreError;
 
@@ -99,6 +100,165 @@ pub struct GatewayCallMetadata {
     pub provider_response_id: Option<String>,
 }
 
+/// Per-call provider options which are intentionally not part of the legacy
+/// gateway signatures. An absent value preserves the provider's default wire
+/// behavior; callers must opt in explicitly when they need a reasoning policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmRequestOptions {
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl LlmRequestOptions {
+    pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = match effort {
+            ReasoningEffort::None => None,
+            _ => Some(effort),
+        };
+        self
+    }
+}
+
+const GATEWAY_FAILURE_PREFIX: &str = "llm_gateway_failure:";
+
+/// Stable diagnostic classes for failures that occur before a provider
+/// response can be represented as a `ChatCompletionResponse`. The associated
+/// `CoreError` contains only a fixed description (plus an HTTP status where
+/// applicable), never request or response payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayFailureKind {
+    TransportTimeout,
+    TransportConnect,
+    TransportDecode,
+    TransportBody,
+    TransportRequest,
+    ProviderHttpTransient,
+    ProviderHttpClient,
+    ProviderResponseJson,
+    ProviderResponseInvalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningWireDialect {
+    DeepSeek,
+    OpenAi,
+    Unsupported,
+}
+
+fn reasoning_wire_dialect(model: &str) -> ReasoningWireDialect {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("deepseek-v4-") {
+        ReasoningWireDialect::DeepSeek
+    } else if model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("gpt-5")
+    {
+        ReasoningWireDialect::OpenAi
+    } else {
+        ReasoningWireDialect::Unsupported
+    }
+}
+
+impl GatewayFailureKind {
+    const fn error_class(self) -> &'static str {
+        match self {
+            Self::TransportTimeout => "transport_timeout",
+            Self::TransportConnect => "transport_connect",
+            Self::TransportDecode => "transport_decode",
+            Self::TransportBody => "transport_body",
+            Self::TransportRequest => "transport_request",
+            Self::ProviderHttpTransient => "provider_http_transient",
+            Self::ProviderHttpClient => "provider_http_client",
+            Self::ProviderResponseJson => "provider_response_json",
+            Self::ProviderResponseInvalid => "provider_response_invalid",
+        }
+    }
+
+    fn from_reqwest(error: &reqwest::Error, reading_body: bool) -> Self {
+        if error.is_timeout() {
+            Self::TransportTimeout
+        } else if error.is_connect() {
+            Self::TransportConnect
+        } else if error.is_decode() {
+            Self::TransportDecode
+        } else if error.is_body() {
+            Self::TransportBody
+        } else if reading_body {
+            Self::TransportBody
+        } else {
+            Self::TransportRequest
+        }
+    }
+
+    fn from_status(status: reqwest::StatusCode) -> Self {
+        if UnifiedGateway::is_retryable_status(status) {
+            Self::ProviderHttpTransient
+        } else {
+            Self::ProviderHttpClient
+        }
+    }
+
+    fn into_core_error(self, safe_detail: impl AsRef<str>) -> CoreError {
+        CoreError::Internal {
+            message: format!(
+                "{GATEWAY_FAILURE_PREFIX}{}:{}",
+                self.error_class(),
+                safe_detail.as_ref()
+            ),
+        }
+    }
+}
+
+/// Recover the payload-free class encoded by this gateway. This keeps the
+/// public `CoreError` surface stable while allowing the interaction lifecycle
+/// and TUI to distinguish transport, provider status and response-shape
+/// failures from unrelated internal errors.
+pub(crate) fn gateway_error_class(error: &CoreError) -> Option<&'static str> {
+    let CoreError::Internal { message } = error else {
+        return None;
+    };
+    let encoded = message.strip_prefix(GATEWAY_FAILURE_PREFIX)?;
+    let class = encoded.split(':').next()?;
+    match class {
+        "transport_timeout" => Some("transport_timeout"),
+        "transport_connect" => Some("transport_connect"),
+        "transport_decode" => Some("transport_decode"),
+        "transport_body" => Some("transport_body"),
+        "transport_request" => Some("transport_request"),
+        "provider_http_transient" => Some("provider_http_transient"),
+        "provider_http_client" => Some("provider_http_client"),
+        "provider_response_json" => Some("provider_response_json"),
+        "provider_response_invalid" => Some("provider_response_invalid"),
+        _ => None,
+    }
+}
+
+/// Recover the numeric provider status from the gateway's payload-free error
+/// detail. Only the exact kernel-authored `provider returned HTTP NNN` shape
+/// is accepted; arbitrary error text is never scanned or copied into normal
+/// telemetry.
+pub(crate) fn gateway_error_http_status(error: &CoreError) -> Option<u16> {
+    let CoreError::Internal { message } = error else {
+        return None;
+    };
+    let encoded = message.strip_prefix(GATEWAY_FAILURE_PREFIX)?;
+    let (_, detail) = encoded.split_once(':')?;
+    detail
+        .strip_prefix("provider returned HTTP ")
+        .or_else(|| detail.strip_prefix("provider stream returned HTTP "))?
+        .parse::<u16>()
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+}
+
+pub(crate) fn gateway_error_retryable(error: &CoreError) -> Option<bool> {
+    match gateway_error_class(error)? {
+        "provider_http_transient" => Some(true),
+        "provider_http_client" => Some(false),
+        _ => None,
+    }
+}
+
 pub struct UnifiedGateway {
     base_url: RwLock<String>,
     api_key: RwLock<String>,
@@ -147,6 +307,72 @@ impl UnifiedGateway {
         self.default_model.read().unwrap().clone()
     }
 
+    /// Normalize a requested reasoning policy to what this gateway can
+    /// actually encode for the routed model. Interaction metadata and request
+    /// hashing use this same value, so an omitted or capped wire option is not
+    /// misleadingly reported as though it were sent verbatim.
+    pub fn effective_request_options(
+        &self,
+        model: &str,
+        options: LlmRequestOptions,
+    ) -> LlmRequestOptions {
+        let requested = options
+            .reasoning_effort
+            .filter(|effort| *effort != ReasoningEffort::None);
+        let reasoning_effort = match reasoning_wire_dialect(model) {
+            ReasoningWireDialect::DeepSeek => requested,
+            ReasoningWireDialect::OpenAi => match requested {
+                Some(ReasoningEffort::Disabled) | None => None,
+                Some(ReasoningEffort::Max) => Some(ReasoningEffort::High),
+                effort => effort,
+            },
+            ReasoningWireDialect::Unsupported => None,
+        };
+        LlmRequestOptions { reasoning_effort }
+    }
+
+    fn validate_chat_reasoning_tool_choice(
+        model: &str,
+        tools_present: bool,
+        tool_choice: Option<&str>,
+        options: LlmRequestOptions,
+    ) -> Result<(), CoreError> {
+        if reasoning_wire_dialect(model) == ReasoningWireDialect::DeepSeek
+            && tools_present
+            && options.reasoning_effort != Some(ReasoningEffort::Disabled)
+            && tool_choice.is_some_and(|choice| !choice.eq_ignore_ascii_case("auto"))
+        {
+            return Err(CoreError::InteractionRejected {
+                stage: "provider_capability".to_string(),
+                reason: "DeepSeek thinking with tools requires automatic tool selection; explicit tool_choice was not sent"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate provider capability conflicts before an interaction records a
+    /// real model dispatch. The transport repeats the check as defense in
+    /// depth for callers that bypass `LlmInteractionService`.
+    pub(crate) fn validate_request_capabilities(
+        &self,
+        model: &str,
+        tools_present: bool,
+        tool_choice: Option<&str>,
+        options: LlmRequestOptions,
+    ) -> Result<(), CoreError> {
+        if self.should_use_responses_api(model) {
+            Ok(())
+        } else {
+            Self::validate_chat_reasoning_tool_choice(
+                model,
+                tools_present,
+                tool_choice,
+                self.effective_request_options(model, options),
+            )
+        }
+    }
+
     pub async fn chat(
         &self,
         messages: Vec<ChatMessage>,
@@ -184,9 +410,42 @@ impl UnifiedGateway {
         tools: Option<Vec<Value>>,
         tool_choice: Option<&str>,
     ) -> Result<ChatCompletionResponse, CoreError> {
-        self.chat_with_params_traced(model, messages, temperature, max_tokens, tools, tool_choice)
-            .await
-            .map(|(response, _)| response)
+        self.chat_with_params_and_options(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            tools,
+            tool_choice,
+            LlmRequestOptions::default(),
+        )
+        .await
+    }
+
+    /// Parameterized request with explicit provider options. Use the legacy
+    /// method when provider-default behavior is desired.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chat_with_params_and_options(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tools: Option<Vec<Value>>,
+        tool_choice: Option<&str>,
+        options: LlmRequestOptions,
+    ) -> Result<ChatCompletionResponse, CoreError> {
+        self.chat_with_params_traced_and_options(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            tools,
+            tool_choice,
+            options,
+        )
+        .await
+        .map(|(response, _)| response)
     }
 
     /// Same request as [`Self::chat_with_params`], with transport metadata for
@@ -200,7 +459,32 @@ impl UnifiedGateway {
         tools: Option<Vec<Value>>,
         tool_choice: Option<&str>,
     ) -> Result<(ChatCompletionResponse, GatewayCallMetadata), CoreError> {
+        self.chat_with_params_traced_and_options(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            tools,
+            tool_choice,
+            LlmRequestOptions::default(),
+        )
+        .await
+    }
+
+    /// Traced variant of [`Self::chat_with_params_and_options`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chat_with_params_traced_and_options(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tools: Option<Vec<Value>>,
+        tool_choice: Option<&str>,
+        options: LlmRequestOptions,
+    ) -> Result<(ChatCompletionResponse, GatewayCallMetadata), CoreError> {
         let messages = Self::sanitize_tool_messages(messages);
+        let options = self.effective_request_options(model, options);
         // Pre-validate messages: check for empty content that might cause 400 errors
         for (i, msg) in messages.iter().enumerate() {
             if msg.content.trim().is_empty() && msg.role != "assistant" {
@@ -213,7 +497,7 @@ impl UnifiedGateway {
 
         if self.should_use_responses_api(model) {
             let url = format!("{}/v1/responses", self.base_url.read().unwrap());
-            let body = Self::build_responses_body(
+            let body = Self::build_responses_body_with_options(
                 model,
                 &messages,
                 temperature,
@@ -221,9 +505,12 @@ impl UnifiedGateway {
                 tools,
                 tool_choice,
                 false,
+                options,
             );
             return self.send_responses_request_traced(&url, body).await;
         }
+
+        Self::validate_chat_reasoning_tool_choice(model, tools.is_some(), tool_choice, options)?;
 
         let url = format!("{}/v1/chat/completions", self.base_url.read().unwrap());
         let mut body = serde_json::json!({
@@ -240,6 +527,7 @@ impl UnifiedGateway {
             body["tools"] = serde_json::json!(t);
             body["tool_choice"] = Self::parse_tool_choice(tool_choice.unwrap_or("auto"));
         }
+        Self::apply_chat_request_options(&mut body, model, options);
         self.send_request_traced(&url, body).await
     }
 
@@ -371,22 +659,28 @@ impl UnifiedGateway {
                     let status = resp.status();
                     if status.is_success() {
                         let response_text = resp.text().await.map_err(|e| {
-                            warn!(error = %e, "Failed to read LLM response body");
-                            CoreError::Internal {
-                                message: format!("Failed to read response body: {e}"),
-                            }
+                            let kind = GatewayFailureKind::from_reqwest(&e, true);
+                            warn!(
+                                error_class = kind.error_class(),
+                                http_status = e.status().map(|status| status.as_u16()),
+                                "Failed to read LLM response body"
+                            );
+                            kind.into_core_error("provider response body read failed")
                         })?;
                         let json: Value = match serde_json::from_str(&response_text) {
                             Ok(v) => v,
                             Err(e) => {
-                                warn!(error = %e, response_len = response_text.len(), "Failed to parse LLM response");
-                                return Err(CoreError::Internal {
-                                    message: format!(
-                                        "Failed to parse LLM response: {} (response length: {})",
-                                        e,
-                                        response_text.len()
-                                    ),
-                                });
+                                let kind = GatewayFailureKind::ProviderResponseJson;
+                                warn!(
+                                    error_class = kind.error_class(),
+                                    response_bytes = response_text.len(),
+                                    error_line = e.line(),
+                                    error_column = e.column(),
+                                    "Failed to parse LLM response"
+                                );
+                                return Err(kind.into_core_error(
+                                    "provider returned a non-JSON success response",
+                                ));
                             }
                         };
                         match parse(&json) {
@@ -417,17 +711,45 @@ impl UnifiedGateway {
                                 ));
                             }
                             Err(e) => {
-                                warn!(error = %e, "Failed to convert LLM response");
-                                return Err(e);
+                                // Preserve the existing explicit output-budget
+                                // classification; all other conversion errors
+                                // are provider response-shape failures. Neither
+                                // branch logs the response payload.
+                                if matches!(
+                                    &e,
+                                    CoreError::Internal { message }
+                                        if message.contains("max_output_tokens")
+                                ) {
+                                    warn!(
+                                        error_class = "output_token_limit",
+                                        "Provider response exhausted its output budget"
+                                    );
+                                    return Err(e);
+                                }
+                                let kind = GatewayFailureKind::ProviderResponseInvalid;
+                                warn!(
+                                    error_class = kind.error_class(),
+                                    "Failed to convert LLM response"
+                                );
+                                return Err(kind.into_core_error(
+                                    "provider response did not match the configured API schema",
+                                ));
                             }
                         }
                     } else {
                         let retry_after = Self::retry_after(resp.headers());
                         let retryable = Self::is_retryable_status(status);
-                        warn!(status = %status, retryable, "LLM API returned an error status");
-                        last_error = Some(CoreError::Internal {
-                            message: format!("LLM API error ({status})"),
-                        });
+                        let kind = GatewayFailureKind::from_status(status);
+                        warn!(
+                            status = %status,
+                            retryable,
+                            error_class = kind.error_class(),
+                            "LLM API returned an error status"
+                        );
+                        last_error = Some(kind.into_core_error(format!(
+                            "provider returned HTTP {}",
+                            status.as_u16()
+                        )));
                         if !retryable || attempt == self.max_retries {
                             break;
                         }
@@ -436,10 +758,13 @@ impl UnifiedGateway {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, "LLM API request failed");
-                    last_error = Some(CoreError::Internal {
-                        message: format!("LLM API request failed: {}", e),
-                    });
+                    let kind = GatewayFailureKind::from_reqwest(&e, false);
+                    warn!(
+                        error_class = kind.error_class(),
+                        http_status = e.status().map(|status| status.as_u16()),
+                        "LLM API request failed"
+                    );
+                    last_error = Some(kind.into_core_error("provider request dispatch failed"));
                     if attempt < self.max_retries {
                         retry_delay = Some(self.retry_backoff(attempt));
                     }
@@ -542,6 +867,29 @@ impl UnifiedGateway {
         tool_choice: Option<&str>,
         stream: bool,
     ) -> Value {
+        Self::build_responses_body_with_options(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            tools,
+            tool_choice,
+            stream,
+            LlmRequestOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_responses_body_with_options(
+        model: &str,
+        messages: &[ChatMessage],
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tools: Option<Vec<Value>>,
+        tool_choice: Option<&str>,
+        stream: bool,
+        options: LlmRequestOptions,
+    ) -> Value {
         let (instructions, input_items) = Self::responses_input_items(messages);
         let mut body = serde_json::json!({
             "model": model,
@@ -561,7 +909,75 @@ impl UnifiedGateway {
             body["tools"] = serde_json::json!(Self::convert_responses_tools(t));
             body["tool_choice"] = Self::parse_tool_choice(tool_choice.unwrap_or("auto"));
         }
+        // `none` is an internal, provider-neutral policy, not a portable
+        // Responses API effort value. Omitting the extension is compatible
+        // with providers that do not support reasoning controls and avoids a
+        // provider-side HTTP 400 on schema-only terminal turns.
+        if let Some(effort) = Self::portable_reasoning_effort(model, options.reasoning_effort) {
+            let wire_effort = if effort == ReasoningEffort::Disabled {
+                "none"
+            } else {
+                effort.as_str()
+            };
+            body["reasoning"] = serde_json::json!({"effort": wire_effort});
+        }
         body
+    }
+
+    /// Return only values that are portable for a provider/model family we
+    /// explicitly recognize. Unknown aliases stay wire-compatible. `max` is
+    /// an internal policy level and is capped to the strongest common wire
+    /// value instead of forwarding an unsupported literal.
+    fn portable_reasoning_effort(
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> Option<ReasoningEffort> {
+        let effort = effort.filter(|effort| *effort != ReasoningEffort::None)?;
+        match reasoning_wire_dialect(model) {
+            ReasoningWireDialect::DeepSeek => Some(effort),
+            ReasoningWireDialect::OpenAi => match effort {
+                ReasoningEffort::Disabled => None,
+                ReasoningEffort::Max => Some(ReasoningEffort::High),
+                effort => Some(effort),
+            },
+            ReasoningWireDialect::Unsupported => None,
+        }
+    }
+
+    /// Apply only model-family wire formats that are known to be compatible.
+    /// Unknown OpenAI-compatible endpoints get the legacy request unchanged.
+    fn apply_chat_request_options(body: &mut Value, model: &str, options: LlmRequestOptions) {
+        let dialect = reasoning_wire_dialect(model);
+        let effort = options.reasoning_effort;
+        if dialect == ReasoningWireDialect::DeepSeek
+            && body.get("tools").is_some()
+            && effort != Some(ReasoningEffort::Disabled)
+        {
+            // DeepSeek thinking+tools performs automatic tool selection and
+            // rejects the otherwise common explicit `tool_choice` field.
+            body.as_object_mut().map(|body| body.remove("tool_choice"));
+        }
+        let Some(effort) = effort.filter(|effort| *effort != ReasoningEffort::None) else {
+            return;
+        };
+        if dialect == ReasoningWireDialect::DeepSeek {
+            if effort == ReasoningEffort::Disabled {
+                body["thinking"] = serde_json::json!({"type": "disabled"});
+                return;
+            }
+            body["thinking"] = serde_json::json!({"type": "enabled"});
+            body["reasoning_effort"] = serde_json::json!(effort.as_str());
+        } else if dialect == ReasoningWireDialect::OpenAi {
+            // OpenAI Chat-compatible reasoning models do not accept
+            // DeepSeek's `thinking` object. `max` is not portable in this
+            // family, so cap it at the strongest common value.
+            let effort = match effort {
+                ReasoningEffort::Disabled => return,
+                ReasoningEffort::Max => ReasoningEffort::High,
+                effort => effort,
+            };
+            body["reasoning_effort"] = serde_json::json!(effort.as_str());
+        }
     }
 
     /// Chat-completions tool definitions nest the function under `"function"`,
@@ -609,6 +1025,20 @@ impl UnifiedGateway {
                 "developer" => items.push(Self::responses_message_item("developer", &msg.content)),
                 "user" => items.push(Self::responses_message_item("user", &msg.content)),
                 "assistant" => {
+                    // Stateless Responses calls must replay the provider's
+                    // reasoning item before the assistant message/tool call.
+                    // DeepSeek documents this as a `reasoning` item containing
+                    // one or more `reasoning_text` blocks.
+                    if let Some(reasoning) = msg
+                        .reasoning_content
+                        .as_deref()
+                        .filter(|reasoning| !reasoning.is_empty())
+                    {
+                        items.push(serde_json::json!({
+                            "type": "reasoning",
+                            "content": [{"type": "reasoning_text", "text": reasoning}],
+                        }));
+                    }
                     items.push(Self::responses_message_item("assistant", &msg.content));
                     if let Some(tool_calls) = &msg.tool_calls {
                         for tc in tool_calls {
@@ -686,13 +1116,19 @@ impl UnifiedGateway {
                     }
                 }
                 Some("function_call") => {
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(|value| value.as_str())
+                        .filter(|call_id| !call_id.is_empty())
+                        .ok_or_else(|| CoreError::Internal {
+                            message: "Responses API function_call omitted required call_id"
+                                .to_string(),
+                        })?;
                     tool_calls.push(ResponseToolCall {
-                        id: item
-                            .get("call_id")
-                            .or_else(|| item.get("id"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
+                        // `id` identifies the output item; `call_id` is the
+                        // provider protocol identity that must be replayed
+                        // byte-for-byte with the tool result.
+                        id: call_id.to_string(),
                         call_type: "function".to_string(),
                         function: ResponseToolCallFunction {
                             name: item
@@ -809,7 +1245,7 @@ impl UnifiedGateway {
 
     /// Sanitize messages to avoid OpenAI/DeepSeek API error:
     /// "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
-    fn sanitize_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    pub(crate) fn sanitize_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
         crate::core::context_compressor::ContextWindowManager::remove_orphaned_tool_messages(
             messages,
         )
@@ -818,15 +1254,14 @@ impl UnifiedGateway {
     pub fn supports_native_reasoning(&self, model: &str) -> bool {
         let model_lower = model.to_lowercase();
 
-        if model_lower.contains("deepseek-r1") || model_lower.contains("deepseek-reasoning") {
+        if !matches!(
+            reasoning_wire_dialect(model),
+            ReasoningWireDialect::Unsupported
+        ) {
             return true;
         }
 
-        if model_lower.starts_with("o1-")
-            || model_lower.starts_with("o3-")
-            || model_lower.starts_with("o1")
-            || model_lower.starts_with("o3")
-        {
+        if model_lower.starts_with("deepseek-r1") || model_lower.starts_with("deepseek-reasoning") {
             return true;
         }
 
@@ -846,9 +1281,61 @@ impl UnifiedGateway {
         tools: Option<Vec<Value>>,
         tool_choice: Option<&str>,
     ) -> Result<MessageStream, CoreError> {
+        self.stream_chat_with_params_and_options(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            tools,
+            tool_choice,
+            LlmRequestOptions::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_chat_with_params_and_options(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tools: Option<Vec<Value>>,
+        tool_choice: Option<&str>,
+        options: LlmRequestOptions,
+    ) -> Result<MessageStream, CoreError> {
+        self.stream_chat_with_params_traced_and_options(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            tools,
+            tool_choice,
+            options,
+        )
+        .await
+        .map(|(stream, _)| stream)
+    }
+
+    /// Streaming dispatch with metadata for the accepted HTTP response. The
+    /// latency covers dispatch through response headers; body consumption is
+    /// tracked by the interaction/runner lifecycle that owns the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_chat_with_params_traced_and_options(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        tools: Option<Vec<Value>>,
+        tool_choice: Option<&str>,
+        options: LlmRequestOptions,
+    ) -> Result<(MessageStream, GatewayCallMetadata), CoreError> {
+        let messages = Self::sanitize_tool_messages(messages);
+        let options = self.effective_request_options(model, options);
         if self.should_use_responses_api(model) {
             let url = format!("{}/v1/responses", self.base_url.read().unwrap());
-            let body = Self::build_responses_body(
+            let body = Self::build_responses_body_with_options(
                 model,
                 &messages,
                 temperature,
@@ -856,9 +1343,14 @@ impl UnifiedGateway {
                 tools,
                 tool_choice,
                 true,
+                options,
             );
-            return self.send_stream_request(&url, body).await;
+            return self
+                .send_stream_request_traced(&url, body, SseDialect::Responses)
+                .await;
         }
+
+        Self::validate_chat_reasoning_tool_choice(model, tools.is_some(), tool_choice, options)?;
 
         let url = format!("{}/v1/chat/completions", self.base_url.read().unwrap());
         let mut body = serde_json::json!({
@@ -877,15 +1369,24 @@ impl UnifiedGateway {
             body["tools"] = serde_json::json!(t);
             body["tool_choice"] = Self::parse_tool_choice(tool_choice.unwrap_or("auto"));
         }
+        Self::apply_chat_request_options(&mut body, model, options);
 
-        self.send_stream_request(&url, body).await
+        self.send_stream_request_traced(&url, body, SseDialect::ChatCompletions)
+            .await
     }
 
-    async fn send_stream_request(
+    async fn send_stream_request_traced(
         &self,
         url: &str,
         body: Value,
-    ) -> Result<MessageStream, CoreError> {
+        dialect: SseDialect,
+    ) -> Result<(MessageStream, GatewayCallMetadata), CoreError> {
+        let started_at = Instant::now();
+        let endpoint = match dialect {
+            SseDialect::Responses => "responses",
+            SseDialect::ChatCompletions => "chat_completions",
+        }
+        .to_string();
         let model = body
             .get("model")
             .and_then(Value::as_str)
@@ -902,19 +1403,41 @@ impl UnifiedGateway {
             .header("Accept", "text/event-stream")
             .json(&body);
 
-        let response = req.send().await.map_err(|e| CoreError::Internal {
-            message: format!("Stream request failed: {}", e),
+        let response = req.send().await.map_err(|e| {
+            let kind = GatewayFailureKind::from_reqwest(&e, false);
+            warn!(
+                error_class = kind.error_class(),
+                http_status = e.status().map(|status| status.as_u16()),
+                "LLM stream request failed"
+            );
+            kind.into_core_error("provider stream dispatch failed")
         })?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(CoreError::Internal {
-                message: format!("Stream API error ({status})"),
-            });
+            let kind = GatewayFailureKind::from_status(status);
+            warn!(
+                status = %status,
+                error_class = kind.error_class(),
+                "LLM stream API returned an error status"
+            );
+            return Err(
+                kind.into_core_error(format!("provider stream returned HTTP {}", status.as_u16()))
+            );
         }
 
         info!(model = %body["model"], "Stream request started");
-        Ok(MessageStream::new(response))
+        Ok((
+            MessageStream::with_dialect(response, dialect),
+            GatewayCallMetadata {
+                endpoint,
+                attempts: 1,
+                cache_hit: false,
+                latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                http_status: Some(status.as_u16()),
+                provider_response_id: None,
+            },
+        ))
     }
 }
 
@@ -939,6 +1462,26 @@ mod tests {
         assert!(!UnifiedGateway::is_retryable_status(
             reqwest::StatusCode::UNAUTHORIZED
         ));
+    }
+
+    #[test]
+    fn gateway_failure_metadata_recovers_only_safe_kernel_fields() {
+        let client =
+            GatewayFailureKind::ProviderHttpClient.into_core_error("provider returned HTTP 400");
+        assert_eq!(gateway_error_class(&client), Some("provider_http_client"));
+        assert_eq!(gateway_error_http_status(&client), Some(400));
+        assert_eq!(gateway_error_retryable(&client), Some(false));
+
+        let transient = GatewayFailureKind::ProviderHttpTransient
+            .into_core_error("provider stream returned HTTP 503");
+        assert_eq!(gateway_error_http_status(&transient), Some(503));
+        assert_eq!(gateway_error_retryable(&transient), Some(true));
+
+        let arbitrary = CoreError::Internal {
+            message: "upstream body mentioned provider returned HTTP 418".to_string(),
+        };
+        assert_eq!(gateway_error_http_status(&arbitrary), None);
+        assert_eq!(gateway_error_retryable(&arbitrary), None);
     }
 
     #[test]
@@ -1102,6 +1645,237 @@ mod tests {
     }
 
     #[test]
+    fn responses_replays_assistant_reasoning_before_tool_round_trip() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I will inspect it.".to_string(),
+                name: None,
+                tool_calls: Some(vec![ToolCallPayload {
+                    id: "call_7".to_string(),
+                    call_type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: "file_read".to_string(),
+                        arguments: r#"{"path":"README.md"}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: Some("The repository evidence is needed first.".to_string()),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "project details".to_string(),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_7".to_string()),
+                reasoning_content: None,
+            },
+        ];
+
+        let (_, input) = UnifiedGateway::responses_input_items(&messages);
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            "The repository evidence is needed first."
+        );
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_7");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_7");
+    }
+
+    #[test]
+    fn responses_reasoning_effort_omits_none_and_serializes_supported_values() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "plan".to_string(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let legacy = UnifiedGateway::build_responses_body(
+            "deepseek-v4-flash",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+        );
+        assert!(legacy.get("reasoning").is_none());
+
+        let provider_default = UnifiedGateway::build_responses_body_with_options(
+            "deepseek-v4-flash",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::None),
+        );
+        assert!(provider_default.get("reasoning").is_none());
+
+        let disabled = UnifiedGateway::build_responses_body_with_options(
+            "deepseek-v4-flash",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Disabled),
+        );
+        assert_eq!(disabled["reasoning"]["effort"], "none");
+
+        let bounded = UnifiedGateway::build_responses_body_with_options(
+            "deepseek-v4-flash",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Low),
+        );
+        assert_eq!(bounded["reasoning"]["effort"], "low");
+
+        let deepseek_max = UnifiedGateway::build_responses_body_with_options(
+            "deepseek-v4-flash",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Max),
+        );
+        assert_eq!(deepseek_max["reasoning"]["effort"], "max");
+
+        let unknown = UnifiedGateway::build_responses_body_with_options(
+            "custom-alias",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert!(unknown.get("reasoning").is_none());
+
+        let capped = UnifiedGateway::build_responses_body_with_options(
+            "gpt-5",
+            &messages,
+            None,
+            Some(4_096),
+            None,
+            None,
+            false,
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Max),
+        );
+        assert_eq!(capped["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn chat_reasoning_extensions_are_capability_scoped_and_none_is_omitted() {
+        let mut legacy = serde_json::json!({"model": "deepseek", "messages": []});
+        UnifiedGateway::apply_chat_request_options(
+            &mut legacy,
+            "deepseek-v4-flash",
+            LlmRequestOptions::default(),
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let mut provider_default = legacy.clone();
+        UnifiedGateway::apply_chat_request_options(
+            &mut provider_default,
+            "deepseek-v4-flash",
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::None),
+        );
+        assert!(provider_default.get("thinking").is_none());
+        assert!(provider_default.get("reasoning_effort").is_none());
+
+        let mut disabled = serde_json::json!({"model": "deepseek-v4-flash", "messages": []});
+        UnifiedGateway::apply_chat_request_options(
+            &mut disabled,
+            "deepseek-v4-flash",
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Disabled),
+        );
+        assert_eq!(disabled["thinking"]["type"], "disabled");
+        assert!(disabled.get("reasoning_effort").is_none());
+
+        let mut enabled = legacy;
+        UnifiedGateway::apply_chat_request_options(
+            &mut enabled,
+            "deepseek-v4-flash",
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(enabled["thinking"]["type"], "enabled");
+        assert_eq!(enabled["reasoning_effort"], "high");
+
+        let mut with_tools = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [],
+            "tools": [{"type":"function","function":{"name":"file_read"}}],
+            "tool_choice": "auto"
+        });
+        UnifiedGateway::apply_chat_request_options(
+            &mut with_tools,
+            "deepseek-v4-flash",
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert_eq!(with_tools["thinking"]["type"], "enabled");
+        assert_eq!(with_tools["reasoning_effort"], "high");
+        assert!(with_tools.get("tool_choice").is_none());
+
+        assert!(UnifiedGateway::validate_chat_reasoning_tool_choice(
+            "deepseek-v4-flash",
+            true,
+            Some("required"),
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::High),
+        )
+        .is_err());
+        assert!(UnifiedGateway::validate_chat_reasoning_tool_choice(
+            "deepseek-v4-flash",
+            true,
+            Some("required"),
+            LlmRequestOptions::default(),
+        )
+        .is_err());
+        assert!(UnifiedGateway::validate_chat_reasoning_tool_choice(
+            "deepseek-v4-flash",
+            true,
+            Some("required"),
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Disabled),
+        )
+        .is_ok());
+
+        let mut unknown = serde_json::json!({"model": "custom-alias", "messages": []});
+        UnifiedGateway::apply_chat_request_options(
+            &mut unknown,
+            "custom-alias",
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::High),
+        );
+        assert!(unknown.get("thinking").is_none());
+        assert!(unknown.get("reasoning_effort").is_none());
+
+        let mut openai = serde_json::json!({"model": "gpt-5", "messages": []});
+        UnifiedGateway::apply_chat_request_options(
+            &mut openai,
+            "gpt-5",
+            LlmRequestOptions::default().with_reasoning_effort(ReasoningEffort::Max),
+        );
+        assert!(openai.get("thinking").is_none());
+        assert_eq!(openai["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn test_parse_responses_response_extracts_output() {
         let json = serde_json::json!({
             "id": "resp_1",
@@ -1110,7 +1884,7 @@ mod tests {
             "output": [
                 {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "I think..."}]},
                 {"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "The answer is 42", "annotations": []}]},
-                {"type": "function_call", "id": "fc_1", "call_id": "call_9", "name": "search", "arguments": "{\"q\":\"rust\"}"}
+                {"type": "function_call", "id": "fc_must_not_replace_call_id", "call_id": " provider/CALL:Raw#09 ", "name": "search", "arguments": "{\"q\":\"rust\"}"}
             ],
             "usage": {"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
             "store": false
@@ -1129,7 +1903,7 @@ mod tests {
 
         let calls = message.tool_calls.as_ref().expect("tool calls present");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_9");
+        assert_eq!(calls[0].id, " provider/CALL:Raw#09 ");
         assert_eq!(calls[0].function.name, "search");
         assert_eq!(calls[0].function.arguments, r#"{"q":"rust"}"#);
 
@@ -1156,6 +1930,24 @@ mod tests {
         );
         assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
         assert!(response.choices[0].message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn responses_function_call_never_falls_back_from_call_id_to_item_id() {
+        let json = serde_json::json!({
+            "id": "resp_missing_call_id",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_is_not_a_call_id",
+                "name": "search",
+                "arguments": "{}"
+            }]
+        });
+        let error = UnifiedGateway::parse_responses_response(&json)
+            .expect_err("missing provider call_id must fail closed");
+        assert!(error.to_string().contains("omitted required call_id"));
+        assert!(!error.to_string().contains("fc_is_not_a_call_id"));
     }
 
     #[test]

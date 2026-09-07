@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6,13 +6,93 @@ use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::tools::hooks::{FunctionHook, HookContext, HookManager, HookPoint, HookResult};
 
-/// Global shared audit log accessible to HTTP endpoints.
-pub static GUARD_AUDIT_LOG: Lazy<Arc<RwLock<Vec<GuardAuditEntry>>>> =
-    Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
+/// Maximum number of retained entries in each ToolGuard audit window.
+///
+/// Both the per-instance log and the process-wide HTTP log use this bound, so
+/// an agent that repeatedly invokes a failing tool cannot grow process memory
+/// without limit. Entries are exposed oldest-to-newest within the retained
+/// window.
+pub const GUARD_AUDIT_LOG_CAPACITY: usize = 4_096;
+
+/// Fixed-capacity FIFO audit window backed by a ring buffer.
+///
+/// `push` is the only insertion API: once full, it evicts the oldest entry.
+/// The inherent `clone` method intentionally returns a `Vec` snapshot to keep
+/// the existing HTTP read-side contract source-compatible.
+#[derive(Debug)]
+pub struct GuardAuditBuffer {
+    entries: VecDeque<GuardAuditEntry>,
+    capacity: usize,
+    dropped_entries: u64,
+}
+
+impl GuardAuditBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
+            dropped_entries: 0,
+        }
+    }
+
+    pub fn push(&mut self, mut entry: GuardAuditEntry) {
+        entry.sanitize_for_storage();
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+            self.dropped_entries = self.dropped_entries.saturating_add(1);
+        }
+        self.entries.push_back(entry);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &GuardAuditEntry> {
+        self.entries.iter()
+    }
+
+    pub fn retain<F>(&mut self, predicate: F)
+    where
+        F: FnMut(&GuardAuditEntry) -> bool,
+    {
+        self.entries.retain(predicate);
+    }
+
+    pub fn dropped_entries(&self) -> u64 {
+        self.dropped_entries
+    }
+
+    pub fn snapshot(&self) -> Vec<GuardAuditEntry> {
+        self.entries.iter().cloned().collect()
+    }
+
+    /// Compatibility snapshot for the existing `GUARD_AUDIT_LOG` reader.
+    #[allow(clippy::should_implement_trait)]
+    pub fn clone(&self) -> Vec<GuardAuditEntry> {
+        self.snapshot()
+    }
+}
+
+impl Default for GuardAuditBuffer {
+    fn default() -> Self {
+        Self::with_capacity(GUARD_AUDIT_LOG_CAPACITY)
+    }
+}
+
+/// Global bounded audit window accessible to HTTP endpoints.
+pub static GUARD_AUDIT_LOG: Lazy<Arc<RwLock<GuardAuditBuffer>>> =
+    Lazy::new(|| Arc::new(RwLock::new(GuardAuditBuffer::default())));
 
 // ─── Tool Category ───
 
@@ -62,7 +142,60 @@ pub struct GuardAuditEntry {
     pub pre_injected: bool,
     pub validation_passed: bool,
     pub retry_count: u32,
+    /// Backwards-compatible failure field. It contains a stable category, not
+    /// raw stderr, response bodies, commands, or validator messages.
     pub error: Option<String>,
+    /// Byte length of the sensitive failure detail before redaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_length: Option<usize>,
+    /// SHA-256 of the sensitive failure detail before redaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_sha256: Option<String>,
+    /// Non-sensitive process exit status, when the failure was a command exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+}
+
+impl GuardAuditEntry {
+    fn sanitize_for_storage(&mut self) {
+        self.tool_name = bounded_audit_label(&self.tool_name);
+        self.agent_id = bounded_audit_label(&self.agent_id);
+        if !self
+            .error_sha256
+            .as_deref()
+            .is_some_and(is_sha256_hex_digest)
+        {
+            self.error_sha256 = None;
+        }
+
+        let Some(raw_error) = self.error.as_deref() else {
+            self.error_length = None;
+            self.error_sha256 = None;
+            self.exit_code = None;
+            return;
+        };
+        if matches!(
+            raw_error,
+            "non_zero_exit"
+                | "structured_tool_error"
+                | "command_validation_failure"
+                | "validation_failure"
+                | "external_failure"
+        ) {
+            return;
+        }
+
+        // The buffer is a security boundary even for direct public callers:
+        // legacy/free-form errors are reduced to the same redacted shape.
+        self.error_length = Some(raw_error.len());
+        self.error_sha256 = Some(hex::encode(Sha256::digest(raw_error.as_bytes())));
+        self.error = Some("external_failure".to_string());
+        self.exit_code = None;
+    }
+}
+
+fn is_sha256_hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +249,14 @@ pub enum ValidationOutcome {
     Fail(String),
 }
 
+/// Structured, non-policy feedback emitted by ToolGuard post-validation.
+///
+/// A failed or incomplete tool result is useful model-visible evidence, not a
+/// disclosure-policy decision. Keeping the feedback on the hook context lets
+/// observability and later hooks inspect it without overloading
+/// `HookResult::Abort`.
+pub const TOOL_GUARD_VALIDATION_FEEDBACK_KEY: &str = "toolguard_validation_feedback";
+
 // ─── ToolGuard ───
 
 /// State per file for cumulative read tracking.
@@ -133,7 +274,7 @@ pub struct ToolGuard {
     pre_injections: Arc<RwLock<HashMap<ToolCategory, Vec<PreInjectionRule>>>>,
     validations: Arc<RwLock<HashMap<ToolCategory, Vec<ValidationRule>>>>,
     tool_categories: HashMap<String, ToolCategory>,
-    audit_log: Arc<RwLock<Vec<GuardAuditEntry>>>,
+    audit_log: Arc<RwLock<GuardAuditBuffer>>,
     config_path: Arc<RwLock<Option<String>>>,
     /// Per-file cumulative read tracking with attempt limit (max 3 per file).
     file_coverage: Arc<Mutex<HashMap<String, FileCoverage>>>,
@@ -141,13 +282,160 @@ pub struct ToolGuard {
     stale_check: Arc<RwLock<Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>>>,
 }
 
+#[derive(Debug)]
+struct AuditFailure {
+    category: String,
+    detail_length: usize,
+    detail_sha256: String,
+    exit_code: Option<i64>,
+}
+
+impl AuditFailure {
+    fn from_validation(validator: &str, result: &Value, fallback_message: &str) -> Self {
+        let exit_code = result.get("exit_code").and_then(Value::as_i64);
+        let (category, detail) = if validator == "exit_code_check" {
+            if exit_code.is_some_and(|code| code != 0) {
+                (
+                    "non_zero_exit".to_string(),
+                    result
+                        .get("stderr")
+                        .and_then(Value::as_str)
+                        .map(str::as_bytes)
+                        .unwrap_or_else(|| fallback_message.as_bytes()),
+                )
+            } else if let Some(error) = result.get("error") {
+                (
+                    "structured_tool_error".to_string(),
+                    error
+                        .as_str()
+                        .map(str::as_bytes)
+                        .unwrap_or_else(|| fallback_message.as_bytes()),
+                )
+            } else {
+                (
+                    "command_validation_failure".to_string(),
+                    fallback_message.as_bytes(),
+                )
+            }
+        } else {
+            (
+                "validation_failure".to_string(),
+                fallback_message.as_bytes(),
+            )
+        };
+
+        Self {
+            category,
+            detail_length: detail.len(),
+            detail_sha256: hex::encode(Sha256::digest(detail)),
+            exit_code: exit_code.filter(|code| *code != 0),
+        }
+    }
+}
+
+const MAX_AUDIT_LABEL_BYTES: usize = 256;
+
+/// Bound attacker-influenced labels even though the number of entries itself
+/// is bounded. The digest keeps a stable identity when truncation is needed.
+fn bounded_audit_label(value: &str) -> String {
+    if value.len() <= MAX_AUDIT_LABEL_BYTES {
+        return value.to_string();
+    }
+
+    let mut prefix_end = MAX_AUDIT_LABEL_BYTES / 2;
+    while !value.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    format!(
+        "{}...[bytes={},sha256={}]",
+        &value[..prefix_end],
+        value.len(),
+        hex::encode(Sha256::digest(value.as_bytes()))
+    )
+}
+
 impl ToolGuard {
+    /// Command tools normally express an expected process failure with only a
+    /// non-zero exit code. Results carrying an `error` field are logged by the
+    /// execution layer, so ToolGuard must not emit a second warning for them.
+    fn nonzero_exit_without_error_field(result: &Value) -> Option<i64> {
+        result
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .filter(|exit_code| *exit_code != 0 && result.get("error").is_none())
+    }
+
+    fn record_audit(
+        &self,
+        ctx: &HookContext,
+        tool_name: &str,
+        validation_passed: bool,
+        failure: Option<AuditFailure>,
+    ) {
+        let (error, error_length, error_sha256, exit_code) = match failure {
+            Some(failure) => (
+                Some(failure.category),
+                Some(failure.detail_length),
+                Some(failure.detail_sha256),
+                failure.exit_code,
+            ),
+            None => (None, None, None, None),
+        };
+        let entry = GuardAuditEntry {
+            timestamp: chrono::Utc::now().timestamp(),
+            tool_name: bounded_audit_label(tool_name),
+            agent_id: bounded_audit_label(&ctx.agent_id),
+            pre_injected: true,
+            validation_passed,
+            retry_count: 0,
+            error,
+            error_length,
+            error_sha256,
+            exit_code,
+        };
+        self.audit_log.write().push(entry.clone());
+        GUARD_AUDIT_LOG.write().push(entry);
+    }
+
+    fn attach_validation_feedback(
+        ctx: &mut HookContext,
+        tool_name: &str,
+        rule: &ValidationRule,
+        message: &str,
+    ) {
+        let diagnostic = format!(
+            "ToolGuard: {} - {}. Fix suggestion: {}",
+            tool_name, message, rule.fix_instruction
+        );
+        ctx.error = Some(diagnostic);
+        let feedback = json!({
+            "tool_name": tool_name,
+            "validator": rule.validator,
+            "classification": if rule.validator == "exit_code_check" {
+                "tool_execution_failure"
+            } else {
+                "tool_result_quality_failure"
+            },
+            "message": message,
+            "fix_instruction": rule.fix_instruction,
+            "blocks_disclosure": false,
+        });
+        match ctx
+            .metadata
+            .entry(TOOL_GUARD_VALIDATION_FEEDBACK_KEY.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            Value::Array(items) => items.push(feedback),
+            slot => *slot = Value::Array(vec![feedback]),
+        }
+    }
+
     pub fn new() -> Self {
         let guard = Self {
             pre_injections: Arc::new(RwLock::new(HashMap::new())),
             validations: Arc::new(RwLock::new(HashMap::new())),
             tool_categories: Self::default_tool_categories(),
-            audit_log: Arc::new(RwLock::new(Vec::new())),
+            audit_log: Arc::new(RwLock::new(GuardAuditBuffer::default())),
             config_path: Arc::new(RwLock::new(None)),
             file_coverage: Arc::new(Mutex::new(HashMap::new())),
             stale_check: Arc::new(RwLock::new(None)),
@@ -164,7 +452,7 @@ impl ToolGuard {
             pre_injections: Arc::new(RwLock::new(HashMap::new())),
             validations: Arc::new(RwLock::new(HashMap::new())),
             tool_categories: Self::default_tool_categories(),
-            audit_log: Arc::new(RwLock::new(Vec::new())),
+            audit_log: Arc::new(RwLock::new(GuardAuditBuffer::default())),
             config_path: Arc::new(RwLock::new(Some(
                 path.as_ref().to_string_lossy().to_string(),
             ))),
@@ -307,6 +595,16 @@ impl ToolGuard {
                 },
                 PreInjectionRule {
                     enforcement: EnforcementLevel::Must,
+                    instruction: "For an expected-negative scenario (invalid input, rejection, or error-path test), \
+                        prefer a project test-framework assertion. If an ad-hoc shell check is necessary, wrap it so \
+                        the overall command exits zero only when the exact expected exit class and observable condition \
+                        are both satisfied, and exits non-zero on unexpected acceptance, the wrong failure, timeout, \
+                        setup failure, or shell error. Never use `|| true` or unconditional exit-code suppression."
+                        .to_string(),
+                    tool_names: vec!["bash".to_string(), "powershell".to_string()],
+                },
+                PreInjectionRule {
+                    enforcement: EnforcementLevel::Must,
                     instruction: "All commands must be executed within the current working directory (workspace). \
                         Do NOT access directories outside the workspace. When using cd, do not go beyond the workspace boundary. \
                         Your workspace boundary is managed by the system; directories outside are unrelated to the current task."
@@ -320,7 +618,7 @@ impl ToolGuard {
             vec![ValidationRule {
                 validator: "exit_code_check".to_string(),
                 params: HashMap::new(),
-                fix_instruction: "Command exited with non-zero code. Please analyze stderr for error information, fix the issue, and retry."
+                fix_instruction: "Command exited with non-zero code. Analyze stderr, fix the issue, and retry. If the child failure was intentionally exercised as a negative scenario, rerun it as an exact assertion wrapper that exits zero only for the intended rejection; do not suppress arbitrary failures."
                     .to_string(),
                 max_retries: 2,
             }],
@@ -435,6 +733,10 @@ impl ToolGuard {
                     if let Some(rules) = pre_guard.pre_injections.read().get(category) {
                         let instructions: Vec<String> = rules
                             .iter()
+                            .filter(|rule| {
+                                rule.tool_names.is_empty()
+                                    || rule.tool_names.iter().any(|name| name == &tool_name)
+                            })
                             .map(|r| {
                                 let tag = match r.enforcement {
                                     EnforcementLevel::Must => "MUST",
@@ -444,15 +746,18 @@ impl ToolGuard {
                                 format!("[ToolGuard-{}] {}", tag, r.instruction)
                             })
                             .collect();
-                        ctx.metadata.insert(
-                            "guard_pre_injections".to_string(),
-                            Value::Array(instructions.into_iter().map(Value::String).collect()),
-                        );
-                        debug!(
-                            tool = %tool_name,
-                            "ToolGuard: Pre-injection applied ({} rules)",
-                            rules.len()
-                        );
+                        if !instructions.is_empty() {
+                            let applied_count = instructions.len();
+                            ctx.metadata.insert(
+                                "guard_pre_injections".to_string(),
+                                Value::Array(instructions.into_iter().map(Value::String).collect()),
+                            );
+                            debug!(
+                                tool = %tool_name,
+                                "ToolGuard: Pre-injection applied ({} rules)",
+                                applied_count
+                            );
+                        }
                     }
                 }
 
@@ -548,37 +853,53 @@ impl ToolGuard {
                                         }
                                     }
 
-                                    let error_msg = format!(
-                                        "ToolGuard: {} - {}. Fix suggestion: {}",
-                                        tool_name, msg, rule.fix_instruction
+                                    // ToolGuard validators assess result
+                                    // quality/completeness; they are not
+                                    // confidentiality policies. Preserve the
+                                    // actual result so the model can diagnose
+                                    // an empty read, HTTP failure, incomplete
+                                    // search, or command error. A separate
+                                    // policy hook may still Abort later in the
+                                    // chain and withhold disclosure.
+                                    ToolGuard::attach_validation_feedback(
+                                        ctx, &tool_name, rule, &msg,
                                     );
-                                    warn!(
-                                        tool = %tool_name,
-                                        reason = %msg,
-                                        "ToolGuard: Validation failed"
+                                    let failure = AuditFailure::from_validation(
+                                        &rule.validator,
+                                        &result,
+                                        &msg,
                                     );
-                                    ctx.error = Some(error_msg);
-
-                                    post_guard.audit_log.write().push(GuardAuditEntry {
-                                        timestamp: chrono::Utc::now().timestamp(),
-                                        tool_name: tool_name.clone(),
-                                        agent_id: ctx.agent_id.clone(),
-                                        pre_injected: true,
-                                        validation_passed: false,
-                                        retry_count: 0,
-                                        error: Some(msg.clone()),
-                                    });
-                                    GUARD_AUDIT_LOG.write().push(GuardAuditEntry {
-                                        timestamp: chrono::Utc::now().timestamp(),
-                                        tool_name: tool_name.clone(),
-                                        agent_id: ctx.agent_id.clone(),
-                                        pre_injected: true,
-                                        validation_passed: false,
-                                        retry_count: 0,
-                                        error: Some(msg),
-                                    });
-
-                                    return HookResult::Abort;
+                                    post_guard.record_audit(ctx, &tool_name, false, Some(failure));
+                                    if rule.validator == "exit_code_check" {
+                                        if let Some(exit_code) =
+                                            ToolGuard::nonzero_exit_without_error_field(&result)
+                                        {
+                                            // One metadata-only root-cause
+                                            // line for normal command
+                                            // failures. stderr and command
+                                            // content remain in the
+                                            // model-visible tool result and
+                                            // are intentionally not logged.
+                                            warn!(
+                                                tool = %tool_name,
+                                                exit_code,
+                                                "Tool execution returned non-zero exit status"
+                                            );
+                                        } else {
+                                            debug!(
+                                                tool = %tool_name,
+                                                validator = %rule.validator,
+                                                "ToolGuard validation retained as non-blocking result feedback"
+                                            );
+                                        }
+                                    } else {
+                                        debug!(
+                                            tool = %tool_name,
+                                            validator = %rule.validator,
+                                            "ToolGuard validation retained as non-blocking result feedback"
+                                        );
+                                    }
+                                    return HookResult::Continue;
                                 }
                                 ValidationOutcome::Warn(msg) => {
                                     warn!(
@@ -591,24 +912,7 @@ impl ToolGuard {
                             }
                         }
 
-                        post_guard.audit_log.write().push(GuardAuditEntry {
-                            timestamp: chrono::Utc::now().timestamp(),
-                            tool_name: tool_name.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            pre_injected: true,
-                            validation_passed: true,
-                            retry_count: 0,
-                            error: None,
-                        });
-                        GUARD_AUDIT_LOG.write().push(GuardAuditEntry {
-                            timestamp: chrono::Utc::now().timestamp(),
-                            tool_name: tool_name.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            pre_injected: true,
-                            validation_passed: true,
-                            retry_count: 0,
-                            error: None,
-                        });
+                        post_guard.record_audit(ctx, &tool_name, true, None);
                     }
                 }
 
@@ -639,7 +943,7 @@ impl ToolGuard {
     // ─── Audit ───
 
     pub fn get_audit_log(&self) -> Vec<GuardAuditEntry> {
-        self.audit_log.read().clone()
+        self.audit_log.read().snapshot()
     }
 
     pub fn get_audit_stats(&self) -> GuardStats {
@@ -814,6 +1118,7 @@ impl ToolGuard {
 mod validators {
     use super::ValidationOutcome;
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
 
     pub fn file_length_check(result: &Value) -> ValidationOutcome {
         // Cache hit: content already provided in a previous read, skip length check
@@ -901,12 +1206,21 @@ mod validators {
             if ec != 0 {
                 let stderr = result["stderr"].as_str().unwrap_or("");
                 return ValidationOutcome::Fail(format!(
-                    "Non-zero exit code: {}, stderr: {}",
+                    "Non-zero exit code: {}; stderr_length: {}; stderr_sha256: {}",
                     ec,
-                    &stderr.chars().take(200).collect::<String>()
+                    stderr.len(),
+                    hex::encode(Sha256::digest(stderr.as_bytes()))
                 ));
             }
-        } else if result.get("error").is_some() {
+        }
+        let has_structured_error = match result.get("error") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+            Some(Value::String(message)) => !message.trim().is_empty(),
+            Some(Value::Array(items)) => !items.is_empty(),
+            Some(Value::Object(fields)) => !fields.is_empty(),
+            Some(_) => true,
+        };
+        if has_structured_error {
             return ValidationOutcome::Fail("Command execution returned error".to_string());
         }
         ValidationOutcome::Pass
@@ -1062,6 +1376,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shell_pre_injection_requires_exact_negative_assertions_and_honors_tool_scope() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+
+        let mut bash_ctx = HookContext::new(HookPoint::SkillBefore, "test_agent", "CA")
+            .with_data("tool_name", Value::String("bash".to_string()));
+        let decision = manager
+            .execute_decision(HookPoint::SkillBefore, &mut bash_ctx)
+            .await;
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Continue);
+        let injections = bash_ctx
+            .metadata
+            .get("guard_pre_injections")
+            .and_then(Value::as_array)
+            .expect("bash must receive its CodeExecution guard rules");
+        let combined = injections
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(combined.contains("expected-negative scenario"));
+        assert!(combined.contains("exact expected exit class and observable condition"));
+        assert!(combined.contains("Never use `|| true`"));
+
+        let mut code_ctx = HookContext::new(HookPoint::SkillBefore, "test_agent", "CA")
+            .with_data("tool_name", Value::String("code_execute".to_string()));
+        manager
+            .execute_decision(HookPoint::SkillBefore, &mut code_ctx)
+            .await;
+        assert!(
+            !code_ctx.metadata.contains_key("guard_pre_injections"),
+            "shell-scoped rules must not leak to another tool in the same category"
+        );
+    }
+
     #[test]
     fn test_file_length_check_pass() {
         let result = json!({"content": "full file content here"});
@@ -1095,6 +1446,312 @@ mod tests {
         let result = json!({"exit_code": 1, "stderr": "error occurred"});
         let outcome = validators::exit_code_check(&result);
         assert!(matches!(outcome, ValidationOutcome::Fail(_)));
+    }
+
+    #[test]
+    fn test_exit_code_check_does_not_ignore_structured_error_with_zero_exit() {
+        let result = json!({"exit_code": 0, "error": {"kind": "runtime"}});
+        let outcome = validators::exit_code_check(&result);
+        assert!(matches!(outcome, ValidationOutcome::Fail(_)));
+    }
+
+    #[test]
+    fn only_plain_nonzero_exit_owns_the_toolguard_root_cause_log() {
+        assert_eq!(
+            ToolGuard::nonzero_exit_without_error_field(
+                &json!({"exit_code": 2, "stderr": "syntax error"})
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            ToolGuard::nonzero_exit_without_error_field(
+                &json!({"exit_code": 2, "error": "spawn wrapper failed"})
+            ),
+            None,
+            "the execution layer owns results with an error field"
+        );
+        assert_eq!(
+            ToolGuard::nonzero_exit_without_error_field(&json!({"exit_code": 0})),
+            None
+        );
+    }
+
+    fn skill_after_context(tool_name: &str, result: Value) -> HookContext {
+        HookContext::new(HookPoint::SkillAfter, "test_agent", "DA")
+            .with_data("tool_name", Value::String(tool_name.to_string()))
+            .with_data("tool_result", Value::String(result.to_string()))
+    }
+
+    #[tokio::test]
+    async fn bash_non_zero_exit_is_diagnostic_not_disclosure_abort() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+        let mut ctx = skill_after_context(
+            "bash",
+            json!({"exit_code": 2, "stdout": "", "stderr": "syntax error"}),
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillAfter, &mut ctx)
+            .await;
+
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Continue);
+        assert_eq!(decision.terminal_hook, None);
+        assert!(ctx
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Non-zero exit code: 2")));
+        let feedback = ctx
+            .metadata
+            .get(TOOL_GUARD_VALIDATION_FEEDBACK_KEY)
+            .and_then(Value::as_array)
+            .expect("failed command must retain structured validation feedback");
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0]["classification"], "tool_execution_failure");
+        assert_eq!(feedback[0]["blocks_disclosure"], false);
+        assert!(feedback[0]["fix_instruction"]
+            .as_str()
+            .is_some_and(|instruction| instruction.contains("exact assertion wrapper")));
+        let audit = guard.get_audit_log();
+        assert_eq!(audit.len(), 1);
+        assert!(!audit[0].validation_passed);
+        assert_eq!(audit[0].error.as_deref(), Some("non_zero_exit"));
+        assert_eq!(audit[0].error_length, Some("syntax error".len()));
+        assert_eq!(
+            audit[0].error_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(b"syntax error")).as_str())
+        );
+        assert_eq!(audit[0].exit_code, Some(2));
+        assert!(!serde_json::to_string(&audit)
+            .unwrap()
+            .contains("syntax error"));
+        assert!(!ctx
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("syntax error"));
+        assert!(!ctx.metadata[TOOL_GUARD_VALIDATION_FEEDBACK_KEY]
+            .to_string()
+            .contains("syntax error"));
+    }
+
+    #[test]
+    fn audit_ring_buffer_is_bounded_and_evicts_oldest_first() {
+        let mut log = GuardAuditBuffer::with_capacity(3);
+        for sequence in 0..5 {
+            log.push(GuardAuditEntry {
+                timestamp: sequence,
+                tool_name: "bash".to_string(),
+                agent_id: format!("agent-{sequence}"),
+                pre_injected: true,
+                validation_passed: true,
+                retry_count: 0,
+                error: None,
+                error_length: None,
+                error_sha256: None,
+                exit_code: None,
+            });
+        }
+
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.dropped_entries(), 2);
+        let retained = log.snapshot();
+        assert_eq!(retained[0].agent_id, "agent-2");
+        assert_eq!(retained[1].agent_id, "agent-3");
+        assert_eq!(retained[2].agent_id, "agent-4");
+    }
+
+    #[test]
+    fn audit_ring_buffer_redacts_legacy_free_form_errors_at_insertion_boundary() {
+        let mut log = GuardAuditBuffer::with_capacity(1);
+        let secret = "password=hunter2";
+        log.push(GuardAuditEntry {
+            timestamp: 1,
+            tool_name: "bash".to_string(),
+            agent_id: "external-writer".to_string(),
+            pre_injected: true,
+            validation_passed: false,
+            retry_count: 0,
+            error: Some(secret.to_string()),
+            error_length: None,
+            error_sha256: None,
+            exit_code: Some(99),
+        });
+
+        let retained = log.snapshot();
+        assert_eq!(retained[0].error.as_deref(), Some("external_failure"));
+        assert_eq!(retained[0].error_length, Some(secret.len()));
+        assert_eq!(
+            retained[0].error_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(secret.as_bytes())).as_str())
+        );
+        assert_eq!(retained[0].exit_code, None);
+        assert!(!serde_json::to_string(&retained).unwrap().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_audit_retains_only_category_length_and_sha256() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+        let agent_id = format!("audit-redaction-{}", uuid::Uuid::new_v4().hyphenated());
+        let sensitive_stderr = "SECRET_TOKEN=do-not-retain\ninvalid calculation";
+        let mut ctx = HookContext::new(HookPoint::SkillAfter, &agent_id, "DA")
+            .with_data("tool_name", Value::String("bash".to_string()))
+            .with_data(
+                "tool_result",
+                Value::String(
+                    json!({
+                        "exit_code": 17,
+                        "stdout": "",
+                        "stderr": sensitive_stderr,
+                    })
+                    .to_string(),
+                ),
+            );
+
+        manager
+            .execute_decision(HookPoint::SkillAfter, &mut ctx)
+            .await;
+
+        let audit = guard.get_audit_log();
+        assert_eq!(audit.len(), 1);
+        let entry = &audit[0];
+        assert_eq!(entry.error.as_deref(), Some("non_zero_exit"));
+        assert_eq!(entry.error_length, Some(sensitive_stderr.len()));
+        assert_eq!(
+            entry.error_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(sensitive_stderr.as_bytes())).as_str())
+        );
+        assert_eq!(entry.exit_code, Some(17));
+
+        let serialized = serde_json::to_string(entry).unwrap();
+        assert!(!serialized.contains("SECRET_TOKEN"));
+        assert!(!serialized.contains("do-not-retain"));
+        assert!(!ctx
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("SECRET_TOKEN"));
+        assert!(!ctx.metadata[TOOL_GUARD_VALIDATION_FEEDBACK_KEY]
+            .to_string()
+            .contains("SECRET_TOKEN"));
+
+        GUARD_AUDIT_LOG
+            .write()
+            .retain(|entry| entry.agent_id != agent_id);
+    }
+
+    #[test]
+    fn audit_entry_deserializes_legacy_shape_without_digest_fields() {
+        let entry: GuardAuditEntry = serde_json::from_value(json!({
+            "timestamp": 1,
+            "tool_name": "bash",
+            "agent_id": "legacy-agent",
+            "pre_injected": true,
+            "validation_passed": false,
+            "retry_count": 0,
+            "error": "legacy error"
+        }))
+        .unwrap();
+
+        assert_eq!(entry.error.as_deref(), Some("legacy error"));
+        assert_eq!(entry.error_length, None);
+        assert_eq!(entry.error_sha256, None);
+        assert_eq!(entry.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn code_execute_structured_error_is_diagnostic_not_disclosure_abort() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+        let mut ctx = skill_after_context(
+            "code_execute",
+            json!({"error": "python interpreter unavailable", "language": "python"}),
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillAfter, &mut ctx)
+            .await;
+
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Continue);
+        assert!(ctx
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Command execution returned error")));
+        assert_eq!(
+            ctx.metadata[TOOL_GUARD_VALIDATION_FEEDBACK_KEY][0]["tool_name"],
+            "code_execute"
+        );
+        assert_eq!(
+            decision.records[0].result,
+            crate::tools::hooks::HookResult::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn file_read_error_is_visible_quality_feedback_not_policy_abort() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+        let mut ctx = skill_after_context(
+            "file_read",
+            json!({
+                "path": "/workspace",
+                "total_lines": 0,
+                "returned": 0,
+                "lines": [],
+                "error": "path is a directory"
+            }),
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillAfter, &mut ctx)
+            .await;
+
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Continue);
+        let feedback = ctx.metadata[TOOL_GUARD_VALIDATION_FEEDBACK_KEY]
+            .as_array()
+            .expect("file read failure feedback");
+        assert_eq!(feedback[0]["classification"], "tool_result_quality_failure");
+        assert_eq!(feedback[0]["blocks_disclosure"], false);
+        assert!(ctx
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("File read returned error")));
+    }
+
+    #[tokio::test]
+    async fn genuine_post_execution_policy_abort_remains_terminal() {
+        let guard = ToolGuard::new();
+        let manager = HookManager::new();
+        guard.register_hooks(&manager);
+        manager.register(Box::new(FunctionHook::new(
+            "deny_tool_result_disclosure",
+            vec![HookPoint::SkillAfter],
+            90,
+            |_| HookResult::Abort,
+        )));
+        let mut ctx = skill_after_context(
+            "bash",
+            json!({"exit_code": 9, "stdout": "sensitive", "stderr": "failed"}),
+        );
+
+        let decision = manager
+            .execute_decision(HookPoint::SkillAfter, &mut ctx)
+            .await;
+
+        assert_eq!(decision.control, crate::tools::hooks::HookControl::Abort);
+        assert_eq!(
+            decision.terminal_hook.as_deref(),
+            Some("deny_tool_result_disclosure")
+        );
+        assert_eq!(decision.records.len(), 2);
+        assert_eq!(decision.records[0].hook_name, "toolguard::post_validate");
+        assert_eq!(decision.records[0].result, HookResult::Continue);
+        assert_eq!(decision.records[1].result, HookResult::Abort);
     }
 
     #[test]
@@ -1257,20 +1914,29 @@ mod tests {
 
     #[test]
     fn test_global_audit_log() {
-        // Verify the global log is accessible and writable
-        let initial_len = GUARD_AUDIT_LOG.read().len();
+        // Verify the global log by identity rather than a racy length delta:
+        // SkillAfter tests legitimately append to this process-wide sink in
+        // parallel.
+        let marker = format!("test-agent-{}", uuid::Uuid::new_v4().hyphenated());
         GUARD_AUDIT_LOG.write().push(GuardAuditEntry {
             timestamp: 0,
             tool_name: "test".to_string(),
-            agent_id: "test-agent".to_string(),
+            agent_id: marker.clone(),
             pre_injected: true,
             validation_passed: false,
             retry_count: 1,
-            error: Some("test error".to_string()),
+            error: Some("test_failure".to_string()),
+            error_length: Some(10),
+            error_sha256: Some(hex::encode(Sha256::digest(b"test error"))),
+            exit_code: None,
         });
-        assert_eq!(GUARD_AUDIT_LOG.read().len(), initial_len + 1);
-        // Cleanup
-        GUARD_AUDIT_LOG.write().pop();
+        assert!(GUARD_AUDIT_LOG
+            .read()
+            .iter()
+            .any(|entry| entry.agent_id == marker));
+        GUARD_AUDIT_LOG
+            .write()
+            .retain(|entry| entry.agent_id != marker);
     }
 
     #[test]

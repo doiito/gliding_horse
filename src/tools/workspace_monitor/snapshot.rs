@@ -108,13 +108,15 @@ impl SnapshotManager {
             }
         }
 
-        Self {
+        let manager = Self {
             db,
             content_store,
             inventory,
             workspace_root: std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root),
             index: RwLock::new(index),
-        }
+        };
+        manager.purge_runtime_tree_snapshots();
+        manager
     }
 
     /// Create a snapshot of the current workspace state.
@@ -448,6 +450,82 @@ impl SnapshotManager {
 
     // ── Private ──
 
+    /// Legacy versions could snapshot the monitor's own redb files after they
+    /// leaked into FileInventory. Such a manifest is unsafe as an atomic
+    /// recovery point, so discard it in full and reclaim blobs not shared by a
+    /// remaining valid snapshot.
+    fn purge_runtime_tree_snapshots(&self) -> usize {
+        let rejected = self
+            .index
+            .read()
+            .values()
+            .filter(|snapshot| {
+                snapshot.files.iter().any(|file| {
+                    crate::tools::workspace_monitor::inventory::is_workspace_runtime_path(
+                        Path::new(&file.path),
+                    )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if rejected.is_empty() {
+            return 0;
+        }
+
+        let rejected_ids = rejected
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id.as_str())
+            .collect::<HashSet<_>>();
+        let retained_hashes = self
+            .index
+            .read()
+            .values()
+            .filter(|snapshot| !rejected_ids.contains(snapshot.snapshot_id.as_str()))
+            .flat_map(|snapshot| snapshot.files.iter().map(|file| file.hash.clone()))
+            .collect::<HashSet<_>>();
+        let orphan_hashes = rejected
+            .iter()
+            .flat_map(|snapshot| snapshot.files.iter().map(|file| file.hash.clone()))
+            .filter(|hash| !retained_hashes.contains(hash))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let persisted = (|| {
+            let write_txn = self.db.begin_write().ok()?;
+            {
+                let mut table = write_txn.open_table(SNAPSHOTS).ok()?;
+                for snapshot in &rejected {
+                    let key = format!("snapshot:{}", snapshot.snapshot_id);
+                    table.remove(key.as_str()).ok()?;
+                }
+            }
+            write_txn.commit().ok()?;
+            Some(())
+        })()
+        .is_some();
+        if !persisted {
+            warn!(
+                snapshots = rejected.len(),
+                "SnapshotManager: failed to persist runtime-snapshot cleanup"
+            );
+            return 0;
+        }
+        {
+            let mut index = self.index.write();
+            for snapshot in &rejected {
+                index.remove(&snapshot.snapshot_id);
+            }
+        }
+        let removed_blobs = self.content_store.remove_snapshot_blobs(&orphan_hashes);
+        warn!(
+            snapshots = rejected.len(),
+            removed_blobs,
+            "SnapshotManager: purged legacy snapshots containing workspace runtime state"
+        );
+        rejected.len()
+    }
+
     fn resolve_snapshot_path(&self, raw_path: &str) -> Result<PathBuf, String> {
         let path = Path::new(raw_path);
         let candidate = if path.is_absolute() {
@@ -564,6 +642,86 @@ mod tests {
 
         let fetched = sm.get_snapshot(&id);
         assert_eq!(fetched.unwrap().files[0].hash.starts_with("sha256:"), true);
+    }
+
+    #[test]
+    fn startup_purges_legacy_runtime_snapshot_and_orphan_blob() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let runtime_path = workspace.path().join(".gliding_horse/ws_monitor/content");
+        let source_path = workspace.path().join("source.txt");
+        std::fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+        std::fs::write(&runtime_path, "self-indexed redb bytes").unwrap();
+        std::fs::write(&source_path, "valid source").unwrap();
+
+        let content_store = Arc::new(crate::tools::workspace_monitor::ContentStore::new(
+            10,
+            65_536,
+            Some(
+                Builder::new()
+                    .create_with_backend(InMemoryBackend::new())
+                    .unwrap(),
+            ),
+        ));
+        let (runtime_hash, runtime_size) = content_store
+            .capture_snapshot_file(&runtime_path.to_string_lossy())
+            .unwrap();
+        let (source_hash, source_size) = content_store
+            .capture_snapshot_file(&source_path.to_string_lossy())
+            .unwrap();
+        let snapshot_db = Arc::new(
+            Builder::new()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
+        let make_snapshot = |id: &str, path: &Path, hash: &str, size: u64| WorkspaceSnapshot {
+            schema_version: 1,
+            snapshot_id: id.to_string(),
+            created_at: 1,
+            reason: "legacy".into(),
+            task_iri: None,
+            workspace_root: workspace.path().to_string_lossy().to_string(),
+            files: vec![SnapshotFileEntry {
+                path: path.to_string_lossy().to_string(),
+                hash: hash.to_string(),
+                size,
+            }],
+        };
+        let unsafe_snapshot =
+            make_snapshot("unsafe-runtime", &runtime_path, &runtime_hash, runtime_size);
+        let safe_snapshot = make_snapshot("safe", &source_path, &source_hash, source_size);
+        {
+            let write_txn = snapshot_db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SNAPSHOTS).unwrap();
+                for snapshot in [&unsafe_snapshot, &safe_snapshot] {
+                    let key = format!("snapshot:{}", snapshot.snapshot_id);
+                    let encoded = serde_json::to_vec(snapshot).unwrap();
+                    table.insert(key.as_str(), encoded.as_slice()).unwrap();
+                }
+            }
+            write_txn.commit().unwrap();
+        }
+        let inventory = Arc::new(RwLock::new(
+            crate::tools::workspace_monitor::FileInventory::new(None, None, vec![]),
+        ));
+
+        let manager = SnapshotManager::new(
+            snapshot_db.clone(),
+            content_store.clone(),
+            inventory,
+            workspace.path().to_path_buf(),
+        );
+        assert!(manager.get_snapshot("unsafe-runtime").is_none());
+        assert!(manager.get_snapshot("safe").is_some());
+        assert!(content_store.get_snapshot_blob(&runtime_hash).is_none());
+        assert_eq!(
+            content_store.get_snapshot_blob(&source_hash).unwrap(),
+            b"valid source"
+        );
+        let read_txn = snapshot_db.begin_read().unwrap();
+        let table = read_txn.open_table(SNAPSHOTS).unwrap();
+        assert!(table.get("snapshot:unsafe-runtime").unwrap().is_none());
+        assert!(table.get("snapshot:safe").unwrap().is_some());
     }
 
     #[test]

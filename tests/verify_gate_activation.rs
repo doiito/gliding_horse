@@ -221,11 +221,16 @@ fn verify_skill_before_after_pairing_records_usage() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // SkillBefore: 触发激活,closure 捕获 pending_skill_activation
-    let mut before = ctx_with(HookPoint::SkillBefore, "DA", Some("glob"));
+    let call_id = "verify-skill-pair";
+    let mut before = ctx_with(HookPoint::SkillBefore, "DA", Some("glob"))
+        .with_data("tool_call_id", Value::String(call_id.to_string()));
     rt.block_on(hm.execute(HookPoint::SkillBefore, &mut before));
 
-    // SkillAfter: closure 结算 pending 为 success
-    let mut after = ctx_with(HookPoint::SkillAfter, "DA", Some("glob"));
+    // SkillAfter: production carries the same interaction trace and concrete
+    // tool-call ID across both points, so the correct concurrent window closes.
+    let mut after = ctx_with(HookPoint::SkillAfter, "DA", Some("glob"))
+        .with_trace_id(before.trace_id.clone())
+        .with_data("tool_call_id", Value::String(call_id.to_string()));
     rt.block_on(hm.execute(HookPoint::SkillAfter, &mut after));
 
     let inner = handle.inner();

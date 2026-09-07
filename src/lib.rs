@@ -53,8 +53,15 @@ pub use config::Settings;
 pub use core::{
     agent_instance::{AgentRole, AgentStatus},
     agent_runner::{TaskContext, TaskResult},
-    sa::{CyclePhase, CycleState, ExecutionPlan, PlanStep, TaskComplexity},
-    AgentInstance, AgentRunner, CoreConfig, CoreError, SupervisorAgent,
+    sa::{CyclePhase, CycleState, ExecutionPlan, PlanStep, PlanWorkPackage, TaskComplexity},
+    AgentInstance, AgentRunner, AgentSpecSourceKind, AgentSpecSourceRecord, CompiledAgentPrompt,
+    ContextAdmissionRule, ContextDisposition, ContextFragment, ContextFragmentKind,
+    ContextFreshnessPolicy, ContextPayloadConstraint, ContextPolicyDecision,
+    ContextPolicyRejectionReason, ContextScope, ContextSlot, ContextSlotSelector,
+    ContextSourceKind, ContextSourceRecord, ContextTrustClass, CoreConfig, CoreError,
+    EffectiveContextManifest, EffectiveContextManifestEntry, EffectiveRoleContext,
+    ExecutionPlanProvenance, ExecutionPlanProvenanceError, GeneratedAgentSpec, RoleContext,
+    RoleContextPolicy, SupervisorAgent,
 };
 pub use gateway::UnifiedGateway;
 pub use jsonld::JsonLdContext;

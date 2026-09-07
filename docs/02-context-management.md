@@ -284,7 +284,7 @@ tool_groups:
 ```yaml
 tool_result_compressor:
   enabled: true
-  max_full_results: 2       # 最多保留 2 个完整结果
+  max_full_results: 2       # 最多保留最近 2 个完整工具批次；同轮结果不会被拆分淘汰
   max_summary_length: 200   # 摘要最大长度
   compression_trigger: 10   # 工具调用超过 10 次触发压缩
 ```

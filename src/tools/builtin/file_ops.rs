@@ -463,6 +463,7 @@ fn is_excluded_search_dir(path: &Path) -> bool {
         ".venv",
         "__pycache__",
         ".next",
+        ".gliding_horse",
     ];
     let name = path.file_name().and_then(|name| name.to_str());
     matches!(name, Some(name) if EXCLUDED.contains(&name))

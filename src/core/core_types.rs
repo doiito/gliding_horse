@@ -50,6 +50,9 @@ pub enum CoreError {
     #[error("Internal error: {message}")]
     Internal { message: String },
 
+    #[error("Interaction rejected at '{stage}': {reason}")]
+    InteractionRejected { stage: String, reason: String },
+
     #[error("Permission denied: agent '{agent}' cannot {action} on '{resource}'")]
     PermissionDenied {
         agent: String,

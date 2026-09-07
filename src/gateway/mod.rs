@@ -6,4 +6,4 @@ pub mod unified_gateway;
 pub use cache::ResponseCache;
 pub use model_router::ModelRouter;
 pub use rate_limiter::RateLimiter;
-pub use unified_gateway::UnifiedGateway;
+pub use unified_gateway::{LlmRequestOptions, UnifiedGateway};

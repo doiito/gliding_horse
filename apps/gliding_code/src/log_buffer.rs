@@ -3,6 +3,9 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use glidinghorse::config::settings::LoggingSettings;
+use glidinghorse::utils::{RedactingWriter, SensitiveFieldSanitizer};
+
 /// A shared buffer that captures formatted tracing output line-by-line.
 ///
 /// Lines are appended to a bounded in-memory queue. When `mirror_to_stderr`
@@ -17,13 +20,23 @@ use std::sync::{Arc, Mutex};
 pub struct LogBuffer {
     buffer: Arc<Mutex<VecDeque<String>>>,
     mirror_to_stderr: Arc<AtomicBool>,
+    sanitizer: SensitiveFieldSanitizer,
 }
 
 impl LogBuffer {
     pub fn new() -> Self {
+        Self::with_sensitive_fields(LoggingSettings::default().sensitive_fields)
+    }
+
+    /// Construct a log buffer with an explicit field-redaction policy.
+    /// Production callers normally use [`LogBuffer::new`], which shares the
+    /// core logging defaults; this constructor keeps tests and deployments
+    /// with additional provider-specific secret names deterministic.
+    pub fn with_sensitive_fields(sensitive_fields: Vec<String>) -> Self {
         Self {
             buffer: Arc::new(Mutex::new(VecDeque::new())),
             mirror_to_stderr: Arc::new(AtomicBool::new(false)),
+            sanitizer: SensitiveFieldSanitizer::new(&sensitive_fields),
         }
     }
 
@@ -60,13 +73,16 @@ fn write_line_to_stderr(line: &str) {
 pub struct SharedLogBuffer(pub Arc<LogBuffer>);
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
-    type Writer = LogBufferWriter;
+    type Writer = RedactingWriter<LogBufferWriter>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        LogBufferWriter {
-            buffer: self.0.buffer.clone(),
-            mirror_to_stderr: self.0.mirror_to_stderr.clone(),
-        }
+        RedactingWriter::with_sanitizer(
+            LogBufferWriter {
+                buffer: self.0.buffer.clone(),
+                mirror_to_stderr: self.0.mirror_to_stderr.clone(),
+            },
+            self.0.sanitizer.clone(),
+        )
     }
 }
 
@@ -106,5 +122,53 @@ impl Write for LogBufferWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::*;
+
+    #[test]
+    fn tracing_writer_redacts_fragmented_fields_before_buffering() {
+        let buffer = Arc::new(LogBuffer::with_sensitive_fields(vec![
+            "api_key".to_string(),
+            "authorization".to_string(),
+        ]));
+        let shared = SharedLogBuffer(buffer.clone());
+        {
+            let mut writer = shared.make_writer();
+            writer.write_all(b"event api_").unwrap();
+            writer.write_all(b"key=tui-never-").unwrap();
+            writer.write_all(b"log, status=ok\n").unwrap();
+            writer
+                .write_all(b"authorization: Bearer another-secret")
+                .unwrap();
+        }
+
+        let lines = buffer.drain();
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.contains("[REDACTED]")));
+        assert!(!lines.join("\n").contains("tui-never-log"));
+        assert!(!lines.join("\n").contains("another-secret"));
+    }
+
+    #[test]
+    fn default_tui_policy_covers_core_sensitive_fields() {
+        let buffer = Arc::new(LogBuffer::new());
+        let shared = SharedLogBuffer(buffer.clone());
+        {
+            let mut writer = shared.make_writer();
+            writer
+                .write_all(b"token=default-secret password=hunter2\n")
+                .unwrap();
+        }
+
+        let output = buffer.drain().join("\n");
+        assert_eq!(output.matches("[REDACTED]").count(), 2);
+        assert!(!output.contains("default-secret"));
+        assert!(!output.contains("hunter2"));
     }
 }

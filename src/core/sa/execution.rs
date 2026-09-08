@@ -223,7 +223,21 @@ pub(super) fn direct_response_recheck_tools(
     let workspace_disabled = constraints
         .get(crate::core::agent_runner::WORKSPACE_CONTEXT_SCOPE_CONSTRAINT)
         .is_some_and(|scope| scope == crate::core::agent_runner::WORKSPACE_CONTEXT_DISABLED);
-    (direct_response && workspace_disabled).then(|| vec!["read_agent_output".to_string()])
+    (direct_response && workspace_disabled).then(|| {
+        let mut tools = vec!["read_agent_output".to_string()];
+        if crate::core::agent_runner::required_capability_contract(constraints).is_some() {
+            tools.extend(["web_search".to_string(), "web_fetch".to_string()]);
+        }
+        if constraints
+            .get(crate::core::agent_runner::REQUIRED_VALIDATION_CONSTRAINT)
+            .is_some_and(|validator| {
+                validator == crate::core::agent_runner::REQUIRED_VALIDATION_MERMAID
+            })
+        {
+            tools.push("mermaid_validate".to_string());
+        }
+        tools
+    })
 }
 
 /// Build the evidence passed from one business agent to the next.
@@ -334,9 +348,9 @@ pub(super) fn execution_subject_handoff(result: &TaskResult, max_chars: usize) -
                 == Some("biz_agent_work_package_order_receipt")
         });
     // The order receipt is kernel-produced evidence, not optional DA prose.
-    // Keep it first and complete even when it alone exceeds the ordinary
-    // handoff budget; truncating its executions tail would silently remove the
-    // exact source_work_packages/path evidence needed by an isolated CA.
+    // Keep it complete even when it alone exceeds the ordinary handoff budget;
+    // truncating its executions tail would silently remove the exact
+    // source_work_packages/path evidence needed by an isolated CA.
     let mandatory_receipt = (!order_receipts.is_empty()).then(|| {
         let receipts = order_receipts
             .iter()
@@ -347,6 +361,21 @@ pub(super) fn execution_subject_handoff(result: &TaskResult, max_chars: usize) -
             .join("\n");
         format!("## Kernel Work-Package Order Receipt (complete)\n{receipts}")
     });
+
+    // A typed handoff grants CA exactly this stable AgentTurn capability. Keep
+    // its model-visible spelling before every potentially large section so a
+    // bounded handoff cannot leave CA authorised to read an IRI it never saw.
+    // Child task roots in the order receipt remain useful provenance, but they
+    // are deliberately identified as non-capabilities.
+    let stable_reference = result
+        .archive_iri
+        .as_deref()
+        .filter(|iri| !iri.trim().is_empty())
+        .map(|iri| {
+            format!(
+                "## Stable DA Aggregate Output Capability (kernel-issued)\n`{iri}`\nWhen the inline deliverable is incomplete, call `read_agent_output` with exactly this value as `node_iri`. This is the only cross-agent AgentTurn read target granted for this DA handoff. Fields named `child_task_iri` and child-manifest references below are provenance/task roots, not readable AgentTurn targets."
+            )
+        });
 
     let mut sections = Vec::new();
     if let Some(output) = result.output.as_ref().filter(|value| !value.is_null()) {
@@ -369,39 +398,34 @@ pub(super) fn execution_subject_handoff(result: &TaskResult, max_chars: usize) -
             sanitized_handoff_text(&artifacts)
         ));
     }
-    if let Some(iri) = result
-        .archive_iri
-        .as_deref()
-        .filter(|iri| !iri.trim().is_empty())
-    {
-        sections.push(format!(
-            "## Stable DA Output Reference\n`{}`\nUse `read_agent_output` only when the inline deliverable is incomplete.",
-            iri
-        ));
-    }
     let optional = sections.join("\n\n");
-    match mandatory_receipt {
-        Some(receipt) => {
+    let mandatory = [stable_reference, mandatory_receipt]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    match mandatory.is_empty() {
+        false => {
             if optional.is_empty() {
-                Some(receipt)
+                Some(mandatory)
             } else {
-                let receipt_chars = receipt.chars().count();
+                let mandatory_chars = mandatory.chars().count();
                 let separator_chars = 2usize;
                 let optional_budget = max_chars
                     .max(1)
-                    .saturating_sub(receipt_chars.saturating_add(separator_chars));
+                    .saturating_sub(mandatory_chars.saturating_add(separator_chars));
                 if optional_budget == 0 {
-                    Some(receipt)
+                    Some(mandatory)
                 } else {
                     Some(format!(
-                        "{receipt}\n\n{}",
+                        "{mandatory}\n\n{}",
                         truncate_chars(&optional, optional_budget)
                     ))
                 }
             }
         }
-        None if optional.is_empty() => None,
-        None => Some(truncate_chars(&optional, max_chars.max(1))),
+        true if optional.is_empty() => None,
+        true => Some(truncate_chars(&optional, max_chars.max(1))),
     }
 }
 
@@ -2124,7 +2148,8 @@ fn ca_action_has_consumed_disclosure(action: &crate::core::tracked_action::Track
 fn ca_action_is_executable_verifier(action: &crate::core::tracked_action::TrackedAction) -> bool {
     matches!(
         action.tool_name.as_str(),
-        "bash"
+        "mermaid_validate"
+            | "bash"
             | "powershell"
             | "code_execute"
             | "jsonld_validate"
@@ -2224,6 +2249,7 @@ fn ca_action_has_model_visible_verifier_evidence(
         "bash"
         | "powershell"
         | "code_execute"
+        | "mermaid_validate"
         | "jsonld_validate"
         | "ontology_validate_turtle"
         | "ontology_validate_shacl"
@@ -11542,6 +11568,56 @@ mod terminal_status_tests {
                 .as_ref()
                 .map(|identity| identity.provider_call_id.as_str()),
             Some("call-failed-pytest")
+        );
+    }
+
+    #[test]
+    fn failed_mermaid_receipt_routes_the_observed_response_defect_to_da() {
+        let task_iri = "iri://task/direct-report-mermaid-defect";
+        let mut five_w2h = crate::core::five_w2h::Task5W2H::new(
+            "Return a Markdown report with Mermaid diagrams",
+            "The delivered Mermaid must parse",
+        );
+        five_w2h.why.success_criteria = vec!["Mermaid diagrams parse".to_string()];
+        let mut ca = result(
+            "failed",
+            "FAIL: archived response has no complete Mermaid fence",
+            Some(
+                r#"{"ca_audit":{"overall_verdict":"fail","dimensions":{"what":{"status":"fail","evidence":"exact archived DA response"},"why":{"status":"fail","evidence":"mermaid_validate failed","criteria":[{"criterion":"Mermaid diagrams parse","status":"fail","failure_class":"observed_defect","evidence":"validator found no complete Mermaid fenced block"}]}},"issues":[],"recommendations":[]}}"#,
+            ),
+        );
+        ca.task_iri = task_iri.to_string();
+        ca.verdict = Some(TaskVerdict::Failed);
+        let validation = serde_json::json!({
+            "schema_version": "mermaid_validation/v1",
+            "success": false,
+            "diagram_count": 0,
+            "validation_error": "archived Markdown contains no complete Mermaid fenced block",
+            "output": "Mermaid validation failed: archived Markdown contains no complete Mermaid fenced block"
+        });
+        ca.tracked_actions = vec![ca_action_with_disclosure(
+            task_iri,
+            "call-failed-mermaid",
+            "mermaid_validate",
+            serde_json::json!({"node_iri": "iri://task/direct-report/session/l1-da/turn_2"}),
+            validation.clone(),
+            validation,
+            true,
+            false,
+            false,
+            true,
+        )];
+
+        assert!(ca_has_evidenced_observed_defect(&ca));
+        assert!(!ca_requires_evidence_recheck(&ca));
+        let report = apply_ca_dimension_audit(&five_w2h, &mut ca, task_iri, None, None);
+        assert_eq!(
+            report.reason,
+            Some(crate::core::recovery::RecoveryReason::LocalExecutionGap)
+        );
+        assert_eq!(
+            crate::core::recovery::select_directive(&report, 0, 2),
+            crate::core::recovery::RecoveryDirective::RetryDa
         );
     }
 

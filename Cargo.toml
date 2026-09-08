@@ -127,6 +127,7 @@ notify-debouncer-mini = "0.4"
 # 文本/Unicode 处理
 unicode-width = "0.1"
 unicode-segmentation = "1.10"
+mermaid-rs-renderer = { version = "0.2", default-features = false }
 
 # ─── Ontologies engine (ported from open-ontologies) ────────
 ontologies = { path = "crates/ontologies" }

@@ -243,9 +243,11 @@ pub struct PlanWorkPackage {
 /// Typed evidence admitted at a canonical work-package boundary.
 ///
 /// The enum is intentionally compact: artifact delivery and workspace
-/// mutation are ownership/effect evidence, while all deterministic verifier
-/// classes retain their kernel-assessed `VerificationKind`. In particular, a
-/// successful build cannot satisfy a test-execution requirement.
+/// mutation are ownership/effect evidence, external research is a successful
+/// live-retrieval receipt, response delivery is the presence of the promised
+/// non-filesystem result, and deterministic verifier classes retain their
+/// kernel-assessed `VerificationKind`. In particular, a successful build
+/// cannot satisfy a test-execution requirement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkPackageEvidenceRequirement {
@@ -261,6 +263,14 @@ pub enum WorkPackageEvidenceRequirement {
     WorkspaceMutation {
         min_actions: u32,
     },
+    /// At least one successful, disclosed live-retrieval action owned by this
+    /// child. Source cardinality belongs to CA's content audit; it must not be
+    /// miscompiled into a number of workspace mutations or network calls.
+    ExternalResearch,
+    /// A non-empty result returned through the Agent response rather than a
+    /// filesystem artifact. This proves transport/delivery only; CA remains
+    /// responsible for checking the requested format and business content.
+    ResponseDelivery,
     Verification {
         kind: crate::core::tracked_action::VerificationKind,
         min_count: u64,
@@ -328,6 +338,8 @@ pub(crate) fn validate_work_package_evidence_requirements(
 
     let mut artifact_delivery_seen = false;
     let mut workspace_mutation_seen = false;
+    let mut external_research_seen = false;
+    let mut response_delivery_seen = false;
     let mut test_execution_scope_seen = false;
     let mut verification_kinds = Vec::new();
     for requirement in &package.evidence_requirements {
@@ -386,6 +398,24 @@ pub(crate) fn validate_work_package_evidence_requirements(
                         package.id, MAX_REQUIRED_MUTATION_ACTIONS
                     ));
                 }
+            }
+            WorkPackageEvidenceRequirement::ExternalResearch => {
+                if external_research_seen {
+                    return Err(format!(
+                        "work package '{}' repeats external_research evidence",
+                        package.id
+                    ));
+                }
+                external_research_seen = true;
+            }
+            WorkPackageEvidenceRequirement::ResponseDelivery => {
+                if response_delivery_seen {
+                    return Err(format!(
+                        "work package '{}' repeats response_delivery evidence",
+                        package.id
+                    ));
+                }
+                response_delivery_seen = true;
             }
             WorkPackageEvidenceRequirement::Verification { kind, min_count } => {
                 if verification_kinds.contains(kind) {

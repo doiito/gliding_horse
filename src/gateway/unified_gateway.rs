@@ -544,6 +544,27 @@ impl UnifiedGateway {
         serde_json::json!(tool_choice)
     }
 
+    /// The Chat Completions API nests an exact function choice under
+    /// `function`, while the Responses API uses a flattened name. Runtime
+    /// callers express the chat-compatible form because it is also accepted
+    /// by OpenAI-compatible chat providers; normalize it at the Responses
+    /// boundary instead of making role code depend on the configured endpoint.
+    fn parse_responses_tool_choice(tool_choice: &str) -> Value {
+        let parsed = Self::parse_tool_choice(tool_choice);
+        let Some(name) = parsed
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        else {
+            return parsed;
+        };
+        if parsed.get("type").and_then(Value::as_str) == Some("function") {
+            serde_json::json!({"type": "function", "name": name})
+        } else {
+            parsed
+        }
+    }
+
     async fn send_request(
         &self,
         url: &str,
@@ -907,7 +928,7 @@ impl UnifiedGateway {
         }
         if let Some(t) = tools {
             body["tools"] = serde_json::json!(Self::convert_responses_tools(t));
-            body["tool_choice"] = Self::parse_tool_choice(tool_choice.unwrap_or("auto"));
+            body["tool_choice"] = Self::parse_responses_tool_choice(tool_choice.unwrap_or("auto"));
         }
         // `none` is an internal, provider-neutral policy, not a portable
         // Responses API effort value. Omitting the extension is compatible
@@ -1987,6 +2008,18 @@ mod tests {
         assert!(obj.is_object());
         assert_eq!(obj["type"], "function");
         assert_eq!(obj["name"], "get_weather");
+
+        let responses = UnifiedGateway::parse_responses_tool_choice(
+            r#"{"type":"function","function":{"name":"submit_result"}}"#,
+        );
+        assert_eq!(
+            responses,
+            serde_json::json!({"type":"function","name":"submit_result"})
+        );
+        assert_eq!(
+            UnifiedGateway::parse_responses_tool_choice("required"),
+            serde_json::json!("required")
+        );
     }
 
     #[test]

@@ -15,15 +15,19 @@ use crate::tools::tool_executor::ToolExecutor;
 use crate::CoreError;
 
 use super::execution::{
-    admit_provider_tool_call_batch, advertised_tool_names, assess_verification_call,
-    attach_toolguard_validation_feedback, ca_evidence_close_directive,
+    add_da_evidence_result_transport, admit_provider_tool_call_batch, advertised_tool_names,
+    assess_verification_call, attach_toolguard_validation_feedback, ca_evidence_close_directive,
     ca_evidence_close_tool_definitions, ca_evidence_focus_tool_definitions,
     ca_has_successful_verifier_receipt, ca_verification_probe_tool_definitions,
-    classify_raw_tool_protocol_response, da_evidence_close_tool_definitions,
-    da_evidence_focus_tool_definitions, da_hard_close_active,
-    da_post_effect_inspection_focus_tool_definitions, da_typed_contract_close_directive,
-    da_verified_close_tool_definitions, da_verified_focus_tool_definitions, disclosed_tool_result,
-    effective_effect_block_turns, effective_role_max_turns, emit_tool_hook_decision, evidence_key,
+    classify_raw_tool_protocol_response, da_evidence_close_directive,
+    da_evidence_close_tool_definitions, da_evidence_focus_tool_definitions,
+    da_evidence_result_tool_choice, da_hard_close_active,
+    da_post_effect_inspection_focus_tool_definitions,
+    da_terminal_native_protocol_correction_directive, da_terminal_result_retry_history,
+    da_typed_contract_close_directive, da_verified_close_tool_definitions,
+    da_verified_focus_tool_definitions, decode_da_evidence_result_submission,
+    disclosed_tool_result, effective_da_evidence_close_turns, effective_effect_block_turns,
+    effective_role_max_turns, emit_tool_hook_decision, evidence_key,
     exact_workspace_write_targets_materialized, execute_tool_hook_decision,
     filter_tool_search_result, finalize_ca_terminal_contract, immediate_correction_recovery_active,
     initial_execution_phase, is_business_handoff_content, is_verification_call,
@@ -39,7 +43,7 @@ use super::execution::{
     workspace_inventory_complete_and_bounded, workspace_inventory_coverage,
     workspace_inventory_tool_definitions, CaAuditConvergence, DaVerificationConvergence,
     ExecutionPhase, ProviderToolCallLedger, RawToolProtocolDisposition, RawToolProtocolShape,
-    RepairBaselineWindow, REPEATED_RAW_TOOL_PROTOCOL_FAILURE,
+    RepairBaselineWindow, DA_EVIDENCE_RESULT_TOOL_NAME, REPEATED_RAW_TOOL_PROTOCOL_FAILURE,
 };
 use super::{LlmParsedResponse, TaskContext, TaskResult, TaskVerdict};
 
@@ -1182,7 +1186,9 @@ impl super::AgentRunner {
             }
         }
 
-        let tools = self.tool_definitions_for_task_context(&agent.role.to_string(), &ctx);
+        let role_name = agent.role.to_string();
+        let effective_allowed_tools = ctx.effective_allowed_tools_for_role(&role_name);
+        let tools = self.tool_definitions_for_task_context(&role_name, &ctx);
         let ca_executable_verifier_available = agent.role == AgentRole::Check
             && self
                 .discoverable_tool_definitions_for_task_context(&agent.role.to_string(), &ctx)
@@ -1227,6 +1233,7 @@ impl super::AgentRunner {
         let mut best_analysis_summary = String::new();
         let mut best_analysis_thought = String::new();
         let mut terminal_completion_observed = false;
+        let mut terminal_protocol_failure_observed = false;
         let workspace_effect_required = requires_workspace_effect(&ctx, agent.role);
         let workspace_effect_tracked = agent.role == AgentRole::Do
             && ctx
@@ -1406,16 +1413,35 @@ impl super::AgentRunner {
                 )
                 && execution_budget.da_evidence_focus_turns > 0
                 && evidence_only_tool_turns >= execution_budget.da_evidence_focus_turns;
+            let effective_da_evidence_close_turns = effective_da_evidence_close_turns(
+                ctx.requires_web_research(),
+                execution_budget.da_evidence_focus_turns,
+                execution_budget.da_evidence_close_turns,
+            );
             let da_evidence_close_active = agent.role == AgentRole::Do
                 && matches!(
                     ctx.effective_effect_policy(),
                     crate::core::effect::EffectPolicy::EvidenceOnly
                 )
-                && execution_budget.da_evidence_close_turns > 0
-                && evidence_only_tool_turns >= execution_budget.da_evidence_close_turns;
+                && effective_da_evidence_close_turns > 0
+                && evidence_only_tool_turns >= effective_da_evidence_close_turns;
             let da_verification_contract_close =
                 da_typed_contract_close_directive(agent.role, &ctx, &action_tracker);
             let da_verification_contract_close_active = da_verification_contract_close.is_some();
+            let da_typed_contract_result_transport_active = da_verification_contract_close_active
+                && ctx
+                    .biz_agent_child_evidence_contract
+                    .as_deref()
+                    .is_some_and(|package| {
+                        package.evidence_requirements.iter().any(|requirement| {
+                            matches!(
+                                requirement,
+                                crate::core::sa::WorkPackageEvidenceRequirement::ExternalResearch
+                            )
+                        })
+                    });
+            let da_result_transport_active =
+                da_evidence_close_active || da_typed_contract_result_transport_active;
             let da_verified_focus_active = da_verification_convergence.focus_active(
                 agent.role,
                 workspace_effect_observed,
@@ -1458,7 +1484,11 @@ impl super::AgentRunner {
                 Self::upsert_runtime_control(
                     &mut turn_runtime_context,
                     "ca_evidence_convergence",
-                    "[CA Evidence Convergence] Multiple audit/inspection tool turns have completed; these are not executable verification receipts. Use the fixed Original Task and Success Criteria already present in this context—do not rediscover the task from runtime metadata or archived model output. Finish with criterion-linked PASS/FAIL unless one named criterion remains; then run only its single targeted check.",
+                    if ctx.requires_web_research() {
+                        "[CA Evidence Convergence] Multiple independent audit turns have completed. Use the fixed Original Task and Success Criteria already present in this context—do not rediscover the task from runtime metadata or archived model output. Finish with criterion-linked PASS/FAIL unless one current-source claim remains unsupported; then use only an advertised live-retrieval tool for that exact gap, avoid an equivalent repeat query, and finish."
+                    } else {
+                        "[CA Evidence Convergence] Multiple audit/inspection tool turns have completed; these are not executable verification receipts. Use the fixed Original Task and Success Criteria already present in this context—do not rediscover the task from runtime metadata or archived model output. Finish with criterion-linked PASS/FAIL unless one named criterion remains; then run only its single targeted check."
+                    },
                 );
             }
             if ca_verification_probe_active {
@@ -1493,14 +1523,18 @@ impl super::AgentRunner {
                 Self::upsert_runtime_control(
                     &mut turn_runtime_context,
                     "da_evidence_convergence",
-                    "[DA Evidence Convergence] The configured evidence-discovery window is complete. Synthesize the requested deliverable now from the sources and evidence already collected. Only one targeted source read is permitted when a specific claim lacks support; do not perform another broad search.",
+                    if ctx.requires_web_research() {
+                        "[DA Evidence Convergence] The broad evidence-discovery window is complete. Synthesize the requested deliverable now. If one named criterion or current claim still lacks live support, use only an advertised web_search or targeted source-read tool for that exact gap, avoid an equivalent repeat query, and then finish. Live retrieval remains available because the task explicitly requires current external evidence; its availability is not a request to restart broad discovery."
+                    } else {
+                        "[DA Evidence Convergence] The configured evidence-discovery window is complete. Synthesize the requested deliverable now from the sources and evidence already collected. Only one targeted source read is permitted when a specific claim lacks support; do not perform another broad search."
+                    },
                 );
             }
             if da_evidence_close_active {
                 Self::upsert_runtime_control(
                     &mut turn_runtime_context,
                     "da_evidence_close",
-                    "[DA Evidence Close Gate] The configured evidence window is exhausted. Do not call another tool. Return the complete evidence-backed deliverable now, explicitly marking any unsupported point as a limitation.",
+                    da_evidence_close_directive(ctx.requires_web_research()),
                 );
             }
             if let Some(directive) = da_verification_contract_close.as_deref() {
@@ -1626,6 +1660,7 @@ impl super::AgentRunner {
                     current_tools,
                     agent.role,
                     ca_evidence_focus_active,
+                    ctx.requires_web_research(),
                     self.tool_executor.as_ref(),
                 );
                 let current_tools = ca_verification_probe_tool_definitions(
@@ -1647,12 +1682,15 @@ impl super::AgentRunner {
                     current_tools,
                     agent.role,
                     da_evidence_focus_active,
+                    ctx.requires_web_research(),
                 );
                 let current_tools = da_evidence_close_tool_definitions(
                     current_tools,
                     agent.role,
                     da_evidence_close_active || da_verification_contract_close_active,
                 );
+                let current_tools =
+                    add_da_evidence_result_transport(current_tools, da_result_transport_active);
                 let current_tools = da_verified_focus_tool_definitions(
                     current_tools,
                     agent.role,
@@ -1682,15 +1720,25 @@ impl super::AgentRunner {
                 .resumed_state
                 .as_ref()
                 .map(|state| state.checkpoint_iri.as_str());
-            let terminal_retry_history = (raw_tool_protocol_correction_dispatch_pending
+            let terminal_retry_history = if raw_tool_protocol_correction_dispatch_pending
+                && agent.role == AgentRole::Do
+                && da_result_transport_active
+            {
+                Some(da_terminal_result_retry_history(
+                    &running_messages,
+                    immutable_prompt_prefix_len,
+                ))
+            } else if raw_tool_protocol_correction_dispatch_pending
                 && agent.role == AgentRole::Check
-                && ca_evidence_close_active)
-                .then(|| {
-                    super::execution::ca_terminal_format_retry_history(
-                        &running_messages,
-                        immutable_prompt_prefix_len,
-                    )
-                });
+                && ca_evidence_close_active
+            {
+                Some(super::execution::ca_terminal_format_retry_history(
+                    &running_messages,
+                    immutable_prompt_prefix_len,
+                ))
+            } else {
+                None
+            };
             let provider_messages = terminal_retry_history
                 .as_deref()
                 .unwrap_or(&running_messages);
@@ -1765,12 +1813,15 @@ impl super::AgentRunner {
                 }
             }
             let request_tools = (!current_tools.is_empty()).then_some(current_tools);
+            let request_tool_choice =
+                da_result_transport_active.then(da_evidence_result_tool_choice);
             let raw_tool_protocol_correction_dispatch =
                 std::mem::take(&mut raw_tool_protocol_correction_dispatch_pending);
             let request_reasoning_effort = react_reasoning_effort_for_dispatch(
                 agent.role,
                 execution_budget,
                 ca_evidence_close_active,
+                da_evidence_close_active,
                 da_verification_contract_close_active,
                 raw_tool_protocol_correction_dispatch,
             );
@@ -1807,6 +1858,7 @@ impl super::AgentRunner {
             let request_payload = serde_json::to_string(&json!({
                 "messages": &request_messages,
                 "tools": &request_tools,
+                "tool_choice": request_tool_choice.as_deref(),
                 "request_options": {
                     "reasoning_effort": request_reasoning_effort.provider_label(),
                 },
@@ -1866,7 +1918,7 @@ impl super::AgentRunner {
                     None,
                     None,
                     request_tools,
-                    None,
+                    request_tool_choice.as_deref(),
                     crate::gateway::LlmRequestOptions::default()
                         .with_reasoning_effort(request_reasoning_effort),
                 )
@@ -2049,12 +2101,104 @@ impl super::AgentRunner {
                 }
             }
 
-            let effective_content = Self::effective_response_content(
-                &stream_response.content,
-                stream_response.thought.as_deref(),
-                &stream_response.finish_reason,
-                !stream_response.tool_calls.is_empty(),
-            );
+            let da_result_submission_attempted = da_result_transport_active
+                && stream_response
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.name == DA_EVIDENCE_RESULT_TOOL_NAME);
+            let da_terminal_native_protocol_violation = da_result_transport_active
+                && !stream_response.tool_calls.is_empty()
+                && !da_result_submission_attempted;
+            if da_terminal_native_protocol_violation && !raw_tool_protocol_correction_used {
+                raw_tool_protocol_correction_used = true;
+                raw_tool_protocol_correction_dispatch_pending = true;
+                Self::upsert_runtime_control(
+                    &mut runtime_context,
+                    "da_terminal_native_protocol_correction",
+                    da_terminal_native_protocol_correction_directive(ctx.requires_web_research()),
+                );
+                warn!(
+                    turn,
+                    role = %agent.role,
+                    request_id = %stream_interaction_id,
+                    provider_call_count = stream_response.tool_calls.len(),
+                    "Streaming provider ignored the DA terminal tool choice; retrying once without historical tool syntax"
+                );
+                if let Some(event_bus) = &self.event_bus {
+                    let _ = event_bus
+                        .emit(
+                            &ctx.task_iri,
+                            "LLM_TOOL_PROTOCOL_CORRECTION",
+                            &agent.agent_id,
+                            &json!({
+                                "role": agent.role.to_string(),
+                                "turn": turn,
+                                "request_id": stream_interaction_id,
+                                "provider_call_ids": stream_response.tool_calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+                                "returned_tool_names": stream_response.tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+                                "advertised_terminal_tool": DA_EVIDENCE_RESULT_TOOL_NAME,
+                                "correction_attempt": 1,
+                                "outcome": "retry_terminal_submission",
+                                "streaming": true,
+                                "operation": "终结请求返回未授权历史工具；未执行并进行一次无旧工具语法重试",
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                }
+                continue;
+            }
+            let da_terminal_native_protocol_failure =
+                da_terminal_native_protocol_violation && raw_tool_protocol_correction_used;
+            if da_terminal_native_protocol_failure {
+                terminal_protocol_failure_observed = true;
+            }
+            let da_result_submission_content = if da_result_submission_attempted {
+                let decoded = match stream_response.tool_calls.as_slice() {
+                    [call] => decode_da_evidence_result_submission(&call.name, &call.arguments)
+                        .unwrap_or_else(|| {
+                            Err("DA evidence result submission used the wrong function".to_string())
+                        }),
+                    _ => Err("DA evidence close accepts exactly one result submission".to_string()),
+                };
+                Some(match decoded {
+                    Ok(content) => content,
+                    Err(error) => {
+                        terminal_protocol_failure_observed = true;
+                        errs.push(error);
+                        json!({
+                            "content": "",
+                            "summary": "FAILED: invalid DA evidence result submission",
+                            "action": "finish",
+                            "emphasis": [],
+                        })
+                        .to_string()
+                    }
+                })
+            } else if da_terminal_native_protocol_failure {
+                let detail = "provider repeated an unadvertised native tool call after the single bounded DA terminal correction; nothing was executed";
+                errs.push(detail.to_string());
+                Some(
+                    json!({
+                        "content": "",
+                        "summary": format!("FAILED: {detail}"),
+                        "action": "finish",
+                        "emphasis": [],
+                    })
+                    .to_string(),
+                )
+            } else {
+                None
+            };
+
+            let effective_content = da_result_submission_content.unwrap_or_else(|| {
+                Self::effective_response_content(
+                    &stream_response.content,
+                    stream_response.thought.as_deref(),
+                    &stream_response.finish_reason,
+                    !stream_response.tool_calls.is_empty(),
+                )
+            });
             let raw_tool_protocol_shape = raw_tool_protocol_shape(&effective_content);
             let typed_contract_terminal_dispatch = da_verification_contract_close_active
                 && advertised_tools.is_empty()
@@ -2144,6 +2288,8 @@ impl super::AgentRunner {
                         agent.role,
                         &advertised_tools,
                         ca_evidence_close_active,
+                        da_evidence_close_active,
+                        ctx.requires_web_research(),
                     ),
                 );
                 raw_tool_protocol_correction_dispatch_pending = true;
@@ -2241,7 +2387,10 @@ impl super::AgentRunner {
             // Preserve its summary rather than auto-summarizing only the
             // inner content; otherwise a valid CA verdict prefix disappears
             // exclusively on the streaming path.
-            if !typed_contract_terminalized_protocol {
+            if !typed_contract_terminalized_protocol
+                && !da_result_submission_attempted
+                && !da_terminal_native_protocol_failure
+            {
                 if let Some(summary) = stream_response.summary.as_ref() {
                     parsed.summary = Some(summary.clone());
                 }
@@ -2261,7 +2410,10 @@ impl super::AgentRunner {
             // Match the synchronous path: structured provider tool calls are
             // authoritative even when message.content contains only native
             // DSML/XML and no ReAct JSON action.
-            let stream_action = if typed_contract_terminal_dispatch {
+            let stream_action = if typed_contract_terminal_dispatch
+                || da_result_submission_attempted
+                || da_terminal_native_protocol_failure
+            {
                 Some("finish")
             } else if stream_response.tool_calls.is_empty() {
                 parsed.action.as_deref()
@@ -2840,7 +2992,7 @@ impl super::AgentRunner {
                                         name,
                                         args,
                                         security_context,
-                                        ctx.allowed_tools.as_deref(),
+                                        effective_allowed_tools.as_deref(),
                                         &ctx.effective_effect_policy(),
                                         execution_profile,
                                     )
@@ -2851,7 +3003,7 @@ impl super::AgentRunner {
                                         name,
                                         args,
                                         security_context,
-                                        ctx.allowed_tools.as_deref(),
+                                        effective_allowed_tools.as_deref(),
                                         &ctx.effective_effect_policy(),
                                         execution_profile,
                                     )
@@ -3586,6 +3738,8 @@ impl super::AgentRunner {
             let detail = "DA finished without creating or modifying substantive workspace content";
             errs.push(detail.to_string());
             final_summary = format!("FAILED: {}. {}", detail, final_summary);
+            TaskVerdict::Failed
+        } else if terminal_protocol_failure_observed {
             TaskVerdict::Failed
         } else if agent.role == AgentRole::Check {
             ca_terminal_verdict.expect("CA normalization must produce a verdict")

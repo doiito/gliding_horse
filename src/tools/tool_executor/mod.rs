@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::knowledge_graph::store::KnowledgeGraphStore;
@@ -125,6 +126,7 @@ const EVIDENCE_CRITICAL_BUILTIN_NAMES: &[&str] = &[
     "bash",
     "powershell",
     "code_execute",
+    "mermaid_validate",
     "jsonld_validate",
     "ontology_validate_turtle",
     "ontology_validate_shacl",
@@ -703,6 +705,238 @@ fn agent_turn_content_page(node: &mut Value, input: &Value, node_iri: &str) -> O
         "cycle_id": node.get("cycle_id").cloned().unwrap_or(Value::Null),
         "session_tool_references_redacted": redacted,
     }))
+}
+
+const MAX_MERMAID_DOCUMENT_CHARS: usize = 128 * 1024;
+const MAX_MERMAID_DIAGRAMS: usize = 16;
+const MAX_MERMAID_DIAGRAM_CHARS: usize = 16 * 1024;
+
+fn markdown_fence(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|ch| *ch == marker).count();
+    (count >= 3).then(|| (marker, count, &trimmed[count..]))
+}
+
+/// Extract complete Mermaid fenced blocks from the exact archived Markdown.
+/// Non-Mermaid fences are consumed too, so an example containing the literal
+/// text ```mermaid cannot be mistaken for a delivered diagram.
+fn extract_mermaid_sources(markdown: &str) -> Result<Vec<String>, String> {
+    let document_chars = markdown.chars().count();
+    if document_chars > MAX_MERMAID_DOCUMENT_CHARS {
+        return Err(format!(
+            "archived Markdown exceeds the Mermaid validation limit ({document_chars} > {MAX_MERMAID_DOCUMENT_CHARS} characters)"
+        ));
+    }
+
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let mut sources = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let Some((marker, width, info)) = markdown_fence(lines[index]) else {
+            index += 1;
+            continue;
+        };
+        let is_mermaid = info
+            .split_whitespace()
+            .next()
+            .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"));
+        let opened_at = index.saturating_add(1);
+        index += 1;
+        let body_start = index;
+        while index < lines.len() {
+            let closes = markdown_fence(lines[index]).is_some_and(
+                |(closing_marker, closing_width, trailing)| {
+                    closing_marker == marker && closing_width >= width && trailing.trim().is_empty()
+                },
+            );
+            if closes {
+                break;
+            }
+            index += 1;
+        }
+        if index == lines.len() {
+            if is_mermaid {
+                return Err(format!(
+                    "Mermaid fence opened at Markdown line {opened_at} is not closed"
+                ));
+            }
+            break;
+        }
+        if is_mermaid {
+            if sources.len() >= MAX_MERMAID_DIAGRAMS {
+                return Err(format!(
+                    "Mermaid diagram count exceeds the validation limit ({MAX_MERMAID_DIAGRAMS})"
+                ));
+            }
+            let source = lines[body_start..index].join("\n");
+            let source_chars = source.chars().count();
+            if source_chars == 0 {
+                return Err(format!(
+                    "Mermaid fence opened at Markdown line {opened_at} is empty"
+                ));
+            }
+            if source_chars > MAX_MERMAID_DIAGRAM_CHARS {
+                return Err(format!(
+                    "Mermaid diagram at Markdown line {opened_at} exceeds the validation limit ({source_chars} > {MAX_MERMAID_DIAGRAM_CHARS} characters)"
+                ));
+            }
+            sources.push(source);
+        }
+        index += 1;
+    }
+
+    if sources.is_empty() {
+        Err("archived Markdown contains no complete Mermaid fenced block".to_string())
+    } else {
+        Ok(sources)
+    }
+}
+
+fn bounded_mermaid_error(error: impl std::fmt::Display) -> String {
+    const MAX_CHARS: usize = 600;
+    error.to_string().chars().take(MAX_CHARS).collect()
+}
+
+fn has_explicit_mermaid_declaration(source: &str) -> bool {
+    let mut in_frontmatter = false;
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter || line.starts_with("%%") {
+            continue;
+        }
+        let token = line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(';')
+            .to_ascii_lowercase();
+        return matches!(
+            token.as_str(),
+            "flowchart"
+                | "graph"
+                | "sequencediagram"
+                | "classdiagram"
+                | "statediagram"
+                | "statediagram-v2"
+                | "erdiagram"
+                | "pie"
+                | "mindmap"
+                | "journey"
+                | "timeline"
+                | "gantt"
+                | "requirementdiagram"
+                | "gitgraph"
+                | "quadrantchart"
+                | "zenuml"
+                | "block"
+                | "packet"
+                | "kanban"
+                | "architecture"
+                | "radar"
+                | "treemap"
+        ) || token.starts_with("c4")
+            || token.starts_with("sankey")
+            || token.starts_with("xychart");
+    }
+    false
+}
+
+fn render_validated_mermaid(source: &str) -> Result<String, String> {
+    if !has_explicit_mermaid_declaration(source) {
+        return Err("missing a supported Mermaid diagram declaration".to_string());
+    }
+    let parsed = mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
+    let theme = mermaid_rs_renderer::Theme::modern();
+    let config = mermaid_rs_renderer::LayoutConfig::default();
+    let layout = mermaid_rs_renderer::compute_layout(&parsed.graph, &theme, &config);
+    if matches!(
+        layout.diagram,
+        mermaid_rs_renderer::layout::DiagramData::Error(_)
+    ) {
+        return Err("renderer produced an error diagram".to_string());
+    }
+    Ok(mermaid_rs_renderer::render_svg(&layout, &theme, &config))
+}
+
+fn validate_mermaid_markdown(markdown: &str, node_iri: &str) -> Value {
+    let sources = match extract_mermaid_sources(markdown) {
+        Ok(sources) => sources,
+        Err(error) => {
+            return json!({
+                "schema_version": "mermaid_validation/v1",
+                "validator": "mermaid-rs-renderer",
+                "node_iri": node_iri,
+                "success": false,
+                "diagram_count": 0,
+                // This is an executed validator's negative finding, not a
+                // transport/handler error.  Keeping it out of the top-level
+                // `error` field lets the typed verification pipeline retain
+                // a Failed outcome instead of degrading it to Inconclusive.
+                "validation_error": error,
+                "output": format!("Mermaid validation failed: {error}"),
+            });
+        }
+    };
+
+    let mut all_valid = true;
+    let diagrams = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let source_sha256 = format!("sha256:{:x}", Sha256::digest(source.as_bytes()));
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render_validated_mermaid(source)
+            }));
+            match rendered {
+                Ok(Ok(svg)) => json!({
+                    "index": index + 1,
+                    "success": true,
+                    "source_chars": source.chars().count(),
+                    "source_sha256": source_sha256,
+                    "rendered_svg_bytes": svg.len(),
+                }),
+                Ok(Err(error)) => {
+                    all_valid = false;
+                    json!({
+                        "index": index + 1,
+                        "success": false,
+                        "source_chars": source.chars().count(),
+                        "source_sha256": source_sha256,
+                        "error": bounded_mermaid_error(error),
+                    })
+                }
+                Err(_) => {
+                    all_valid = false;
+                    json!({
+                        "index": index + 1,
+                        "success": false,
+                        "source_chars": source.chars().count(),
+                        "source_sha256": source_sha256,
+                        "error": "Mermaid renderer panicked while parsing this bounded diagram",
+                    })
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "mermaid_validation/v1",
+        "validator": "mermaid-rs-renderer",
+        "node_iri": node_iri,
+        "success": all_valid,
+        "diagram_count": diagrams.len(),
+        "diagrams": diagrams,
+    })
 }
 
 fn reader_usize_argument(input: &Value, name: &str) -> Result<Option<usize>, String> {
@@ -1487,6 +1721,7 @@ fn builtin_security_skill_iri(name: &str) -> Option<&'static str> {
         | "knowledge_query"
         | "knowledge_neighbors"
         | "read_agent_output"
+        | "mermaid_validate"
         | "read_full_result"
         | "get_entity_details"
         | "expand_relation" => Some("iri://skills/file_read"),
@@ -1709,7 +1944,8 @@ impl ToolExecutor {
             .with_tool_requirement("grep_search", PermissionMode::ReadOnly)
             .with_tool_requirement("glob_search", PermissionMode::ReadOnly)
             .with_tool_requirement("web_search", PermissionMode::ReadOnly)
-            .with_tool_requirement("web_fetch", PermissionMode::ReadOnly);
+            .with_tool_requirement("web_fetch", PermissionMode::ReadOnly)
+            .with_tool_requirement("mermaid_validate", PermissionMode::ReadOnly);
         self.permission_policy = Some(policy);
     }
 
@@ -2485,6 +2721,54 @@ impl ToolExecutor {
                 }
             })
         }), all);
+
+        let proj_for_mermaid = self.projection_engine.clone();
+        self.register(
+            "mermaid_validate",
+            "Deterministically parse and render every Mermaid fenced block in one exact, authorized archived AgentTurn. Use the stable DA aggregate node_iri from the typed handoff; copied diagram text is not accepted.",
+            json!({
+                "properties": {
+                    "node_iri": {"type":"string","description":"Exact stable DA aggregate AgentTurn IRI from the typed handoff."}
+                },
+                "required": ["node_iri"],
+                "additionalProperties": false
+            }),
+            Arc::new(move |input: Value| {
+                let proj = proj_for_mermaid.clone();
+                Box::pin(async move {
+                    let node_iri = input
+                        .get("node_iri")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "Missing node_iri parameter".to_string())?;
+                    if node_iri.starts_with("iri://tool-result/") {
+                        return Err(
+                            "Tool-result IRIs are session-scoped and cannot be Mermaid validation targets"
+                                .to_string(),
+                        );
+                    }
+                    let guard = proj.read();
+                    let engine = guard
+                        .as_ref()
+                        .ok_or_else(|| "Projection engine not initialized".to_string())?;
+                    let node = engine
+                        .read_node(node_iri)
+                        .map_err(|error| format!("Failed to read L2 node: {error}"))?
+                        .ok_or_else(|| format!("Node not found: {node_iri}"))?;
+                    if node.get("@id").and_then(Value::as_str) != Some(node_iri)
+                        || node.get("@type").and_then(Value::as_str) != Some("AgentTurn")
+                    {
+                        return Err(format!(
+                            "Node is not an exact archived AgentTurn: {node_iri}"
+                        ));
+                    }
+                    let content = node.get("content").and_then(Value::as_str).ok_or_else(|| {
+                        format!("Archived AgentTurn has no textual content: {node_iri}")
+                    })?;
+                    Ok(validate_mermaid_markdown(content, node_iri))
+                })
+            }),
+            &["CA", "Check"],
+        );
 
         // ========== Ontology Tools ==========
         #[cfg(feature = "ontology")]
@@ -3378,27 +3662,28 @@ impl ToolExecutor {
     }
 
     fn enforce_agent_turn_read_capability(
+        tool_name: &str,
         input: &Value,
         security_context: Option<&SecurityContext>,
     ) -> Result<(), Value> {
         let Some(node_iri) = input.get("node_iri").and_then(Value::as_str) else {
             return Err(json!({
-                "error": "Security denied: read_agent_output requires an exact node_iri",
-                "tool": "read_agent_output",
+                "error": format!("Security denied: {tool_name} requires an exact node_iri"),
+                "tool": tool_name,
                 "reason": "agent_turn_capability_required",
             }));
         };
         let Some(context) = security_context else {
             return Err(json!({
-                "error": "Security denied: read_agent_output requires a trusted runtime context",
-                "tool": "read_agent_output",
+                "error": format!("Security denied: {tool_name} requires a trusted runtime context"),
+                "tool": tool_name,
                 "reason": "agent_turn_capability_required",
             }));
         };
         if !context.permits_agent_turn_read(node_iri) {
             return Err(json!({
                 "error": "Security denied: AgentTurn is outside the active L1 and typed handoff scope",
-                "tool": "read_agent_output",
+                "tool": tool_name,
                 "reason": "agent_turn_capability_required",
                 "node_iri": node_iri,
             }));
@@ -3542,7 +3827,7 @@ impl ToolExecutor {
         // Reject an unauthorized stable archive before external hooks observe
         // its IRI, then repeat this check below against any hook-rewritten
         // input. Argument-aware authorization must bracket that trust boundary.
-        if name == "read_agent_output" {
+        if matches!(name, "read_agent_output" | "mermaid_validate") {
             if input
                 .get("node_iri")
                 .and_then(Value::as_str)
@@ -3554,7 +3839,7 @@ impl ToolExecutor {
                 );
             }
             if let Err(rejection) =
-                Self::enforce_agent_turn_read_capability(&input, security_context)
+                Self::enforce_agent_turn_read_capability(name, &input, security_context)
             {
                 return Ok(rejection);
             }
@@ -3702,7 +3987,7 @@ impl ToolExecutor {
             return Ok(rejection);
         }
 
-        if name == "read_agent_output" {
+        if matches!(name, "read_agent_output" | "mermaid_validate") {
             if effective_input
                 .get("node_iri")
                 .and_then(Value::as_str)
@@ -3714,7 +3999,7 @@ impl ToolExecutor {
                 );
             }
             if let Err(rejection) =
-                Self::enforce_agent_turn_read_capability(&effective_input, security_context)
+                Self::enforce_agent_turn_read_capability(name, &effective_input, security_context)
             {
                 return Ok(rejection);
             }

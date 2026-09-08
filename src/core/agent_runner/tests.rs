@@ -413,6 +413,7 @@ fn ca_evidence_focus_keeps_independent_checks_but_drops_new_discovery() {
         ],
         AgentRole::Check,
         true,
+        false,
         runner.tool_executor.as_ref(),
     );
     let names = filtered
@@ -438,6 +439,7 @@ fn ca_evidence_focus_keeps_independent_checks_but_drops_new_discovery() {
         ],
         AgentRole::Check,
         false,
+        false,
         runner.tool_executor.as_ref(),
     );
     let names = before_focus
@@ -448,6 +450,23 @@ fn ca_evidence_focus_keeps_independent_checks_but_drops_new_discovery() {
         names,
         vec!["file_list", "file_read", shell_reader.reader_name.as_str()]
     );
+
+    let research_focus = super::execution::ca_evidence_focus_tool_definitions(
+        vec![
+            definition("web_search"),
+            definition("web_fetch"),
+            definition("rag_search"),
+        ],
+        AgentRole::Check,
+        true,
+        true,
+        runner.tool_executor.as_ref(),
+    );
+    let research_names = research_focus
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(research_names, vec!["web_search", "web_fetch"]);
 }
 
 #[test]
@@ -646,6 +665,7 @@ fn evidence_only_da_convergence_withdraws_discovery_then_closes_tools() {
         ],
         AgentRole::Do,
         true,
+        false,
     );
     let focused_names = focused
         .iter()
@@ -656,6 +676,18 @@ fn evidence_only_da_convergence_withdraws_discovery_then_closes_tools() {
         vec!["web_fetch", "read_agent_output", routed_reader.as_str()]
     );
 
+    let research_focused = super::execution::da_evidence_focus_tool_definitions(
+        vec![definition("web_search"), definition("web_fetch")],
+        AgentRole::Do,
+        true,
+        true,
+    );
+    let research_focused_names = research_focused
+        .iter()
+        .filter_map(|value| value["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(research_focused_names, vec!["web_search", "web_fetch"]);
+
     let closed = super::execution::da_evidence_close_tool_definitions(focused, AgentRole::Do, true);
     assert!(closed.is_empty());
     let implementation_da = super::execution::da_evidence_close_tool_definitions(
@@ -664,6 +696,34 @@ fn evidence_only_da_convergence_withdraws_discovery_then_closes_tools() {
         false,
     );
     assert_eq!(implementation_da.len(), 1);
+}
+
+#[test]
+fn live_research_gets_one_targeted_turn_after_the_focus_gate() {
+    use super::execution::effective_da_evidence_close_turns;
+
+    assert_eq!(effective_da_evidence_close_turns(true, 5, 8), 6);
+    assert_eq!(effective_da_evidence_close_turns(true, 7, 12), 8);
+    assert_eq!(
+        effective_da_evidence_close_turns(false, 5, 8),
+        8,
+        "non-research evidence work retains the configured close window"
+    );
+    assert_eq!(
+        effective_da_evidence_close_turns(true, 0, 8),
+        8,
+        "a disabled focus gate must not silently introduce another limit"
+    );
+    assert_eq!(
+        effective_da_evidence_close_turns(true, 5, 0),
+        0,
+        "a disabled close gate remains disabled"
+    );
+    assert_eq!(
+        effective_da_evidence_close_turns(true, u32::MAX, u32::MAX),
+        u32::MAX,
+        "threshold arithmetic must saturate"
+    );
 }
 
 #[test]
@@ -750,6 +810,91 @@ fn verification_only_child_closes_from_authenticated_current_receipt() {
         json!({"evidence_requirements":[{"type":"verification","kind":"test_execution","min_count":1}]}),
     );
     assert!(da_typed_contract_close_directive(AgentRole::Do, &untrusted, &tracker).is_none());
+}
+
+#[test]
+fn external_research_child_closes_only_from_a_disclosed_successful_live_receipt() {
+    use std::sync::Arc;
+
+    use crate::core::execution_journal::ToolCallIdentity;
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+    use crate::core::tracked_action::ActionTracker;
+
+    use super::execution::da_typed_contract_close_directive;
+
+    let package = PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "research notes".to_string(),
+        success_criteria: "current sources are covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    };
+    let mut context = super::TaskContext::new("iri://task/research-child", "research", 20)
+        .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(package));
+    let mut tracker = ActionTracker::new(&context.task_iri, "DA");
+    let identity = ToolCallIdentity::new("agent-da", "l1-da", "request-1", "call-search");
+    let result = json!({"results":[{"title":"source","url":"https://example.com"}]});
+    tracker.record_with_identity(
+        "web_search",
+        &json!({"query":"latest agent research"}),
+        &result,
+        0.01,
+        Some(identity.clone()),
+    );
+    assert!(
+        da_typed_contract_close_directive(AgentRole::Do, &context, &tracker).is_none(),
+        "execution without disclosure is not evidence delivered to the Agent"
+    );
+    assert!(tracker.record_disclosure(&identity, "web_search", false, &result.to_string()));
+    let directive = da_typed_contract_close_directive(AgentRole::Do, &context, &tracker)
+        .expect("a successful disclosed live search closes the research contract");
+    assert!(directive.contains("external_research"));
+    assert!(directive.contains("call-search"));
+}
+
+#[test]
+fn combined_research_and_response_child_closes_into_terminal_delivery() {
+    use std::sync::Arc;
+
+    use crate::core::execution_journal::ToolCallIdentity;
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+    use crate::core::tracked_action::ActionTracker;
+
+    use super::execution::da_typed_contract_close_directive;
+
+    let package = PlanWorkPackage {
+        id: "research_report".to_string(),
+        objective: "research and return the report".to_string(),
+        expected_output: "complete Markdown response".to_string(),
+        success_criteria: "current sources and a non-empty response".to_string(),
+        evidence_requirements: vec![
+            WorkPackageEvidenceRequirement::ExternalResearch,
+            WorkPackageEvidenceRequirement::ResponseDelivery,
+        ],
+        dependencies: Vec::new(),
+    };
+    let mut context = super::TaskContext::new("iri://task/research-report", "research", 20)
+        .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(package));
+    let mut tracker = ActionTracker::new(&context.task_iri, "DA");
+    let identity = ToolCallIdentity::new("agent-da", "l1-da", "request-1", "call-search");
+    let result = json!({"results":[{"title":"source","url":"https://example.com"}]});
+    tracker.record_with_identity(
+        "web_search",
+        &json!({"query":"latest agent research"}),
+        &result,
+        0.01,
+        Some(identity.clone()),
+    );
+    assert!(tracker.record_disclosure(&identity, "web_search", false, &result.to_string()));
+
+    let directive = da_typed_contract_close_directive(AgentRole::Do, &context, &tracker)
+        .expect("terminal response delivery must not force another research turn");
+    assert!(directive.contains("external_research"));
+    assert!(directive.contains("response_delivery"));
+    assert!(directive.contains("pending_this_terminal_dispatch"));
 }
 
 #[test]
@@ -1242,7 +1387,7 @@ fn test_verification_receipts_reject_forged_prefixes_and_hidden_output() {
 #[test]
 fn verification_kind_distinguishes_all_supported_evidence_classes() {
     use super::execution::assess_verification_call;
-    use crate::core::tracked_action::VerificationKind;
+    use crate::core::tracked_action::{VerificationKind, VerificationOutcome};
 
     let cases = [
         (
@@ -1283,6 +1428,19 @@ fn verification_kind_distinguishes_all_supported_evidence_classes() {
         .is_none(),
         "tool availability/version probing is not artifact verification"
     );
+    let mermaid = assess_verification_call(
+        "mermaid_validate",
+        &json!({"node_iri":"iri://task/t/session/da/turn_1"}),
+        &json!({
+            "schema_version":"mermaid_validation/v1",
+            "success":true,
+            "diagram_count":2
+        }),
+    )
+    .unwrap();
+    assert_eq!(mermaid.kind, VerificationKind::Artifact);
+    assert_eq!(mermaid.outcome, VerificationOutcome::Passed);
+    assert_eq!(mermaid.count, Some(1));
     let smoke = assess_verification_call(
         "code_execute",
         &json!({"code":"assert 2 + 2 == 4"}),
@@ -2458,6 +2616,8 @@ fn raw_tool_protocol_correction_is_scoped_and_bounded_for_stop_and_end_turn() {
         AgentRole::Check,
         &std::collections::HashSet::new(),
         true,
+        false,
+        false,
     );
     assert!(close_correction.contains("CA Terminal-Only Format Correction"));
     assert!(close_correction.contains("do not request either a native or textual tool call"));
@@ -2468,9 +2628,81 @@ fn raw_tool_protocol_correction_is_scoped_and_bounded_for_stop_and_end_turn() {
         AgentRole::Do,
         &std::collections::HashSet::from(["file_read".to_string()]),
         false,
+        false,
+        false,
     );
     assert!(ordinary_correction.contains("provider-native structured `tool_calls`"));
     assert!(ordinary_correction.contains("file_read"));
+
+    let research_close_correction = raw_tool_protocol_correction_directive(
+        AgentRole::Do,
+        &std::collections::HashSet::new(),
+        false,
+        true,
+        true,
+    );
+    assert!(research_close_correction.contains("DA Terminal-Only Format Correction"));
+    assert!(research_close_correction.contains("full Markdown report"));
+    assert!(research_close_correction.contains("result-submission function"));
+    assert!(research_close_correction.contains("network policy"));
+    assert!(!research_close_correction.contains("If a tool is needed"));
+}
+
+#[test]
+fn da_evidence_close_uses_typed_terminal_transport_without_external_execution() {
+    use super::execution::{
+        add_da_evidence_result_transport, da_evidence_result_tool_choice,
+        decode_da_evidence_result_submission, DA_EVIDENCE_RESULT_TOOL_NAME,
+    };
+
+    let tools = add_da_evidence_result_transport(
+        vec![json!({
+            "type": "function",
+            "function": {"name": "web_search", "parameters": {"type": "object"}}
+        })],
+        true,
+    );
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], DA_EVIDENCE_RESULT_TOOL_NAME);
+    assert_eq!(
+        tools[0]["function"]["parameters"]["additionalProperties"],
+        false
+    );
+    let choice: Value = serde_json::from_str(&da_evidence_result_tool_choice()).unwrap();
+    assert_eq!(choice["type"], "function");
+    assert_eq!(choice["function"]["name"], DA_EVIDENCE_RESULT_TOOL_NAME);
+
+    let submitted = decode_da_evidence_result_submission(
+        DA_EVIDENCE_RESULT_TOOL_NAME,
+        &json!({
+            "content": "# Report\n\n```mermaid\nflowchart TD\nA --> B\n```",
+            "summary": "report completed with disclosed fetch limitations",
+            "outcome": "success"
+        }),
+    )
+    .expect("terminal transport is recognized")
+    .expect("valid submission is decoded");
+    let envelope: Value = serde_json::from_str(&submitted).unwrap();
+    assert_eq!(envelope["action"], "finish");
+    assert_eq!(
+        envelope["summary"],
+        "SUCCESS: report completed with disclosed fetch limitations"
+    );
+    assert!(envelope["content"].as_str().unwrap().contains("mermaid"));
+
+    let failed = decode_da_evidence_result_submission(
+        DA_EVIDENCE_RESULT_TOOL_NAME,
+        &json!({"content": "", "summary": "empty", "outcome": "success"}),
+    )
+    .unwrap();
+    assert!(failed.unwrap_err().contains("content is empty"));
+    assert!(decode_da_evidence_result_submission("web_search", &json!({})).is_none());
+
+    let untouched = add_da_evidence_result_transport(
+        vec![json!({"type": "function", "function": {"name": "web_search"}})],
+        false,
+    );
+    assert_eq!(untouched[0]["function"]["name"], "web_search");
 }
 
 #[test]
@@ -6488,6 +6720,600 @@ async fn non_streaming_textual_tool_protocol_gets_one_native_correction() {
 }
 
 #[tokio::test]
+async fn non_streaming_research_close_submits_typed_result_without_executing_a_fake_tool() {
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+
+    let report = "# AI Agent Report\n\n```mermaid\nflowchart TD\nA --> B\n```\n\nSource: https://example.com/research";
+    let (base_url, server, requests) = capturing_agent_response_sequence_server(vec![
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-research-search",
+            "web_search",
+            json!({"query":"current AI agent trends"}),
+        ),
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-research-submit",
+            super::execution::DA_EVIDENCE_RESULT_TOOL_NAME,
+            json!({
+                "content": report,
+                "summary": "research report completed with source limitations disclosed",
+                "outcome": "success"
+            }),
+        ),
+    ])
+    .await;
+    let mut settings = crate::config::settings::AgentSettings::default();
+    settings.execution_budget.da_evidence_focus_turns = 1;
+    settings.execution_budget.da_evidence_close_turns = 1;
+    let runner = create_test_runner_with_settings_at(settings, &base_url);
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_searches = searches.clone();
+    runner.tool_executor.write().register(
+        "web_search",
+        "bounded web search fixture",
+        json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query"]
+        }),
+        Arc::new(move |_| {
+            observed_searches.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(json!({
+                    "results":[{"title":"Current source","url":"https://example.com/research"}]
+                }))
+            })
+        }),
+        &[],
+    );
+    let mut agent = crate::core::agent_instance::AgentInstance::new(
+        "sync-research-result-transport-agent".to_string(),
+        AgentRole::Do,
+    );
+    let mut context = TaskContext::new(
+        "iri://task/sync-research-result-transport",
+        "research current AI Agent trends and return a Markdown report",
+        5,
+    )
+    .with_constraint(
+        REQUIRED_CAPABILITY_CONSTRAINT,
+        REQUIRED_CAPABILITY_WEB_RESEARCH,
+    )
+    .with_constraint(
+        WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+        WORKSPACE_CONTEXT_DISABLED,
+    )
+    .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "evidence handoff".to_string(),
+        success_criteria: "current sources are covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    }));
+    let result = runner
+        .execute_with_agent_md(
+            &mut agent,
+            context,
+            "Research current sources, then return the complete report",
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    assert_eq!(result.verdict, Some(TaskVerdict::Success));
+    assert_eq!(result.turn_count, 2);
+    assert_eq!(
+        result.tool_call_count, 1,
+        "terminal result transport is not an executed runtime tool"
+    );
+    assert_eq!(
+        result.summary,
+        "SUCCESS: research report completed with source limitations disclosed"
+    );
+    assert_eq!(result.output.as_ref().and_then(Value::as_str), Some(report));
+    assert!(result.errors.is_empty());
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let terminal = captured_http_request_json(&requests[1]);
+    assert_eq!(
+        terminal["tool_choice"]["function"]["name"],
+        super::execution::DA_EVIDENCE_RESULT_TOOL_NAME
+    );
+    let tools = terminal["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        tools[0]["function"]["name"],
+        super::execution::DA_EVIDENCE_RESULT_TOOL_NAME
+    );
+    assert!(tools.iter().all(|tool| {
+        !matches!(
+            tool["function"]["name"].as_str(),
+            Some("web_search" | "web_fetch")
+        )
+    }));
+    assert_eq!(terminal["thinking"]["type"], "disabled");
+    assert!(terminal.get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
+async fn non_streaming_research_close_corrects_one_stale_native_tool_without_counting_it() {
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+
+    let report = "# Corrected Report\n\n```mermaid\nflowchart TD\nA --> B\n```\n\nSource: https://example.com/current";
+    let (base_url, server, requests) = capturing_agent_response_sequence_server(vec![
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-current-search",
+            "web_search",
+            json!({"query":"current agent research"}),
+        ),
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-stale-search",
+            "web_search",
+            json!({"query":"repeat current agent research"}),
+        ),
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-corrected-submit",
+            super::execution::DA_EVIDENCE_RESULT_TOOL_NAME,
+            json!({
+                "content": report,
+                "summary": "report submitted after terminal protocol correction",
+                "outcome": "success"
+            }),
+        ),
+    ])
+    .await;
+    let mut settings = crate::config::settings::AgentSettings::default();
+    settings.execution_budget.da_evidence_focus_turns = 1;
+    settings.execution_budget.da_evidence_close_turns = 1;
+    let runner = create_test_runner_with_settings_at(settings, &base_url);
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_searches = searches.clone();
+    runner.tool_executor.write().register(
+        "web_search",
+        "bounded correction fixture",
+        json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query"]
+        }),
+        Arc::new(move |_| {
+            observed_searches.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(json!({
+                    "results":[{"title":"Current source","url":"https://example.com/current"}]
+                }))
+            })
+        }),
+        &[],
+    );
+    let mut agent = crate::core::agent_instance::AgentInstance::new(
+        "sync-research-native-correction-agent".to_string(),
+        AgentRole::Do,
+    );
+    let mut context = TaskContext::new(
+        "iri://task/sync-research-native-correction",
+        "research current AI Agent trends and return a report",
+        6,
+    )
+    .with_constraint(
+        REQUIRED_CAPABILITY_CONSTRAINT,
+        REQUIRED_CAPABILITY_WEB_RESEARCH,
+    )
+    .with_constraint(
+        WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+        WORKSPACE_CONTEXT_DISABLED,
+    )
+    .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "evidence-backed report".to_string(),
+        success_criteria: "current sources are covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    }));
+
+    let result = runner
+        .execute_with_agent_md(
+            &mut agent,
+            context,
+            "Research once, then submit the complete report",
+        )
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    assert_eq!(result.verdict, Some(TaskVerdict::Success));
+    assert_eq!(result.turn_count, 3);
+    assert_eq!(
+        result.tool_call_count, 1,
+        "an unadvertised historical call is protocol noise, not an executable tool action"
+    );
+    assert_eq!(result.output.as_ref().and_then(Value::as_str), Some(report));
+    assert!(result.errors.is_empty());
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let corrected = captured_http_request_json(&requests[2]);
+    assert_eq!(corrected["thinking"]["type"], "disabled");
+    assert_eq!(
+        corrected["tool_choice"]["function"]["name"],
+        super::execution::DA_EVIDENCE_RESULT_TOOL_NAME
+    );
+    let corrected_messages = corrected["messages"].as_array().unwrap();
+    assert!(corrected_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("DA Native Terminal Protocol Correction"))
+    }));
+    assert!(corrected_messages.iter().any(|message| {
+        message["content"].as_str().is_some_and(|content| {
+            content.contains("https://example.com/current")
+                && content.contains("historical tool syntax removed")
+        })
+    }));
+    assert!(corrected_messages.iter().all(|message| {
+        message["role"] != "tool"
+            && message["tool_calls"]
+                .as_array()
+                .is_none_or(|calls| calls.is_empty())
+            && message["tool_call_id"].is_null()
+            && message["content"]
+                .as_str()
+                .is_none_or(|content| !content.contains("call-stale-search"))
+    }));
+    assert!(
+        corrected_messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("call-current-search"))
+        }),
+        "the authenticated successful call identity must remain in the typed evidence ledger"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_research_close_fails_after_one_native_protocol_correction() {
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+
+    let (base_url, server, requests) = capturing_agent_response_sequence_server(vec![
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-bounded-search",
+            "web_search",
+            json!({"query":"current agent research"}),
+        ),
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-first-stale-search",
+            "web_search",
+            json!({"query":"repeat current agent research"}),
+        ),
+        react_response_with_tool_arguments(
+            "tool_call",
+            "call-second-stale-search",
+            "web_search",
+            json!({"query":"repeat current agent research again"}),
+        ),
+    ])
+    .await;
+    let mut settings = crate::config::settings::AgentSettings::default();
+    settings.execution_budget.da_evidence_focus_turns = 1;
+    settings.execution_budget.da_evidence_close_turns = 8;
+    let runner = create_test_runner_with_settings_at(settings, &base_url);
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_searches = searches.clone();
+    runner.tool_executor.write().register(
+        "web_search",
+        "bounded failure fixture",
+        json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query"]
+        }),
+        Arc::new(move |_| {
+            observed_searches.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(json!({
+                    "results":[{"title":"Current source","url":"https://example.com/current"}]
+                }))
+            })
+        }),
+        &[],
+    );
+    let mut agent = crate::core::agent_instance::AgentInstance::new(
+        "sync-research-bounded-native-correction-agent".to_string(),
+        AgentRole::Do,
+    );
+    let mut context = TaskContext::new(
+        "iri://task/sync-research-bounded-native-correction",
+        "research current AI Agent trends and return a report",
+        12,
+    )
+    .with_constraint(
+        REQUIRED_CAPABILITY_CONSTRAINT,
+        REQUIRED_CAPABILITY_WEB_RESEARCH,
+    )
+    .with_constraint(
+        WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+        WORKSPACE_CONTEXT_DISABLED,
+    )
+    .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "evidence-backed report".to_string(),
+        success_criteria: "current sources are covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    }));
+
+    let result = runner
+        .execute_with_agent_md(&mut agent, context, "Research once, then submit the report")
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    assert_eq!(result.turn_count, 3);
+    assert_eq!(result.tool_call_count, 1);
+    assert!(matches!(
+        result.verdict,
+        Some(TaskVerdict::Failed | TaskVerdict::Blocked)
+    ));
+    assert!(result
+        .errors
+        .iter()
+        .any(|error| error.contains("single bounded DA terminal correction")));
+}
+
+#[tokio::test]
+async fn streaming_research_close_uses_the_same_typed_result_transport() {
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+
+    let report = "# Streaming Report\n\n```mermaid\nflowchart LR\nA --> B\n```";
+    let (base_url, server, requests) = streaming_agent_response_server(vec![
+        streaming_react_response(
+            "tool_call",
+            Some((
+                "call-stream-research-search",
+                "web_search",
+                json!({"query":"current agent research"}),
+            )),
+        ),
+        streaming_react_response(
+            "tool_call",
+            Some((
+                "call-stream-research-submit",
+                super::execution::DA_EVIDENCE_RESULT_TOOL_NAME,
+                json!({
+                    "content": report,
+                    "summary": "streaming research report completed",
+                    "outcome": "success"
+                }),
+            )),
+        ),
+    ])
+    .await;
+    let mut settings = crate::config::settings::AgentSettings::default();
+    settings.execution_budget.da_evidence_focus_turns = 1;
+    settings.execution_budget.da_evidence_close_turns = 1;
+    let runner = create_test_runner_with_settings_at(settings, &base_url);
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_searches = searches.clone();
+    runner.tool_executor.write().register(
+        "web_search",
+        "bounded streaming web search fixture",
+        json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query"]
+        }),
+        Arc::new(move |_| {
+            observed_searches.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(json!({"results":[{"title":"Current source"}]})) })
+        }),
+        &[],
+    );
+    let mut agent = crate::core::agent_instance::AgentInstance::new(
+        "stream-research-result-transport-agent".to_string(),
+        AgentRole::Do,
+    );
+    let mut context = TaskContext::new(
+        "iri://task/stream-research-result-transport",
+        "research current AI Agent trends and return a Markdown report",
+        5,
+    )
+    .with_constraint(
+        REQUIRED_CAPABILITY_CONSTRAINT,
+        REQUIRED_CAPABILITY_WEB_RESEARCH,
+    )
+    .with_constraint(
+        WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+        WORKSPACE_CONTEXT_DISABLED,
+    )
+    .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "evidence handoff".to_string(),
+        success_criteria: "current sources are covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    }));
+    let result = runner
+        .execute_streaming(&mut agent, context, |_| {})
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    assert_eq!(result.verdict, Some(TaskVerdict::Success));
+    assert_eq!(result.tool_call_count, 1);
+    assert_eq!(result.output.as_ref().and_then(Value::as_str), Some(report));
+    let requests = requests.lock().unwrap();
+    let terminal = captured_http_request_json(&requests[1]);
+    assert_eq!(
+        terminal["tool_choice"]["function"]["name"],
+        super::execution::DA_EVIDENCE_RESULT_TOOL_NAME
+    );
+    assert_eq!(
+        terminal["tools"][0]["function"]["name"],
+        super::execution::DA_EVIDENCE_RESULT_TOOL_NAME
+    );
+}
+
+#[tokio::test]
+async fn streaming_research_close_corrects_one_stale_native_tool_without_counting_it() {
+    use crate::core::sa::{PlanWorkPackage, WorkPackageEvidenceRequirement};
+
+    let report = "# Corrected Streaming Report\n\n```mermaid\nflowchart LR\nA --> B\n```\n\nSource: https://example.com/current";
+    let (base_url, server, requests) = streaming_agent_response_server(vec![
+        streaming_react_response(
+            "tool_call",
+            Some((
+                "call-stream-current-search",
+                "web_search",
+                json!({"query":"current agent research"}),
+            )),
+        ),
+        streaming_react_response(
+            "tool_call",
+            Some((
+                "call-stream-stale-search",
+                "web_search",
+                json!({"query":"repeat current agent research"}),
+            )),
+        ),
+        streaming_react_response(
+            "tool_call",
+            Some((
+                "call-stream-corrected-submit",
+                super::execution::DA_EVIDENCE_RESULT_TOOL_NAME,
+                json!({
+                    "content": report,
+                    "summary": "streaming report submitted after protocol correction",
+                    "outcome": "success"
+                }),
+            )),
+        ),
+    ])
+    .await;
+    let mut settings = crate::config::settings::AgentSettings::default();
+    settings.execution_budget.da_evidence_focus_turns = 1;
+    settings.execution_budget.da_evidence_close_turns = 1;
+    let runner = create_test_runner_with_settings_at(settings, &base_url);
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_searches = searches.clone();
+    runner.tool_executor.write().register(
+        "web_search",
+        "bounded streaming correction fixture",
+        json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query"]
+        }),
+        Arc::new(move |_| {
+            observed_searches.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(json!({
+                    "results":[{"title":"Current source","url":"https://example.com/current"}]
+                }))
+            })
+        }),
+        &[],
+    );
+    let mut agent = crate::core::agent_instance::AgentInstance::new(
+        "stream-research-native-correction-agent".to_string(),
+        AgentRole::Do,
+    );
+    let mut context = TaskContext::new(
+        "iri://task/stream-research-native-correction",
+        "research current AI Agent trends and return a report",
+        6,
+    )
+    .with_constraint(
+        REQUIRED_CAPABILITY_CONSTRAINT,
+        REQUIRED_CAPABILITY_WEB_RESEARCH,
+    )
+    .with_constraint(
+        WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+        WORKSPACE_CONTEXT_DISABLED,
+    )
+    .with_effect_policy(crate::core::effect::EffectPolicy::EvidenceOnly);
+    context.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "evidence-backed report".to_string(),
+        success_criteria: "current sources are covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    }));
+
+    let result = runner
+        .execute_streaming(&mut agent, context, |_| {})
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    assert_eq!(result.verdict, Some(TaskVerdict::Success));
+    assert_eq!(result.turn_count, 3);
+    assert_eq!(
+        result.tool_call_count, 1,
+        "streaming terminal protocol noise must not become a runtime tool action"
+    );
+    assert_eq!(result.output.as_ref().and_then(Value::as_str), Some(report));
+    assert!(result.errors.is_empty());
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let corrected = captured_http_request_json(&requests[2]);
+    assert_eq!(corrected["thinking"]["type"], "disabled");
+    assert_eq!(
+        corrected["tool_choice"]["function"]["name"],
+        super::execution::DA_EVIDENCE_RESULT_TOOL_NAME
+    );
+    let corrected_messages = corrected["messages"].as_array().unwrap();
+    assert!(corrected_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("DA Native Terminal Protocol Correction"))
+    }));
+    assert!(corrected_messages.iter().any(|message| {
+        message["content"].as_str().is_some_and(|content| {
+            content.contains("https://example.com/current")
+                && content.contains("historical tool syntax removed")
+        })
+    }));
+    assert!(corrected_messages.iter().all(|message| {
+        message["role"] != "tool"
+            && message["tool_calls"]
+                .as_array()
+                .is_none_or(|calls| calls.is_empty())
+            && message["tool_call_id"].is_null()
+            && message["content"]
+                .as_str()
+                .is_none_or(|content| !content.contains("call-stream-stale-search"))
+    }));
+    assert!(corrected_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("call-stream-current-search"))
+    }), "the streaming typed evidence ledger must preserve the authenticated successful call identity");
+}
+
+#[tokio::test]
 async fn non_streaming_repeated_textual_tool_protocol_fails_closed_after_two_turns() {
     let (base_url, server, requests) = capturing_agent_response_sequence_server(vec![
         raw_dsml_terminal_response("file_read"),
@@ -9855,29 +10681,34 @@ fn react_reasoning_effort_is_selected_independently_for_every_role() {
     );
 
     assert_eq!(
-        react_reasoning_effort_for_dispatch(AgentRole::Check, &budget, false, false, false),
+        react_reasoning_effort_for_dispatch(AgentRole::Check, &budget, false, false, false, false),
         ReasoningEffort::Max,
         "ordinary CA work keeps the configured reasoning budget"
     );
     assert_eq!(
-        react_reasoning_effort_for_dispatch(AgentRole::Check, &budget, true, false, false),
+        react_reasoning_effort_for_dispatch(AgentRole::Check, &budget, true, false, false, false),
         ReasoningEffort::Disabled,
         "CA close is a schema-only terminal request"
     );
     assert_eq!(
-        react_reasoning_effort_for_dispatch(AgentRole::Plan, &budget, false, false, true),
+        react_reasoning_effort_for_dispatch(AgentRole::Plan, &budget, false, false, false, true),
         ReasoningEffort::Disabled,
         "the one protocol correction is schema-only for every role"
     );
     assert_eq!(
-        react_reasoning_effort_for_dispatch(AgentRole::Do, &budget, true, false, false),
+        react_reasoning_effort_for_dispatch(AgentRole::Do, &budget, true, false, false, false),
         ReasoningEffort::Low,
         "a CA-only close flag cannot alter another role"
     );
     assert_eq!(
-        react_reasoning_effort_for_dispatch(AgentRole::Do, &budget, false, true, false),
+        react_reasoning_effort_for_dispatch(AgentRole::Do, &budget, false, false, true, false),
         ReasoningEffort::Disabled,
         "the typed DA verification close is a receipt-bound terminal request"
+    );
+    assert_eq!(
+        react_reasoning_effort_for_dispatch(AgentRole::Do, &budget, false, true, false, false),
+        ReasoningEffort::Disabled,
+        "the evidence-only DA close is a terminal synthesis request"
     );
 }
 
@@ -10506,6 +11337,66 @@ fn workspace_disabled_task_keeps_web_tools_and_withholds_project_tools() {
     super::execution::filter_tool_search_result(&mut search_result, &discoverable);
     assert_eq!(search_result["count"], 1);
     assert_eq!(search_result["matches"][0]["name"], "web_fetch");
+}
+
+#[test]
+fn required_web_research_is_a_read_only_capability_floor_for_every_executing_role() {
+    let runner = create_test_runner();
+    let ctx = TaskContext::new("iri://task/required-research", "verify current claims", 10)
+        .with_allowed_tools(vec!["file_read".to_string()])
+        .with_constraint(
+            WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+            WORKSPACE_CONTEXT_DISABLED,
+        )
+        .with_constraint(
+            REQUIRED_CAPABILITY_CONSTRAINT,
+            REQUIRED_CAPABILITY_WEB_RESEARCH,
+        );
+
+    for role in ["PA", "DA", "CA"] {
+        let names = runner
+            .tool_definitions_for_task_context(role, &ctx)
+            .into_iter()
+            .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(names.contains("web_search"), "{role} lost web_search");
+        assert!(names.contains("web_fetch"), "{role} lost web_fetch");
+        assert!(
+            !names.contains("file_read"),
+            "workspace scope leaked to {role}"
+        );
+    }
+
+    assert!(runner
+        .tool_definitions_for_task_context("AA", &ctx)
+        .is_empty());
+}
+
+#[test]
+fn required_mermaid_validation_adds_only_the_safe_ca_verifier() {
+    let runner = create_test_runner();
+    let ctx = TaskContext::new("iri://task/direct-mermaid", "return a Mermaid report", 10)
+        .with_allowed_tools(vec!["read_agent_output".to_string()])
+        .with_constraint(
+            WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+            WORKSPACE_CONTEXT_DISABLED,
+        )
+        .with_constraint(REQUIRED_VALIDATION_CONSTRAINT, REQUIRED_VALIDATION_MERMAID);
+
+    let names_for = |role: &str| {
+        runner
+            .tool_definitions_for_task_context(role, &ctx)
+            .into_iter()
+            .filter_map(|definition| definition["function"]["name"].as_str().map(str::to_string))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let ca = names_for("CA");
+    assert!(ca.contains("read_agent_output"));
+    assert!(ca.contains("mermaid_validate"));
+    assert!(!ca.contains("bash"));
+    assert!(!names_for("PA").contains("mermaid_validate"));
+    assert!(!names_for("DA").contains("mermaid_validate"));
+    assert!(names_for("AA").is_empty());
 }
 
 #[test]
@@ -12106,6 +12997,55 @@ fn canonical_child_tool_scope_pins_verifier_and_blocks_unrelated_discovery() {
     assert!(!discoverable.contains("tool_search"));
     assert!(!discoverable.contains("web_search"));
 
+    let research_verification = verification
+        .clone()
+        .with_constraint(
+            WORKSPACE_CONTEXT_SCOPE_CONSTRAINT,
+            WORKSPACE_CONTEXT_DISABLED,
+        )
+        .with_constraint(
+            REQUIRED_CAPABILITY_CONSTRAINT,
+            REQUIRED_CAPABILITY_WEB_RESEARCH,
+        );
+    let research_names =
+        names(runner.tool_definitions_for_task_context("DA", &research_verification));
+    assert!(research_names.contains("web_search"));
+    assert!(research_names.contains("web_fetch"));
+    assert!(!research_names.contains("bash"));
+    assert!(!research_names.contains("file_read"));
+
+    let mut external_research = research_verification.clone();
+    external_research.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "research_sources".to_string(),
+        objective: "search current sources".to_string(),
+        expected_output: "research notes".to_string(),
+        success_criteria: "current evidence is covered".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+        dependencies: Vec::new(),
+    }));
+    let external_names = names(runner.tool_definitions_for_task_context("DA", &external_research));
+    assert!(external_names.contains("web_search"));
+    assert!(external_names.contains("web_fetch"));
+    assert!(!external_names.contains("bash"));
+    assert!(!external_names.contains("file_read"));
+    assert!(!external_names.contains("file_write"));
+
+    let mut response = research_verification.clone();
+    response.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
+        id: "draft_report".to_string(),
+        objective: "write the report in the response".to_string(),
+        expected_output: "Markdown response".to_string(),
+        success_criteria: "report is complete".to_string(),
+        evidence_requirements: vec![WorkPackageEvidenceRequirement::ResponseDelivery],
+        dependencies: vec!["research_sources".to_string()],
+    }));
+    assert!(
+        runner
+            .tool_definitions_for_task_context("DA", &response)
+            .is_empty(),
+        "a response-only synthesis child must not repeat its research dependency's tool work"
+    );
+
     let mut mixed = verification.clone();
     mixed.biz_agent_child_evidence_contract = Some(Arc::new(PlanWorkPackage {
         id: "wp_tests".to_string(),
@@ -12436,6 +13376,33 @@ fn effectful_tool_start_is_required_while_readonly_start_remains_best_effort() {
         error,
         crate::CoreError::InteractionRejected { ref stage, .. } if stage == "effect_journal"
     ));
+}
+
+#[test]
+fn mermaid_validator_is_read_only_and_negative_findings_are_typed_failures() {
+    let arguments = serde_json::json!({
+        "node_iri": "iri://task/report/session/l1-da/turn_2"
+    });
+    let result = serde_json::json!({
+        "schema_version": "mermaid_validation/v1",
+        "success": false,
+        "diagram_count": 0,
+        "validation_error": "archived Markdown contains no complete Mermaid fenced block",
+        "output": "Mermaid validation failed: archived Markdown contains no complete Mermaid fenced block"
+    });
+
+    assert!(!super::execution::tool_call_has_side_effect_risk(
+        "mermaid_validate",
+        &arguments
+    ));
+    let assessment =
+        super::execution::assess_verification_call("mermaid_validate", &arguments, &result)
+            .expect("the validator is an executable artifact check");
+    assert_eq!(
+        assessment.outcome,
+        crate::core::tracked_action::VerificationOutcome::Failed
+    );
+    assert_eq!(assessment.count, Some(1));
 }
 
 #[test]

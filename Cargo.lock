@@ -1607,6 +1607,7 @@ dependencies = [
  "libc",
  "lru 0.12.5",
  "md5",
+ "mermaid-rs-renderer",
  "mockall",
  "notify 6.1.1",
  "notify-debouncer-mini",

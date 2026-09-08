@@ -65,7 +65,7 @@ const SUBTASK_PLAN_SCHEMA_VERSION: u32 = 2;
 const BIZ_AGENT_CHILD_MANIFEST_SCHEMA_VERSION: u32 = 3;
 pub(crate) const BIZ_AGENT_WORK_PACKAGE_ORDER_RECEIPT_SCHEMA_VERSION: u64 = 6;
 const CHILD_RECEIPT_REUSE_SCHEMA_VERSION: u32 = 3;
-const BIZ_AGENT_ORCHESTRATION_STATE_SCHEMA_VERSION: u32 = 9;
+const BIZ_AGENT_ORCHESTRATION_STATE_SCHEMA_VERSION: u32 = 10;
 const BIZ_AGENT_PARENT_EFFECT_RECEIPT_SCHEMA_VERSION: u32 = 2;
 const RECOVERED_PARENT_WORKSPACE_MUTATION_SCHEMA_VERSION: u32 = 1;
 const RECOVERED_PARENT_WORKSPACE_MUTATION_TYPE: &str =
@@ -3442,7 +3442,7 @@ impl BizAgent {
             }),
         )
         .await;
-        let result = self
+        let mut result = self
             .aggregate_with_orchestration(
                 &context,
                 &parent_interaction_id,
@@ -3461,6 +3461,18 @@ impl BizAgent {
                     "BizAgent refused to commit an aggregate after its workspace ledger changed: {error}"
                 ),
             );
+        }
+        match self.archive_parent_aggregate(&context, session, &result) {
+            Ok(archive_iri) => result.archive_iri = Some(archive_iri),
+            Err(error) => {
+                warn!(
+                    task_iri = %context.task_iri,
+                    agent = %self.agent_id(),
+                    role = %self.role(),
+                    %error,
+                    "BizAgent aggregate AgentTurn archive degraded"
+                );
+            }
         }
         state.aggregation_status = AggregationStatus::Completed;
         state.aggregate_result = Some(result.clone());
@@ -3486,6 +3498,54 @@ impl BizAgent {
         )
         .await;
         result
+    }
+
+    /// Persist the parent BizAgent reduction as one stable AgentTurn.
+    ///
+    /// Child AgentTurns remain isolated and keep their provider call identities.
+    /// Downstream roles receive only this parent-owned, kernel-materialized
+    /// aggregate capability, so a multi-child handoff never has to infer read
+    /// authority from model-visible child manifests.
+    fn archive_parent_aggregate(
+        &self,
+        context: &TaskContext,
+        session: &L1Session,
+        result: &TaskResult,
+    ) -> Result<String, CoreError> {
+        let content = result
+            .output
+            .as_ref()
+            .filter(|value| !value.is_null())
+            .cloned()
+            .unwrap_or_else(|| Value::String(result.summary.clone()));
+        let turn = u32::try_from(session.turn_count().saturating_add(1)).map_err(|_| {
+            CoreError::Internal {
+                message: "BizAgent parent L1 turn counter exceeded u32".to_string(),
+            }
+        })?;
+        let node_iri = crate::core::agent_runner::agent_turn_iri(
+            &context.task_iri,
+            session.session_id(),
+            turn,
+        );
+        let node = json!({
+            "@id": &node_iri,
+            "@type": "AgentTurn",
+            "role": self.role().to_string(),
+            "agent_id": self.agent_id(),
+            "session_id": session.session_id(),
+            "cycle_id": context.cycle_id,
+            "content": content,
+            "summary": result.summary,
+            "producer_kind": "kernel_materialized_bizagent_aggregate",
+            "child_count": self.child_results.len(),
+        });
+        self.runner.blackboard.write_node(
+            &node_iri,
+            &node.to_string(),
+            &crate::CoreConfig::default(),
+        )?;
+        Ok(node_iri)
     }
 
     async fn decompose(
@@ -5905,6 +5965,7 @@ fn tool_is_retry_safe_after_interruption(tool: &str) -> bool {
             | "knowledge_query"
             | "knowledge_neighbors"
             | "read_agent_output"
+            | "mermaid_validate"
             | "jsonld_validate"
             | "ontology_validate_turtle"
             | "ontology_validate_shacl"
@@ -6844,6 +6905,23 @@ fn work_package_evidence_contract_satisfied_in_epoch(
         })
         .collect::<BTreeSet<_>>();
 
+    let successful_external_research = result.tracked_actions.iter().any(|action| {
+        matches!(
+            action.tool_name.as_str(),
+            "web_search" | "web_fetch" | "http_request"
+        ) && action.status == crate::core::tracked_action::ActionStatus::Success
+            && action.error.is_none()
+            && action.call_identity.is_some()
+            && action.disclosure.as_ref().is_some_and(|disclosure| {
+                disclosure.disclosed_to_model && !disclosure.result_withheld
+            })
+    });
+    let response_delivered = result.output.as_ref().is_some_and(|output| match output {
+        Value::String(content) => !content.trim().is_empty(),
+        Value::Null => false,
+        _ => true,
+    });
+
     for requirement in &package.evidence_requirements {
         match requirement {
             WorkPackageEvidenceRequirement::ArtifactDelivery { paths, min_paths } => {
@@ -6924,6 +7002,18 @@ fn work_package_evidence_contract_satisfied_in_epoch(
                 return Err(format!(
                     "package '{}' requires {} trusted workspace mutation action(s), observed {}",
                     package.id, min_actions, mutation_actions
+                ));
+            }
+            WorkPackageEvidenceRequirement::ExternalResearch if !successful_external_research => {
+                return Err(format!(
+                    "package '{}' requires one successful disclosed external-research receipt",
+                    package.id
+                ));
+            }
+            WorkPackageEvidenceRequirement::ResponseDelivery if !response_delivered => {
+                return Err(format!(
+                    "package '{}' requires a non-empty response delivery",
+                    package.id
                 ));
             }
             WorkPackageEvidenceRequirement::Verification { kind, min_count } => {
@@ -13704,6 +13794,96 @@ mod tests {
     }
 
     #[test]
+    fn evidence_only_research_and_response_use_their_own_typed_receipts() {
+        let research_package = crate::core::sa::PlanWorkPackage {
+            id: "research_sources".to_string(),
+            objective: "search current sources".to_string(),
+            expected_output: "research notes".to_string(),
+            success_criteria: "current sources are covered".to_string(),
+            evidence_requirements: vec![
+                crate::core::sa::WorkPackageEvidenceRequirement::ExternalResearch,
+            ],
+            dependencies: Vec::new(),
+        };
+        let mut research = successful_result("iri://task/research", "research notes");
+        let mut actions = crate::core::tracked_action::ActionTracker::new(&research.task_iri, "DA");
+        let identity = crate::core::execution_journal::ToolCallIdentity::new(
+            "research-child",
+            "research-l1",
+            "research-request",
+            "research-call",
+        );
+        let tool_result = json!({"results": [{"title": "source", "url": "https://example.com"}]});
+        actions.record_with_identity(
+            "web_search",
+            &json!({"query": "latest agent research"}),
+            &tool_result,
+            0.01,
+            Some(identity.clone()),
+        );
+        assert!(actions.record_disclosure(
+            &identity,
+            "web_search",
+            false,
+            &tool_result.to_string(),
+        ));
+        let routed_hash = actions.actions[0]
+            .disclosure
+            .as_ref()
+            .unwrap()
+            .routed_payload_sha256
+            .clone();
+        actions
+            .confirm_disclosures_for_provider_request(&[(identity.provider_call_id, routed_hash)]);
+        research.tracked_actions = actions.actions;
+        work_package_evidence_contract_satisfied(&research_package, &research)
+            .expect("a disclosed successful web search is typed research evidence");
+
+        let mut blocked_fetch = successful_result("iri://task/research", "blocked fetch");
+        let mut blocked =
+            crate::core::tracked_action::ActionTracker::new(&blocked_fetch.task_iri, "DA");
+        blocked.record_with_identity(
+            "web_fetch",
+            &json!({"url": "https://example.com"}),
+            &json!({"error": "reserved target blocked"}),
+            0.01,
+            Some(crate::core::execution_journal::ToolCallIdentity::new(
+                "research-child",
+                "research-l1",
+                "research-request-2",
+                "research-call-2",
+            )),
+        );
+        blocked_fetch.tracked_actions = blocked.actions;
+        assert!(
+            work_package_evidence_contract_satisfied(&research_package, &blocked_fetch)
+                .unwrap_err()
+                .contains("successful disclosed external-research")
+        );
+
+        let response_package = crate::core::sa::PlanWorkPackage {
+            id: "draft_report".to_string(),
+            objective: "write report in response".to_string(),
+            expected_output: "Markdown response".to_string(),
+            success_criteria: "report is complete".to_string(),
+            evidence_requirements: vec![
+                crate::core::sa::WorkPackageEvidenceRequirement::ResponseDelivery,
+            ],
+            dependencies: vec!["research_sources".to_string()],
+        };
+        let response = successful_result("iri://task/report", "# Report");
+        work_package_evidence_contract_satisfied(&response_package, &response)
+            .expect("non-empty response output is typed delivery evidence");
+        let mut missing = successful_result("iri://task/report", "empty");
+        missing.output = Some(Value::String("  ".to_string()));
+        assert!(
+            work_package_evidence_contract_satisfied(&response_package, &missing)
+                .unwrap_err()
+                .contains("non-empty response delivery")
+        );
+    }
+
+    #[test]
     fn zero_delta_verifier_releases_successor_but_cannot_replace_parent_mutation() {
         let storage = tempfile::tempdir().unwrap();
         let runner = test_runner("http://127.0.0.1:9".to_string(), storage.path());
@@ -15252,6 +15432,104 @@ mod tests {
         }));
         assert!(std::iter::from_fn(|| events.try_recv().ok())
             .all(|event| event.scope.stage != "bizagent_aggregate"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_archive_is_the_only_typed_read_capability_in_a_fresh_ca_child() {
+        let storage = tempfile::tempdir().unwrap();
+        let runner = test_runner("http://127.0.0.1:9".to_string(), storage.path());
+        let mut parent = BizAgent::new(
+            "aggregate_capability_parent".to_string(),
+            AgentRole::Do,
+            "# generated DA",
+            runner.clone(),
+            AgentConfig::default(),
+        );
+        let task_iri = "iri://task/aggregate-capability";
+        add_successful_children(&mut parent, task_iri);
+        let child_archives = [
+            format!("{task_iri}/biz-agent-child/first/session/l1_first/turn_1"),
+            format!("{task_iri}/biz-agent-child/second/session/l1_second/turn_1"),
+        ];
+        for (index, archive_iri) in child_archives.iter().enumerate() {
+            parent.child_results[index].archive_iri = Some(archive_iri.clone());
+            parent.sub_results[index].archive_iri = Some(archive_iri.clone());
+        }
+
+        let parent_context = TaskContext::new(task_iri, "combine two reports", 3)
+            .with_effect_policy(EffectPolicy::EvidenceOnly)
+            .with_allowed_tools(vec!["read_agent_output".to_string()]);
+        let aggregate = parent.aggregate_results(&parent_context);
+        let session = L1Session::with_budget(
+            parent.agent_id(),
+            &parent.role().to_string(),
+            task_iri,
+            4_000,
+        );
+        let aggregate_iri = parent
+            .archive_parent_aggregate(&parent_context, &session, &aggregate)
+            .expect("the kernel aggregate must be archived as a stable AgentTurn");
+
+        let archived = runner
+            .projection
+            .read_node(&aggregate_iri)
+            .unwrap()
+            .expect("aggregate AgentTurn must exist");
+        assert_eq!(archived["@type"], "AgentTurn");
+        assert!(archived["content"].to_string().contains("first complete"));
+        assert!(archived["content"].to_string().contains("second complete"));
+
+        let ca_parent_context = TaskContext::new(task_iri, "audit aggregate", 3)
+            .with_effect_policy(EffectPolicy::EvidenceOnly)
+            .with_allowed_tools(vec!["read_agent_output".to_string()])
+            .with_execution_handoff("review the exact parent aggregate", aggregate_iri.clone());
+        let ca_spec = spec("content_audit", Vec::new());
+        let provenance = test_decomposition_provenance(
+            &ca_parent_context,
+            AgentRole::Check,
+            "ca_parent",
+            "ca_decomposition_request",
+        );
+        let ca_parent = BizAgent::new(
+            "ca_parent".to_string(),
+            AgentRole::Check,
+            "# generated CA",
+            runner.clone(),
+            AgentConfig::default(),
+        );
+        let prepared = ca_parent
+            .prepare_child(&ca_parent_context, &ca_spec, &[], &provenance, "", &[])
+            .await;
+        let security =
+            prepared
+                .context
+                .tool_security_context(&prepared.child_id, "CA", "fresh_ca_l1");
+        assert!(security.permits_agent_turn_read(&aggregate_iri));
+        for child_archive in &child_archives {
+            assert!(
+                !security.permits_agent_turn_read(child_archive),
+                "model-visible child provenance must not become an implicit capability"
+            );
+        }
+
+        let mut executor = crate::tools::tool_executor::ToolExecutor::new();
+        executor.set_projection_engine(Arc::new(
+            crate::memory::l3_projection::ProjectionEngine::new(runner.blackboard.clone(), 8_000),
+        ));
+        let read = executor
+            .execute_with_security_context(
+                "read_agent_output",
+                json!({"node_iri": aggregate_iri}),
+                security,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(read["content"].as_str().unwrap().contains("first complete"));
+        assert!(read["content"]
+            .as_str()
+            .unwrap()
+            .contains("second complete"));
     }
 
     #[tokio::test]

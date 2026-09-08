@@ -198,6 +198,7 @@ impl ToolGroupManager {
                 "bash".to_string(),
                 "powershell".to_string(),
                 "jsonld_validate".to_string(),
+                "mermaid_validate".to_string(),
             ]),
         );
 

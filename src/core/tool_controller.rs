@@ -34,6 +34,11 @@ pub const CA_TOOL_CEILING: &[&str] = &[
     "glob_search",
     "bash",
     "tool_search",
+    // Current-source verification is part of CA's independent evidence role.
+    // These remain read-only and are still subject to the task capability
+    // contract, exact per-turn advertisement, and network policy.
+    "web_search",
+    "web_fetch",
     "jsonld_validate",
     "rag_search",
     "kg_search",
@@ -43,6 +48,7 @@ pub const CA_TOOL_CEILING: &[&str] = &[
     "knowledge_query",
     "knowledge_neighbors",
     "read_agent_output",
+    "mermaid_validate",
     "ontology_validate_turtle",
     "ontology_validate_shacl",
     "ontology_lint_turtle",
@@ -263,6 +269,8 @@ mod tests {
         assert!(do_tools.contains(&"file_write".to_string()));
         let check_tools = tc.list_available_tools(&AgentRole::Check);
         assert!(check_tools.contains(&"bash".to_string()));
+        assert!(check_tools.contains(&"web_search".to_string()));
+        assert!(check_tools.contains(&"web_fetch".to_string()));
         assert!(!check_tools.contains(&"file_write".to_string()));
         assert!(tc.list_available_tools(&AgentRole::Act).is_empty());
     }

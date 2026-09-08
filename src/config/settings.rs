@@ -683,7 +683,10 @@ pub struct AgentExecutionBudgetSettings {
     #[serde(default = "default_da_evidence_focus_turns")]
     pub da_evidence_focus_turns: u32,
     /// At this many evidence-only DA tool turns, remove tools and require the
-    /// final evidence-backed deliverable. Zero disables the close gate.
+    /// final evidence-backed deliverable. Required live-research work closes
+    /// after at most one targeted turn beyond its focus gate because a single
+    /// provider turn may contain several parallel retrieval calls. Zero
+    /// disables the close gate.
     #[serde(default = "default_da_evidence_close_turns")]
     pub da_evidence_close_turns: u32,
     /// After a workspace-changing DA has successfully run a recognisable

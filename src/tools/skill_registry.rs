@@ -177,6 +177,7 @@ impl SkillRegistry {
             "knowledge_bridge",
             "knowledge_extract_code",
             "read_agent_output",
+            "mermaid_validate",
             "ontology_validate_turtle",
             "ontology_lint_turtle",
             "ontology_diff_turtle",
@@ -216,7 +217,15 @@ impl SkillRegistry {
         ]
         .into_iter()
         .filter(|(role, _)| {
-            crate::core::tool_controller::business_role_allows_tool(*role, tool_name)
+            // DA's open ceiling means "no additional generic ceiling"; it
+            // must not override a built-in handler's narrower role contract.
+            // This validator is intentionally CA-only so skill discovery and
+            // executable registration describe the same authority.
+            if tool_name == "mermaid_validate" {
+                *role == crate::core::agent_instance::AgentRole::Check
+            } else {
+                crate::core::tool_controller::business_role_allows_tool(*role, tool_name)
+            }
         })
         .map(|(_, name)| name.to_string())
         .collect();
@@ -1394,6 +1403,23 @@ mod tests {
 
         let da_skills = registry.list_skills_for_role("DA");
         assert!(!da_skills.is_empty());
+    }
+
+    #[test]
+    fn mermaid_validator_skill_matches_its_ca_only_runtime_authority() {
+        let registry = SkillRegistry::new();
+        let skill = registry
+            .get_skill("iri://skills/mermaid_validate")
+            .expect("built-in validator skill");
+        assert_eq!(skill.allowed_roles, vec!["CA"]);
+        assert!(registry
+            .list_skills_for_role("CA")
+            .iter()
+            .any(|candidate| candidate.skill_iri == skill.skill_iri));
+        assert!(!registry
+            .list_skills_for_role("DA")
+            .iter()
+            .any(|candidate| candidate.skill_iri == skill.skill_iri));
     }
 
     #[test]

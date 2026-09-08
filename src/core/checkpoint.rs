@@ -17,15 +17,16 @@ use crate::CoreError;
 /// carry one complete, validated [`TaskResumeState`].  Reconstructing state
 /// from loosely related legacy fields made an apparently valid resume depend
 /// on guesses that were not protected by the execution journal.
-// v6/v4 deliberately invalidate pre-isolation, pre-typed-evidence, and
-// pre-two-level-DAG snapshots. A restored generated plan must still prove the
-// same downstream Check evidence relation accepted during SA planning.
+// v8/v6 deliberately invalidate pre-isolation, pre-typed-evidence,
+// pre-two-level-DAG, and pre-direct-response/research evidence snapshots. A
+// restored generated plan must still prove the same downstream Check evidence
+// relation and delivery/capability boundary accepted during SA planning.
 // snapshots. Older contracts may contain kernel-generic role definitions or
 // work packages without exact artifact/verifier requirements; replaying them
 // would silently undo the fresh LLM-derived agent.md boundary or admit a
 // model-success result without the current kernel evidence contract.
-pub const TASK_RESUME_STATE_SCHEMA_VERSION: u32 = 7;
-pub const TASK_RESUME_CONTRACT_SCHEMA_VERSION: u32 = 5;
+pub const TASK_RESUME_STATE_SCHEMA_VERSION: u32 = 8;
+pub const TASK_RESUME_CONTRACT_SCHEMA_VERSION: u32 = 6;
 pub const ACTIVE_NODE_CONTINUATION_SCHEMA_VERSION: u32 = 1;
 
 /// Checkpoints belonging to one task share an IRI namespace, but they do not

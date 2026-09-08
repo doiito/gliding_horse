@@ -32,7 +32,7 @@ When the original task requires design/specification before implementation, the 
 
 Treat user-facing compatibility and lifecycle statements as testable artifact claims. A minimum runtime, dependency, platform or tool version must agree with the delivered syntax, imports, APIs, configuration and lock data; success on one newer environment proves only that observed environment, not the stated older minimum. Verify the claimed boundary with an available representative runtime/tool plus static inspection, or require the documentation to state only the actually verified environment (or omit an unsupported minimum). Final documentation must not describe delivered work as pending, unimplemented or otherwise stale unless the text is clearly labelled as historical context.
 
-When the original task explicitly requires Mermaid output, counting Markdown fences or grepping for the word `mermaid` proves presence only, never parseability. After reading the exact Markdown artifact, use an available `mmdc` executable as one direct deterministic verifier call against that Markdown file, with generated check output outside the task workspace; do not combine extraction scripts, pipes, redirections, or a second verifier in the same call. A parser/render failure is an `observed_defect` owned by that exact artifact path. If no Mermaid parser is available, record a `verification_gap` instead of claiming the diagram is valid.
+When the original task explicitly requires Mermaid output, counting Markdown fences or grepping for the word `mermaid` proves presence only, never parseability. For a direct-response deliverable, call `mermaid_validate` with the exact stable DA aggregate `node_iri`; it validates the archived text itself, so never submit copied or rewritten diagram text. For a workspace Markdown artifact, use an available `mmdc` executable as one direct deterministic verifier call against that file, with generated check output outside the task workspace; do not combine extraction scripts, pipes, redirections, or a second verifier in the same call. A parser/render failure is an `observed_defect` owned by that exact archived response or artifact path. If no applicable Mermaid parser is advertised, record a `verification_gap` instead of claiming the diagram is valid.
 
 The terminal response MUST use the ordinary outer ReAct JSON object and set `action` to `finish`. Its `summary` MUST begin with exactly `PASS:`, `CONDITIONAL_PASS:`, or `FAIL:`. Its `content` MUST be this JSON object (not prose and not a JSON string):
 
@@ -1160,6 +1160,26 @@ impl super::AgentRunner {
                 }) {
                     control.push_str(
                         "\n\nArtifactDelivery execution rule: finish only after this fresh child has invoked `file_write` for every exact declared artifact path. If a declared file already exists and its complete content is correct, read it completely and invoke `file_write` once with that exact full unchanged content; the runtime records a changed=false identical-artifact attestation without manufacturing a modification. If it is incorrect, write the corrected complete content. `file_read`, directory presence, dependency prose, or a finish statement alone cannot authenticate delivery. Do not create, edit, or remove undeclared paths.",
+                    );
+                }
+                if package.evidence_requirements.iter().any(|requirement| {
+                    matches!(
+                        requirement,
+                        crate::core::sa::WorkPackageEvidenceRequirement::ExternalResearch
+                    )
+                }) {
+                    control.push_str(
+                        "\n\nExternalResearch execution rule: obtain at least one current result through an advertised live-retrieval tool. A blocked fetch is a disclosed limitation, not evidence that a successful web_search did not occur. Source-count and coverage criteria describe report quality; they do not require the same number of tool calls. Preserve links and disclose retrieval limits in the response.",
+                    );
+                }
+                if package.evidence_requirements.iter().any(|requirement| {
+                    matches!(
+                        requirement,
+                        crate::core::sa::WorkPackageEvidenceRequirement::ResponseDelivery
+                    )
+                }) {
+                    control.push_str(
+                        "\n\nResponseDelivery execution rule: return the complete assigned deliverable as non-empty response content. Do not invent a filesystem path or claim that a file is required. This receipt proves response transport only; the independent CA checks the requested format and content.",
                     );
                 }
                 if package.evidence_requirements.iter().any(|requirement| {

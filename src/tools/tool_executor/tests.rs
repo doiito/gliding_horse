@@ -18,7 +18,14 @@ mod tests {
     #[test]
     fn external_registration_cannot_replace_evidence_critical_builtin() {
         let mut executor = ToolExecutor::new();
-        for name in ["file_read", "file_write", "file_edit", "bash", "powershell"] {
+        for name in [
+            "file_read",
+            "file_write",
+            "file_edit",
+            "bash",
+            "powershell",
+            "mermaid_validate",
+        ] {
             assert!(executor.tools.contains_key(name), "missing built-in {name}");
             assert_eq!(
                 executor.tool_provenance.get(name),
@@ -542,6 +549,146 @@ mod tests {
                 "agent_turn_capability_required"
             );
         });
+    }
+
+    #[test]
+    fn mermaid_extraction_requires_complete_real_fences() {
+        let sources = extract_mermaid_sources(
+            "```text\nliteral ```mermaid is not a diagram\n```\n\n~~~MERMAID\nflowchart TD\nA-->B\n~~~~",
+        )
+        .unwrap();
+        assert_eq!(sources, vec!["flowchart TD\nA-->B"]);
+        assert!(extract_mermaid_sources("```mermaid\nflowchart TD\nA-->B")
+            .unwrap_err()
+            .contains("not closed"));
+        assert!(extract_mermaid_sources("plain Markdown")
+            .unwrap_err()
+            .contains("no complete Mermaid"));
+        let invalid = validate_mermaid_markdown(
+            "```mermaid\ndefinitely_not_a_mermaid_diagram\n```",
+            "iri://task/t/session/da/turn_1",
+        );
+        assert_eq!(invalid["success"], false);
+        assert_eq!(invalid["diagrams"][0]["success"], false);
+
+        let missing = validate_mermaid_markdown(
+            "# Report\\n\\n```mermaid\\nflowchart TD\\nA-->B\\n```",
+            "iri://task/t/session/da/turn_2",
+        );
+        assert_eq!(missing["success"], false);
+        assert!(missing.get("error").is_none());
+        assert!(missing["validation_error"]
+            .as_str()
+            .is_some_and(|value| value.contains("no complete Mermaid")));
+        assert!(missing["output"]
+            .as_str()
+            .is_some_and(|value| value.contains("Mermaid validation failed")));
+    }
+
+    #[test]
+    fn mermaid_validator_uses_only_an_exact_authorized_agent_turn() {
+        rt().block_on(async {
+            let blackboard = Arc::new(crate::memory::l2_blackboard::Blackboard::new().unwrap());
+            let exact_iri = crate::core::agent_runner::agent_turn_iri(
+                "iri://task/mermaid-access",
+                "l1_da_parent",
+                1,
+            );
+            let foreign_iri = crate::core::agent_runner::agent_turn_iri(
+                "iri://task/mermaid-access",
+                "l1_da_child",
+                2,
+            );
+            let config = crate::CoreConfig::default();
+            for iri in [&exact_iri, &foreign_iri] {
+                blackboard
+                    .write_node(
+                        iri,
+                        &json!({
+                            "@id": iri,
+                            "@type": "AgentTurn",
+                            "content": "# Report\n\n```mermaid\nflowchart TD\nA-->B\n```",
+                        })
+                        .to_string(),
+                        &config,
+                    )
+                    .unwrap();
+            }
+
+            let mut executor = ToolExecutor::new();
+            executor.set_projection_engine(Arc::new(
+                crate::memory::l3_projection::ProjectionEngine::new(blackboard, 500),
+            ));
+            let context = crate::core::agent_runner::TaskContext::new(
+                "iri://task/mermaid-access",
+                "validate the direct response",
+                2,
+            )
+            .with_execution_handoff("stable DA aggregate", exact_iri.clone())
+            .tool_security_context("agent:ca", "CA", "l1_ca_fresh");
+
+            let validated = executor
+                .execute_with_security_context(
+                    "mermaid_validate",
+                    json!({"node_iri": exact_iri}),
+                    context.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(validated["schema_version"], "mermaid_validation/v1");
+            assert_eq!(validated["success"], true);
+            assert_eq!(validated["diagram_count"], 1);
+            assert_eq!(validated["diagrams"][0]["success"], true);
+
+            let denied = executor
+                .execute_with_security_context(
+                    "mermaid_validate",
+                    json!({"node_iri": foreign_iri}),
+                    context,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied["tool"], "mermaid_validate");
+            assert_eq!(denied["reason"], "agent_turn_capability_required");
+
+            let untrusted = executor
+                .execute("mermaid_validate", json!({"node_iri": exact_iri}))
+                .await
+                .unwrap();
+            assert_eq!(untrusted["reason"], "agent_turn_capability_required");
+        });
+    }
+
+    #[test]
+    fn mermaid_validator_accepts_the_report_diagram_mix() {
+        let report = r#"
+```mermaid
+flowchart TD
+    A[Goal] --> B[Agent]
+```
+```mermaid
+flowchart LR
+    A[Plan] --> B[Act]
+```
+```mermaid
+timeline
+    title Agent progress
+    2025 : Tool use
+    2026 : Durable agents
+```
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent
+    U->>A: Goal
+    A-->>U: Result
+```
+"#;
+        let result = validate_mermaid_markdown(report, "iri://task/t/session/da/turn_1");
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["diagram_count"], 4);
     }
 
     #[test]

@@ -127,6 +127,12 @@ pub const DELIVERY_TARGET_PATH_CONSTRAINT: &str = "delivery_target_path";
 pub const REQUIRED_CAPABILITY_CONSTRAINT: &str = "required_capability";
 pub const REQUIRED_CAPABILITY_WEB_RESEARCH: &str = "web_research";
 
+/// Application-declared deterministic validation required for the delivered
+/// response.  The application classifies natural language; the kernel only
+/// consumes this typed capability contract.
+pub const REQUIRED_VALIDATION_CONSTRAINT: &str = "required_validation";
+pub const REQUIRED_VALIDATION_MERMAID: &str = "mermaid";
+
 /// Kernel-owned contract established from the original user order and a
 /// validated prerequisite DAG.  The serialized value is checkpoint data, not
 /// free-form prompt text: every consumer must deserialize and validate it
@@ -609,7 +615,7 @@ pub(crate) fn direct_response_delivery_contract(
         .get(DELIVERY_MODE_CONSTRAINT)
         .is_some_and(|mode| mode == DELIVERY_MODE_DIRECT_RESPONSE)
         .then_some(
-            "Delivery mode is direct_response: the final deliverable must be returned in the agent response. A filesystem path, file artifact, or invented graph IRI is neither required nor valid acceptance evidence unless the original user request explicitly requires one.",
+            "Delivery mode is direct_response: the final deliverable must be returned in the agent response. A filesystem path, file artifact, or invented graph IRI is neither required nor valid acceptance evidence unless the original user request explicitly requires one. When returning Markdown through JSON or a native function argument, escape line breaks exactly once so the decoded deliverable contains real newline characters, never visible literal `\\n` sequences.",
         )
 }
 
@@ -1134,6 +1140,39 @@ impl TaskContext {
         self.constraints
             .get(REQUIRED_CAPABILITY_CONSTRAINT)
             .is_some_and(|capability| capability == REQUIRED_CAPABILITY_WEB_RESEARCH)
+    }
+
+    pub fn requires_mermaid_validation(&self) -> bool {
+        self.constraints
+            .get(REQUIRED_VALIDATION_CONSTRAINT)
+            .is_some_and(|validator| validator == REQUIRED_VALIDATION_MERMAID)
+    }
+
+    /// Resolve the executable allowlist after applying kernel-owned capability
+    /// requirements. A model-authored SA/BizAgent tool list may narrow optional
+    /// tools, but it cannot silently remove the read-only retrieval primitives
+    /// required by the application's live-research contract.
+    pub(crate) fn effective_allowed_tools_for_role(&self, role: &str) -> Option<Vec<String>> {
+        let mut allowed = self.allowed_tools.clone()?;
+        if matches!(role, "AA" | "Act") {
+            return Some(allowed);
+        }
+        if self.requires_web_research() {
+            for required in ["web_search", "web_fetch"] {
+                if !allowed.iter().any(|candidate| candidate == required) {
+                    allowed.push(required.to_string());
+                }
+            }
+        }
+        if matches!(role, "CA" | "Check")
+            && self.requires_mermaid_validation()
+            && !allowed
+                .iter()
+                .any(|candidate| candidate == "mermaid_validate")
+        {
+            allowed.push("mermaid_validate".to_string());
+        }
+        Some(allowed)
     }
 
     pub fn with_allowed_tools(mut self, tools: Vec<String>) -> Self {
@@ -1874,16 +1913,21 @@ impl AgentRunner {
         )
     }
 
-    fn apply_task_tool_scope(&self, definitions: Vec<Value>, ctx: &TaskContext) -> Vec<Value> {
+    fn apply_task_tool_scope(
+        &self,
+        definitions: Vec<Value>,
+        role: &str,
+        ctx: &TaskContext,
+    ) -> Vec<Value> {
         let executor = self.tool_executor.read();
+        let effective_allowed_tools = ctx.effective_allowed_tools_for_role(role);
         definitions
             .into_iter()
             .filter(|definition| {
                 let Some(name) = definition["function"]["name"].as_str() else {
                     return false;
                 };
-                let allowlisted = ctx
-                    .allowed_tools
+                let allowlisted = effective_allowed_tools
                     .as_deref()
                     .map(|allowed| executor.allowlist_permits(name, allowed))
                     .unwrap_or(true);
@@ -1903,9 +1947,10 @@ impl AgentRunner {
         ctx: &TaskContext,
         session_micro_tools: &HashSet<String>,
     ) -> Vec<Value> {
+        let effective_allowed_tools = ctx.effective_allowed_tools_for_role(role);
         let mut definitions = self.tool_definitions_for_context_with_microtools(
             role,
-            ctx.allowed_tools.as_deref(),
+            effective_allowed_tools.as_deref(),
             session_micro_tools,
         );
         if ctx.requires_web_research() {
@@ -1920,7 +1965,7 @@ impl AgentRunner {
                 };
                 if !matches!(name, "web_search" | "web_fetch" | "http_request")
                     || !names.insert(name.to_string())
-                    || ctx.allowed_tools.as_deref().is_some_and(|allowed| {
+                    || effective_allowed_tools.as_deref().is_some_and(|allowed| {
                         !ToolExecutor::explicit_allowlist_permits(name, allowed)
                     })
                 {
@@ -1930,7 +1975,7 @@ impl AgentRunner {
             }
         }
         definitions = self.apply_canonical_child_tool_scope(definitions, role, ctx);
-        self.apply_task_tool_scope(definitions, ctx)
+        self.apply_task_tool_scope(definitions, role, ctx)
     }
 
     /// Turn a canonical child evidence contract into its least-authority tool
@@ -1951,6 +1996,7 @@ impl AgentRunner {
         let Some(package) = ctx.biz_agent_child_evidence_contract.as_deref() else {
             return definitions;
         };
+        let effective_allowed_tools = ctx.effective_allowed_tools_for_role(role);
         let has_artifact = package.evidence_requirements.iter().any(|requirement| {
             matches!(
                 requirement,
@@ -1969,6 +2015,34 @@ impl AgentRunner {
                 crate::core::sa::WorkPackageEvidenceRequirement::Verification { .. }
             )
         });
+        let has_external_research = package.evidence_requirements.iter().any(|requirement| {
+            matches!(
+                requirement,
+                crate::core::sa::WorkPackageEvidenceRequirement::ExternalResearch
+            )
+        });
+        let has_response_delivery = package.evidence_requirements.iter().any(|requirement| {
+            matches!(
+                requirement,
+                crate::core::sa::WorkPackageEvidenceRequirement::ResponseDelivery
+            )
+        });
+        if has_external_research && !has_artifact && !has_verification && !has_unscoped_mutation {
+            definitions.retain(|definition| {
+                definition["function"]["name"]
+                    .as_str()
+                    .is_some_and(|name| matches!(name, "web_search" | "web_fetch" | "http_request"))
+            });
+            return definitions;
+        }
+        if has_response_delivery
+            && !has_external_research
+            && !has_artifact
+            && !has_verification
+            && !has_unscoped_mutation
+        {
+            return Vec::new();
+        }
         if !has_artifact && !has_verification || has_unscoped_mutation {
             return definitions;
         }
@@ -1992,7 +2066,7 @@ impl AgentRunner {
             let catalog = self.tool_executor.read().tool_definitions_for_role(role);
             for required_name in &required {
                 if names.contains(*required_name)
-                    || ctx.allowed_tools.as_deref().is_some_and(|allowed| {
+                    || effective_allowed_tools.as_deref().is_some_and(|allowed| {
                         !ToolExecutor::explicit_allowlist_permits(required_name, allowed)
                     })
                 {
@@ -2012,6 +2086,8 @@ impl AgentRunner {
                 return false;
             };
             ToolExecutor::is_micro_tool_name(name)
+                || (ctx.requires_web_research()
+                    && matches!(name, "web_search" | "web_fetch" | "http_request"))
                 || (has_artifact
                     && matches!(name, "file_write" | "file_read" | "read_agent_output"))
                 || (has_verification && matches!(name, "bash" | "powershell" | "code_execute"))
@@ -2033,7 +2109,7 @@ impl AgentRunner {
             role,
             ctx,
         );
-        self.apply_task_tool_scope(definitions, ctx)
+        self.apply_task_tool_scope(definitions, role, ctx)
     }
 
     pub(super) fn tool_definitions_for_task_context(

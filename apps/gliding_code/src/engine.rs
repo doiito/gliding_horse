@@ -3138,6 +3138,14 @@ fn with_glidingcode_task_constraints(
     } else {
         ctx
     };
+    let ctx = if !uses_workspace && normalized.contains("mermaid") {
+        ctx.with_constraint(
+            glidinghorse::core::agent_runner::REQUIRED_VALIDATION_CONSTRAINT,
+            glidinghorse::core::agent_runner::REQUIRED_VALIDATION_MERMAID,
+        )
+    } else {
+        ctx
+    };
     let ctx = if uses_workspace && glidingcode_task_requires_new_child_directory(user_input) {
         ctx.with_constraint(
             glidinghorse::core::agent_runner::WORKSPACE_LAYOUT_CONSTRAINT,
@@ -3579,6 +3587,12 @@ mod tests {
                 .get(glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT)
                 .map(String::as_str),
             Some(glidinghorse::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH)
+        );
+        assert_eq!(
+            ctx.constraints()
+                .get(glidinghorse::core::agent_runner::REQUIRED_VALIDATION_CONSTRAINT)
+                .map(String::as_str),
+            Some(glidinghorse::core::agent_runner::REQUIRED_VALIDATION_MERMAID)
         );
         assert!(!glidingcode_task_uses_workspace(
             "编写一份量子计算趋势报告并直接输出 Markdown"

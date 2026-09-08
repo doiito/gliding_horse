@@ -3289,6 +3289,7 @@ mod tests {
 
     #[test]
     fn ca_review_subject_contains_da_deliverable_but_not_da_success_claims() {
+        let aggregate_iri = "iri://task/direct-review/session/l1_da_aggregate/turn_2".to_string();
         let result = TaskResult {
             task_iri: "iri://task/direct-review".to_string(),
             status: "success".to_string(),
@@ -3304,16 +3305,67 @@ mod tests {
             tool_call_count: 1,
             five_w2h_updates: None,
             tracked_actions: Vec::new(),
-            archive_iri: Some("iri://task/direct-review/turn_2".to_string()),
+            archive_iri: Some(aggregate_iri.clone()),
         };
 
         let subject = super::execution::execution_subject_handoff(&result, 6_000)
             .expect("reviewable DA output");
         assert!(subject.contains("PASS_WORD_IS_PART_OF_DELIVERABLE_CONTENT"));
         assert!(subject.contains("report.md"));
-        assert!(subject.contains("iri://task/direct-review/turn_2"));
+        assert!(subject.contains(&aggregate_iri));
+        assert!(subject.starts_with("## Stable DA Aggregate Output Capability"));
         assert!(!subject.contains("SUCCESS_HINT_SHOULD_NOT_REACH_CA"));
         assert!(!subject.contains("status: success"));
+    }
+
+    #[test]
+    fn bounded_ca_handoff_keeps_only_the_typed_parent_aggregate_read_capability() {
+        let parent_aggregate =
+            "iri://task/parallel-da/session/l1_da_parent_aggregate/turn_7".to_string();
+        let child_turn =
+            "iri://task/parallel-da/subtask/research/session/l1_child/turn_3".to_string();
+        let child_task = "iri://task/parallel-da/subtask/research".to_string();
+        let result = TaskResult {
+            task_iri: "iri://task/parallel-da".to_string(),
+            status: "success".to_string(),
+            verdict: Some(TaskVerdict::Success),
+            summary: "model success claim".to_string(),
+            output: Some(serde_json::Value::String(
+                "large-deliverable-".repeat(2_000),
+            )),
+            jsonld_output: None,
+            artifacts: vec![serde_json::json!({
+                "type": "biz_agent_work_package_order_receipt",
+                "child_task_iri": child_task,
+                "child_archive_iri": child_turn,
+                "executions": [{
+                    "child_task_iri": "iri://task/parallel-da/subtask/research",
+                    "status": "success"
+                }]
+            })],
+            errors: vec![],
+            turn_count: 7,
+            tool_call_count: 2,
+            five_w2h_updates: None,
+            tracked_actions: Vec::new(),
+            archive_iri: Some(parent_aggregate.clone()),
+        };
+
+        let handoff = super::execution::execution_subject_handoff(&result, 120)
+            .expect("the kernel aggregate is reviewable");
+        assert!(handoff.starts_with("## Stable DA Aggregate Output Capability"));
+        assert!(handoff.contains(&parent_aggregate));
+        assert!(handoff.contains("only cross-agent AgentTurn read target"));
+        assert!(handoff.contains("not readable AgentTurn targets"));
+        assert!(handoff.contains("## Kernel Work-Package Order Receipt (complete)"));
+        assert!(!handoff.contains("large-deliverable-"));
+
+        let context = TaskContext::new("iri://task/parallel-da", "verify", 4)
+            .with_execution_handoff(handoff, parent_aggregate.clone());
+        let security = context.tool_security_context("ca-child", "CA", "l1_fresh_ca");
+        assert!(security.permits_agent_turn_read(&parent_aggregate));
+        assert!(!security.permits_agent_turn_read(&child_turn));
+        assert!(!security.permits_agent_turn_read(&child_task));
     }
 
     #[test]
@@ -3427,7 +3479,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_response_recheck_uses_only_the_exact_agent_output_reader() {
+    fn direct_response_recheck_uses_the_agent_output_reader_and_required_live_retrieval() {
         let constraints = std::collections::HashMap::from([
             (
                 crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
@@ -3441,6 +3493,34 @@ mod tests {
         assert_eq!(
             super::execution::direct_response_recheck_tools(&constraints),
             Some(vec!["read_agent_output".to_string()])
+        );
+
+        let mut research_constraints = constraints.clone();
+        research_constraints.insert(
+            crate::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT.to_string(),
+            crate::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH.to_string(),
+        );
+        assert_eq!(
+            super::execution::direct_response_recheck_tools(&research_constraints),
+            Some(vec![
+                "read_agent_output".to_string(),
+                "web_search".to_string(),
+                "web_fetch".to_string(),
+            ])
+        );
+
+        research_constraints.insert(
+            crate::core::agent_runner::REQUIRED_VALIDATION_CONSTRAINT.to_string(),
+            crate::core::agent_runner::REQUIRED_VALIDATION_MERMAID.to_string(),
+        );
+        assert_eq!(
+            super::execution::direct_response_recheck_tools(&research_constraints),
+            Some(vec![
+                "read_agent_output".to_string(),
+                "web_search".to_string(),
+                "web_fetch".to_string(),
+                "mermaid_validate".to_string(),
+            ])
         );
 
         let workspace_task = std::collections::HashMap::from([(

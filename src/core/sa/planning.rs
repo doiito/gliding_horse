@@ -332,6 +332,47 @@ fn has_artifact_delivery_requirement(package: &PlanWorkPackage) -> bool {
     })
 }
 
+fn has_response_delivery_requirement(package: &PlanWorkPackage) -> bool {
+    package.evidence_requirements.iter().any(|requirement| {
+        matches!(
+            requirement,
+            WorkPackageEvidenceRequirement::ResponseDelivery
+        )
+    })
+}
+
+fn has_external_research_requirement(package: &PlanWorkPackage) -> bool {
+    package.evidence_requirements.iter().any(|requirement| {
+        matches!(
+            requirement,
+            WorkPackageEvidenceRequirement::ExternalResearch
+        )
+    })
+}
+
+/// ExternalResearch proves that live evidence reached the Agent; it is not a
+/// command-count contract.  A model-authored plan that names a concrete
+/// retrieval tool together with a numeric quota makes successful delivery
+/// depend on an implementation detail (and encouraged the DA to keep calling
+/// a withdrawn tool).  Source/topic coverage remains valid when expressed
+/// without binding it to `web_search`, `web_fetch`, or `http_request` calls.
+fn external_research_has_tool_call_quota(package: &PlanWorkPackage) -> bool {
+    if !has_external_research_requirement(package) {
+        return false;
+    }
+    let criteria = package.success_criteria.to_lowercase();
+    let names_retrieval_tool = ["web_search", "web_fetch", "http_request"]
+        .iter()
+        .any(|tool| criteria.contains(tool));
+    let contains_number = criteria.chars().any(|character| character.is_ascii_digit());
+    let describes_call_count = [
+        "次", "调用", "执行", "完成", "call", "invoke", "execute", "request",
+    ]
+    .iter()
+    .any(|marker| criteria.contains(marker));
+    names_retrieval_tool && contains_number && describes_call_count
+}
+
 fn has_test_execution_requirement(package: &PlanWorkPackage) -> bool {
     package.evidence_requirements.iter().any(|requirement| {
         matches!(
@@ -1008,10 +1049,11 @@ fn validate_fresh_do_work_package_evidence(package: &PlanWorkPackage) -> Result<
     }
     if contains_any_marker(&text, DELIVERY_MARKERS)
         && !has_artifact_delivery_requirement(package)
+        && !has_response_delivery_requirement(package)
         && !is_explicit_verification_only_work_package(package)
     {
         return Err(format!(
-            "design, implementation or documentation work package '{}' requires artifact_delivery with min_paths >= 1",
+            "design, implementation or documentation work package '{}' requires artifact_delivery with min_paths >= 1 or response_delivery when the task contract permits a direct response",
             package.id
         ));
     }
@@ -1605,6 +1647,72 @@ fn validate_fresh_generated_plan_evidence_contract(steps: &[PlanStep]) -> Result
             )
         }
     })
+}
+
+/// Bind the model-authored work-package evidence to the application-owned
+/// delivery/capability contract. This is deliberately a candidate gate: a
+/// planner may propose stricter filesystem work, but it cannot turn a direct
+/// response into an invented file side effect or represent live research as
+/// workspace mutation.
+fn validate_generated_plan_against_task_contract(
+    steps: &[PlanStep],
+    task_constraints: &HashMap<String, String>,
+) -> Result<(), String> {
+    let do_packages = steps
+        .iter()
+        .filter(|step| step.role == AgentRole::Do)
+        .flat_map(|step| &step.work_packages)
+        .collect::<Vec<_>>();
+
+    if crate::core::agent_runner::direct_response_delivery_contract(task_constraints).is_some()
+        && !do_packages.is_empty()
+    {
+        if let Some(package) = do_packages.iter().find(|package| {
+            package.evidence_requirements.iter().any(|requirement| {
+                matches!(
+                    requirement,
+                    WorkPackageEvidenceRequirement::ArtifactDelivery { .. }
+                        | WorkPackageEvidenceRequirement::WorkspaceMutation { .. }
+                )
+            })
+        }) {
+            return Err(format!(
+                "direct_response task work package '{}' invents filesystem mutation evidence; use response_delivery for a response result",
+                package.id
+            ));
+        }
+        if !do_packages
+            .iter()
+            .any(|package| has_response_delivery_requirement(package))
+        {
+            return Err(
+                "direct_response task with Do work packages requires at least one response_delivery evidence boundary"
+                    .to_string(),
+            );
+        }
+    }
+
+    if crate::core::agent_runner::required_capability_contract(task_constraints).is_some()
+        && !do_packages.is_empty()
+        && !do_packages
+            .iter()
+            .any(|package| has_external_research_requirement(package))
+    {
+        return Err(
+            "web-research task with Do work packages requires at least one external_research evidence boundary"
+                .to_string(),
+        );
+    }
+    if let Some(package) = do_packages
+        .iter()
+        .find(|package| external_research_has_tool_call_quota(package))
+    {
+        return Err(format!(
+            "external_research work package '{}' specifies a retrieval-tool call quota; express required source or topic coverage as content criteria and let the runtime choose retrieval count",
+            package.id
+        ));
+    }
+    Ok(())
 }
 
 /// Revalidate the normalized two-level contract stored in an execution plan.
@@ -3095,6 +3203,98 @@ mod generated_plan_gate_tests {
         assert!(error.to_string().contains("runtime capacity is 5"));
         validate_generated_work_package_capacity(&[step], 8).unwrap();
     }
+
+    #[test]
+    fn direct_response_research_rejects_invented_mutations_and_accepts_typed_transport() {
+        let constraints = HashMap::from([
+            (
+                crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+            ),
+            (
+                crate::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT.to_string(),
+                crate::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH.to_string(),
+            ),
+        ]);
+        let mut do_step = generated_gate_step(AgentRole::Do, "research");
+        do_step.work_packages = vec![
+            PlanWorkPackage {
+                id: "research_sources".to_string(),
+                objective: "Find at least five current sources".to_string(),
+                expected_output: "Verified research notes".to_string(),
+                success_criteria: "At least five sources are covered".to_string(),
+                evidence_requirements: vec![WorkPackageEvidenceRequirement::WorkspaceMutation {
+                    min_actions: 5,
+                }],
+                dependencies: Vec::new(),
+            },
+            PlanWorkPackage {
+                id: "draft_report".to_string(),
+                objective: "Write the Markdown report in the response".to_string(),
+                expected_output: "Markdown response\nExact artifact: report.md".to_string(),
+                success_criteria: "Complete report".to_string(),
+                evidence_requirements: vec![WorkPackageEvidenceRequirement::ArtifactDelivery {
+                    paths: vec!["report.md".to_string()],
+                    min_paths: 1,
+                }],
+                dependencies: vec!["research_sources".to_string()],
+            },
+        ];
+        let error = validate_generated_plan_against_task_contract(&[do_step.clone()], &constraints)
+            .expect_err("direct response must reject invented filesystem evidence");
+        assert!(error.contains("invents filesystem mutation evidence"));
+
+        do_step.work_packages[0].evidence_requirements =
+            vec![WorkPackageEvidenceRequirement::ExternalResearch];
+        do_step.work_packages[1].expected_output = "Complete Markdown response".to_string();
+        do_step.work_packages[1].evidence_requirements =
+            vec![WorkPackageEvidenceRequirement::ResponseDelivery];
+        validate_generated_plan_against_task_contract(&[do_step], &constraints)
+            .expect("typed live-research and response evidence match the task contract");
+    }
+
+    #[test]
+    fn external_research_rejects_tool_call_quotas_but_accepts_source_coverage() {
+        let constraints = HashMap::from([
+            (
+                crate::core::agent_runner::DELIVERY_MODE_CONSTRAINT.to_string(),
+                crate::core::agent_runner::DELIVERY_MODE_DIRECT_RESPONSE.to_string(),
+            ),
+            (
+                crate::core::agent_runner::REQUIRED_CAPABILITY_CONSTRAINT.to_string(),
+                crate::core::agent_runner::REQUIRED_CAPABILITY_WEB_RESEARCH.to_string(),
+            ),
+        ]);
+        let mut do_step = generated_gate_step(AgentRole::Do, "research");
+        do_step.work_packages = vec![
+            PlanWorkPackage {
+                id: "research_sources".to_string(),
+                objective: "Research current AI Agent developments".to_string(),
+                expected_output: "Current source evidence".to_string(),
+                success_criteria: "至少完成5次成功的web_search检索，并至少读取3个网页内容"
+                    .to_string(),
+                evidence_requirements: vec![WorkPackageEvidenceRequirement::ExternalResearch],
+                dependencies: Vec::new(),
+            },
+            PlanWorkPackage {
+                id: "draft_report".to_string(),
+                objective: "Deliver the complete report".to_string(),
+                expected_output: "Markdown response".to_string(),
+                success_criteria: "Complete Markdown and Mermaid report".to_string(),
+                evidence_requirements: vec![WorkPackageEvidenceRequirement::ResponseDelivery],
+                dependencies: vec!["research_sources".to_string()],
+            },
+        ];
+
+        let error = validate_generated_plan_against_task_contract(&[do_step.clone()], &constraints)
+            .expect_err("tool-call quotas are an invalid implementation-level contract");
+        assert!(error.contains("retrieval-tool call quota"));
+
+        do_step.work_packages[0].success_criteria =
+            "至少覆盖5个不同的权威来源，并覆盖主要技术趋势与应用场景".to_string();
+        validate_generated_plan_against_task_contract(&[do_step], &constraints)
+            .expect("content-level source coverage is a valid research criterion");
+    }
 }
 
 impl SupervisorAgent {
@@ -3618,6 +3818,7 @@ Output only JSON, no other content."#;
                 five_w2h,
                 keyword_complexity,
                 explicit_order_required,
+                task_constraints,
             )
             .await
         {
@@ -3662,6 +3863,7 @@ Output only JSON, no other content."#;
         response: &crate::gateway::unified_gateway::ChatCompletionResponse,
         keyword_complexity: TaskComplexity,
         explicit_order_required: bool,
+        task_constraints: &HashMap<String, String>,
     ) -> Result<ExecutionPlan, SaPlanCandidateRejection> {
         if let Some(reason) = unusable_sa_plan_completion(response) {
             return Err(SaPlanCandidateRejection::unusable(reason));
@@ -3713,6 +3915,17 @@ Output only JSON, no other content."#;
         }
         validate_llm_plan_role_contract(&plan.steps, plan.task_complexity)
             .map_err(|error| SaPlanCandidateRejection::from_core(error, content.clone()))?;
+        validate_generated_plan_against_task_contract(&plan.steps, task_constraints).map_err(
+            |reason| {
+                SaPlanCandidateRejection::from_core(
+                    CoreError::InteractionRejected {
+                        stage: "sa_plan_evidence_contract".to_string(),
+                        reason,
+                    },
+                    content.clone(),
+                )
+            },
+        )?;
         validate_generated_work_package_capacity(
             &plan.steps,
             self.runner.agent_settings.execution_budget.max_sub_agents,
@@ -3728,6 +3941,7 @@ Output only JSON, no other content."#;
         five_w2h: &crate::core::five_w2h::Task5W2H,
         keyword_complexity: TaskComplexity,
         explicit_order_required: bool,
+        task_constraints: &HashMap<String, String>,
     ) -> Result<ExecutionPlan, CoreError> {
         let mut w2h_section = String::new();
 
@@ -3864,7 +4078,7 @@ Each role is one parent BizAgent in this cross-role plan. Every parent has the s
 
 `work_packages` is a canonical prerequisite contract owned by that one parent, not additional SA role instances. Use an empty array for atomic work. A work package's `dependencies` may name only another package in the same parent. When the original task explicitly requires one same-parent business outcome before another, list both outcomes here and put the predecessor id in the successor's `dependencies`. Express dependencies between different BizAgent parents only with the owning steps' `dependencies`; never reference a package id from another step. Independent outcomes must not receive invented dependencies.
 
-Every Do work package MUST declare a non-empty `evidence_requirements` array. All entries are jointly required (logical AND). Available shapes are `{{"type":"artifact_delivery","paths":["exact/workspace/relative.file"],"min_paths":N}}`, `{{"type":"workspace_mutation","min_actions":N}}`, and `{{"type":"verification","kind":"test_execution|build|lint|type|syntax|artifact|smoke","min_count":N}}`, with every N at least 1. Artifact paths must be exact canonical workspace-relative file paths (forward slashes; no absolute paths, `.` or `..`), every path must also appear literally in that package's `expected_output`, and `min_paths` MUST equal the number of declared paths because every promised artifact is mandatory; unrelated writes do not count. Artifact ownership must be disjoint across packages: do not repeat a path or declare parent/child paths in different packages. A later rewrite of another package's file requires a future explicit handoff contract and is not valid ArtifactDelivery. Design, implementation and documentation packages require artifact_delivery. Any package that claims to run or execute tests requires verification kind test_execution; a build, syntax check, file mutation or prose claim is not a test. A pure test-artifact writer may declare only artifact_delivery, but only when a later test_execution package is ordered after it: use a local package dependency when both belong to Do, or place the verifier in Check and make the Check step transitively depend on the Do step. A package that both creates test files/suites and executes them requires BOTH artifact_delivery and test_execution, and every promised test file always requires artifact_delivery. When test artifacts and final user documentation (README, usage/user/API/CLI guide, manual or equivalent) are both delivered, every final user-documentation package MUST transitively depend on every test-artifact writer. Its objective/success criteria must require inspecting the delivered test artifact and deriving the documented framework and copy-paste command from it; never guess or translate pytest into unittest (or the reverse). A prerequisite design/specification document is not final user documentation. Keep test-artifact creation before final user documentation, then use a separate verification-only final test-execution package after the documentation and every other artifact mutation; this ordering preserves an explicit user request to test before documenting without creating a stale-receipt dependency cycle. Every canonical test_execution package must be strictly downstream of every other artifact_delivery/workspace_mutation package through its local package DAG or a transitive parent-step barrier, so its own typed receipt runs after all writers and describes the final workspace epoch. Do not create an early canonical testing package and expect another package's later test to satisfy it. Earlier exploratory tests may stay inside a predecessor as diagnostic activity, but declare one pure canonical final-verification package after all artifact writers. If multiple testing packages would also deliver test artifacts, split artifact creation into an artifact-only writer package and keep the final test package verification-only.
+Every Do work package MUST declare a non-empty `evidence_requirements` array. All entries are jointly required (logical AND). Available shapes are `{{"type":"artifact_delivery","paths":["exact/workspace/relative.file"],"min_paths":N}}`, `{{"type":"workspace_mutation","min_actions":N}}`, `{{"type":"external_research"}}`, `{{"type":"response_delivery"}}`, and `{{"type":"verification","kind":"test_execution|build|lint|type|syntax|artifact|smoke","min_count":N}}`, with every N at least 1. `external_research` means at least one successful live web retrieval whose result reached the Agent; source-count requirements remain content criteria and MUST NOT be translated into a number of mutations or network calls. Never put a numeric call quota on a named retrieval tool such as `web_search`, `web_fetch`, or `http_request` in success criteria; require source/topic coverage and let the runtime choose the retrieval count. `response_delivery` means a non-empty direct Agent response; it proves delivery, while CA checks Markdown, Mermaid, completeness, and other content criteria. If the Delivery Contract says `direct_response`, use `response_delivery` for the final response package and NEVER invent artifact_delivery, workspace_mutation, a filename, or an “Exact artifact” line. A web-research task with work packages must assign `external_research` to at least one research package. Artifact paths must be exact canonical workspace-relative file paths (forward slashes; no absolute paths, `.` or `..`), every path must also appear literally in that package's `expected_output`, and `min_paths` MUST equal the number of declared paths because every promised artifact is mandatory; unrelated writes do not count. Artifact ownership must be disjoint across packages: do not repeat a path or declare parent/child paths in different packages. A later rewrite of another package's file requires a future explicit handoff contract and is not valid ArtifactDelivery. Filesystem design, implementation and documentation packages require artifact_delivery; direct-response reports and analysis use response_delivery. Any package that claims to run or execute tests requires verification kind test_execution; a build, syntax check, file mutation or prose claim is not a test. A pure test-artifact writer may declare only artifact_delivery, but only when a later test_execution package is ordered after it: use a local package dependency when both belong to Do, or place the verifier in Check and make the Check step transitively depend on the Do step. A package that both creates test files/suites and executes them requires BOTH artifact_delivery and test_execution, and every promised test file always requires artifact_delivery. When test artifacts and final user documentation (README, usage/user/API/CLI guide, manual or equivalent) are both delivered, every final user-documentation package MUST transitively depend on every test-artifact writer. Its objective/success criteria must require inspecting the delivered test artifact and deriving the documented framework and copy-paste command from it; never guess or translate pytest into unittest (or the reverse). A prerequisite design/specification document is not final user documentation. Keep test-artifact creation before final user documentation, then use a separate verification-only final test-execution package after the documentation and every other artifact mutation; this ordering preserves an explicit user request to test before documenting without creating a stale-receipt dependency cycle. Every canonical test_execution package must be strictly downstream of every other artifact_delivery/workspace_mutation package through its local package DAG or a transitive parent-step barrier, so its own typed receipt runs after all writers and describes the final workspace epoch. Do not create an early canonical testing package and expect another package's later test to satisfy it. Earlier exploratory tests may stay inside a predecessor as diagnostic activity, but declare one pure canonical final-verification package after all artifact writers. If multiple testing packages would also deliver test artifacts, split artifact creation into an artifact-only writer package and keep the final test package verification-only.
 
 ## Complexity Definitions
 - **simple**: Simple query, single step (DA only)
@@ -3928,6 +4142,7 @@ Output only JSON, no other content."#,
             &initial_response.response,
             keyword_complexity,
             explicit_order_required,
+            task_constraints,
         ) {
             Ok(plan) => (plan, initial_response.interaction_id),
             Err(initial_rejection) => {
@@ -3956,6 +4171,7 @@ Output only JSON, no other content."#,
                     &retry_response.response,
                     keyword_complexity,
                     explicit_order_required,
+                    task_constraints,
                 ) {
                     Ok(plan) => (plan, retry_response.interaction_id),
                     Err(retry_rejection) => {

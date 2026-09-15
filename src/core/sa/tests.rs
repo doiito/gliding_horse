@@ -468,7 +468,7 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(agent_ids.len(), 2, "SA must not reuse a BizAgent instance");
 
-        let requests = captured_requests.lock().unwrap();
+        let requests = captured_requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
         let request_messages = requests
             .iter()

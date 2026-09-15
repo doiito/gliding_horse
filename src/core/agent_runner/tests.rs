@@ -9987,10 +9987,8 @@ async fn large_execution_result_keeps_verification_receipt_inline_and_exactly_re
     // broader page. Reader progress is monotonic: once a broader request has
     // delivered past this cursor, replaying the overlapping prefix correctly
     // returns a lightweight receipt instead of duplicate body text.
-    let continuation = runner
-        .tool_executor
-        .read()
-        .clone()
+    let executor = runner.tool_executor.read().clone();
+    let continuation = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"stream": "stdout", "char_offset": stdout_cursor}),
@@ -10003,10 +10001,7 @@ async fn large_execution_result_keeps_verification_receipt_inline_and_exactly_re
         Some(expected_next)
     );
 
-    let page = runner
-        .tool_executor
-        .read()
-        .clone()
+    let page = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"stream": "stdout", "char_offset": 0}),
@@ -10017,10 +10012,7 @@ async fn large_execution_result_keeps_verification_receipt_inline_and_exactly_re
     assert!(page["content"]
         .as_str()
         .is_some_and(|content| content.starts_with("29 passed")));
-    let repeated_page = runner
-        .tool_executor
-        .read()
-        .clone()
+    let repeated_page = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"stream": "stdout", "char_offset": 0}),
@@ -10034,10 +10026,7 @@ async fn large_execution_result_keeps_verification_receipt_inline_and_exactly_re
     assert_eq!(repeated_page["status"], "already_delivered_prefix");
     assert_eq!(repeated_page["content"], "");
 
-    let raw_page = runner
-        .tool_executor
-        .read()
-        .clone()
+    let raw_page = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"stream": "raw", "char_offset": 0}),
@@ -10114,10 +10103,8 @@ async fn routed_large_file_reader_pages_source_lines_instead_of_single_line_json
     // The routed preview may have aged out of provider history before a
     // repair needs a complete overwrite baseline. An explicit restart can
     // replay that bounded body once; this is not transcript/session reuse.
-    let replay = runner
-        .tool_executor
-        .read()
-        .clone()
+    let executor = runner.tool_executor.read().clone();
+    let replay = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"offset": 0, "limit": 40, "char_offset": 0}),
@@ -10127,10 +10114,7 @@ async fn routed_large_file_reader_pages_source_lines_instead_of_single_line_json
     assert!(replay["content"]
         .as_str()
         .is_some_and(|content| content.starts_with("routed-source-line-000")));
-    let duplicate_replay = runner
-        .tool_executor
-        .read()
-        .clone()
+    let duplicate_replay = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"offset": 0, "limit": 40, "char_offset": 0}),
@@ -10148,10 +10132,7 @@ async fn routed_large_file_reader_pages_source_lines_instead_of_single_line_json
         .as_u64()
         .expect("kernel preview exposes an exact character cursor")
         as usize;
-    let page = runner
-        .tool_executor
-        .read()
-        .clone()
+    let page = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({
@@ -10202,10 +10183,8 @@ async fn routed_cjk_wide_line_continues_from_exact_preview_cursor_without_replay
         .unwrap();
     assert_eq!(visible.chars().count(), char_offset);
 
-    let skipped = runner
-        .tool_executor
-        .read()
-        .clone()
+    let executor = runner.tool_executor.read().clone();
+    let skipped = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({
@@ -10220,10 +10199,7 @@ async fn routed_cjk_wide_line_continues_from_exact_preview_cursor_without_replay
     assert_eq!(skipped["content"], "");
     assert_eq!(skipped["next_cursor"], cursor);
 
-    let page = runner
-        .tool_executor
-        .read()
-        .clone()
+    let page = executor
         .execute(&routing.reader_name, cursor)
         .await
         .unwrap();
@@ -10233,10 +10209,7 @@ async fn routed_cjk_wide_line_continues_from_exact_preview_cursor_without_replay
         source_line.chars().nth(char_offset)
     );
 
-    let repeated = runner
-        .tool_executor
-        .read()
-        .clone()
+    let repeated = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"offset": 0, "limit": 1, "char_offset": 0}),
@@ -10246,10 +10219,7 @@ async fn routed_cjk_wide_line_continues_from_exact_preview_cursor_without_replay
     assert!(repeated["content"]
         .as_str()
         .is_some_and(|content| content.starts_with(&source_line[..30])));
-    let duplicate = runner
-        .tool_executor
-        .read()
-        .clone()
+    let duplicate = executor
         .execute(
             &routing.reader_name,
             serde_json::json!({"offset": 0, "limit": 1, "char_offset": 0}),
@@ -11221,12 +11191,8 @@ fn failed_shell_effect_retains_exact_complete_delta_without_becoming_success() {
             let before = capture_workspace_effect_snapshot_async(&executor)
                 .await
                 .unwrap();
-            let result = executor
-                .read()
-                .clone()
-                .execute("bash", args.clone())
-                .await
-                .unwrap();
+            let executor_handle = executor.read().clone();
+            let result = executor_handle.execute("bash", args.clone()).await.unwrap();
             assert!(crate::core::tracked_action::tool_result_failed(&result));
             let evidence = confirmed_workspace_effect_evidence(
                 &executor,

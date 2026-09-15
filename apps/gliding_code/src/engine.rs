@@ -3888,8 +3888,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut config = CliConfig::from_env_and_args(
-            None,
-            None,
+            Some("offline-test-key".into()),
+            Some("http://offline.test".into()),
             "offline-test-model".into(),
             workspace.path().to_string_lossy().to_string(),
             1,

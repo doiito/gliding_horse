@@ -77,7 +77,11 @@ fn validate_jsonld_basic(json_str: &str) -> Result<Value, String> {
 }
 
 fn build_system(max_iterations: u32) -> (SupervisorAgent, TempDir) {
-    let api_key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set");
+    // Rule-based tests (task classification / plan structure) never call the
+    // LLM, so a placeholder key keeps them runnable in CI without secrets.
+    // Live tests are gated behind `live-tests` and require a real key.
+    let api_key = std::env::var("DEEPSEEK_API_KEY")
+        .unwrap_or_else(|_| "placeholder-key-for-rule-based-tests".to_string());
     let base_url = std::env::var("DEEPSEEK_API_URL")
         .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
 

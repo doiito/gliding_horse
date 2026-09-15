@@ -3616,8 +3616,9 @@ sequenceDiagram
             use std::process::Command;
             // Spawn a real background sleep; pkill -f on a unique marker
             // must still terminate it (protection only filters the agent).
+            // `exec -a` is a bash builtin — /bin/sh (dash on CI) rejects it.
             let marker = format!("real_target_marker_{}", std::process::id());
-            let mut child = Command::new("sh")
+            let mut child = Command::new("bash")
                 .arg("-c")
                 .arg(format!("exec -a {} sleep 60", marker))
                 .spawn()

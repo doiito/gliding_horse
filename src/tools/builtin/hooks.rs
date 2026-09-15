@@ -1056,7 +1056,9 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message.contains("timed out")));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Generous wall-clock ceiling: CI runners are slow and loaded, so a
+        // tight bound flakes. This only guards against a hung kill path.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(windows)]

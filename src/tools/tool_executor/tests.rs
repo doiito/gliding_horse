@@ -3614,34 +3614,53 @@ sequenceDiagram
     fn test_bash_self_protect_pkill_still_kills_real_target() {
         rt().block_on(async {
             use std::process::Command;
-            // Spawn a real background sleep; pkill -f on a unique marker
-            // must still terminate it (protection only filters the agent).
-            // `exec -a` is a bash builtin — /bin/sh (dash on CI) rejects it.
+            // Spawn a real background sleep whose command line carries a
+            // unique marker; pkill -f on that marker must still terminate it
+            // (the protection only filters the agent's own PID). The marker
+            // lives in the script path so no bash-only builtin (`exec -a`) or
+            // extra interpreter is required on CI.
             let marker = format!("real_target_marker_{}", std::process::id());
-            let mut child = Command::new("bash")
-                .arg("-c")
-                .arg(format!("exec -a {} sleep 60", marker))
+            let script = std::env::temp_dir().join(format!("{marker}.sh"));
+            std::fs::write(&script, "sleep 60").expect("write target script");
+            let mut child = Command::new("sh")
+                .arg(&script)
                 .spawn()
                 .expect("spawn sleep");
-            // Give it a moment to exec so the marker appears in argv[0].
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Wait until the target is actually visible to pgrep — CI runners
+            // can be slow, and a fixed sleep flakes.
+            let visible = (0..50).any(|_| {
+                let found = Command::new("pgrep")
+                    .args(["-f", &marker])
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                if !found {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                found
+            });
+            if !visible {
+                let diag = Command::new("pgrep").args(["-af", &marker]).output();
+                panic!("spawned target never became visible to pgrep; pgrep -af: {diag:?}");
+            }
             let cmd = format!("pkill -f '{}'", marker);
             let result = super::builtins::execute_bash(json!({"command": cmd}))
                 .await
                 .unwrap();
-            assert_eq!(
-                result["exit_code"], 0,
-                "pkill should find the target: {:?}",
-                result
-            );
+            if result["exit_code"] != 0 {
+                let diag = Command::new("pgrep").args(["-af", &marker]).output();
+                panic!("pkill should find the target: {result:?}; pgrep -af: {diag:?}");
+            }
             // The child must be gone shortly after.
             for _ in 0..50 {
                 if let Ok(Some(status)) = child.try_wait() {
+                    let _ = std::fs::remove_file(&script);
                     assert!(!status.success() || status.code() != Some(0));
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            let _ = std::fs::remove_file(&script);
             panic!("target process was not killed");
         });
     }

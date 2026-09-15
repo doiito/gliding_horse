@@ -1464,6 +1464,12 @@ pub(super) fn truncate_output(s: &str) -> (String, bool) {
 /// When the command mentions pkill/killall, we prepend shell function
 /// overrides that resolve targets via `pgrep` and exclude both the agent's
 /// own PID and the wrapper shell's PID before signaling.
+///
+/// Signaling is per-PID with "at least one success wins": under dash the
+/// command substitution forks a short-lived subshell whose own command line
+/// contains the pattern, so `pgrep` can report a PID that no longer exists
+/// by the time `kill` runs. A single `kill -SIG $pids` then exits 1 even
+/// though the real target was signaled, which callers read as "not found".
 #[cfg(unix)]
 fn self_protect_bash_command(command: &str) -> String {
     if !command.contains("pkill") && !command.contains("killall") {
@@ -1489,7 +1495,11 @@ pkill() {{
   local pids
   pids="$(command pgrep $f -- "$pat" 2>/dev/null | grep -vw "$_agent_self_pid" | grep -vw "$$" || true)"
   [ -z "$pids" ] && return 1
-  command kill "-$sig" $pids 2>/dev/null
+  local sent=1 p
+  for p in $pids; do
+    command kill "-$sig" "$p" 2>/dev/null && sent=0
+  done
+  return $sent
 }}
 killall() {{
   local sig="TERM"
@@ -1504,7 +1514,11 @@ killall() {{
   local pids
   pids="$(command pgrep -- "$pat" 2>/dev/null | grep -vw "$_agent_self_pid" | grep -vw "$$" || true)"
   [ -z "$pids" ] && return 1
-  command kill "-$sig" $pids 2>/dev/null
+  local sent=1 p
+  for p in $pids; do
+    command kill "-$sig" "$p" 2>/dev/null && sent=0
+  done
+  return $sent
 }}
 {command}
 "#

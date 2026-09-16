@@ -3293,7 +3293,15 @@ fn apply_ca_dimension_audit(
         // are stable, bounded by recovery::actionable_evidence_keys, and the
         // complete report remains available through its durable AgentTurn.
         crate::core::recovery::enrich_findings_with_evidence(&mut report, &complete_ca_evidence);
-        let display_evidence = truncate_chars_exact(&complete_ca_evidence, 2_000);
+        // A structured CA audit envelope is protocol data: truncating it mid
+        // JSON makes the downstream dimension audit reject the report as
+        // "invalid CA structured audit" even when the verdict was pass. Keep
+        // structured envelopes whole; only free-form evidence is bounded.
+        let display_evidence = if complete_ca_evidence.contains("ca_audit/v1") {
+            complete_ca_evidence.clone()
+        } else {
+            truncate_chars_exact(&complete_ca_evidence, 2_000)
+        };
         for finding in &mut report.findings {
             finding.evidence = display_evidence.clone();
         }

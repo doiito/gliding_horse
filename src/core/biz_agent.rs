@@ -7023,7 +7023,13 @@ fn work_package_evidence_contract_satisfied_in_epoch(
                         globally_current_verification_receipts
                             .is_none_or(|receipts| receipts.contains(&evidence.receipt_sha256))
                     })
-                    .filter(|evidence| evidence.assessment.kind == *kind)
+                    .filter(|evidence| {
+                        verification_kind_satisfies(
+                            evidence.assessment.kind,
+                            *kind,
+                            package_scopes_test_paths(package),
+                        )
+                    })
                     .filter_map(|evidence| evidence.assessment.count)
                     .max()
                     .unwrap_or(0);
@@ -7086,6 +7092,42 @@ fn recovery_verification_requirements_match_current_manifest(
     .is_ok()
 }
 
+/// Whether a work package scopes exact *test artifact* paths it requires
+/// executed. A scope that only names the delivered program (`demo_async.py`)
+/// is the script-run case, not a real test-suite execution contract.
+fn package_scopes_test_paths(package: &PlanWorkPackage) -> bool {
+    const TEST_FILE_MARKERS: &[&str] = &["test_", "_test.", "_tests.", ".test.", ".spec."];
+    package.evidence_requirements.iter().any(|requirement| {
+        matches!(
+            requirement,
+            WorkPackageEvidenceRequirement::TestArtifactExecutionScope { paths }
+                if paths.iter().any(|path| {
+                    let lower = path.to_lowercase();
+                    TEST_FILE_MARKERS.iter().any(|marker| lower.contains(marker))
+                })
+        )
+    })
+}
+
+/// A `TestExecution` requirement that scopes no real test artifact means "run
+/// the delivered program and show it works". Running that program is
+/// classified as a smoke verification, and its exit status is equally
+/// attributable, so the smoke receipt satisfies the requirement — otherwise a
+/// script-run task can never produce the declared kind and the DA loops on an
+/// impossible receipt. Real scoped test paths stay strict: the named tests
+/// must actually execute.
+fn verification_kind_satisfies(
+    actual: crate::core::tracked_action::VerificationKind,
+    required: crate::core::tracked_action::VerificationKind,
+    scoped_real_test_paths: bool,
+) -> bool {
+    use crate::core::tracked_action::VerificationKind;
+    actual == required
+        || (required == VerificationKind::TestExecution
+            && actual == VerificationKind::Smoke
+            && !scoped_real_test_paths)
+}
+
 /// Explain a terminal-verifier rejection without exposing command output or
 /// file contents. The previous boolean-only gate collapsed manifest drift,
 /// coordinator/epoch rejection, an under-counted run and an exact-target
@@ -7115,11 +7157,13 @@ fn validate_recovery_verification_requirements_against_current_manifest(
         return Err("current_manifest_unavailable".to_string());
     };
     let evidence = current_successful_verification_evidence(actions);
+    let scoped_test_paths = package_scopes_test_paths(package);
     for (kind, min_count) in requirements {
+        let kind_matches = |actual| verification_kind_satisfies(actual, kind, scoped_test_paths);
         let current_manifest_count = evidence
             .iter()
             .filter(|item| {
-                item.assessment.kind == kind
+                kind_matches(item.assessment.kind)
                     && item.workspace_manifest_sha256.as_deref() == Some(current_manifest)
             })
             .count();
@@ -7127,7 +7171,7 @@ fn validate_recovery_verification_requirements_against_current_manifest(
             .iter()
             .filter(|item| {
                 globally_current_verification_receipts.contains(&item.receipt_sha256)
-                    && item.assessment.kind == kind
+                    && kind_matches(item.assessment.kind)
                     && item.workspace_manifest_sha256.as_deref() == Some(current_manifest)
             })
             .count();
@@ -7135,7 +7179,7 @@ fn validate_recovery_verification_requirements_against_current_manifest(
             .iter()
             .filter(|item| {
                 globally_current_verification_receipts.contains(&item.receipt_sha256)
-                    && item.assessment.kind == kind
+                    && kind_matches(item.assessment.kind)
                     && item.workspace_manifest_sha256.as_deref() == Some(current_manifest)
             })
             .filter_map(|item| item.assessment.count)
@@ -7144,11 +7188,11 @@ fn validate_recovery_verification_requirements_against_current_manifest(
         if observed < min_count {
             let local_kind_count = evidence
                 .iter()
-                .filter(|item| item.assessment.kind == kind)
+                .filter(|item| kind_matches(item.assessment.kind))
                 .count();
             let local_manifests = evidence
                 .iter()
-                .filter(|item| item.assessment.kind == kind)
+                .filter(|item| kind_matches(item.assessment.kind))
                 .filter_map(|item| item.workspace_manifest_sha256.clone())
                 .collect::<BTreeSet<_>>();
             return Err(format!(
@@ -10323,6 +10367,31 @@ fn validate_subtask_plan_against_work_package_contract(
                     subtask.id, source_id
                 ));
             }
+            // An artifact-delivery child must retain a write capability: a
+            // narrowed `required_tools` list without file_write/file_edit can
+            // never satisfy the package's typed contract, and the dependency
+            // chain only discovers it after the child has burned its budget.
+            if let Some(package) = packages.iter().find(|package| package.id == *source_id) {
+                let has_artifact_delivery =
+                    package.evidence_requirements.iter().any(|requirement| {
+                        matches!(
+                            requirement,
+                            crate::core::sa::WorkPackageEvidenceRequirement::ArtifactDelivery { .. }
+                        )
+                    });
+                if has_artifact_delivery && !subtask.required_tools.is_empty() {
+                    let can_write = subtask
+                        .required_tools
+                        .iter()
+                        .any(|tool| matches!(tool.as_str(), "file_write" | "file_edit"));
+                    if !can_write {
+                        return Err(format!(
+                            "artifact-delivery child '{}' must include file_write or file_edit in required_tools so it can deliver '{}'; a narrowed list without a write tool cannot satisfy the package contract",
+                            subtask.id, package.id
+                        ));
+                    }
+                }
+            }
             if let Some(first_owner) = owners.insert(source_id, &subtask.id) {
                 return Err(format!(
                     "canonical work package '{}' is covered more than once (by '{}' and '{}')",
@@ -11538,6 +11607,93 @@ mod tests {
             ],
             dependencies: dependencies.iter().map(|id| id.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn smoke_receipt_satisfies_test_execution_without_real_test_scope() {
+        use crate::core::tracked_action::VerificationKind;
+
+        // A scope naming the delivered program is the script-run case: the
+        // smoke receipt from running it satisfies the declared TestExecution.
+        let mut program_scope = canonical_package("run_program", &[]);
+        program_scope.evidence_requirements.push(
+            crate::core::sa::WorkPackageEvidenceRequirement::TestArtifactExecutionScope {
+                paths: vec!["demo_async.py".to_string()],
+            },
+        );
+        assert!(!package_scopes_test_paths(&program_scope));
+        assert!(verification_kind_satisfies(
+            VerificationKind::Smoke,
+            VerificationKind::TestExecution,
+            package_scopes_test_paths(&program_scope),
+        ));
+
+        // A scope naming a real test artifact stays strict: only a real test
+        // execution satisfies it.
+        let mut test_scope = canonical_package("run_tests", &[]);
+        test_scope.evidence_requirements.push(
+            crate::core::sa::WorkPackageEvidenceRequirement::TestArtifactExecutionScope {
+                paths: vec!["tests/test_async.py".to_string()],
+            },
+        );
+        assert!(package_scopes_test_paths(&test_scope));
+        assert!(!verification_kind_satisfies(
+            VerificationKind::Smoke,
+            VerificationKind::TestExecution,
+            package_scopes_test_paths(&test_scope),
+        ));
+        assert!(verification_kind_satisfies(
+            VerificationKind::TestExecution,
+            VerificationKind::TestExecution,
+            package_scopes_test_paths(&test_scope),
+        ));
+    }
+
+    #[test]
+    fn artifact_delivery_child_requires_a_write_tool() {
+        let mut package = canonical_package("deliver", &[]);
+        package.evidence_requirements = vec![
+            crate::core::sa::WorkPackageEvidenceRequirement::ArtifactDelivery {
+                paths: vec!["out.md".to_string()],
+                min_paths: 1,
+            },
+        ];
+        let packages = vec![package];
+
+        let mut child = spec("child_deliver", Vec::new());
+        child.source_work_packages = vec!["deliver".to_string()];
+
+        // A narrowed capability without a write tool is rejected before the
+        // child runs, instead of failing the dependency chain afterwards.
+        child.required_tools = vec!["bash".to_string()];
+        let narrowed = SubtaskPlan {
+            schema_version: SUBTASK_PLAN_SCHEMA_VERSION,
+            mode: SubtaskExecutionMode::Orchestrate,
+            rationale: "deliver artifact".to_string(),
+            subtasks: vec![child.clone()],
+        };
+        let error =
+            validate_subtask_plan_against_work_package_contract(&narrowed, &packages).unwrap_err();
+        assert!(error.contains("file_write or file_edit"), "{error}");
+
+        // Declaring the write tool (or leaving the list unrestricted) passes.
+        child.required_tools = vec!["file_write".to_string()];
+        let writable = SubtaskPlan {
+            schema_version: SUBTASK_PLAN_SCHEMA_VERSION,
+            mode: SubtaskExecutionMode::Orchestrate,
+            rationale: "deliver artifact".to_string(),
+            subtasks: vec![child.clone()],
+        };
+        validate_subtask_plan_against_work_package_contract(&writable, &packages).unwrap();
+
+        child.required_tools = Vec::new();
+        let unrestricted = SubtaskPlan {
+            schema_version: SUBTASK_PLAN_SCHEMA_VERSION,
+            mode: SubtaskExecutionMode::Orchestrate,
+            rationale: "deliver artifact".to_string(),
+            subtasks: vec![child],
+        };
+        validate_subtask_plan_against_work_package_contract(&unrestricted, &packages).unwrap();
     }
 
     #[test]

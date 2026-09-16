@@ -5,6 +5,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Task completion blocked by a verification-kind mismatch**: a planner-declared `TestExecution` requirement could never be satisfied by running a delivered program (classified as smoke), so script-run tasks looped on an impossible receipt until their budget ran out. A smoke receipt now satisfies a `TestExecution` requirement that scopes no real test artifact; scopes that name real test files stay strict, and a scoped path that only names the delivered program is executed by running it.
+  - `src/core/biz_agent.rs`, `src/core/agent_runner/execution.rs`
+
+- **Artifact-delivery children could lose their write tool**: a narrowed `required_tools` list without `file_write`/`file_edit` left the child unable to deliver its declared artifacts, and the dependency chain only discovered this after the child had burned its whole budget. The subtask-plan contract now rejects such lists at plan time so the correction pass fixes them.
+  - `src/core/biz_agent.rs`
+
+- **Truncated CA audit envelope rejected as invalid JSON**: the bounded handoff cut the structured `ca_audit/v1` envelope mid-JSON, so a passing audit was rejected as "not valid standalone JSON" and the task failed. Structured envelopes are now kept whole; only free-form evidence is bounded.
+  - `src/core/sa/execution.rs`
+
+- **Positive CA verdicts rejected for lacking a shell receipt**: a pure artifact-delivery task has no executable verifier to run, so its kernel-tracked file-write receipts — and the CA child's successful reads of the delivered artifact — now satisfy the receipt requirement instead of failing the task.
+  - `src/core/agent_runner/execution.rs`
+
 ### Release summary since v0.1.6.preview (2026-08-28)
 
 This section describes the seven commits after the last published tag,

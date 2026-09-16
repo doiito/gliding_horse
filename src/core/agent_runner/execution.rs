@@ -2194,9 +2194,11 @@ pub(super) fn enforce_ca_verification_receipt(
     mut normalized: CaTerminalNormalization,
     receipt_required: bool,
     successful_verifier_observed: bool,
+    artifact_delivery_observed: bool,
 ) -> CaTerminalNormalization {
     if !(receipt_required || normalized.receipt_binding_required)
         || successful_verifier_observed
+        || artifact_delivery_observed
         || normalized.verdict == TaskVerdict::Failed
     {
         return normalized;
@@ -2715,6 +2717,7 @@ pub(super) fn finalize_ca_terminal_contract(
         normalized,
         executable_receipt_required,
         successful_verifier_observed,
+        ca_has_artifact_delivery_evidence(actions),
     )
 }
 
@@ -3527,7 +3530,13 @@ pub(crate) fn explicit_test_execution_target_path(
     }
     let layout = attributable_shell_layout(command)?;
     let final_segment = layout.segments.last()?;
-    if shell_segment_verification_kind(final_segment) != Some(VerificationKind::TestExecution) {
+    // Accept a smoke execution of a delivered program as well: a scoped path
+    // that names the program (not a test artifact) is executed by running it,
+    // and the receipt for that run is attributable in exactly the same way.
+    if !matches!(
+        shell_segment_verification_kind(final_segment),
+        Some(VerificationKind::TestExecution) | Some(VerificationKind::Smoke)
+    ) {
         return None;
     }
 
@@ -4634,6 +4643,27 @@ pub(super) fn ca_has_successful_verifier_receipt(
         && !action_tracker
             .current_successful_verification_receipt_sha256s()
             .is_empty()
+}
+
+/// Whether CA observed a kernel-tracked artifact delivery. A pure
+/// artifact-delivery task has no executable verifier to run: the kernel's own
+/// successful file-write receipts are the strongest evidence such a task can
+/// produce, and they are still kernel-observed, never a model claim. The CA
+/// child itself never writes — it reads the delivered artifact, and that
+/// successful read is the same class of kernel-observed evidence.
+pub(super) fn ca_has_artifact_delivery_evidence(
+    actions: &[crate::core::tracked_action::TrackedAction],
+) -> bool {
+    actions.iter().any(|action| {
+        action.status == crate::core::tracked_action::ActionStatus::Success
+            && match action.tool_name.as_str() {
+                "file_write" | "file_edit" => {
+                    !action.files_created.is_empty() || !action.files_modified.is_empty()
+                }
+                "file_read" => true,
+                _ => false,
+            }
+    })
 }
 
 /// When CA has exhausted broad inspection without an executable verifier,

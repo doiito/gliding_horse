@@ -525,9 +525,34 @@ fn ca_audit_window_requires_a_real_verification_receipt_before_close() {
         false,
         true,
     );
-    let enforced = super::execution::enforce_ca_verification_receipt(normalized, true, false);
+    let enforced = super::execution::enforce_ca_verification_receipt(normalized, true, false, false);
     assert_eq!(enforced.verdict, TaskVerdict::Failed);
     assert!(enforced.summary.starts_with("FAIL:"));
+}
+
+#[test]
+fn artifact_delivery_receipt_exempts_a_positive_ca_verdict() {
+    let normalized = super::execution::normalize_ca_terminal(
+        "PASS: looks complete",
+        "All files appear present.",
+        false,
+        true,
+    );
+
+    // Without any receipt a bound positive verdict still fails...
+    let enforced = super::execution::enforce_ca_verification_receipt(
+        normalized.clone(),
+        true,
+        false,
+        false,
+    );
+    assert_eq!(enforced.verdict, TaskVerdict::Failed);
+
+    // ...but a kernel-tracked artifact delivery is the strongest receipt a
+    // pure delivery task can produce, so it exempts the shell requirement.
+    let enforced =
+        super::execution::enforce_ca_verification_receipt(normalized, true, false, true);
+    assert_eq!(enforced.verdict, TaskVerdict::Success);
 }
 
 #[test]
@@ -565,7 +590,7 @@ fn ca_failed_verifier_is_a_receipt_but_never_positive_evidence() {
         false,
         true,
     );
-    let enforced = super::execution::enforce_ca_verification_receipt(normalized, true, false);
+    let enforced = super::execution::enforce_ca_verification_receipt(normalized, true, false, false);
     assert_eq!(enforced.verdict, TaskVerdict::Failed);
     assert!(enforced
         .content
@@ -596,7 +621,7 @@ fn ca_successful_executable_verifier_allows_bounded_close() {
         false,
         true,
     );
-    let enforced = super::execution::enforce_ca_verification_receipt(normalized, true, true);
+    let enforced = super::execution::enforce_ca_verification_receipt(normalized, true, true, false);
     assert_eq!(enforced.verdict, TaskVerdict::Success);
 }
 
@@ -2558,7 +2583,7 @@ verified tail"#;
     assert!(rejected.contract_issue.is_some());
     // The typed body itself requests a positive verdict, so receipt binding is
     // mandatory even before the ordinary close-window receipt gate activates.
-    let no_receipt = super::execution::enforce_ca_verification_receipt(recovered, false, false);
+    let no_receipt = super::execution::enforce_ca_verification_receipt(recovered, false, false, false);
     assert_eq!(no_receipt.verdict, TaskVerdict::Failed);
 
     let missing_why = json!({

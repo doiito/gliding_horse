@@ -1351,6 +1351,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_report_plan_corrects_paths_and_ownership_in_one_causal_retry() {
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&typed_testing_plan("test_execution")).unwrap();
+        invalid["description"] = serde_json::json!("Write a product design report");
+        invalid["steps"][1]["objective"] = serde_json::json!("Write a product design report");
+        invalid["steps"][1]["expected_output"] = serde_json::json!("product_design.md");
+        invalid["steps"][1]["success_criteria"] =
+            serde_json::json!("All requested sections delivered");
+        invalid["steps"][1]["work_packages"] = serde_json::json!([
+            {"id":"market","objective":"Analyze the market and pain points","expected_output":"/workspace/product_design.md","success_criteria":"Market and pain points covered","evidence_requirements":[{"type":"artifact_delivery","paths":["/workspace/product_design.md"],"min_paths":1}],"dependencies":[]},
+            {"id":"architecture","objective":"Analyze product architecture","expected_output":"/workspace/product_design.md","success_criteria":"Architecture and Mermaid diagram covered","evidence_requirements":[{"type":"artifact_delivery","paths":["/workspace/product_design.md"],"min_paths":1}],"dependencies":[]}
+        ]);
+        let mut corrected = invalid.clone();
+        for package in corrected["steps"][1]["work_packages"]
+            .as_array_mut()
+            .unwrap()
+        {
+            package["expected_output"] =
+                serde_json::json!("Complete section contribution in the response");
+            package["evidence_requirements"] = serde_json::json!([{"type":"response_delivery"}]);
+        }
+        corrected["steps"][1]["work_packages"].as_array_mut().unwrap().push(serde_json::json!({
+            "id":"report","objective":"Integrate market, pain points and architecture into the product design report",
+            "expected_output":"product_design.md","success_criteria":"Read both contributions and integrate all requested sections into product_design.md",
+            "evidence_requirements":[{"type":"artifact_delivery","paths":["product_design.md"],"min_paths":1}],
+            "dependencies":["market","architecture"]
+        }));
+        let invalid_text = invalid.to_string();
+        let (base_url, server, requests) = sa_capturing_response_server(vec![
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response("provider-shared-report-invalid", &invalid_text),
+            ),
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-shared-report-corrected",
+                    &corrected.to_string(),
+                ),
+            ),
+        ])
+        .await;
+        let (mut sa, _dir) = make_sa_with_tempdir_at(&base_url);
+        Arc::get_mut(&mut sa.runner).unwrap().workspace_root = Some("/workspace".into());
+        let constraints = HashMap::from([
+            (
+                "delivery_mode".to_string(),
+                "workspace_artifact".to_string(),
+            ),
+            (
+                "delivery_target_path".to_string(),
+                "product_design.md".to_string(),
+            ),
+        ]);
+        let plan = sa.analyze_task_with_llm(
+            "iri://task/shared-report-correction", "写一个产品设计，包含市场分析、痛点、架构和 Mermaid 图，输出到 /workspace/product_design.md",
+            &crate::core::five_w2h::Task5W2H::default(), &[], &constraints,
+        ).await.unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let initial: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let prompt = initial["messages"][0]["content"].as_str().unwrap();
+        assert!(prompt.contains("\"/workspace\""));
+        assert!(prompt.contains("## Single-file deliverables"));
+        assert!(initial["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Delivery mode is workspace_artifact"));
+        let retry: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        assert_eq!(retry["messages"][2]["content"], invalid_text);
+        let correction = retry["messages"][3]["content"].as_str().unwrap();
+        assert!(correction.contains("canonical workspace-relative"));
+        assert!(correction.contains("ownership overlaps"));
+        let packages = &plan
+            .steps
+            .iter()
+            .find(|step| step.role == AgentRole::Do)
+            .unwrap()
+            .work_packages;
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[2].dependencies, ["market", "architecture"]);
+        assert!(
+            matches!(&packages[2].evidence_requirements[0], WorkPackageEvidenceRequirement::ArtifactDelivery { paths, .. } if paths == &["product_design.md"])
+        );
+        assert!(matches!(
+            packages[0].evidence_requirements[0],
+            WorkPackageEvidenceRequirement::ResponseDelivery
+        ));
+
+        // The user's second candidate must still be rejected: removing only
+        // the slash does not resolve the double-writer contract.
+        let repeated = invalid_text.replace(
+            "/workspace/product_design.md",
+            "workspace/product_design.md",
+        );
+        assert!(sa
+            .parse_llm_plan(&repeated)
+            .unwrap_err()
+            .to_string()
+            .contains("ownership overlaps"));
+    }
+
+    #[tokio::test]
     async fn invalid_typed_evidence_gets_one_causal_plan_contract_correction() {
         let invalid_plan = typed_testing_plan("build");
         let corrected_plan = typed_testing_plan("test_execution");

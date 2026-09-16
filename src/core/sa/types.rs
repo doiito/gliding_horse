@@ -482,6 +482,11 @@ pub(crate) fn validate_plan_work_package_dag(
     use std::collections::{HashMap, HashSet};
 
     let mut ids = HashSet::with_capacity(work_packages.len());
+    // The planner has one correction opportunity. Report independent evidence
+    // defects together so an invalid path does not hide a shared-file writer.
+    // Bound diagnostics without truncating validation or accepting bad input.
+    const MAX_EVIDENCE_DIAGNOSTICS: usize = 32;
+    let mut evidence_errors = Vec::new();
     for package in work_packages {
         if package.id.trim().is_empty() {
             return Err("work-package id must not be empty".to_string());
@@ -509,7 +514,11 @@ pub(crate) fn validate_plan_work_package_dag(
                 package.id
             ));
         }
-        validate_work_package_evidence_requirements(package, false)?;
+        if let Err(error) = validate_work_package_evidence_requirements(package, false) {
+            if evidence_errors.len() < MAX_EVIDENCE_DIAGNOSTICS {
+                evidence_errors.push(error);
+            }
+        }
     }
 
     // ArtifactDelivery grants exact package ownership. Shared paths and
@@ -527,28 +536,32 @@ pub(crate) fn validate_plan_work_package_dag(
                     _ => None,
                 })
                 .flatten()
-                .filter_map(|path| {
-                    normalize_work_package_artifact_path(path)
-                        .map(|normalized| (package.id.as_str(), normalized))
-                })
+                // Compare raw claims even when their syntax is invalid: two
+                // identical absolute paths still reveal conflicting owners.
+                // This is diagnosis only, never path repair or authorization.
+                .map(|path| (package.id.as_str(), path.trim()))
         })
         .collect::<Vec<_>>();
     for (index, (left_owner, left)) in artifact_paths.iter().enumerate() {
         for (right_owner, right) in artifact_paths.iter().skip(index + 1) {
             let overlap = left == right
                 || left
-                    .strip_prefix(right.as_str())
+                    .strip_prefix(*right)
                     .is_some_and(|suffix| suffix.starts_with('/'))
                 || right
-                    .strip_prefix(left.as_str())
+                    .strip_prefix(*left)
                     .is_some_and(|suffix| suffix.starts_with('/'));
-            if overlap {
-                return Err(format!(
+            if overlap && evidence_errors.len() < MAX_EVIDENCE_DIAGNOSTICS {
+                evidence_errors.push(format!(
                     "artifact_delivery ownership overlaps between package '{}' path '{}' and package '{}' path '{}'",
                     left_owner, left, right_owner, right
                 ));
             }
         }
+    }
+
+    if !evidence_errors.is_empty() {
+        return Err(evidence_errors.join("; "));
     }
 
     for package in work_packages {
@@ -853,6 +866,26 @@ mod work_package_evidence_tests {
                 .unwrap_err()
                 .contains("repeats artifact_delivery path")
         );
+    }
+
+    #[test]
+    fn invalid_paths_do_not_hide_shared_artifact_ownership() {
+        let mut left = package(vec![WorkPackageEvidenceRequirement::ArtifactDelivery {
+            paths: vec!["/workspace/product_design.md".to_string()],
+            min_paths: 1,
+        }]);
+        left.id = "market".to_string();
+        let mut right = left.clone();
+        right.id = "architecture".to_string();
+        right.dependencies = vec![left.id.clone()];
+        let packages = vec![left, right];
+        let before = serde_json::to_value(&packages).unwrap();
+        let error = validate_plan_work_package_dag(&packages).unwrap_err();
+        assert_eq!(error.matches("canonical workspace-relative").count(), 2);
+        assert!(error.contains("ownership overlaps"));
+        assert!(error.contains("market"));
+        assert!(error.contains("architecture"));
+        assert_eq!(serde_json::to_value(&packages).unwrap(), before);
     }
 
     #[test]

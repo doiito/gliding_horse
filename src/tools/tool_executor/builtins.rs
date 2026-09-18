@@ -2240,7 +2240,12 @@ fn verify_workspace_identity(root: &OwnedFd, workspace: &Path) -> Result<(), Str
         .map_err(|error| format!("Cannot inspect workspace descriptor: {error}"))?;
     let path_metadata = std::fs::metadata(workspace)
         .map_err(|error| format!("Cannot inspect resolved workspace: {error}"))?;
-    if descriptor.st_dev != path_metadata.dev() || descriptor.st_ino != path_metadata.ino() {
+    // `MetadataExt::dev()` is `u64` on every Unix target, but `libc::dev_t` is
+    // narrower where it matters (for example `i32` on Apple platforms). Normalize
+    // the descriptor field exactly the way the standard library does.
+    #[allow(clippy::unnecessary_cast)] // Required on Apple targets, a no-op on Linux.
+    let descriptor_device = descriptor.st_dev as u64;
+    if descriptor_device != path_metadata.dev() || descriptor.st_ino != path_metadata.ino() {
         return Err("Current workspace identity changed during path resolution".to_string());
     }
     Ok(())

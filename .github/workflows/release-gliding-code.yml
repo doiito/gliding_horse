@@ -165,12 +165,34 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          # 每个 target 只上传自己唯一的产物；CHANGELOG.md 由独立的
+          # publish-changelog job 上传一次，避免多个 matrix job 并发覆盖
+          # 同名 asset 导致 404 update-a-release-asset。
           files: |
             glidingcode-${{ matrix.target }}.tar.gz
             glidingcode-${{ matrix.target }}.zip
-            CHANGELOG.md
-          # 矩阵各 target 都会上传同一个 CHANGELOG.md，需允许覆盖
           overwrite_files: true
           fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # CHANGELOG.md 是所有 target 共用的同名 asset。以前每个 matrix job 都上传它，
+  # 并发覆盖时 action-gh-release 会在 PATCH 已被其它 job 替换的 asset 时返回 404。
+  # 这里在全部构建结束后只上传一次，保证同一时刻只有一个写入者。
+  publish-changelog:
+    name: Publish CHANGELOG
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload CHANGELOG to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CHANGELOG.md
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -11,11 +11,11 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![gRPC](https://img.shields.io/badge/gRPC-Protocol-green.svg)](https://grpc.io/)
 [![Knowledge Graph](https://img.shields.io/badge/Knowledge%20Graph-Oxigraph-purple.svg)](https://oxigraph.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/doiito/gliding_horse/releases)
+[![Release](https://img.shields.io/github/v/release/doiito/gliding_horse?include_prereleases&label=release)](https://github.com/doiito/gliding_horse/releases)
 
 ---
 
-[**English**](README.md) · [**中文**](README.zh.md) · [**Design Detail →**](docs/DESIGN_DETAIL.md)
+[**English**](README.md) · [**中文**](README.zh.md) · [**Design Detail →**](docs/DESIGN_DETAIL.md) · [**Changelog →**](CHANGELOG.md)
 [**medium URL**](https://medium.com/@doiito-sun)
 [**中文稀土掘金**](https://juejin.cn/column/7647868075887165450)
 [**中文博客园**](https://www.cnblogs.com/doiito)
@@ -26,71 +26,7 @@
 
 ---
 
-## Historical v0.1.4.preview Notes
-
-These are retained historical preview notes. The authoritative current workspace version is declared once in `[workspace.package]` in `Cargo.toml`.
-
-**Highlights:**
-
-| Area | Description |
-|------|-------------|
-| **SA Module Monolith Decomposition** | Split the 3408-line `sa/mod.rs` into 8 focused modules (`types`, `planning`, `execution`, `intervention`, `agent`, `process`, `stats`, `actions`) — each with a single responsibility. The largest structural refactor in the codebase. |
-| **Unified Timeline System** | New `TimeRange` + `TimelineEntry` framework for cross-subsystem temporal queries. Includes exponential time-decay reranking (`apply_time_decay()`) for memory recall — older entries gracefully decay in relevance. |
-| **5W2H Dimension Audit** | Formalized dimension-level audit with `AuditStatus` (Pass/Warning/Fail) and automatic causal chain linkage. Failed dimensions now feed into `CausalEngine` for root-cause analysis — no more black-box PASS/FAIL. |
-| **Knowledge Graph Context Injection** | Agent system prompts now auto-inject relevant KG entities before each execution turn, ensuring SA interventions and new knowledge are immediately visible to all agents. |
-| **Time-Aware System Prompt** | Agents now receive current time and session context via `SystemPromptRegion::TimeAwareness`, enabling time-sensitive reasoning and checkpoint-consistent recovery. |
-| **Hyperspace-Integrated Proactive Perception** | `ProactiveEngine` now uses HyperspaceStore semantic search (with time decay λ=0.5) for experience retrieval — replacing L0 tag-substring matching. Graceful fallback to legacy path. |
-| **Causal-Integrated Workspace Monitor** | File events (create/modify/delete) now record `CausalObservation` for root-cause traceability. Pre-task snapshots + objective-aware file inventory injection. |
-| **LLRU Cold Archive (Skill Graph)** | `SkillGraphStore` auto-archives cold skills (`last_used_at < cutoff`) to L0 with `storage_tier = L0Permanent`. `find_stale_skills()` triggers re-indexing of outdated entries. |
-| **TimelineStore Mutation Tracking** | Every `SkillGraphStore` structural change (register/update/remove/link/MOC) now records a `GraphMutation` — making `pending_mutations()` and `snapshot_count()` accurately reflect real graph activity. |
-| **Old DAG Workflow Engine Removed** | Removed the 211-line petgraph-based `DagEngine` — PDCA's 7-level adaptive execution now fully replaces the legacy DAG orchestration. |
-| **HNSW Lock-Free Safety** | `visited_gen` changed from `Vec<usize>` to `Vec<AtomicUsize>` in `IncrementalHNSW`, eliminating concurrent search data races while preserving lock-free throughput. |
-| **PDCA P0: Pre-check Runtime Error** | Fixed crash (`Error("expect L0-3")`) when TL fails to match a skill — gracefully falls back to L0 execution instead of aborting the workflow. |
-| **PDCA P1: PA Uncreatable** | Fixed PA creation failure when DA/TL sets `PauseOnError` — missing `execute` field now properly populated. |
-| **PDCA P2: No Output on L0 Fallback** | Fixed silent output loss when metrics unavailable — default metrics ensure user always receives a response. |
-| **TL: pend always 0** | Fixed `pend_sum` calculation in TL aggregation — was incorrectly using `sum` instead of actual pend values from sub-tasks. |
-| **Error Handling Cleanup** | Removed two `.expect("RwLock poisoned")` calls in `execution.rs` — graceful degradation over panic. |
-| **Skill Graph Security Enhancements** | New access-control checkpoints in skill registration and query paths, plus MCP tool call security filtering. |
-
----
-
-## 🎉 v0.1.3 Release
-
-We are proud to announce the **v0.1.3 release** of Gliding Horse Agent OS.
-
-**What's new in v0.1.3:**
-
-| Feature | Description |
-|---------|-------------|
-| **Causal Engine** | New standalone causal analysis subsystem with `CausalEngine`, `FusionEngine`, `CausalStore`, and typed `CausalFactor`. Enables causal reasoning across agent operations with fused multi-factor analysis — identifies root causes, propagates failure chains, and computes causal graphs for agent decisions. |
-| **Unified Graph Backend** | Consolidated `GraphBackend` (~1,200 LOC) replacing fragmented graph storage — provides a single, optimized interface for node/edge CRUD with batch operations, subgraph extraction, and path-finding across all knowledge layers. |
-| **Graph Features Computation** | New `graph_features` module computing structural feature vectors (degree centrality, clustering coefficient, PageRank, betweenness) and graph similarity scoring via feature-distance comparison. Enables quantitative graph analysis and comparison across cognitive snapshots. |
-| **Snapshot Timeline** | Skill-graph snapshots with durable post-snapshot mutation records, point-in-time restoration, and diff support. It is an experimental graph timeline, not a complete session-history or crash-recovery system. |
-| **Self-Awareness (SA) Overhaul** | Major rewrite of the self-awareness module (+410 lines) with enhanced monitoring of agent state, environment perception, and adaptive behavior. Integrated with the causal engine for self-diagnosis. |
-| **5W2H Dimension Audit Enhancement** | Expanded dimension-level audit in `src/core/five_w2h.rs` with deeper causal attribution per dimension. What/Why failures now chain into the causal engine for automated root-cause analysis. |
-| **Advanced Features Design** | Comprehensive [`ADVANCED_FEATURES_DESIGN.md`](docs/ADVANCED_FEATURES_DESIGN.md) document covering graph backend architecture, causal reasoning design, timeline-based snapshot semantics, and performance benchmarks. |
-| **Graph Backend Benchmarks** | New benchmark suite (`benches/bench_graph_backend.rs`) measuring node/edge R/W, subgraph extraction, and path-finding throughput. |
-| **Gliding Code TUI Refinements** | Engine and TUI improvements in the terminal client — better Markdown rendering, enhanced MCP server lifecycle, and internal refactoring for maintainability. |
-| **Bug Fixes** | Fixed duplicate secondary-index update in L2 `write_node` that caused inconsistent indexing under concurrent writes. |
-
----
-
-## 🎉 v0.1.2 Release
-
-We are proud to announce the **v0.1.2 release** of Gliding Horse Agent OS.
-
-**What's new in v0.1.2:**
-
-| Feature | Description |
-|---------|-------------|
-| **HyperspaceEngine** | Production-grade vector embedding engine with HNSW ANN search, Write-Ahead Log (WAL), tangent-space pruning, and runtime-switchable metrics (Poincaré, Cosine, Euclidean, Lorentz). |
-| **Skill Graph Cognitive Network** | Hypergraph composition, Poincaré structural embeddings, PageRank/betweenness/community detection algorithms, causal failure analysis, experimental temporal snapshots/rollback, formal invariant verification (6 checks), hybrid text×structural search. |
-| **Semantic Skill Discovery** | Vector-store integration in `SkillDiscoveryEngine` — finds semantically related skills via HyperspaceStore cosine search, replaces Jaccard-only `suggest_links()` |
-| **Oxigraph SPARQL Bridge** | Skill-graph-to-Oxigraph RDF projection via SPARQL INSERT/DELETE with named-graph isolation; reverse RDF-to-skill synchronization is not implemented. |
-| **L2 Blackboard Memory** | Typed document store with JSON-LD threading, projections, message packs, and LRU eviction for long-term agent context |
-| **Workspace Monitor** | Real-time file system perception engine with 10 event triggers, anomaly deduplication, and 5W2H constraint checking |
-| **Batch Agent Manager** | Sliding-window batch components with configurable triggers, event-bus integration, and business-domain isolation. The root gRPC service wires opt-in custom-event and cron/window consumption, including streaming requests through shared service state; its L0 event journal deduplicates, acknowledges on successful execution, and replays pending input at startup. `KnowledgePersister` is not wired to this execution path; graph-changing handlers are disabled unless `apply_graph_mutations` is explicitly enabled, and that opt-in path still lacks event-id idempotency and approval/transaction gates. |
-| **Gliding Code TUI** | Interactive terminal UI (ratatui v0.28) with Markdown rendering, MCP server support, checkpoint/resume, and multi-model backends |
+Release notes and version history are tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -105,15 +41,15 @@ An **AI agent operating system** built in Rust that orchestrates multiple agents
 | Layer | Technology | Role |
 |-------|-----------|------|
 | **Core Coordination** (Rust) | `PDCA cycle` · `5W2H ontology` · `EventBus` | Agent orchestration & lifecycle |
-| **Skill Graph** | `RDF` · `6 link types` · `18 modules` | Dynamic cognitive network |
-| **Memory System** | `L0 Sled` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI coherence` | Hierarchical memory with prefetch |
+| **Skill Graph** | `RDF` · `6 link types` · `15 modules` | Dynamic cognitive network |
+| **Memory System** | `L0 redb` · `L1 Session` · `L2 Oxigraph + Blackboard` · `L3 Projection` · `MESI coherence` | Hierarchical memory with prefetch |
 | **Knowledge Graph** | `Oxigraph RDF` · `SPARQL 1.1` · `Code AST` · `Named Graphs` | Cross-subsystem unified store |
-| **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean` · `Hybrid search` | Embedded vector embeddings |
+| **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean/Lorentz` · `Hybrid search` | Embedded vector embeddings |
 | **Gliding Code TUI** | `ratatui` · `crossterm` · `MCP` · `checkpoint/resume` | Terminal AI coding assistant |
-| **Data Bus** | `JSON-LD 1.1` · `@id/@type/@context` · `Named Graphs` | Universal interoperability |
-| **Gateway** | `gRPC` · `HTTP (OpenAI-compatible)` · `MCP` | Production interface |
+| **Data Bus** | `JSON-LD subset` · `@id/@type/@context` · `Named Graphs` | Internal interoperability |
+| **Gateway** | `gRPC` · `HTTP (axum REST)` · `MCP` | Service interface |
 | **Perception Engine** | `10 triggers` · `Anomaly dedup` · `5W2H constraint check` | Proactive monitoring |
-| **Agent Workflow** | `PA/DA/CA` · `Tool system` · `Checkpoint` · `Tracked actions` | Multi-agent execution |
+| **Agent Workflow** | `SA/PA/DA/CA/AA` · `Tool system` · `Checkpoint` · `Tracked actions` | Multi-agent execution |
 
 ---
 
@@ -145,46 +81,46 @@ This ancient wisdom guides our design: **flexible orchestration that adapts to t
 ## 🔧 Key Highlights
 
 ### 1. HyperspaceEngine — Embedded Vector Engine
-Production-grade spatial memory engine with **runtime-switchable metrics** (Poincaré, Cosine, Euclidean, Lorentz). Features **HNSW approximate nearest neighbor search**, CRC32-verified **Write-Ahead Log (WAL)** with 3 sync modes, **tangent-space pruning** for Poincaré ball search, JSON-LD metadata index with RoaringBitmap filters, and dual-space **hybrid search** (text × structural). A self-contained crate with zero external vector database dependencies.
+Self-contained vector engine with **runtime-switchable metrics** (Cosine, Poincaré, Lorentz, Euclidean). Features **HNSW approximate nearest neighbor search**, CRC32-verified **Write-Ahead Log (WAL)** with 3 sync modes, **tangent-space pruning** for Poincaré ball search, a JSON-LD metadata index with RoaringBitmap filters, and dual-space **hybrid search** (text × structural). The `crates/hyperspace-engine` crate has no external vector database dependency.
 
 ### 2. Skill Graph Cognitive Network
-Dynamic in-memory cognitive network with **6 semantic link types** (Prerequisite, Composition, Related, Alternative, Extends, Generalization). Includes **Poincaré structural embedding** computation from graph topology (prerequisite depth, tag fingerprinting), **hypergraph composition** with first-class `Hyperedge` and `CompositionType` (Sequential, Parallel, Conditional, Optional, Fallback), **graph algorithms** (PageRank, betweenness centrality, label-propagation community detection, DFS prerequisite chains, Tarjan SCC cycle detection), **causal failure analysis** with root cause inference, **formal invariant verification** (6 checks: acyclicity, link existence, composite reachability, no deprecated prereqs, valid 5W2H, valid security levels), and **temporal versioning** with snapshot/rollback.
+Dynamic in-memory cognitive network with **6 semantic link types** (Prerequisite, Composition, Related, Alternative, Extends, Generalization). Includes **Poincaré structural embedding** computation from graph topology (prerequisite depth, tag fingerprinting), **hypergraph composition** with first-class `Hyperedge` and `CompositionType` (Conjunction, Disjunction, Exactly(n), AtLeast(n), Pipeline), **graph algorithms** (PageRank, betweenness centrality, community detection, prerequisite-chain traversal, Tarjan SCC cycle detection), **causal failure analysis** with root cause inference, **formal invariant verification** (6 checks: acyclicity, link target existence, composite reachability, no deprecated prerequisites, valid 5W2H, valid security levels), and **temporal versioning** with snapshot/rollback.
 
 ### 3. Generalized PDCA — 7-Level Adaptive Execution
-Dynamically selects from 7 complexity levels (L0 instant → L5 recursive → L6 emergency) via 5W2H metadata. One engine handles everything from instant queries to multi-week projects — no rigid workflows. **PA/DA/CA agent roles** with template-driven prompt construction.
+Dynamically selects one of 7 complexity levels from 5W2H metadata: `Instant` → `Simple` → `Standard` → `Complex` → `Exploratory` → `Emergency` → `Recursive`. One engine handles everything from instant queries to multi-week projects — no rigid workflows. **SA/PA/DA/CA/AA agent roles** with template-driven prompt construction.
 
 ### 4. CPU Cache-Inspired Memory — 4 Layers + MESI Coherence
-**L0** Sled disk storage → **L1** session context → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL projection cache. The repository implements cache-inspired coordination and prefetch components; no end-to-end latency or multi-agent consistency benchmark is currently published.
+**L0** redb disk storage → **L1** session context → **L2** Oxigraph-backed blackboard → **L3** projection cache. The repository implements cache-inspired coordination and prefetch components; no end-to-end latency or multi-agent consistency benchmark is currently published.
 
-### 5. JSON-LD Universal Data Bus — Internal Interoperability Subset
+### 5. JSON-LD Data Bus — Internal Interoperability Subset
 The internal JSON-LD utilities support `@context`, `@id`, `@graph`, framing, validation and routing used by this repository. They are not a claim of complete JSON-LD 1.1, SHACL, or general RDF interoperability.
 
 ### 6. Self-Evolving Skill Graph — Autonomous Learning
-AA agents record knowledge fragments, links, and evolution suggestions after task completion. `/learn` and `/reduce` provide explicit acquisition/consolidation operations; suggestions are not automatically applied because typed-patch verification, security, and conflict gates are still pending. `BootstrapEngine` ingests markdown skills from the filesystem.
+AA agents record knowledge fragments, links, and evolution proposals after task completion. `BootstrapEngine` exposes explicit learn/reduce operations and ingests Markdown skills from the filesystem; evolution proposals require approval, validation, and commit, so suggestions are not applied automatically.
 
 ### 7. Universal Knowledge Graph — Unified Cognitive Backbone
 Skills, memories, tasks, and code knowledge can use the shared **Oxigraph RDF store** through named graphs, enabling scoped SPARQL joins where producers are wired to that store. Code ASTs parsed by tree-sitter are converted to RDF triples. `SkillGraphStore` projects its changes into the semantic store; reverse RDF-to-skill synchronization is not implemented.
 
 ### 8. Semantic Skill Discovery Engine
-`SkillDiscoveryEngine` wraps `HyperspaceStore` for vector-based semantic search across skills. `suggest_links()` falls back from Jaccard tag overlap to cosine similarity via embedding vectors. Includes BFS path finding (`find_skill_chain()`), composition tree construction (`get_skill_tree()`), and conflict detection.
+`SkillDiscoveryEngine` wraps `HyperspaceStore` for vector-based semantic search across skills. `suggest_links()` prefers cosine similarity via embedding vectors and falls back to Jaccard tag overlap when embeddings are unavailable. Includes BFS path finding (`find_skill_chain()`), composition tree construction (`get_skill_tree()`), and conflict detection.
 
 ### 9. 5W2H Dimension-Level Audit — Precision Rollback
-CA audits each of the 7 dimensions independently. What/Why fail → re-analyze. How/Where fail → re-plan. When/HowMuch fail → conditional pass. No more black-box "PASS/FAIL" — you know exactly what went wrong.
+CA audits all 7 dimensions (`what`, `why`, `who`, `when`, `where`, `how`, `how_much`) independently. What/Why fail → re-analyze. How/Where fail → re-plan. When/HowMuch fail → conditional pass. No more black-box "PASS/FAIL" — you know exactly what went wrong.
 
 ### 10. Proactive Perception Engine
-10 execution triggers with 60-second anomaly deduplication. Monitors deadline violations, budget overruns (>80% tokens), role mismatches, environment conflicts. **Workspace Monitor** detects file creations/modifications/deletions in real-time. Auto-escalates to human when needed.
+10 execution triggers (`TaskStart`, `PlanCompleted`, `ProgressAnomaly`, `CheckCompleted`, `TaskEnd`, `CycleTimeout`, `AgentBlocked`, `ResourceConflict`, `QualityDegradation`, `UserFeedback`) with a 60-second anomaly deduplication window. Monitors deadline violations, budget overruns (>80% tokens), role mismatches, and environment conflicts. **Workspace Monitor** detects file creations/modifications/deletions in real-time. Auto-escalates to human when needed.
 
 ### 11. Micro-Tool System — Tame Large Outputs
-Results >8KB auto-generate conversational micro-tools (e.g., "search_in_results"). Transforms unwieldy 50KB+ outputs into interactive, queryable artifacts within the LLM context.
+Results at or above 16 KB (16,384 bytes) auto-generate conversational micro-tools (e.g., "search_in_results"). Transforms unwieldy large outputs into interactive, queryable artifacts within the LLM context.
 
 ### 12. MCP Integration — One Protocol to Connect Them All
-Standard **Model Context Protocol** connects GitHub, Slack, Jira, and any MCP-compatible server. Dynamic tool discovery at runtime. Supports both HTTP SSE and stdio transport modes with repeatable `--mcp-server` CLI flags.
+Standard **Model Context Protocol** connects GitHub, Slack, Jira, and any MCP-compatible server. Dynamic tool discovery at runtime. Supports both HTTP SSE and stdio transport modes with repeatable `--mcp-server` / `--mcp-server-stdio` CLI flags.
 
 ### 13. Checkpoint & Recovery — Explicit Session Management
 Session checkpoints and `--resume <task_iri>` / `--list-checkpoints` support explicit session management. Crash recovery and complete long-running-task replay require dedicated fault-injection and end-to-end validation before being claimed.
 
 ### 14. Center + Edge Federation — Local Autonomy, Global Orchestration
-Go Center handles workflow orchestration (Temporal), project management, agent registry. Rust Edge runs local LLM execution with Docker sandbox. VS Code Plugin provides real-time developer awareness. No single point of failure.
+The [`apps/software_engineering_team`](apps/software_engineering_team/README.md) prototype splits the system across three tiers: a Go **Center** (Gin + Temporal + gRPC) owns workflow orchestration, project management, and agent registration; a Rust **Edge daemon** (axum + async-openai) runs local LLM execution, caches graph data, and communicates with the IDE; a TypeScript **VS Code plugin** provides chat, task, and graph views over WebSocket/REST. The Docker sandbox for heavy isolation is reserved; the repository's `unshare` process sandbox is the default lightweight path.
 
 ---
 
@@ -215,14 +151,7 @@ Go Center handles workflow orchestration (Temporal), project management, agent r
 
 ### Download & Run — Gliding Code
 
-No dependencies required. Just download, extract, and run:
-
-| Platform | Download |
-|----------|----------|
-| Linux (x86_64, musl) | [`glidingcode-x86_64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (~15 MB) |
-| Linux (aarch64, musl) | [`glidingcode-aarch64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (~14 MB) |
-| macOS (Apple Silicon) | [`glidingcode-aarch64-apple-darwin.tar.gz`](https://github.com/doiito/gliding_horse/releases) (~13 MB) |
-| Windows (x86_64) | [`glidingcode-x86_64-pc-windows-msvc.zip`](https://github.com/doiito/gliding_horse/releases) (~12 MB) |
+Prebuilt binaries for Linux (x86_64 / aarch64, fully static musl), macOS (Apple Silicon), and Windows (x86_64) are published on the **[Releases](https://github.com/doiito/gliding_horse/releases)** page. Download the archive for your platform, then:
 
 ```bash
 # Linux / macOS
@@ -230,7 +159,7 @@ tar xzf glidingcode-*.tar.gz
 ./glidingcode --help
 
 # Windows (PowerShell)
-Expand-Archive glidingcode-x86_64-pc-windows-msvc.zip .
+Expand-Archive glidingcode-*.zip .
 .\glidingcode.exe --help
 ```
 
@@ -315,19 +244,20 @@ cargo build -p code_cli --release
 
 ## 🗺️ Roadmap
 
-**v0.1.x Release Series** (stabilization):
-- Binary distribution for Linux/macOS/Windows via GitHub Releases
-- Pre-built musl static builds for Linux (zero-dependency)
-- MCP tool ecosystem expansion and documentation
-- Checkpoint/resume polish and testing
+**v0.1.x series — released** (current: `v0.1.7.preview`)
+- Prebuilt binaries for Linux (x86_64 / aarch64, fully static musl), macOS (Apple Silicon), and Windows (x86_64), published on the Releases page
+- MCP integration over HTTP SSE and stdio with repeatable `--mcp-server` / `--mcp-server-stdio` flags
+- Checkpoint/resume, explicit JSON-LD DAG workflow execution, and durable continuous-learning audit surfaces
+- Reproducible L0 / L2 / L3 / HNSW / Poincaré benchmarks via `examples/readme_performance.rs`
 
-**v0.2.x Release Series** (planned):
+**v0.2.x series — in progress / planned**
+- Harden the Center + Edge federation prototype (`apps/software_engineering_team`), including the Docker sandbox for the Edge daemon
 - Native web dashboard for agent monitoring and task management
 - Python/TypeScript SDK for easier integration
-- Skill marketplace prototype with community plugin registry
+- Skill marketplace prototype with a community plugin registry
 - Multi-model routing with cost-aware scheduling
 
-**v0.3.x+ Release Series** (future):
+**v0.3.x+ series — future**
 - Kubernetes deployment operator for production scaling
 - Distributed agent mesh across Edge nodes
 - Multi-modal agent support (vision, audio)
@@ -337,20 +267,21 @@ cargo build -p code_cli --release
 
 ## 📊 Performance Targets
 
-| Operation | Latency | Throughput |
-|-----------|---------|-----------|
-| L2 Node Write (Oxigraph) | ~2ms | 500 ops/sec |
-| L3 SPARQL Projection | ~15ms | 66 ops/sec |
-| L0 redb KV Read | ~1ms | 1000 ops/sec |
-| Hyperspace HNSW Search (10K vectors) | ~1ms | 1000 qps |
-| Poincaré Embedding (4D) | ~50µs | — |
-| Agent ReAct Turn | 1-5s | 0.2-1 turns/sec |
-| Idle Memory | ~200MB | scales with tasks |
+| Operation | Target latency | Target throughput |
+|-----------|---------------|-------------------|
+| L2 durable node write (Oxigraph-backed blackboard) | ~2ms | 500 ops/sec |
+| L3 cold projection | ~15ms | 66 ops/sec |
+| L0 redb KV read | ~1ms | 1000 ops/sec |
+| HNSW search (10K vectors) | ~1ms | 1000 qps |
+| Poincaré 4D vector construction | ~50µs | — |
+| Agent ReAct turn | 1–5s | environment/model dependent |
+| Idle memory | ~200MB | scales with tasks |
 
-The deterministic local targets (L0/L2/L3/HNSW/Poincaré) can be measured in
-release mode with `cargo run --release --example readme_performance`. Agent
-turn latency and idle memory are environment/model-level measurements and must
-be verified from a real provider run and the glidingcode process respectively.
+These are **targets**, not published benchmarks. The first five are reproducible
+in release mode with `cargo run --release --example readme_performance`, which
+prints the actual value next to each target and a pass/fail status. Agent turn
+latency and idle memory are environment/model-level measurements and must be
+verified from a real provider run and the glidingcode process respectively.
 
 ---
 
@@ -359,6 +290,7 @@ be verified from a real provider run and the glidingcode process respectively.
 - **Design Detail** → [`docs/DESIGN_DETAIL.md`](docs/DESIGN_DETAIL.md) · [`docs/DESIGN_DETAIL.zh.md`](docs/DESIGN_DETAIL.zh.md) (中文)
 - **Core Design Philosophy** → [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) · [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) (中文)
 - **Ontology Namespace Migration** → [`docs/16-ONTOLOGY_NAMESPACE_MIGRATION.md`](docs/16-ONTOLOGY_NAMESPACE_MIGRATION.md)
+- **Changelog** → [`CHANGELOG.md`](CHANGELOG.md)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
 
 ---

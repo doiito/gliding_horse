@@ -15,7 +15,7 @@
 
 ---
 
-[**中文**] · [**English**](README.md) · [**设计细节 →**](docs/DESIGN_DETAIL.zh.md)
+[**中文**] · [**English**](README.md) · [**设计细节 →**](docs/DESIGN_DETAIL.zh.md) · [**变更日志 →**](CHANGELOG.md)
 [**medium URL**](https://medium.com/@doiito-sun)
 [**中文稀土掘金**](https://juejin.cn/column/7647868075887165450)
 [**中文博客园**](https://www.cnblogs.com/doiito)
@@ -26,67 +26,7 @@
 
 ---
 
-## 🎉 v0.1.4.preview 发布
-
-我们自豪地宣布 **流马智能体操作系统 v0.1.4.preview 发布** — 本次发布是一次重大的稳定性与智能感知升级，涉及 85 个文件的架构重构与功能增强（+6134 / −4127 行）。
-
-**发布亮点：**
-
-| 领域 | 说明 |
-|------|------|
-| **SA 模块单体拆分重构** | 将 3408 行的 `sa/mod.rs` 拆分为 8 个专注模块（`types`、`planning`、`execution`、`intervention`、`agent`、`process`、`stats`、`actions`）——代码库中最大的结构性重构。 |
-| **统一时间线系统** | 新增 `TimeRange` + `TimelineEntry` 跨子系统时间线查询框架。包含指数时间衰减重排序（`apply_time_decay()`）——旧记忆优雅降权，确保最新相关记忆优先。 |
-| **5W2H 维度审计** | 正式化的维度级审计，含 `AuditStatus`（通过/警告/失败）三级状态，失败维度自动连锁到因果引擎进行根因分析——告别黑盒"通过/不通过"。 |
-| **知识图谱上下文注入** | Agent 系统提示现自动注入相关 KG 实体，SA 干预后的新知识立即可见。 |
-| **时间感知系统提示** | Agent 现接收当前时间与会话上下文，支持时间敏感推理和检查点一致性恢复。 |
-| **Hyperspace 集成主动感知** | 经验查询优先使用 HyperspaceStore 语义搜索（时间衰减 λ=0.5），替代 L0 标签子串匹配，优雅降级至原路径。 |
-| **因果集成工作区监控** | 文件创建/修改/删除事件记录 `CausalObservation`，支持根因追溯。任务前快照 + 目标感知文件清单注入。 |
-| **LLRU 冷归档（技能图谱）** | 自动将冷数据技能归档至 L0（`storage_tier = L0Permanent`），`find_stale_skills()` 触发过期技能重新索引。 |
-| **TimelineStore 突变追踪** | 每次技能图谱结构变更（注册/更新/删除/链接/MOC）记录 `GraphMutation`，确保 `pending_mutations()` 反映真实图活动。 |
-| **旧 DAG 工作流引擎移除** | 移除基于 petgraph 的 211 行 `DagEngine`——PDCA 7 级自适应执行已完全取代旧有 DAG 编排。 |
-| **HNSW 无锁并发安全** | `IncrementalHNSW` 的 `visited_gen` 从 `Vec<usize>` 改为 `Vec<AtomicUsize>`，消除并发搜索数据竞争，保留无锁路径高吞吐。 |
-| **PDCA P0: 预检运行时错误** | 修复 TL 无法匹配技能时的崩溃——优雅降级至 L0 而非中止工作流。 |
-| **PDCA P1: PA 无法创建** | 修复 `PauseOnError` 时 PA 创建失败——补全 `execute` 字段。 |
-| **PDCA P2: L0 降级无输出** | 修复指标不可用时静默输出丢失——默认指标确保始终产出可读响应。 |
-| **TL: pend 始终为 0** | 修复 TL 聚合中 `pend_sum` 误用 `sum` 而非子任务实际 pend 值的问题。 |
-| **错误处理规范化** | 移除 `execution.rs` 中两处 `.expect("RwLock poisoned")` panic ——优雅降级优于崩溃。 |
-| **技能图谱安全增强** | 新增技能注册/查询路径的访问控制检查点，及 MCP 工具调用安全过滤。 |
-
----
-
-## 🎉 v0.1.3 正式发布
-
-我们自豪地宣布 **流马智能体操作系统 v0.1.3 正式发布**。
-
-**v0.1.3 新增核心特性：**
-
-| 特性 | 说明 |
-|------|------|
-| **因果引擎 (Causal Engine)** | 全新独立因果分析子系统，包含 `CausalEngine`、`FusionEngine`、`CausalStore` 和类型化 `CausalFactor`。支持跨智能体操作的因果推理，融合多因子分析——识别根因、传播故障链、计算智能体决策的因果图。 |
-| **统一图后端 (Graph Backend)** | 整合的 `GraphBackend`（约 1200 行）替代碎片化的图存储——提供统一的节点/边 CRUD 优化接口，支持批量操作、子图提取和跨知识层的路径查找。 |
-| **图特征计算 (Graph Features)** | 新增 `graph_features` 模块，计算结构特征向量（度中心性、聚类系数、PageRank、介数中心性），并通过特征距离比较实现图相似度评分。支持跨认知快照的定量图分析。 |
-| **快照时间线 (Snapshot Timeline)** | 技能图快照与持久化的快照后 mutation 记录，支持时间点恢复和差异查询。它仍是实验性图时间线，并非完整会话历史或防崩溃恢复系统。 |
-| **自我意识模块重构** | 自我意识（SA）模块重大重写（+410 行），增强智能体状态监控、环境感知和自适应行为。与因果引擎集成实现自动自我诊断。 |
-| **5W2H 维度审计增强** | 扩展了维度级审计功能，每个维度增加了更深层的因果归因。What/Why 失败现可链入因果引擎进行自动根因分析。 |
-| **高级特性设计文档** | 新增全面的 [`ADVANCED_FEATURES_DESIGN.md`](docs/ADVANCED_FEATURES_DESIGN.md)，涵盖图后端架构、因果推理设计、时间线快照语义和性能基准。 |
-| **图后端基准测试** | 新增基准测试套件（`benches/bench_graph_backend.rs`），涵盖节点/边读写、子图提取和路径查找吞吐量。 |
-| **Gliding Code TUI 优化** | 终端客户端的引擎和 TUI 改进——更好的 Markdown 渲染、增强的 MCP 服务器生命周期管理、内部重构以提升可维护性。 |
-| **Bug 修复** | 修复了 L2 `write_node` 中的重复二级索引更新问题，该问题在并发写入时会导致索引不一致。 |
-
----
-
-## 🎉 v0.1.2 正式发布
-
-| 特性 | 说明 |
-|------|------|
-| **HyperspaceEngine 向量引擎** | 生产级嵌入式向量引擎，支持 HNSW ANN 搜索、预写日志（WAL）、切线空间剪枝及运行时可选度量空间（Poincaré、Cosine、Euclidean、Lorentz）。 |
-| **技能图谱认知网络** | 超图组合、Poincaré 结构嵌入、PageRank/Betweenness/社区发现算法、因果故障分析、实验性的时序快照/回滚、6 项形式化不变式检查、混合文本×结构搜索。 |
-| **语义技能发现引擎** | `SkillDiscoveryEngine` 集成 HyperspaceStore 向量搜索，用余弦相似度替代纯 Jaccard 标签重叠的 `suggest_links()`，支持 BFS 路径发现、组合树构建和冲突检测。 |
-| **Oxigraph SPARQL 桥接** | 技能图谱通过 SPARQL INSERT/DELETE 投影到 Oxigraph RDF 存储，并使用命名图隔离；尚未实现 RDF 到技能图的反向同步。 |
-| **L2 Blackboard 记忆系统** | 带 JSON-LD 线程、投影、消息包的类型化文档存储，LRU 淘汰策略，支撑长期智能体上下文。 |
-| **工作区监控器** | 实时文件系统感知引擎，10 种事件触发器，60 秒异常去重，5W2H 约束检查。 |
-| **批处理智能体管理器** | 基于滑动窗口的批处理组件，支持可配置触发器、事件总线集成和业务域隔离；根 gRPC 服务已接线 opt-in 自定义事件及 cron/window 消费，流式请求复用共享服务状态；事件持久化重放仍待完成。 |
-| **Gliding Code TUI 终端助手** | 交互式终端 UI（ratatui v0.28），支持 Markdown 渲染、Mermaid 图表、MCP 服务器集成、断点恢复、多模型后端。 |
+版本变化与发布记录统一记录在 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -99,17 +39,17 @@
 ### 核心技术栈
 
 | 层级 | 技术 | 职责 |
-|------|------|------|------|
+|------|------|------|
 | **核心编排** (Rust) | `PDCA 循环` · `5W2H 本体` · `事件总线` | 智能体编排与生命周期管理 |
-| **技能图谱** | `RDF` · `6 种链接类型` · `18 模块` | 动态认知网络 |
-| **记忆系统** | `L0 Sled` · `L1 Session` · `L2 Blackboard` · `L3 Projection` · `MESI 一致性` | 带预取的分层记忆 |
+| **技能图谱** | `RDF` · `6 种链接类型` · `15 模块` | 动态认知网络 |
+| **记忆系统** | `L0 redb` · `L1 Session` · `L2 Oxigraph + Blackboard` · `L3 Projection` · `MESI 一致性` | 带预取的分层记忆 |
 | **知识图谱** | `Oxigraph RDF` · `SPARQL 1.1` · `代码 AST` · `命名图` | 跨子系统统一存储 |
-| **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean` · `混合搜索` | 嵌入式向量嵌入引擎 |
+| **HyperspaceEngine** | `HNSW ANN` · `WAL` · `Poincaré/Cosine/Euclidean/Lorentz` · `混合搜索` | 嵌入式向量嵌入引擎 |
 | **Gliding Code TUI** | `ratatui` · `crossterm` · `MCP` · `断点恢复` | 终端 AI 编程助手 |
-| **数据总线** | `JSON-LD 1.1` · `@id/@type/@context` · `命名图` | 通用互操作层 |
-| **网关** | `gRPC` · `HTTP (兼容 OpenAI)` · `MCP` | 生产级接口 |
+| **数据总线** | `JSON-LD 子集` · `@id/@type/@context` · `命名图` | 内部互操作层 |
+| **网关** | `gRPC` · `HTTP (axum REST)` · `MCP` | 服务接口 |
 | **感知引擎** | `10 种触发器` · `异常去重` · `5W2H 约束检查` | 主动监控 |
-| **智能体工作流** | `PA/DA/CA` · `工具系统` · `检查点` · `追踪操作` | 多智能体执行 |
+| **智能体工作流** | `SA/PA/DA/CA/AA` · `工具系统` · `检查点` · `追踪操作` | 多智能体执行 |
 
 ---
 
@@ -141,46 +81,46 @@
 ## 🔧 亮点速览
 
 ### 1. HyperspaceEngine — 嵌入式向量引擎
-生产级空间记忆引擎，支持 **运行时可选度量空间**（Poincaré、Cosine、Euclidean、Lorentz）。内置 **HNSW 近似最近邻搜索**、CRC32 校验的**预写日志（WAL）**（3 种同步模式）、**切线空间剪枝**（优化 Poincaré 球搜索）、JSON-LD 元数据索引（RoaringBitmap 位图过滤器）以及双空间**混合搜索**（文本 × 结构）。独立 crate，零外部向量数据库依赖。
+自包含向量引擎，支持 **运行时可选度量空间**（Cosine、Poincaré、Lorentz、Euclidean）。内置 **HNSW 近似最近邻搜索**、CRC32 校验的**预写日志（WAL）**（3 种同步模式）、**切线空间剪枝**（优化 Poincaré 球搜索）、JSON-LD 元数据索引（RoaringBitmap 位图过滤器）以及双空间**混合搜索**（文本 × 结构）。`crates/hyperspace-engine` 独立 crate，不依赖任何外部向量数据库。
 
 ### 2. 技能图谱认知网络
-动态内存认知网络，**6 种语义链接类型**（前置依赖、组合、关联、替代、扩展、泛化）。核心能力包括：基于图谱拓扑的 **Poincaré 结构嵌入**（前置依赖深度 + 标签域指纹）；**超图组合**——一等公民 `Hyperedge` 与 `CompositionType`（顺序、并行、条件、可选、回退）；**图算法**（PageRank、介数中心性、标签传播社区发现、DFS 前置链、Tarjan SCC 环检测）；**因果故障分析**与根因推断；**形式化不变式验证**（6 项检查：无环、链接可达、组合可达、无废弃前置依赖、5W2H 有效、安全等级有效）；**时序版本管理**与快照回滚。
+动态内存认知网络，**6 种语义链接类型**（前置依赖、组合、关联、替代、扩展、泛化）。核心能力包括：基于图谱拓扑的 **Poincaré 结构嵌入**（前置依赖深度 + 标签域指纹）；**超图组合**——一等公民 `Hyperedge` 与 `CompositionType`（Conjunction、Disjunction、Exactly(n)、AtLeast(n)、Pipeline）；**图算法**（PageRank、介数中心性、社区发现、前置链遍历、Tarjan SCC 环检测）；**因果故障分析**与根因推断；**形式化不变式验证**（6 项检查：无环、链接目标存在、组合可达、无废弃前置依赖、5W2H 有效、安全等级有效）；**时序版本管理**与快照回滚。
 
 ### 3. 泛化 PDCA — 7 级自适应执行
-通过 5W2H 元数据动态选择 7 级复杂度（L0 即时 → L5 递归 → L6 应急）。同一引擎同时处理即时查询与数周工程项目——无需僵硬的固定流程。**PA/DA/CA 智能体角色**，基于模板的提示词构建。
+通过 5W2H 元数据在 7 个复杂度等级中动态选择：`Instant` → `Simple` → `Standard` → `Complex` → `Exploratory` → `Emergency` → `Recursive`。同一引擎同时处理即时查询与数周工程项目——无需僵硬的固定流程。**SA/PA/DA/CA/AA 智能体角色**，基于模板的提示词构建。
 
-### 4. 语义技能发现引擎
-`SkillDiscoveryEngine` 包装 `HyperspaceStore` 实现基于向量的语义技能搜索。`suggest_links()` 从 Jaccard 标签重叠优雅降级到余弦相似度搜索。内置 BFS 路径发现（`find_skill_chain()`）、组合树构建（`get_skill_tree()`）和冲突检测。
+### 4. CPU 缓存记忆 — 4 层结构 + MESI 一致性
+**L0** redb 磁盘存储 → **L1** 会话上下文 → **L2** Oxigraph 支撑的 Blackboard → **L3** 投影缓存。仓库实现了借鉴缓存一致性的协调与预取组件；目前没有已发布的端到端延迟或多智能体一致性基准。
 
-### 5. CPU 缓存记忆 — 4 层结构 + MESI 一致性
-**L0** Sled 磁盘存储 → **L1** 会话上下文 → **L2** Oxigraph RDF + Blackboard → **L3** SPARQL 投影缓存。仓库实现了借鉴缓存一致性的协调与预取组件；目前没有已发布的端到端延迟或多智能体一致性基准。
-
-### 6. JSON-LD 通用数据总线 — 内部互操作子集
+### 5. JSON-LD 数据总线 — 内部互操作子集
 内部 JSON-LD 工具支持本仓库使用的 `@context`、`@id`、`@graph`、framing、校验和路由；这不是完整 JSON-LD 1.1、SHACL 或通用 RDF 互操作性声明。
 
-### 7. 自进化技能图谱 — 自主学习
-AA 智能体在任务完成后记录知识片段、链接和演化建议。`/learn`/`/reduce` 提供显式的技能获取与归并操作；建议不会自动应用，因为 typed patch 的验证、安全与冲突门禁尚待实现。`BootstrapEngine` 从文件系统摄取 Markdown 格式技能。
+### 6. 自进化技能图谱 — 自主学习
+AA 智能体在任务完成后记录知识片段、链接和演化提案。`BootstrapEngine` 提供显式的 learn/reduce 操作，并从文件系统摄取 Markdown 格式技能；演化提案需要审批、验证与提交后才会生效，因此建议不会自动应用。
 
-### 8. 通用知识图谱 — 统一认知骨干
+### 7. 通用知识图谱 — 统一认知骨干
 技能、记忆、任务和代码知识可通过命名图使用共享 **Oxigraph RDF 存储**；已接线的生产者可进行受范围约束的 SPARQL 联合查询。tree-sitter 解析的代码 AST 会转为 RDF 三元组。`SkillGraphStore` 将变更投影到语义存储；尚未实现 RDF 到技能图的反向同步。
 
+### 8. 语义技能发现引擎
+`SkillDiscoveryEngine` 包装 `HyperspaceStore` 实现基于向量的语义技能搜索。`suggest_links()` 优先使用嵌入向量的余弦相似度，在嵌入不可用时回退到 Jaccard 标签重叠。内置 BFS 路径发现（`find_skill_chain()`）、组合树构建（`get_skill_tree()`）和冲突检测。
+
 ### 9. 5W2H 维度级审计 — 精准回滚
-CA 独立审计 7 个维度。What/Why 失败 → 重新分析。How/Where 失败 → 重新规划。When/HowMuch 失败 → 条件通过。告别黑盒"通过/不通过"——精确定位问题根因。
+CA 独立审计全部 7 个维度（`what`、`why`、`who`、`when`、`where`、`how`、`how_much`）。What/Why 失败 → 重新分析。How/Where 失败 → 重新规划。When/HowMuch 失败 → 条件通过。告别黑盒"通过/不通过"——精确定位问题根因。
 
 ### 10. 主动感知引擎 — 防患于未然
-10 种执行触发器，60 秒异常去重窗口。监控截止时间违规、预算超支（>80% Token）、角色不匹配、环境冲突。**工作区监控器**实时检测文件创建/修改/删除。必要时自动升级到人工处理。
+10 种执行触发器（`TaskStart`、`PlanCompleted`、`ProgressAnomaly`、`CheckCompleted`、`TaskEnd`、`CycleTimeout`、`AgentBlocked`、`ResourceConflict`、`QualityDegradation`、`UserFeedback`），异常去重窗口 60 秒。监控截止时间违规、预算超支（>80% Token）、角色不匹配、环境冲突。**工作区监控器**实时检测文件创建/修改/删除。必要时自动升级到人工处理。
 
 ### 11. 微工具系统 — 驾驭大型输出
-结果 >8KB 时自动生成可对话的微工具（如"search_in_results"）。将 50KB+ 的笨重输出转变为 LLM 上下文中可交互、可查询的产物。
+结果达到或超过 16 KB（16,384 字节）时自动生成可对话的微工具（如"search_in_results"）。将笨重的大型输出转变为 LLM 上下文中可交互、可查询的产物。
 
 ### 12. MCP 集成 — 一个协议连接一切
-标准 **Model Context Protocol** 连接 GitHub、Slack、Jira 等任意 MCP 兼容服务器。运行时动态发现工具。支持 HTTP SSE 和 stdio 两种传输模式，通过可重复 `--mcp-server` CLI 标志配置。
+标准 **Model Context Protocol** 连接 GitHub、Slack、Jira 等任意 MCP 兼容服务器。运行时动态发现工具。支持 HTTP SSE 和 stdio 两种传输模式，通过可重复 `--mcp-server` / `--mcp-server-stdio` CLI 标志配置。
 
 ### 13. 检查点与恢复 — 显式会话管理
 关键执行点会保存会话检查点，`--resume <task_iri>` 和 `--list-checkpoints` 提供显式会话管理。崩溃恢复和完整长任务回放仍需故障注入与端到端验证后才能作为能力宣称。
 
 ### 14. Center + Edge 联邦 — 本地自治，全局编排
-Go Center 负责工作流编排（Temporal）、项目管理、智能体注册。Rust Edge 运行本地 LLM 执行与 Docker 沙箱。VS Code 插件提供实时开发者感知。无单点故障。
+[`apps/software_engineering_team`](apps/software_engineering_team/README.md) 原型将系统分为三层：Go **Center**（Gin + Temporal + gRPC）负责工作流编排、项目管理与智能体注册；Rust **Edge Daemon**（axum + async-openai）负责本地 LLM 执行、图数据缓存，并与 IDE 通信；TypeScript **VS Code 插件**通过 WebSocket/REST 提供对话、任务与图视图。重型隔离用的 Docker 沙箱为预留能力；主仓的 `unshare` 进程级沙箱是默认的轻量路径。
 
 ---
 
@@ -193,7 +133,8 @@ Go Center 负责工作流编排（Temporal）、项目管理、智能体注册�
 - **MCP 服务器集成**，通过 `--mcp-server` 和 `--mcp-server-stdio` 标志
 - **检查点恢复**：`--resume <task_iri>` 和 `--list-checkpoints`
 - **多模型后端**：DeepSeek、兼容 OpenAI 的 API
-- **PDCA 工作流执行**：规划/执行/检查/行动完整周期
+- **PDCA 与 JSON-LD DAG 工作流**均可通过同一 SA → BizAgent 运行时执行
+- **可审计的持续学习**：CA 校验、任务族范围的知识与受门禁控制的策略提升
 - **可配置**：工作区、最大迭代次数、最大 PDCA 周期、日志级别
 
 ![Gliding Code 演示](assets/screenshot.gif)
@@ -210,14 +151,7 @@ Go Center 负责工作流编排（Temporal）、项目管理、智能体注册�
 
 ### 直接下载 — Gliding Code
 
-无需任何依赖。下载、解压、直接运行：
-
-| 平台 | 下载 |
-|------|------|
-| Linux (x86_64, musl) | [`glidingcode-x86_64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (~15 MB) |
-| Linux (aarch64, musl) | [`glidingcode-aarch64-unknown-linux-musl.tar.gz`](https://github.com/doiito/gliding_horse/releases) (~14 MB) |
-| macOS (Apple Silicon) | [`glidingcode-aarch64-apple-darwin.tar.gz`](https://github.com/doiito/gliding_horse/releases) (~13 MB) |
-| Windows (x86_64) | [`glidingcode-x86_64-pc-windows-msvc.zip`](https://github.com/doiito/gliding_horse/releases) (~12 MB) |
+适用于 Linux（x86_64 / aarch64，musl 全静态）、macOS（Apple Silicon）和 Windows（x86_64）的预编译二进制发布在 **[Releases](https://github.com/doiito/gliding_horse/releases)** 页面。下载对应平台的压缩包后：
 
 ```bash
 # Linux / macOS
@@ -225,7 +159,7 @@ tar xzf glidingcode-*.tar.gz
 ./glidingcode --help
 
 # Windows (PowerShell)
-Expand-Archive glidingcode-x86_64-pc-windows-msvc.zip .
+Expand-Archive glidingcode-*.zip .
 .\glidingcode.exe --help
 ```
 
@@ -258,6 +192,10 @@ export EXA_API_KEY="your-exa-api-key"
 # 附接 MCP 服务器
 ./glidingcode --mcp-server chrome=http://localhost:3000/sse
 
+# 可选：使用 Parallel Search MCP（无需账号或 API Key）
+# 所选择的查询与请求的 URL 会发送给 Parallel。
+./glidingcode --mcp-server parallel-search=https://search.parallel.ai/mcp
+
 # 可选：附接 You.com 搜索 MCP（free profile，无需账号或 API Key）
 # 为智能体提供带引用来源的网页搜索工具。
 ./glidingcode --mcp-server you-search=https://api.you.com/mcp?profile=free
@@ -266,9 +204,27 @@ export EXA_API_KEY="your-exa-api-key"
 # 在 https://you.com/platform/api-keys 获取 API Key，然后：
 export GLIDING_HORSE_MCP_SERVERS='[{"name":"you","url":"https://api.you.com/mcp","headers":{"Authorization":"Bearer <your-api-key>"}}]'
 
+# 隐私提示：第三方 MCP 服务器（如 chrome、parallel-search、you-search）会收到你通过它们
+# 发送的查询、URL 与提示词，启用前请阅读对应服务器的隐私政策。
+
 # 从检查点恢复
 ./glidingcode --resume task:abc123
+
+# 使用显式 JSON-LD DAG 取代默认的 PDCA 生成计划
+./glidingcode --workflow ./workflow.jsonld "Run the workflow"
+
+# 无需启动完整 TUI 引擎即可查看持久化的任务级学习证据
+./glidingcode --list-learning-evaluations
+./glidingcode --summarize-learning-evaluations
+
+# 受控的 baseline/shadow/active 回放标签。各实验臂需复用同一 pair ID、模型、
+# 随机种子、目标、工作区快照与编排模式。
+./glidingcode --learning-mode baseline --learning-pair-id replay-001 --learning-seed 42 "Task"
+./glidingcode --learning-mode shadow   --learning-pair-id replay-001 --learning-seed 42 "Task"
+./glidingcode --learning-mode active   --learning-pair-id replay-001 --learning-seed 42 "Task"
 ```
+
+主动学习永远不会绕过当前任务的 CA 审计。在同一归一化任务族累积到至少 5 个独立的 baseline 样本与 5 个候选样本，并通过可配置的正向提升门禁之前，学习到的策略始终只是有界候选（或 shadow 观测）。受控配对还需匹配随机种子、模型、应用/工作流/技能目录配置、工作区快照、目标与编排模式；重复使用同一个 pair ID 不会增加独立样本数。汇总命令会报告实际观测到的样本数、成功率、P50/P95 奖励、延迟、prompt token、轮次、工具调用，以及各回放臂是否真正可比；它不会凭空合成缺失的反事实结果。
 
 ### 从源码构建
 
@@ -276,7 +232,7 @@ export GLIDING_HORSE_MCP_SERVERS='[{"name":"you","url":"https://api.you.com/mcp"
 git clone https://github.com/doiito/gliding_horse.git
 cd gliding_horse
 
-# 编译 glidingcode 二进制（release，约 51 MB）
+# 编译 glidingcode 二进制（release）
 cargo build -p code_cli --release
 ./target/release/glidingcode --help
 ```
@@ -285,19 +241,20 @@ cargo build -p code_cli --release
 
 ## 🗺️ 路线图
 
-**v0.1.x 发布系列**（稳定化）：
-- Linux/macOS/Windows 多平台二进制分发
-- Linux musl 全静态编译（零依赖）
-- MCP 工具生态扩展与文档完善
-- 检查点恢复功能的测试与打磨
+**v0.1.x 系列 — 已发布**（当前：`v0.1.7.preview`）
+- Linux（x86_64 / aarch64，musl 全静态）、macOS（Apple Silicon）、Windows（x86_64）预编译二进制，发布在 Releases 页面
+- 支持 HTTP SSE 与 stdio 的 MCP 集成，通过可重复 `--mcp-server` / `--mcp-server-stdio` 标志配置
+- 检查点恢复、显式 JSON-LD DAG 工作流执行，以及持久化的持续学习审计入口
+- 可复现的 L0 / L2 / L3 / HNSW / Poincaré 基准测试（`examples/readme_performance.rs`）
 
-**v0.2.x 发布系列**（规划中）：
+**v0.2.x 系列 — 进行中 / 规划中**
+- 完善 Center + Edge 联邦原型（`apps/software_engineering_team`），包括 Edge Daemon 的 Docker 沙箱
 - 原生 Web 仪表盘（智能体监控与任务管理）
 - Python/TypeScript SDK 简化集成
 - 技能市场原型与社区插件注册表
 - 多模型路由与成本感知调度
 
-**v0.3.x+ 发布系列**（未来）：
+**v0.3.x+ 系列 — 未来**
 - Kubernetes 部署算子，生产级弹性伸缩
 - 跨 Edge 节点的分布式智能体网格
 - 多模态智能体支持（视觉、音频）
@@ -307,15 +264,20 @@ cargo build -p code_cli --release
 
 ## 📊 性能目标
 
-| 操作 | 延迟 | 吞吐量 |
-|------|------|--------|
-| L2 节点写入 (Oxigraph) | ~2ms | 500 ops/sec |
-| L3 SPARQL 投影 | ~15ms | 66 ops/sec |
-| L0 Sled KV 读取 | ~1ms | 1000 ops/sec |
-| Hyperspace HNSW 搜索（万级向量） | ~1ms | 1000 qps |
-| Poincaré 嵌入（4 维） | ~50µs | — |
-| Agent ReAct 单轮 | 1-5s | 0.2-1 turns/sec |
+| 操作 | 目标延迟 | 目标吞吐量 |
+|------|---------|-----------|
+| L2 持久化节点写入（Oxigraph 支撑的 Blackboard） | ~2ms | 500 ops/sec |
+| L3 冷投影 | ~15ms | 66 ops/sec |
+| L0 redb KV 读取 | ~1ms | 1000 ops/sec |
+| HNSW 搜索（万级向量） | ~1ms | 1000 qps |
+| Poincaré 4D 向量构造 | ~50µs | — |
+| Agent ReAct 单轮 | 1–5s | 依环境/模型而定 |
 | 空闲内存 | ~200MB | 随任务扩展 |
+
+以上为**目标值**，并非已发布的基准测试结果。前五项可在 release 模式下通过
+`cargo run --release --example readme_performance` 复现，命令会打印实测值、目标值
+及通过/未通过状态。Agent 单轮延迟与空闲内存属于环境/模型级指标，需分别通过真实
+provider 运行与 glidingcode 进程实测验证。
 
 ---
 
@@ -324,6 +286,7 @@ cargo build -p code_cli --release
 - **设计细节** → [`docs/DESIGN_DETAIL.zh.md`](docs/DESIGN_DETAIL.zh.md) · [`docs/DESIGN_DETAIL.md`](docs/DESIGN_DETAIL.md) (English)
 - **核心设计理念** → [`docs/CORE_DESIGN_PHILOSOPHY.zh.md`](docs/CORE_DESIGN_PHILOSOPHY.zh.md) · [`docs/CORE_DESIGN_PHILOSOPHY.md`](docs/CORE_DESIGN_PHILOSOPHY.md) (English)
 - **本体命名空间迁移** → [`docs/16-ONTOLOGY_NAMESPACE_MIGRATION.md`](docs/16-ONTOLOGY_NAMESPACE_MIGRATION.md) (English)
+- **变更日志** → [`CHANGELOG.md`](CHANGELOG.md)
 - **gRPC Proto** → [`proto/pdca_core.proto`](proto/pdca_core.proto)
 
 ---

@@ -5,6 +5,11 @@ use std::collections::{BTreeMap, HashMap};
 pub struct McpServerEntry {
     pub name: String,
     pub url: String,
+    /// Optional HTTP headers (e.g. `Authorization`) sent with every request
+    /// to this server. Empty by default so unauthenticated servers keep the
+    /// exact behavior they had before.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// A parsed entry for a stdio MCP server (from env or CLI args).
@@ -247,9 +252,12 @@ impl CliConfig {
 
     /// 从环境变量加载 MCP 服务器配置。
     /// 支持两种格式：
-    /// 1. `GLIDING_HORSE_MCP_SERVERS` JSON 数组：
-    ///    [{"name":"chrome","url":"http://localhost:3000/sse"}]
-    /// 2. 独立的 `MCP_SERVER__{NAME}` 环境变量（值=URL），优先级更高：
+    /// 1. `GLIDING_HORSE_MCP_SERVERS` JSON 数组（可选 `headers` 字段，例如
+    ///    需要鉴权的远端服务器）：
+    ///    [{"name":"chrome","url":"http://localhost:3000/sse"},
+    ///     {"name":"you","url":"https://api.you.com/mcp",
+    ///      "headers":{"Authorization":"Bearer <token>"}}]
+    /// 2. 独立的 `MCP_SERVER__{NAME}` 环境变量（值=URL，无 headers），优先级更高：
     ///    MCP_SERVER__chrome=http://localhost:3000/sse
     fn load_mcp_servers() -> Vec<McpServerEntry> {
         let mut servers = Vec::new();
@@ -270,7 +278,11 @@ impl CliConfig {
                     if let Some(pos) = servers.iter().position(|s| s.name == name) {
                         servers[pos].url = val;
                     } else {
-                        servers.push(McpServerEntry { name, url: val });
+                        servers.push(McpServerEntry {
+                            name,
+                            url: val,
+                            headers: BTreeMap::new(),
+                        });
                     }
                 }
             }
@@ -377,5 +389,34 @@ impl CliConfig {
             mcp_servers: self.mcp_servers.clone(),
             mcp_stdio_servers: self.mcp_stdio_servers.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_server_entry_parses_without_headers() {
+        // `MCP_SERVER__{NAME}` / `--mcp-server` entries never carry headers;
+        // existing configs must keep parsing unchanged.
+        let entry: McpServerEntry =
+            serde_json::from_str(r#"{"name":"chrome","url":"http://localhost:3000/sse"}"#)
+                .expect("header-less entry must parse");
+        assert_eq!(entry.name, "chrome");
+        assert_eq!(entry.url, "http://localhost:3000/sse");
+        assert!(entry.headers.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_entry_parses_optional_headers() {
+        let entry: McpServerEntry = serde_json::from_str(
+            r#"{"name":"you","url":"https://api.you.com/mcp","headers":{"Authorization":"Bearer tok"}}"#,
+        )
+        .expect("entry with headers must parse");
+        assert_eq!(
+            entry.headers.get("Authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
     }
 }

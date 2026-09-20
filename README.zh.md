@@ -258,6 +258,14 @@ export EXA_API_KEY="your-exa-api-key"
 # 附接 MCP 服务器
 ./glidingcode --mcp-server chrome=http://localhost:3000/sse
 
+# 可选：附接 You.com 搜索 MCP（free profile，无需账号或 API Key）
+# 为智能体提供带引用来源的网页搜索工具。
+./glidingcode --mcp-server you-search=https://api.you.com/mcp?profile=free
+
+# 需要鉴权的 You.com MCP（完整工具集）通过 JSON 环境变量配置：
+# 在 https://you.com/platform/api-keys 获取 API Key，然后：
+export GLIDING_HORSE_MCP_SERVERS='[{"name":"you","url":"https://api.you.com/mcp","headers":{"Authorization":"Bearer <your-api-key>"}}]'
+
 # 从检查点恢复
 ./glidingcode --resume task:abc123
 ```

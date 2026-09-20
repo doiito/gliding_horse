@@ -359,6 +359,7 @@ fn main() -> anyhow::Result<()> {
                 config.mcp_servers.push(code_cli::config::McpServerEntry {
                     name,
                     url: url.to_string(),
+                    headers: std::collections::BTreeMap::new(),
                 });
             }
         }

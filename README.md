@@ -267,7 +267,15 @@ export EXA_API_KEY="your-exa-api-key"
 # Chosen queries and requested URLs are sent to Parallel.
 ./glidingcode --mcp-server parallel-search=https://search.parallel.ai/mcp
 
-# Privacy note: third-party MCP servers (e.g. chrome, parallel-search)
+# Optional: use You.com Search MCP (keyless free profile, no account or API key)
+# Gives the agent a web-search tool with cited web results.
+./glidingcode --mcp-server you-search=https://api.you.com/mcp?profile=free
+
+# Authenticated You.com MCP (full tool set) via the JSON env config.
+# Get an API key at https://you.com/platform/api-keys, then:
+export GLIDING_HORSE_MCP_SERVERS='[{"name":"you","url":"https://api.you.com/mcp","headers":{"Authorization":"Bearer <your-api-key>"}}]'
+
+# Privacy note: third-party MCP servers (e.g. chrome, parallel-search, you-search)
 # receive the queries, URLs, and prompts you send through them. Review
 # each server's privacy policy before enabling.
 

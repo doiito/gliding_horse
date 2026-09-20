@@ -57,6 +57,17 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
+/// Extract the payload of an SSE `data:` line, if the line is one.
+/// Multi-line data fields are not used by streamable-HTTP MCP replies,
+/// which send each JSON-RPC message as a single `data:` line.
+fn parse_sse_data_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("data:")
+        .map(|payload| payload.trim())
+        .filter(|payload| !payload.is_empty())
+}
+
 // ── Stdio process management ──────────────────────────────────────
 
 /// Manages a spawned MCP server subprocess with stdin/stdout JSON-RPC transport.
@@ -591,7 +602,13 @@ impl McpClient {
         headers: &BTreeMap<String, String>,
         request: &JsonRpcRequest,
     ) -> Result<JsonRpcResponse, CoreError> {
-        let mut request_builder = self.http_client.post(url);
+        let mut request_builder = self
+            .http_client
+            .post(url)
+            // Streamable-HTTP MCP servers (2025-03-26 spec) require clients to
+            // accept both content types and may reply with either. Plain-JSON
+            // servers ignore the Accept header, so this is safe to send always.
+            .header("Accept", "application/json, text/event-stream");
         for (name, value) in headers {
             request_builder = request_builder.header(name, value);
         }
@@ -611,10 +628,30 @@ impl McpClient {
                 message: format!("MCP HTTP request failed with {status}: {body}"),
             });
         }
-        let rpc_response: JsonRpcResponse =
-            response.json().await.map_err(|e| CoreError::Internal {
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let body = response.text().await.map_err(|e| CoreError::Internal {
+            message: format!("MCP response read failed: {}", e),
+        })?;
+        let rpc_response = if content_type.contains("text/event-stream") {
+            // An SSE-framed reply carries the JSON-RPC response in `data:` lines.
+            // Take the first line that parses as a JSON-RPC message; unrelated
+            // event types (e.g. `event: ping`) carry no data payload.
+            body.lines()
+                .filter_map(parse_sse_data_line)
+                .find_map(|line| serde_json::from_str::<JsonRpcResponse>(line).ok())
+                .ok_or_else(|| CoreError::Internal {
+                    message: "MCP SSE response contained no JSON-RPC message".to_string(),
+                })?
+        } else {
+            serde_json::from_str(&body).map_err(|e| CoreError::Internal {
                 message: format!("MCP response parse failed: {}", e),
-            })?;
+            })?
+        };
 
         Ok(rpc_response)
     }
@@ -975,5 +1012,65 @@ mod tests {
         let tools = client.connect("authenticated").await.unwrap();
         assert!(tools.is_empty());
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+    use crate::config::McpRemoteServerConfig;
+
+    #[test]
+    fn parses_single_sse_data_line() {
+        let line = r#"data: {"jsonrpc":"2.0","result":{"ok":true},"id":7}"#;
+        let payload = parse_sse_data_line(line).expect("data line must yield payload");
+        let parsed: JsonRpcResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.id, 7);
+        assert_eq!(parsed.result, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn ignores_non_data_sse_lines() {
+        assert_eq!(parse_sse_data_line("event: message"), None);
+        assert_eq!(parse_sse_data_line(""), None);
+        assert_eq!(parse_sse_data_line(": keepalive"), None);
+        assert_eq!(parse_sse_data_line("data:"), None);
+    }
+
+    #[tokio::test]
+    async fn http_mcp_parses_sse_framed_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Minimal streamable-HTTP MCP reply: SSE framing around one JSON-RPC message.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            // Streamable-HTTP clients must send both accepted content types.
+            assert!(request.contains("accept: application/json, text/event-stream"));
+            let body = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]},\"id\":1}\r\n\r\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let mut client = McpClient::new();
+        client.register_from_config(
+            "sse-server",
+            &McpServerConfig::Http(McpRemoteServerConfig {
+                url: format!("http://{address}/mcp"),
+                headers: BTreeMap::new(),
+            }),
+        );
+        let tools = client.connect("sse-server").await.unwrap();
+        assert!(tools.is_empty());
+        server.join().unwrap();
     }
 }

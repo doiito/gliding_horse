@@ -196,7 +196,15 @@ export EXA_API_KEY="your-exa-api-key"
 # 所选择的查询与请求的 URL 会发送给 Parallel。
 ./glidingcode --mcp-server parallel-search=https://search.parallel.ai/mcp
 
-# 隐私提示：第三方 MCP 服务器（如 chrome、parallel-search）会收到你通过它们
+# 可选：附接 You.com 搜索 MCP（free profile，无需账号或 API Key）
+# 为智能体提供带引用来源的网页搜索工具。
+./glidingcode --mcp-server you-search=https://api.you.com/mcp?profile=free
+
+# 需要鉴权的 You.com MCP（完整工具集）通过 JSON 环境变量配置：
+# 在 https://you.com/platform/api-keys 获取 API Key，然后：
+export GLIDING_HORSE_MCP_SERVERS='[{"name":"you","url":"https://api.you.com/mcp","headers":{"Authorization":"Bearer <your-api-key>"}}]'
+
+# 隐私提示：第三方 MCP 服务器（如 chrome、parallel-search、you-search）会收到你通过它们
 # 发送的查询、URL 与提示词，启用前请阅读对应服务器的隐私政策。
 
 # 从检查点恢复

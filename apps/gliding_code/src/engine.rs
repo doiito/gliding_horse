@@ -6,7 +6,9 @@ use std::time::Instant;
 use glidinghorse::causal::engine::CausalEngine;
 use glidinghorse::causal::fused::FusedRootCauseEngine;
 use glidinghorse::causal::store::CausalModelStore;
-use glidinghorse::config::{AgentSettings, McpServerConfig, McpStdioServerConfig, Settings};
+use glidinghorse::config::{
+    AgentSettings, McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig, Settings,
+};
 use glidinghorse::core::agent_runner::TaskResult;
 use glidinghorse::core::event_bus::{Event, EventBus};
 use glidinghorse::core::sa::SupervisorAgent;
@@ -1131,7 +1133,11 @@ impl CodeCliEngine {
             let mut client = McpClient::with_timeout(agent_settings.mcp_timeout_secs);
             for server in &config.mcp_servers {
                 info!(name = %server.name, url = %server.url, "注册 MCP 服务器 (HTTP)");
-                client.register_server(&server.name, &server.url);
+                let cfg = McpServerConfig::Http(McpRemoteServerConfig {
+                    url: server.url.clone(),
+                    headers: server.headers.clone(),
+                });
+                client.register_from_config(&server.name, &cfg);
             }
             for (name, entry) in &config.mcp_stdio_servers {
                 let stdio_config = McpStdioServerConfig {
